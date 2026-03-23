@@ -208,12 +208,31 @@ extern "C" void kmain(void) {
 	char str[64];
 	to_hex(usb_prog_if, str); print((char*)"Prog_If:"); print(str);
 
-	portfailed     = (volatile bool*)alloc_table();
+	portfailed = (volatile bool*)alloc_table();
+
+	// ── Outer restart loop ───────────────────────────────────────────────────
+	// When the main loop detects a Port Status Change (keyboard disconnected or
+	// reconnected), it sets needsResetting=true and breaks.  We jump back here,
+	// re-run setupUSB to re-enumerate all ports, reinitialise per-keyboard state,
+	// re-queue TRBs, and re-enter the main loop — hot-plug handled correctly.
+	restart:
+	// Clear portfailed so every port gets a fresh attempt.  Entries set in a
+	// previous pass must not carry over — the reconnected keyboard's port would
+	// be permanently skipped otherwise.
+	for (int _p = 0; _p < 4096; _p++) ((volatile uint8_t*)portfailed)[_p] = 0;
+
 	needsResetting = true;
 	while (needsResetting)
 		setupUSB(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, usb_prog_if);
 
-	if (keyboard_count == 0) { print((char*)"No keyboard found!"); hcf(); }
+	if (keyboard_count == 0) {
+		print((char*)"No keyboard found after enumeration, waiting for reconnect...");
+		// Wait for any PSC event then retry — keyboard may still be connecting.
+		for (;;) {
+			USB_Response r = get_usb_response(1000000);
+			if (r.gotresponse && r.type == 34) goto restart;
+		}
+	}
 
 	// ── TSC-based repeat thresholds ───────────────────────────────────────────
 	//
@@ -250,6 +269,49 @@ extern "C" void kmain(void) {
 		}
 
 	print((char*)"About to enter main loop");
+
+	// ── Drain stale events accumulated during enumeration ────────────────────
+	// Non-keyboard devices (e.g. a USB boot drive) may have left pending
+	// Transfer Events in the ring from their EP0 descriptor reads, or from
+	// being left in a confused state after UEFI used them.  Consume and discard
+	// everything now so the main loop starts with a clean event ring.
+	// We do this BEFORE queueing keyboard TRBs so we can't accidentally
+	// discard a real keyboard event.
+	{
+		USB_Response stale;
+		do { stale = get_usb_response(1); } while (stale.gotresponse);
+	}
+
+	// ── Queue one initial TRB per keyboard ───────────────────────────────────
+	// enumerate_device_after_address intentionally does NOT ring the doorbell
+	// or queue a TRB, because any resulting transfer event would be thrown away
+	// by the command-completion polling loops inside enumeration.  We do it
+	// here, after all enumeration is finished, so every event lands in the
+	// main loop below where we can actually handle it.
+	for (int k = 0; k < keyboard_count; k++) {
+		USBDevice* kd = keyboards[k];
+
+		volatile uint8_t* buf = (volatile uint8_t*)alloc_table();
+		for (int j = 0; j < 4096; j++) buf[j] = 0;
+		uint64_t buf_phys = (uint64_t)buf - HHDM;
+
+		volatile TRB* trb = &kd->kbd_ring->trb[kd->kbd_ring->enq];
+		trb->parameter = buf_phys;
+		trb->status    = 8;
+		trb->control   = (1u << 10) | (1u << 5) | (kd->kbd_ring->pcs & 1u);
+
+		if (++kd->kbd_ring->enq == LINK_INDEX) {
+			kd->kbd_ring->trb[LINK_INDEX].control =
+				(TRB_TYPE_LINK << 10) | (1u << 1) | (kd->kbd_ring->pcs & 1u);
+			kd->kbd_ring->enq = 0;
+			kd->kbd_ring->pcs ^= 1;
+		}
+
+		doorbell32[kd->slot_id] = 3;   // Ring EP1 IN (DCI=3)
+		print((char*)"Queued initial TRB for keyboard slot:");
+		to_str(kd->slot_id, str); print(str);
+	}
+
 	print((char*)"Press any key...");
 
 	uint32_t event_count = 0;
@@ -260,6 +322,22 @@ extern "C" void kmain(void) {
 		USB_Response resp = get_usb_response(1);
 		if (resp.gotresponse) {
 			event_count++;
+
+			// ── Port Status Change (type 34) ─────────────────────────────────
+			// A PSC event means something changed on a root port — a device was
+			// connected, disconnected, or reset.  We have no hot-plug handler,
+			// so the safest response is a full re-enumeration: set needsResetting
+			// and break out to the outer while(needsResetting) loop in kmain,
+			// which will call setupUSB again and re-discover all keyboards.
+			// This handles both disconnect (keyboard gone) and reconnect (keyboard
+			// reappears on same or different port) correctly.
+			if (resp.type == 34) {
+				uint32_t port_id = (resp.event->parameter >> 24) & 0xFF;
+				print((char*)"PSC on port during main loop:");
+				to_str(port_id, str); print(str);
+				needsResetting = true;
+				break;
+			}
 
 			if (resp.type == 32) {   // Transfer Event
 				uint32_t code    = (resp.event->status >> 24) & 0xFF;
@@ -380,4 +458,7 @@ extern "C" void kmain(void) {
 			}
 		}
 	}
+
+	// A PSC event caused break — go back and re-enumerate all ports.
+	goto restart;
 }

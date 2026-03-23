@@ -352,7 +352,26 @@ static void enumerate_device_after_address(
 	dev->is_hub      = found_hub;
 
 	if (!found_keyboard && !found_hub) {
-		print((char*)"Device is neither keyboard nor hub; skipping.");
+		print((char*)"Device is neither keyboard nor hub; disabling slot.");
+
+		// Issue Disable Slot so the xHC stops all activity on this slot and
+		// frees its resources.  Without this, the device (e.g. a USB boot
+		// drive) is left in the Addressed state with EP0 live.  The xHC can
+		// then generate stray Transfer Events (NAKs, STALLs, errors on EP0)
+		// that fill the event ring and cause keyboard events to be lost or
+		// delayed in the main loop.
+		ring_push_cmd(&cr, (10u << 10) | (dev->slot_id << 24), 0, 0);
+		doorbell32[0] = 0;
+		{
+			USB_Response resp;
+			for (int i = 0; i < 1000000; i++) {
+				resp = get_usb_response(1);
+				if (resp.gotresponse && resp.type == 33) break;
+			}
+		}
+		// Clear DCBAA entry so the slot is fully released.
+		g_dcbaa[dev->slot_id] = 0;
+		print((char*)"Slot disabled for non-keyboard device.");
 		return;
 	}
 
@@ -464,26 +483,12 @@ static void enumerate_device_after_address(
 		print((char*)"Configured EP1 IN for keyboard.");
 	}
 
-	/* ── Queue initial transfer TRB ── */
-	volatile uint8_t* kbd_buf = (volatile uint8_t*)alloc_table();
-	for (int j = 0; j < 4096; j++) kbd_buf[j] = 0;
-	uint64_t kbd_buf_phys = (uint64_t)kbd_buf - HHDM;
-
-	volatile TRB* trb1 = &dev->kbd_ring->trb[dev->kbd_ring->enq];
-	trb1->parameter = kbd_buf_phys;
-	trb1->status    = 8;
-	trb1->control   = (1u << 10) | (1u << 5) | (dev->kbd_ring->pcs & 1u);
-
-	if (++dev->kbd_ring->enq == LINK_INDEX) {
-		// Write link TRB with OLD pcs first so the controller can cross it,
-		// then flip — same rule as ring_push_cmd and the kmain re-queue path.
-		dev->kbd_ring->trb[LINK_INDEX].control =
-			(TRB_TYPE_LINK << 10) | (1u << 1) | (dev->kbd_ring->pcs & 1u);
-		dev->kbd_ring->enq = 0;
-		dev->kbd_ring->pcs ^= 1;
-	}
-
-	doorbell32[dev->slot_id] = 3;
+	// ── Do NOT queue the initial TRB here ─────────────────────────────────
+	// Any transfer event generated during enumeration would be silently
+	// discarded by the command-completion loops (for(;;) waiting on type 33)
+	// that follow this call.  The TRB would be consumed with no re-queue,
+	// leaving kmain's main loop waiting forever for an event that never comes.
+	// kmain queues one TRB per keyboard after all enumeration is done.
 
 	if (keyboard_count < MAX_KEYBOARDS) {
 		keyboards[keyboard_count++] = dev;
@@ -492,6 +497,7 @@ static void enumerate_device_after_address(
 		print((char*)"Keyboard array full.");
 	}
 }
+
 
 /* ── configure_hub_slot ───────────────────────────────────── */
 static void configure_hub_slot(USBDevice* hub, uint8_t num_ports, struct Ring& cr) {
@@ -863,6 +869,12 @@ static void setupUSB(uint64_t usb_virt_base, uint8_t usb_start,
 	global_port_index = 0;
 	needsResetting    = false;
 
+	// Reset keyboard list so a retry pass does not accumulate stale entries
+	// from the failed first pass.  The USBDevice objects from a previous pass
+	// are orphaned when the controller resets, so they must not be used again.
+	keyboard_count = 0;
+	for (int k = 0; k < MAX_KEYBOARDS; k++) keyboards[k] = nullptr;
+
 	char str[64];
 
 	if (usb_prog_if != 0x30) {
@@ -1028,7 +1040,7 @@ static void setupUSB(uint64_t usb_virt_base, uint8_t usb_start,
 
 	auto port_reset = [&](volatile uint32_t* portsc) -> bool {
 		*portsc = (*portsc | PORTSC_PR);
-
+	
 		USB_Response resp;
 		for (int attempts = 0; attempts < 500; attempts++) {
 			resp = get_usb_response(100000);
@@ -1040,12 +1052,12 @@ static void setupUSB(uint64_t usb_virt_base, uint8_t usb_start,
 				return true;
 			}
 			print((char*)"Port reset: PED not set");
-			return false;
+			return false;   // ← bails on the very first PSC regardless of which port it's for
 		}
 		print((char*)"Port reset: timed out");
 		return false;
 	};
-
+	
 	for (uint32_t i = 0; i < max_ports; i++) {
 		global_port_index++;
 		if (portfailed[global_port_index]) {
@@ -1144,13 +1156,23 @@ static void setupUSB(uint64_t usb_virt_base, uint8_t usb_start,
 		ring_push_cmd(&cr, (11u << 10) | (slot_id << 24), ictx_phys, 0);
 		doorbell32[0] = 0;
 
+		// Wait for Address Device completion (type 33).
+		// IMPORTANT: count only empty polls against the timeout, not unrelated
+		// events (type 34 Port Status Change, type 32 Transfer).  On machines
+		// with many ports there can be 6+ PSC events in flight at the same time;
+		// if those count against the limit the command times out before its
+		// completion event even has a chance to arrive.
 		resp.gotresponse = false;
-		for (int j = 0; j < 200; j++) {
-			resp = get_usb_response();
-			if (!resp.gotresponse) continue;
-			if (resp.type == 33) break;
-			print((char*)"Event while waiting for addr device:");
-			to_str(resp.type, str); print(str);
+		{
+			int empty_polls = 0;
+			while (empty_polls < 2000000) {
+				resp = get_usb_response(1);
+				if (!resp.gotresponse) { empty_polls++; continue; }
+				if (resp.type == 33) break;   // got our completion
+				// Any other event (PSC, transfer from a different slot, etc.)
+				// is silently swallowed — do NOT count it against the timeout.
+				resp.gotresponse = false;
+			}
 		}
 
 		if (!resp.gotresponse) {
