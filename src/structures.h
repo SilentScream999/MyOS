@@ -138,6 +138,7 @@ struct USBSetupPacket {
 struct USBDevice {
 	uint8_t slot_id;
 	uint8_t port_num;     // port number on *parent* hub/root (1-based)
+	uint8_t root_port_num;   // 1-based root port this device is on; 0 if behind a hub
 	uint32_t speed;
 	struct Ring* ep0_ring;
 	struct Ring* kbd_ring;

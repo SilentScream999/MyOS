@@ -28,6 +28,46 @@ static volatile uint32_t*  doorbell32 = nullptr;
 static volatile uint64_t*  g_dcbaa = nullptr;
 static uint32_t             g_hcc1  = 0;
 
+// Exposed so kmain can read PORTSC registers to detect disconnects without
+// relying solely on PSC events, which some controllers do not generate
+// reliably on disconnect.
+static volatile XHCIOpRegs* g_ops      = nullptr;
+static uint8_t              g_max_ports = 0;
+
+// ── TSC-based delay helpers ───────────────────────────────────────────────────
+// Mirrors the timing strategy in kmain.cpp: use the invariant TSC so delays
+// are correct regardless of loop speed or compiler optimisation level.
+// All spin_delay() calls in this file are replaced with tsc_delay_ms().
+
+static inline uint64_t _usb_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static uint64_t _usb_tsc_hz(void) {
+    uint32_t eax, ebx, ecx, edx;
+    // CPUID leaf 0x15: TSC/crystal ratio (Intel Skylake+)
+    __asm__ volatile ("cpuid"
+        : "=a"(eax),"=b"(ebx),"=c"(ecx),"=d"(edx)
+        : "a"(0x15u) : "memory");
+    if (eax && ebx && ecx) return (uint64_t)ecx * ebx / eax;
+    // CPUID leaf 0x16: base frequency in MHz
+    __asm__ volatile ("cpuid"
+        : "=a"(eax),"=b"(ebx),"=c"(ecx),"=d"(edx)
+        : "a"(0x16u) : "memory");
+    if (eax & 0xFFFFu) return (uint64_t)(eax & 0xFFFFu) * 1000000ULL;
+    return 3000000000ULL;   // fallback: 3 GHz
+}
+
+// Accurate millisecond delay — call from anywhere in usbhelpers.h
+static void tsc_delay_ms(uint32_t ms) {
+    static uint64_t hz = 0;
+    if (!hz) hz = _usb_tsc_hz();
+    uint64_t end = _usb_rdtsc() + hz * (uint64_t)ms / 1000ULL;
+    while (_usb_rdtsc() < end) { __asm__ volatile ("pause"); }
+}
+
 /* ── Ring helpers ─────────────────────────────────────────── */
 static void ring_init(struct Ring *r) {
 	r->trb  = (volatile TRB*)alloc_table();
@@ -233,6 +273,15 @@ static bool hub_get_port_status(USBDevice &hub, uint16_t port, uint8_t* status4)
 static  USBDevice*    keyboards[MAX_KEYBOARDS];
 static  int           keyboard_count = 0;
 
+// Each registered hub gets a slot here so kmain can queue and service
+// its status-change interrupt endpoint — exactly like Linux hub_activate()
+// and hub_irq().  hub_dcis[] stores the DCI of each hub's interrupt IN
+// endpoint so the doorbell can be rung with the right value.
+#define MAX_HUBS 4
+static  USBDevice*    hubs[MAX_HUBS];
+static  uint8_t       hub_dcis[MAX_HUBS];   // DCI = ep_num*2+1 for IN
+static  int           hub_count = 0;
+
 static  volatile bool* portfailed        = nullptr;
 static  bool           needsResetting    = true;
 static  int            global_port_index = 0;
@@ -392,8 +441,140 @@ static void enumerate_device_after_address(
 		}
 	}
 
+	/* ════════════════════════════════════════════════════════════
+	   Hub path — configure the hub's status-change interrupt IN
+	   endpoint and register the hub so kmain can queue and service
+	   it exactly like a keyboard's interrupt IN endpoint.
+
+	   This mirrors what Linux does in hub_probe() / hub_activate():
+	   find the status-change endpoint, submit a persistent interrupt
+	   URB (hub_irq()), and re-submit after every completion.  When
+	   any downstream port changes state, the hub sends one byte on
+	   this endpoint; we restart enumeration in response, cleanly
+	   handling both connect and disconnect without any polling or
+	   timeout hacks.
+	   ════════════════════════════════════════════════════════════ */
 	if (found_hub) {
-		print((char*)"Found a hub device.");
+		print((char*)"Found hub; setting up status-change interrupt pipe.");
+
+		// ── Find interrupt IN endpoint in config descriptor ──────
+		uint8_t  hub_ep_num  = 0;
+		uint16_t hub_ep_mps  = 1;
+		uint8_t  hub_ep_ivl  = 0xFF;
+
+		int scan     = 0;
+		int scan_len = (int)((uint16_t)config_buf[2] | ((uint16_t)config_buf[3] << 8));
+		while (scan + 2 < scan_len) {
+			uint8_t blen  = config_buf[scan];
+			uint8_t btype = config_buf[scan + 1];
+			if (blen == 0) break;
+			if (btype == 5 && scan + 7 <= scan_len) {
+				uint8_t  addr = config_buf[scan + 2];
+				uint8_t  attr = config_buf[scan + 3];
+				uint16_t mps  = (uint16_t)config_buf[scan + 4]
+				              | ((uint16_t)config_buf[scan + 5] << 8);
+				uint8_t  ivl  = config_buf[scan + 6];
+				// Interrupt IN: direction bit set, transfer type == 3
+				if ((addr & 0x80u) && (attr & 0x03u) == 3) {
+					hub_ep_num = addr & 0x0Fu;
+					hub_ep_mps = mps;
+					hub_ep_ivl = ivl;
+					break;
+				}
+			}
+			scan += blen;
+		}
+
+		if (hub_ep_num == 0) {
+			print((char*)"Hub has no interrupt IN endpoint; hub reconnects won't fire events.");
+			// Children can still be enumerated; we just can't detect
+			// downstream reconnects without the status-change pipe.
+			return;
+		}
+
+		// DCI for an IN endpoint: ep_num * 2 + 1  (xHCI spec §4.8.1)
+		uint8_t hub_dci = (uint8_t)(hub_ep_num * 2u + 1u);
+		to_str(hub_dci, str); print((char*)"Hub interrupt IN DCI:"); print(str);
+
+		// ── Configure the endpoint via Configure Endpoint command ──
+		struct Ring* hub_ring = (struct Ring*)alloc_table();
+		ring_init(hub_ring);
+		dev->kbd_ring = hub_ring;   // reuse field — it's just a Ring*
+
+		volatile uint64_t* ictx2      = alloc_table();
+		uint64_t           ictx2_phys = (uint64_t)ictx2 - HHDM;
+		for (int j = 0; j < 512; j++) ictx2[j] = 0;
+
+		volatile InputControlCtx* icc2 = (volatile InputControlCtx*)ictx2;
+		icc2->drop_flags = 0;
+		icc2->add_flags  = (1u << 0) | (1u << hub_dci);
+
+		volatile uint32_t* dev_slot_out = (volatile uint32_t*)((uint64_t)dev->device_ctx);
+		volatile uint32_t* dev_ep0_out  = (volatile uint32_t*)((uint64_t)dev->device_ctx + ctx_stride);
+
+		volatile uint32_t* in_slot2   = (volatile uint32_t*)((uint64_t)ictx2 + ctx_stride);
+		volatile uint32_t* in_ep02    = (volatile uint32_t*)((uint64_t)ictx2 + ctx_stride * 2);
+		// Context slot for hub_dci lives at stride * (hub_dci + 1) because
+		// the input context array is: [ctrl][slot][ep0][ep1out][ep1in]...
+		volatile uint32_t* in_hub_ep  = (volatile uint32_t*)((uint64_t)ictx2 + ctx_stride * ((uint64_t)hub_dci + 1u));
+
+		int dws2 = (int)(ctx_stride / 4);
+		for (int j = 0; j < dws2; j++) {
+			in_slot2[j]  = dev_slot_out[j];
+			in_ep02[j]   = dev_ep0_out[j];
+			in_hub_ep[j] = 0;
+		}
+
+		// Update Context Entries in slot DW0[31:27] to cover hub_dci.
+		in_slot2[0] = (in_slot2[0] & ~(0x1Fu << 27)) | ((uint32_t)hub_dci << 27);
+
+		// For HS hubs use the bInterval value directly (2^(n-1) * 125 µs
+		// microframes); for FS/LS use it as-is in frames.
+		uint8_t interval = (dev->speed >= 4) ? 0u : hub_ep_ivl;
+		in_hub_ep[0] = ((uint32_t)interval << 16);
+		// EP type 7 = Interrupt IN, CErr = 3
+		in_hub_ep[1] = (3u << 1) | (7u << 3) | ((uint32_t)hub_ep_mps << 16);
+		uint64_t deq = hub_ring->phys | 1u;
+		in_hub_ep[2] = (uint32_t)(deq & 0xFFFFFFFFu);
+		in_hub_ep[3] = (uint32_t)(deq >> 32);
+		in_hub_ep[4] = (uint32_t)hub_ep_mps;
+
+		ring_push_cmd(&cr, (12u << 10) | (dev->slot_id << 24), ictx2_phys, 0);
+		doorbell32[0] = 0;
+
+		{
+			USB_Response resp;
+			for (;;) {
+				resp = get_usb_response();
+				if (!resp.gotresponse) continue;
+				if (resp.type == 33) break;
+			}
+			uint32_t code = (resp.event->status >> 24) & 0xFF;
+			if (code != 1) {
+				print((char*)"Hub interrupt EP configure failed, code:");
+				to_str(code, str); print(str);
+				// Not fatal for the hub's children — enumeration can still
+				// proceed; we just cannot receive status-change notifications.
+				return;
+			}
+			print((char*)"Hub interrupt IN endpoint configured.");
+		}
+
+		// ── Register hub so kmain queues a TRB and services events ──
+		// (same pattern as keyboards[] / keyboard_count)
+		if (hub_count < MAX_HUBS) {
+			hubs[hub_count]     = dev;
+			hub_dcis[hub_count] = hub_dci;
+			hub_count++;
+			print((char*)"Hub registered for status-change monitoring.");
+		} else {
+			print((char*)"Hub array full; status-change pipe not monitored.");
+		}
+
+		// Do NOT queue the initial TRB here — same reason as keyboards:
+		// any resulting Transfer Event would be discarded by the command-
+		// completion polling loops still running inside enumeration.
+		// kmain queues one TRB per hub after all enumeration is complete.
 		return;
 	}
 
@@ -520,15 +701,11 @@ static void configure_hub_slot(USBDevice* hub, uint8_t num_ports, struct Ring& c
 	// Set Hub bit in DW0[26]
 	in_slot[0] |= (1u << 26);
 
-	// ── FIX 1 ──────────────────────────────────────────────────────────────────
 	// Number of Ports lives in DW1[31:24], NOT DW1[15:8].
 	// DW1[15:8] is the low byte of Max Exit Latency — corrupting that field
 	// causes the hub slot to be mis-configured, making every child Address Device
 	// fail with code 17 because the controller has no valid hub state to route
 	// transactions through.
-	//
-	// Wrong:  (in_slot[1] & ~(0xFFu << 8))  | ((uint32_t)num_ports << 8)
-	// Correct:
 	in_slot[1] = (in_slot[1] & ~(0xFFu << 24)) | ((uint32_t)num_ports << 24);
 
 	ring_push_cmd(&cr, (12u << 10) | (hub->slot_id << 24), ictx_phys, 0);
@@ -624,7 +801,7 @@ static void enumerate_hub_children(
 
 		// Power the port (feature 8 = PORT_POWER)
 		hub_set_port_feature(*hub, p, 8);
-		spin_delay(100000);
+		tsc_delay_ms(20);   // 20ms power stabilisation — USB 2.0 spec §11.11
 
 		// Read pre-reset status — verify something is connected
 		{
@@ -652,10 +829,11 @@ static void enumerate_hub_children(
 			portfailed[global_port_index] = true; needsResetting = true; return;
 		}
 
-		// Poll for C_PORT_RESET (wPortChange bit 4) for up to ~200 ms
+		// Poll for C_PORT_RESET (wPortChange bit 4) for up to 200ms.
+		// 1ms per poll matches Linux hub_port_reset() — no busy spinning.
 		bool reset_done = false;
 		for (int attempt = 0; attempt < 200; attempt++) {
-			spin_delay(10000);
+			tsc_delay_ms(1);   // 1ms per poll, 200ms total budget
 			uint8_t st[4]; for (int i = 0; i < 4; i++) st[i] = 0;
 			if (!hub_get_port_status(*hub, p, st)) {
 				print((char*)"FAIL: get_port_status during reset poll");
@@ -676,10 +854,10 @@ static void enumerate_hub_children(
 		// Clear C_PORT_RESET change bit (feature 20)
 		hub_clear_port_feature(*hub, p, 20);
 
-		// USB spec requires at least 10 ms TRSTRCY after reset before first
-		// transaction.  spin_delay(500000) on a fast host may be under 1 ms;
-		// spin_delay(5000000) gives comfortable margin on most hardware.
-		spin_delay(5000000);
+		// USB 2.0 §7.1.7.5: 10ms TRSTRCY recovery after reset before first
+		// transaction. The old spin_delay(5000000) was wildly over-budget
+		// (potentially seconds); 10ms is the spec minimum and more than enough.
+		tsc_delay_ms(10);
 
 		// Read final port status
 		uint8_t status4[4]; for (int i = 0; i < 4; i++) status4[i] = 0;
@@ -699,9 +877,8 @@ static void enumerate_hub_children(
 			portfailed[global_port_index] = true; needsResetting = true; return;
 		}
 
-		// ── FIX 2 ──────────────────────────────────────────────────────────────
 		// Hub port speed bits (USB 2.0 hub spec, wPortStatus):
-		//   bit 9  = PORT_LOW_SPEED  → xHCI speed code 2 (was wrongly mapped to 1)
+		//   bit 9  = PORT_LOW_SPEED  → xHCI speed code 2
 		//   bit 10 = PORT_HIGH_SPEED → xHCI speed code 3
 		//   neither                  → Full Speed → xHCI speed code 1
 		uint16_t port_status = (uint16_t)status4[0] | ((uint16_t)status4[1] << 8);
@@ -747,39 +924,16 @@ static void enumerate_hub_children(
 		volatile uint32_t* slot_ctx = (volatile uint32_t*)((uint64_t)ictx + ctx_stride);
 		volatile uint32_t* ep0_ctx  = (volatile uint32_t*)((uint64_t)ictx + ctx_stride * 2);
 
-		// ── FIX 3 ──────────────────────────────────────────────────────────────
-		// Slot context layout per xHCI spec §6.2.2 Table 57:
-		//
-		// DW0[19:0]  = Route String: tier-1 nibble = hub's downstream port p
-		//              (the root port itself is NOT part of the route string;
-		//              it lives in DW1[23:16] as Root Hub Port Number)
-		//
-		// DW1[23:16] = Root Hub Port Number = hub->port_num  (1-based root port)
-		//
-		// DW2[15:8]  = TT Port Number      = p   (port on the TT hub)  ← was [7:0]
-		// DW2[23:16] = TT Hub Slot ID      = hub->slot_id               ← was correct
-		//
-		// The child device is NOT a hub itself — do NOT set bit 26 (Hub flag)
-		// on its slot context.  Previously slot_ctx[0] |= (1u << 26) was
-		// applied here, which told the controller the keyboard was a hub and
-		// completely corrupted its routing, producing code 17 on every
-		// Address Device attempt.
-
-		uint32_t route_string = (uint32_t)(p & 0xFu);   // tier-1 port only
+		uint32_t route_string = (uint32_t)(p & 0xFu);
 
 		slot_ctx[0] = ((speed & 0xFu) << 20) | (1u << 27) | route_string;
-		slot_ctx[1] = ((uint32_t)(hub->port_num & 0xFFu) << 16);   // Root Hub Port Number
+		slot_ctx[1] = ((uint32_t)(hub->port_num & 0xFFu) << 16);
 		slot_ctx[2] = 0;
 		slot_ctx[3] = 0;
 
 		if (hub->speed == 3 && speed < 3) {
-			// Device needs Transaction Translation through the HS hub.
-			// SeaBIOS ground truth (src/hw/xhci.c):
-			//   ctx[2] = (tt.port << 8) | tt.hubdev->slotid
-			// DW2[7:0]  = TT Hub Slot ID  (slot of the hub providing TT)
-			// DW2[15:8] = TT Port Number  (port on that hub the device is on)
-			slot_ctx[2] = (hub->slot_id & 0xFFu)          // TT Hub Slot ID → [7:0]
-			            | ((uint32_t)(p & 0xFFu) << 8);   // TT Port Number → [15:8]
+			slot_ctx[2] = (hub->slot_id & 0xFFu)
+			            | ((uint32_t)(p & 0xFFu) << 8);
 		}
 
 		uint16_t ep0_mps = (speed >= 4) ? 512u : (speed == 3 ? 64u : 8u);
@@ -800,7 +954,10 @@ static void enumerate_hub_children(
 					resp = get_usb_response();
 					if (resp.gotresponse && resp.type == 33) break;
 				}
-				spin_delay(500000 * addr_attempts);
+				// Exponential backoff: 100ms, 200ms, 300ms...
+				// The old spin_delay(500000 * n) was uncalibrated and potentially
+				// several seconds per attempt. 100ms per step is plenty.
+				tsc_delay_ms(100 * addr_attempts);
 
 				// Enable a fresh slot
 				ring_push_cmd(&cr, (9u << 10), 0, 0);
@@ -836,13 +993,14 @@ static void enumerate_hub_children(
 		next_port: continue;
 		addr_done:
 
-		// Give the device a moment to process the SET_ADDRESS before we
-		// start reading descriptors from it.
-		spin_delay(1000000);
+		// USB spec §9.2.6.3: 2ms recovery after SET_ADDRESS before the first
+		// descriptor read. The old spin_delay(1000000) was uncalibrated.
+		tsc_delay_ms(2);
 
 		USBDevice* child     = (USBDevice*)alloc_table();
 		child->slot_id       = (uint8_t)slot_id;
 		child->port_num      = p;
+		child->root_port_num = 0;
 		child->speed         = speed;
 		child->ep0_ring      = ep0;
 		child->ep0_ring_phys = ep0->phys;
@@ -874,6 +1032,13 @@ static void setupUSB(uint64_t usb_virt_base, uint8_t usb_start,
 	// are orphaned when the controller resets, so they must not be used again.
 	keyboard_count = 0;
 	for (int k = 0; k < MAX_KEYBOARDS; k++) keyboards[k] = nullptr;
+
+	// Reset hub list for the same reason.
+	hub_count = 0;
+	for (int h = 0; h < MAX_HUBS; h++) {
+		hubs[h]     = nullptr;
+		hub_dcis[h] = 0;
+	}
 
 	char str[64];
 
@@ -939,6 +1104,10 @@ static void setupUSB(uint64_t usb_virt_base, uint8_t usb_start,
 	to_str(ver, str); print(str);
 
 	volatile XHCIOpRegs* ops = (volatile XHCIOpRegs*)((uintptr_t)USB_VA_BASE + caplen);
+
+	// Expose ops globally so kmain can compute PORTSC addresses for disconnect
+	// detection by polling CCS without relying solely on PSC events.
+	g_ops = ops;
 
 	doorbell32             = (volatile uint32_t*)(USB_VA_BASE + (dboff & ~0x3u));
 	volatile uint8_t* rt_base = (volatile uint8_t*)(USB_VA_BASE + (rtsoff & ~0x1Fu));
@@ -1015,6 +1184,7 @@ static void setupUSB(uint64_t usb_virt_base, uint8_t usb_start,
 	print((char*)"xHCI controller running.");
 
 	uint8_t  max_ports  = (hcs1 >> 24) & 0xFF;
+	g_max_ports         = max_ports;
 	bool     needs_ppc  = (hcc1 & (1u << 3));
 
 	if (needs_ppc) print((char*)"Manual port power required.");
@@ -1024,40 +1194,49 @@ static void setupUSB(uint64_t usb_virt_base, uint8_t usb_start,
 	constexpr uint32_t PORTSC_PR     = 1u << 4;
 	constexpr uint32_t PORTSC_PP     = 1u << 9;
 
-	// Wait briefly for hot-plug events
+	// Flush any PSC events queued during controller start-up — no fixed spin.
+	// Linux doesn't wait here either; PORTSC is read directly during port scan.
+	// 50ms gives slow firmware time to post initial events before we drain them.
+	tsc_delay_ms(50);
 	{
-		size_t timeout = 4000000;
-		while (timeout-- > 0) {
-			for (volatile int i = 0; i < 1000; i++);
-			USB_Response resp = get_usb_response(1);
-			if (!resp.gotresponse || resp.type != 34) continue;
-			uint32_t port_id = (resp.event->parameter >> 24) & 0xFF;
-			print((char*)"Early PSC on port:"); to_str(port_id, str); print(str);
+		USB_Response resp;
+		while ((resp = get_usb_response(1)).gotresponse) {
+			if (resp.type == 34) {
+				uint32_t port_id = (resp.event->parameter >> 24) & 0xFF;
+				print((char*)"Early PSC on port:"); to_str(port_id, str); print(str);
+			}
 		}
 	}
 
 	print((char*)"Scanning root ports...");
 
 	auto port_reset = [&](volatile uint32_t* portsc) -> bool {
-		*portsc = (*portsc | PORTSC_PR);
-	
-		USB_Response resp;
-		for (int attempts = 0; attempts < 500; attempts++) {
-			resp = get_usb_response(100000);
-			if (!resp.gotresponse) continue;
-			if (resp.type != 34)  continue;
-			if (*portsc & PORTSC_PED) {
-				spin_delay(200000);
-				print((char*)"Port enabled.");
-				return true;
+		// Assert PR. Zero the W1C change bits (17–22) so a read-modify-write
+		// doesn't accidentally clear them — writing 1 to a W1C bit clears it.
+		uint32_t val = *portsc;
+		val &= ~0x00FE0002u;   // zero: PED(1), CSC(17), PEC(18), WRC(19),
+							//       OCC(20), PRC(21), PLC(22), CEC(23)
+		val |= PORTSC_PR;
+		*portsc = val;
+
+		// Poll PR=0 with up to 100ms (USB 2.0 spec: 50ms reset pulse + margin).
+		// We read PORTSC directly — no need to wait for a PSC event.
+		for (int ms = 0; ms < 100; ms++) {
+			tsc_delay_ms(1);
+			uint32_t sc = *portsc;
+			if (sc & PORTSC_PR) continue;           // reset still asserted
+			if (!(sc & PORTSC_PED)) {
+				print((char*)"Port reset: PED=0, device not enabled");
+				return false;
 			}
-			print((char*)"Port reset: PED not set");
-			return false;   // ← bails on the very first PSC regardless of which port it's for
+			tsc_delay_ms(10);   // TRSTRCY: USB 2.0 §7.1.7.5 — 10ms recovery
+			print((char*)"Port enabled.");
+			return true;
 		}
 		print((char*)"Port reset: timed out");
 		return false;
 	};
-	
+
 	for (uint32_t i = 0; i < max_ports; i++) {
 		global_port_index++;
 		if (portfailed[global_port_index]) {
@@ -1069,7 +1248,7 @@ static void setupUSB(uint64_t usb_virt_base, uint8_t usb_start,
 
 		if (needs_ppc) {
 			*portsc |= PORTSC_PP;
-			spin_delay(50000);
+			tsc_delay_ms(20);   // USB spec: 20ms power stabilisation
 		}
 
 		if (!(*portsc & PORTSC_CCS)) continue;
@@ -1113,6 +1292,7 @@ static void setupUSB(uint64_t usb_virt_base, uint8_t usb_start,
 		USBDevice* newdev          = (USBDevice*)alloc_table();
 		newdev->slot_id            = (uint8_t)slot_id;
 		newdev->port_num           = (uint8_t)(i + 1);
+		newdev->root_port_num      = (uint8_t)(i + 1);  // directly on a root port
 		newdev->speed              = speed;
 		newdev->is_hub             = false;
 		newdev->is_keyboard        = false;
@@ -1157,20 +1337,15 @@ static void setupUSB(uint64_t usb_virt_base, uint8_t usb_start,
 		doorbell32[0] = 0;
 
 		// Wait for Address Device completion (type 33).
-		// IMPORTANT: count only empty polls against the timeout, not unrelated
-		// events (type 34 Port Status Change, type 32 Transfer).  On machines
-		// with many ports there can be 6+ PSC events in flight at the same time;
-		// if those count against the limit the command times out before its
-		// completion event even has a chance to arrive.
+		// Count only empty polls against the timeout, not unrelated events
+		// (type 34 Port Status Change, type 32 Transfer).
 		resp.gotresponse = false;
 		{
 			int empty_polls = 0;
 			while (empty_polls < 2000000) {
 				resp = get_usb_response(1);
 				if (!resp.gotresponse) { empty_polls++; continue; }
-				if (resp.type == 33) break;   // got our completion
-				// Any other event (PSC, transfer from a different slot, etc.)
-				// is silently swallowed — do NOT count it against the timeout.
+				if (resp.type == 33) break;
 				resp.gotresponse = false;
 			}
 		}
@@ -1191,7 +1366,7 @@ static void setupUSB(uint64_t usb_virt_base, uint8_t usb_start,
 			return;
 		}
 		print((char*)"Address Device success.");
-		spin_delay(100000);
+		tsc_delay_ms(2);   // USB spec §9.2.6.3: 2ms recovery after SET_ADDRESS
 
 		enumerate_device_after_address(newdev, ops, rt_base, cr, hcc1, hcs1, hcs2);
 		if (needsResetting) return;

@@ -211,26 +211,107 @@ extern "C" void kmain(void) {
 	portfailed = (volatile bool*)alloc_table();
 
 	// ── Outer restart loop ───────────────────────────────────────────────────
-	// When the main loop detects a Port Status Change (keyboard disconnected or
-	// reconnected), it sets needsResetting=true and breaks.  We jump back here,
-	// re-run setupUSB to re-enumerate all ports, reinitialise per-keyboard state,
-	// re-queue TRBs, and re-enter the main loop — hot-plug handled correctly.
+	// When the main loop detects a disconnect or Port Status Change, it sets
+	// needsResetting=true and breaks.  We jump back here, re-run setupUSB to
+	// re-enumerate all ports, reinitialise per-keyboard state, re-queue TRBs,
+	// and re-enter the main loop.
 	restart:
-	// Clear portfailed so every port gets a fresh attempt.  Entries set in a
-	// previous pass must not carry over — the reconnected keyboard's port would
-	// be permanently skipped otherwise.
+	// Clear portfailed so every port gets a fresh attempt on each restart.
 	for (int _p = 0; _p < 4096; _p++) ((volatile uint8_t*)portfailed)[_p] = 0;
 
 	needsResetting = true;
 	while (needsResetting)
 		setupUSB(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, usb_prog_if);
 
+	// ── Queue hub status-change TRBs BEFORE the keyboard_count == 0 check ───
+	//
+	// CRITICAL ORDER: hub TRBs must be queued here, before the empty-keyboard
+	// wait loop below, not after it.
+	//
+	// The old code queued hub TRBs after the keyboard TRB loop, which is only
+	// reached when keyboard_count > 0.  When an empty hub is plugged in,
+	// keyboard_count == 0 so the wait loop fires first — hub TRBs are never
+	// queued, the interrupt IN pipe is never armed, and the hub is completely
+	// invisible.  It cannot signal downstream connect, disconnect, or anything
+	// else, because there is no pending TRB for the xHCI to complete.
+	//
+	// With hub TRBs queued here:
+	//   - Empty hub plug/unplug → Transfer Event on hub slot → wait loop
+	//     catches it → goto restart → keyboard found on next pass.
+	//   - Hub with keyboard already attached → same path, works identically.
+	//   - No hub at all → hub_count == 0, loop body never runs, no cost.
+	for (int h = 0; h < hub_count; h++) {
+		USBDevice* hd = hubs[h];
+
+		volatile uint8_t* buf = (volatile uint8_t*)alloc_table();
+		for (int j = 0; j < 4096; j++) buf[j] = 0;
+		uint64_t buf_phys = (uint64_t)buf - HHDM;
+
+		volatile TRB* trb = &hd->kbd_ring->trb[hd->kbd_ring->enq];
+		trb->parameter = buf_phys;
+		trb->status    = 1;   // 1 byte status-change bitmap (covers up to 7 ports)
+		trb->control   = (1u << 10) | (1u << 5) | (hd->kbd_ring->pcs & 1u);
+
+		if (++hd->kbd_ring->enq == LINK_INDEX) {
+			hd->kbd_ring->trb[LINK_INDEX].control =
+				(TRB_TYPE_LINK << 10) | (1u << 1) | (hd->kbd_ring->pcs & 1u);
+			hd->kbd_ring->enq = 0;
+			hd->kbd_ring->pcs ^= 1;
+		}
+
+		doorbell32[hd->slot_id] = hub_dcis[h];
+		print((char*)"Queued status-change TRB for hub slot:");
+		to_str(hd->slot_id, str); print(str);
+	}
+
+	// ── Wait for a keyboard if none was found ────────────────────────────────
+	//
+	// Hub TRBs are now armed above so all four hotplug cases work:
+	//
+	//   1. Root-port keyboard unplug/replug → PSC event (type 34) → restart.
+	//
+	//   2. Hub-connected keyboard unplug/replug → hub fires interrupt IN
+	//      (type 32, code 1/13) → restart.
+	//
+	//   3. Empty hub plugged in → same as case 2: hub fires interrupt IN
+	//      for its downstream port connecting → restart → keyboard found.
+	//
+	//   4. Empty hub unplugged → xHCI aborts pending interrupt IN TRB with
+	//      error (type 32, code != 1/13) OR root port fires PSC (type 34)
+	//      → both handled below → restart.
+	//
+	// A 300ms settle delay before each restart gives PORTSC time to stabilise
+	// after a reconnect on the same port — without it setupUSB runs in ~50ms,
+	// still sees CCS=0, finds nothing, and we block here again with no pending
+	// events (the reconnect PSC was already consumed during the scan).
+	// 300ms matches Linux hub_port_debounce() and costs nothing on normal boot.
 	if (keyboard_count == 0) {
-		print((char*)"No keyboard found after enumeration, waiting for reconnect...");
-		// Wait for any PSC event then retry — keyboard may still be connecting.
-		for (;;) {
-			USB_Response r = get_usb_response(1000000);
-			if (r.gotresponse && r.type == 34) goto restart;
+		print((char*)"No keyboard found. Waiting for hotplug event...");
+
+		while (true) {
+			USB_Response r = get_usb_response(100000);
+			if (!r.gotresponse) continue;
+
+			// Root-port connect/disconnect → PSC event
+			if (r.type == 34) {
+				print((char*)"PSC event — re-enumerating.");
+				tsc_delay_ms(300);
+				goto restart;
+			}
+
+			// Hub slot Transfer Event (any code) → downstream port changed
+			// state, or hub itself was unplugged.  Both need re-enumeration.
+			if (r.type == 32) {
+				uint32_t slot = (r.ctrl >> 24) & 0xFF;
+				for (int h = 0; h < hub_count; h++) {
+					if (hubs[h]->slot_id == slot) {
+						print((char*)"Hub event while waiting — re-enumerating.");
+						tsc_delay_ms(300);
+						goto restart;
+					}
+				}
+				// Transfer event from some other slot — ignore.
+			}
 		}
 	}
 
@@ -276,7 +357,7 @@ extern "C" void kmain(void) {
 	// being left in a confused state after UEFI used them.  Consume and discard
 	// everything now so the main loop starts with a clean event ring.
 	// We do this BEFORE queueing keyboard TRBs so we can't accidentally
-	// discard a real keyboard event.
+	// discard a real event.
 	{
 		USB_Response stale;
 		do { stale = get_usb_response(1); } while (stale.gotresponse);
@@ -312,6 +393,11 @@ extern "C" void kmain(void) {
 		to_str(kd->slot_id, str); print(str);
 	}
 
+	// NOTE: Hub TRBs were already queued before the keyboard_count == 0 block
+	// above.  Do NOT queue them again here — doing so would advance enq/pcs
+	// and ring the doorbell on an already-armed pipe, producing a duplicate
+	// or corrupt TRB that confuses the xHCI.
+
 	print((char*)"Press any key...");
 
 	uint32_t event_count = 0;
@@ -325,16 +411,14 @@ extern "C" void kmain(void) {
 
 			// ── Port Status Change (type 34) ─────────────────────────────────
 			// A PSC event means something changed on a root port — a device was
-			// connected, disconnected, or reset.  We have no hot-plug handler,
-			// so the safest response is a full re-enumeration: set needsResetting
-			// and break out to the outer while(needsResetting) loop in kmain,
-			// which will call setupUSB again and re-discover all keyboards.
-			// This handles both disconnect (keyboard gone) and reconnect (keyboard
-			// reappears on same or different port) correctly.
+			// connected, disconnected, or reset.  Trigger a full re-enumeration.
+			// 300ms settle delay gives PORTSC time to stabilise on same-port
+			// reconnects before setupUSB scans it.
 			if (resp.type == 34) {
 				uint32_t port_id = (resp.event->parameter >> 24) & 0xFF;
-				print((char*)"PSC on port during main loop:");
+				print((char*)"PSC event on port:");
 				to_str(port_id, str); print(str);
+				tsc_delay_ms(300);
 				needsResetting = true;
 				break;
 			}
@@ -342,6 +426,55 @@ extern "C" void kmain(void) {
 			if (resp.type == 32) {   // Transfer Event
 				uint32_t code    = (resp.event->status >> 24) & 0xFF;
 				uint64_t trb_ptr = resp.event->parameter;
+				uint32_t slot_from_event = (resp.ctrl >> 24) & 0xFF;
+
+				// ── Hub status-change interrupt ───────────────────────────────
+				//
+				// When any downstream port changes state (connect, disconnect,
+				// reset complete), the hub fires its interrupt IN endpoint.
+				// We get a Transfer Event here on the hub's slot.  Like Linux
+				// hub_irq() → schedule hub_event() → hub_port_status(), we
+				// restart full enumeration so every changed port is handled.
+				//
+				// 300ms settle delay before restart so PORTSC is stable on
+				// same-port reconnects.
+				{
+					int which_hub = -1;
+					for (int h = 0; h < hub_count; h++) {
+						if (hubs[h]->slot_id == slot_from_event) { which_hub = h; break; }
+					}
+
+					if (which_hub >= 0 && (code == 1 || code == 13)) {
+						print((char*)"Hub status-change interrupt — re-enumerating.");
+
+						// Re-queue the status-change TRB so the pipe stays armed.
+						USBDevice* hd     = hubs[which_hub];
+						volatile TRB* nxt = &hd->kbd_ring->trb[hd->kbd_ring->enq];
+						nxt->parameter = ((volatile TRB*)(HHDM + trb_ptr))->parameter;
+						nxt->status    = 1;
+						nxt->control   = (1u << 10) | (1u << 5) | (hd->kbd_ring->pcs & 1u);
+						if (++hd->kbd_ring->enq == LINK_INDEX) {
+							hd->kbd_ring->trb[LINK_INDEX].control =
+								(TRB_TYPE_LINK << 10) | (1u << 1) | (hd->kbd_ring->pcs & 1u);
+							hd->kbd_ring->enq = 0;
+							hd->kbd_ring->pcs ^= 1;
+						}
+						doorbell32[hd->slot_id] = hub_dcis[which_hub];
+
+						tsc_delay_ms(300);
+						needsResetting = true;
+						break;
+					}
+
+					// Transfer error on a hub slot → hub itself disconnected.
+					if (which_hub >= 0 && code != 1 && code != 13) {
+						print((char*)"Hub transfer error, code:");
+						to_str(code, str); print(str);
+						tsc_delay_ms(300);
+						needsResetting = true;
+						break;
+					}
+				}
 
 				if (code == 1 || code == 13) {   // Success or Short Packet
 
@@ -351,7 +484,6 @@ extern "C" void kmain(void) {
 					uint64_t          report_phys   = completed_trb->parameter;
 					volatile uint8_t* report        = (volatile uint8_t*)(HHDM + report_phys);
 
-					uint32_t slot_from_event = (resp.ctrl >> 24) & 0xFF;
 					int which_kbd = -1;
 					for (int k = 0; k < keyboard_count; k++) {
 						if (keyboards[k]->slot_id == slot_from_event) { which_kbd = k; break; }
@@ -414,26 +546,62 @@ extern "C" void kmain(void) {
 
 						doorbell32[kd->slot_id] = 3;   // Ring EP1 IN (DCI=3)
 					}
+
+				} else {
+					// ── Transfer error on a keyboard slot → device disconnected ──
+					//
+					// When the keyboard is unplugged, the xHCI aborts the pending
+					// interrupt-IN TRB and posts a Transfer Event with an error code
+					// (typically 4 = USB Transaction Error, or 26 = Stopped).
+					// Some controllers emit this INSTEAD OF or BEFORE the PSC event,
+					// so we treat any error on a keyboard's slot as a disconnect
+					// signal and trigger a full re-enumeration.
+					// 300ms settle delay for same reason as PSC handler above.
+					uint32_t err_slot = slot_from_event;
+					for (int k = 0; k < keyboard_count; k++) {
+						if (keyboards[k]->slot_id == err_slot) {
+							print((char*)"Transfer error on keyboard slot, code:");
+							to_str(code, str); print(str);
+							print((char*)"Triggering re-enumeration.");
+							tsc_delay_ms(300);
+							needsResetting = true;
+							break;
+						}
+					}
+					if (needsResetting) break;
 				}
 			}
 		}
+
+		// ── PORTSC disconnect polling ─────────────────────────────────────────
+		//
+		// Some xHCI controllers do not reliably generate a PSC event when a
+		// device is unplugged from the same port it was originally enumerated on.
+		// As a safety net we poll the PORTSC register directly: if CCS (bit 0)
+		// is 0 on any keyboard's root port, the device is gone.
+		//
+		// IMPORTANT: only poll keyboards that are directly on a root port
+		// (root_port_num != 0).  For hub-connected keyboards, port_num is the
+		// hub's downstream port number, NOT a root port index.
+		for (int k = 0; k < keyboard_count; k++) {
+			uint8_t rp = keyboards[k]->root_port_num;
+			if (rp == 0) continue;   // hub child — skip PORTSC poll
+			volatile uint32_t* portsc = (volatile uint32_t*)(
+				(uintptr_t)g_ops + 0x400 + (uint32_t)(rp - 1) * 0x10);
+			if (!(*portsc & 1u)) {   // CCS = 0: no device on this port
+				print((char*)"Keyboard disconnected (PORTSC poll), port:");
+				to_str(rp, str); print(str);
+				tsc_delay_ms(300);
+				needsResetting = true;
+				break;
+			}
+		}
+		if (needsResetting) break;
 
 		// ── Software key-repeat (mirrors Linux input_repeat_key()) ───────────
 		//
 		// Runs every iteration so repeat timing tracks wall-clock time via TSC,
 		// not USB event arrival rate.
-		//
-		// Linux behaviour (drivers/input/input.c, input_repeat_key):
-		//   1. Key-down  → arm one-shot timer for repeat_delay.
-		//   2. Timer fire → emit repeat, re-arm for repeat_period.
-		//   3. Key-up    → cancel timer.
-		//
-		// We replicate phases 1-3 with TSC comparisons:
-		//   - key_down_at  tracks when each key went down (TSC ticks).
-		//   - last_repeat_fire tracks when we last emitted a synthetic repeat.
-		//   - Phase 1: skip if now - key_down_at < REPEAT_DELAY.
-		//   - Phase 2: skip if now - last_repeat_fire < REPEAT_PERIOD.
-		//   - Phase 3: key-up clears both fields (handled in transfer event above).
 		uint64_t now = rdtsc();
 
 		for (int k = 0; k < keyboard_count; k++) {
@@ -459,6 +627,7 @@ extern "C" void kmain(void) {
 		}
 	}
 
-	// A PSC event caused break — go back and re-enumerate all ports.
+	// A disconnect or PSC event caused break — go back and re-enumerate
+	// all ports.  Without this goto the kernel entry point returns into nothing.
 	goto restart;
 }
