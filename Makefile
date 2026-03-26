@@ -2,6 +2,8 @@ CC=clang
 CXX=clang++
 LD=ld.lld
 
+LIMINE_BIN = limine/limine
+
 CFLAGS = -O0 -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
          -mno-red-zone -mcmodel=kernel -target x86_64-elf \
          -fno-builtin -fno-builtin-memset -fno-builtin-memcpy -fno-builtin-memmove \
@@ -25,6 +27,7 @@ myos: $(OBJ) linker.ld
 iso: all
 	rm -rf iso_root
 	mkdir -p iso_root/boot
+
 	cp myos iso_root/boot/
 	cp limine.conf iso_root/               # <-- config must be named limine.conf
 	cp limine/limine-bios.sys iso_root/boot/
@@ -36,7 +39,7 @@ iso: all
 	  -efi-boot-part --efi-boot-image --protective-msdos-label \
 	  iso_root -o myos.iso
 
-	limine/limine bios-install myos.iso
+	-$(LIMINE_BIN) bios-install myos.iso || limine/limine.exe bios-install myos.iso || true
 
 
 run: iso

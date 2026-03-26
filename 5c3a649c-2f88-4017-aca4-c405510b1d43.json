@@ -1,0 +1,4 @@
+{
+	"LSPs": {},
+	"build_command": "\n\ncd /mnt/c/Users/kaihe/Downloads/MyOS && make clean && make iso && make run"
+}
