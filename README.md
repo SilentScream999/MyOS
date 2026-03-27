@@ -84,13 +84,11 @@ Framebuffer output is already working and used for early debugging.
 * [ ] Interrupt dispatcher system
 * [ ] Pluggable IRQ handler system
 
-## Timer System (HPET-BASED)
+## Timer System
 
-* [x] HPET initialization already present
-* [ ] HPET interrupt routing (if not already fully wired)
-* [ ] Global tick counter abstraction over HPET
-* [ ] Sleep/delay functions based on HPET
-* [ ] (Optional later) APIC timer fallback support
+* [ ] PIT or APIC timer setup
+* [ ] Global tick counter
+* [ ] Basic sleep/delay functions
 ---
 
 # 🧠 PHASE 2 — MEMORY MANAGEMENT
