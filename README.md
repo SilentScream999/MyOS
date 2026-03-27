@@ -61,28 +61,28 @@ Framebuffer output is already working and used for early debugging.
 
 ## GDT (Global Descriptor Table)
 
-* [ ] 64-bit flat GDT setup
-* [ ] Kernel + user segment preparation (ring 0 / ring 3)
+* [x] 64-bit flat GDT setup
+* [x] Kernel + user segment preparation (ring 0 / ring 3)
 
 ## IDT (Interrupt Descriptor Table)
 
-* [ ] IDT setup
+* [x] IDT setup
 
-* [ ] Exception handlers:
+* [x] Exception handlers:
 
-  * [ ] Divide by zero
-  * [ ] General protection fault
-  * [ ] Page fault
-  * [ ] Invalid opcode
-  * [ ] Double fault
+  * [x] Divide by zero
+  * [x] General protection fault
+  * [x] Page fault
+  * [x] Invalid opcode
+  * [x] Double fault
 
-* [ ] Kernel panic system with framebuffer output
+* [x] Kernel panic system with framebuffer output
 
 ## IRQ + Interrupt Handling
 
-* [ ] IRQ remapping (PIC or APIC)
-* [ ] Interrupt dispatcher system
-* [ ] Pluggable IRQ handler system
+* [x] IRQ remapping (PIC or APIC)
+* [x] Interrupt dispatcher system
+* [x] Pluggable IRQ handler system
 
 ## Timer System
 

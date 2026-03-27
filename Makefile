@@ -9,7 +9,7 @@ CFLAGS = -O0 -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
          -fno-builtin -fno-builtin-memset -fno-builtin-memcpy -fno-builtin-memmove \
          -fno-unwind-tables -fno-asynchronous-unwind-tables
 
-CXXFLAGS = $(CFLAGS) -std=c++20 -fno-exceptions -fno-rtti
+CXXFLAGS = $(CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -mno-red-zone
 
 LDFLAGS=-nostdlib -z max-page-size=0x1000
 

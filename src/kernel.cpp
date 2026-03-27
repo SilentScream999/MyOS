@@ -5,6 +5,12 @@
 #include "pagingstuff.h"
 #include "usbhelpers.h"
 
+#include "gdt.h"
+#include "idt.h"
+
+#include "irq.h"    // PIC remapping + irq_register
+#include "timer.h"  // PIT driver + g_tick_count
+
 __attribute__((used, section(".limine_requests")))
 static volatile LIMINE_BASE_REVISION(4);
 
@@ -71,6 +77,16 @@ extern "C" void kmain(void) {
 	if (!fb_req.response || fb_req.response->framebuffer_count < 1) hcf();
 
 	fb = fb_req.response->framebuffers[0];
+
+	// ── NEW ──────────────────────────────────────
+	init_gdt();
+	print((char*)"GDT loaded.");
+	init_idt();
+	init_irq();              // remap PIC, mask all IRQ lines
+	init_timer(1000);        // PIT at 1000 Hz → 1 ms tick
+	__asm__ volatile ("sti"); // enable hardware interrupts
+	print((char*)"Interrupts enabled. Timer running.");
+	// ── END NEW ──────────────────────────────────────
 
 	print((char*)"Stack size req response:");
 	if (stack_size_req.response == NULL) {
