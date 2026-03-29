@@ -11,6 +11,8 @@
 #include "irq.h"    // PIC remapping + irq_register
 #include "timer.h"  // PIT driver + g_tick_count
 
+#include "heap.h"
+
 __attribute__((used, section(".limine_requests")))
 static volatile LIMINE_BASE_REVISION(4);
 
@@ -116,6 +118,8 @@ extern "C" void kmain(void) {
 	init_physical_allocator();
 	map_hhdm_usable(PRESENT | WRITABLE);
 	print((char*)"Mapped the entire ram");
+
+	init_heap();
 
 	if (!rsdp_req.response) hcf();
 	uint64_t rsdp_va = (uint64_t)rsdp_req.response->address;

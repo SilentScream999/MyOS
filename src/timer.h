@@ -1,5 +1,6 @@
 #ifndef timer_h
 #define timer_h
+#include "scheduler.h"
 
 // ── timer.h ───────────────────────────────────────────────────────────────────
 // PIT (Programmable Interval Timer, Intel 8253/8254) driver.
@@ -55,6 +56,7 @@ static uint32_t g_timer_hz = 0;
 // by exception_dispatch() — do NOT call it here.
 static void _timer_irq_handler() {
     g_tick_count++;
+    scheduler_tick();
 }
 
 // ── _pit_set_hz ───────────────────────────────────────────────────────────────
