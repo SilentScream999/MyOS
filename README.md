@@ -86,31 +86,31 @@ Framebuffer output is already working and used for early debugging.
 
 ## Timer System
 
-* [x] PIT or APIC timer setup
-* [x] Global tick counter
-* [x] Basic sleep/delay functions
+* [ ] PIT or APIC timer setup
+* [ ] Global tick counter
+* [ ] Basic sleep/delay functions
 ---
 
 # 🧠 PHASE 2 — MEMORY MANAGEMENT
 
 ## Physical Memory Manager (PMM)
 
-* [x] Parse Limine memory map
-* [x] Frame allocator (bitmap or stack)
-* [x] alloc_frame / free_frame
+* [ ] Parse Limine memory map
+* [ ] Frame allocator (bitmap or stack)
+* [ ] alloc_frame / free_frame
 
 ## Virtual Memory Manager (VMM)
 
-* [x] Page table manager (4-level paging)
-* [x] map_page / unmap_page
-* [x] Kernel heap region setup
-* [x] User vs kernel memory separation prep
+* [ ] Page table manager (4-level paging)
+* [ ] map_page / unmap_page
+* [ ] Kernel heap region setup
+* [ ] User vs kernel memory separation prep
 
 ## Kernel Heap
 
-* [x] kmalloc / kfree
-* [x] bump allocator → slab allocator later
-* [x] Heap built on VMM
+* [ ] kmalloc / kfree
+* [ ] bump allocator → slab allocator later
+* [ ] Heap built on VMM
 
 ---
 
@@ -118,18 +118,18 @@ Framebuffer output is already working and used for early debugging.
 
 ## Task Model
 
-* [x] PCB (PID, registers, stack, state, page table)
+* [ ] PCB (PID, registers, stack, state, page table)
 
 ## Context Switching
 
-* [x] Save/restore CPU state
-* [x] Stack switching
-* [x] CR3 switching
+* [ ] Save/restore CPU state
+* [ ] Stack switching
+* [ ] CR3 switching
 
 ## Scheduler
 
-* [x] Round-robin scheduler (single core first)
-* [x] Task queue system
+* [ ] Round-robin scheduler (single core first)
+* [ ] Task queue system
 * [ ] Timer-driven scheduling (later)
 
 ---
