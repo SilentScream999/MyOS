@@ -10,6 +10,14 @@
 
 #include "irq.h"    // PIC remapping + irq_register
 #include "timer.h"  // PIT driver + g_tick_count
+#include "heap.h"
+#include "tty.h"
+#include "acpi.h"
+#include "syscall.h"
+#include "ramfs.h"
+#include "exec.h"
+#include "graphics.h"
+#include "wm.h"
 
 __attribute__((used, section(".limine_requests")))
 static volatile LIMINE_BASE_REVISION(4);
@@ -18,6 +26,18 @@ __attribute__((used, section(".limine_requests")))
 static volatile struct limine_framebuffer_request fb_req = {
 	.id = LIMINE_FRAMEBUFFER_REQUEST,
 	.revision = 0
+};
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_module_request module_req = {
+    .id = LIMINE_MODULE_REQUEST,
+    .revision = 0
+};
+
+__attribute__((used, section(".limine_requests")))
+volatile struct limine_efi_system_table_request efi_st_req = {
+    .id = LIMINE_EFI_SYSTEM_TABLE_REQUEST,
+    .revision = 0
 };
 
 __attribute__((used, section(".limine_requests")))
@@ -48,28 +68,75 @@ static inline uint64_t rdtsc() {
 	return ((uint64_t)hi << 32) | lo;
 }
 
-static uint64_t get_tsc_freq_hz() {
-	uint32_t eax, ebx, ecx, edx;
+// ── Syscall globals ───────────────────────────────────────────────────────────
+alignas(16) uint8_t g_syscall_kstack[64u * 1024u];
+uint64_t g_saved_user_rsp = 0;
 
-	// CPUID leaf 0x15: TSC / core-crystal ratio (Intel Skylake+).
-	// TSC freq = crystal_hz (ecx) * ebx / eax
-	__asm__ volatile ("cpuid"
-		: "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
-		: "a"(0x15u) : );
-	if (eax != 0 && ebx != 0 && ecx != 0)
-		return (uint64_t)ecx * (uint64_t)ebx / (uint64_t)eax;
+// ── klog globals ──────────────────────────────────────────────────────────────
+#include "klog.h"
+char     g_klog_buffer[KLOG_BUFFER_SIZE];
+uint64_t g_klog_pos = 0;
+bool     g_klog_bypass_framebuffer = false;
+uint8_t* g_backbuffer = nullptr;
+uint8_t* g_master_backbuffer = nullptr;
 
-	// CPUID leaf 0x16: processor base frequency in MHz (bits 15:0 of eax).
-	// Available on Intel Skylake+ when leaf 0x15 has no crystal frequency.
-	__asm__ volatile ("cpuid"
-		: "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
-		: "a"(0x16u) : );
-	if ((eax & 0xFFFFu) != 0)
-		return (uint64_t)(eax & 0xFFFFu) * 1000000ULL;
+// Phase 11: Speed King globals
+uint32_t g_voffset = 0;
+volatile uint32_t g_dirty_min_y = 0xFFFFFFFF;
+volatile uint32_t g_dirty_max_y = 0;
+volatile uint32_t g_dirty_min_x = 0xFFFFFFFF;
+volatile uint32_t g_dirty_max_x = 0;
+int32_t  g_view_delta = 0;   // rows scrolled up from bottom (0=live, negative=scrolled back)
 
-	// Last resort: assume 3 GHz.  This is wrong on exotic hardware but will
-	// at least produce recognisable (if slightly mistimed) repeat behaviour.
-	return 3000000000ULL;
+// Phase 9: WM post-flip hook (set to wm_render_chrome once WM is active)
+post_flip_hook_fn g_post_flip_hook = nullptr;
+pre_flip_hook_fn  g_pre_flip_hook  = nullptr;
+static uint64_t last_mouse_flip_tsc = 0;
+
+// Phase 9: Terminal window origin + size (set by wm_init)
+uint32_t g_term_ox = 8;          // fallback: full-screen margin
+uint32_t g_term_oy = 8;
+uint32_t g_term_max_cols = 80;
+uint32_t g_term_max_rows = 24;
+uint32_t g_term_history_rows = 0; // lines typed since WM start
+uint32_t g_term_total_rows = 0;   // total capacity of backbuffer (rows)
+uint32_t g_term_buf_height = 0;   // virtual backbuffer pixel height
+
+int32_t g_mouse_x = 400;
+int32_t g_mouse_y = 300;
+uint8_t g_mouse_buttons = 0;
+uint8_t g_mouse_prev_buttons = 0;
+uint64_t tsc_hz = 3000000000ULL; // Calibrated at boot
+volatile bool g_needs_refresh = true;
+volatile bool wm_chrome_dirty = false;
+volatile bool g_dragging_test = false;
+volatile bool g_dragging_term = false;
+volatile bool g_dragging_rain = false;
+volatile uint32_t g_mouse_btns_prev = 0;
+
+#include "mouse.h"
+
+// Phase 18: High-precision TSC calibration against PIT
+static void calibrate_tsc_pit() {
+    print((char*)"Calibrating TSC...");
+    
+    // Wait for a PIT tick boundary (g_tick_count from timer.h)
+    uint64_t start_tick = g_tick_count;
+    while (g_tick_count == start_tick);
+    
+    // Start measurement
+    uint64_t tsc1 = rdtsc();
+    uint64_t m_start = g_tick_count;
+    
+    // Measuring for 100ms (100 ticks) for high precision
+    while (g_tick_count < m_start + 100);
+    uint64_t tsc2 = rdtsc();
+    
+    uint64_t delta = tsc2 - tsc1;
+    tsc_hz = delta * 10; // 100ms * 10 = 1 second
+    
+    char mstr[32];
+    print((char*)" TSC Hz: "); to_str(tsc_hz, mstr); print(mstr);
 }
 
 extern "C" void kmain(void) {
@@ -78,13 +145,32 @@ extern "C" void kmain(void) {
 
 	fb = fb_req.response->framebuffers[0];
 
+    // --- SSE & SIMD Enablement (CR0, CR4) ---
+    {
+        uint64_t cr0;
+        __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+        cr0 &= ~(1ULL << 2); // Clear EM (Emulation)
+        cr0 |= (1ULL << 1);  // Set MP (Monitor Coprocessor)
+        __asm__ volatile("mov %0, %%cr0" :: "r"(cr0) : "memory");
+
+        uint64_t cr4;
+        __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+        cr4 |= (1ULL << 9);  // Set OSFXSR (FXSAVE/FXRSTOR support)
+        cr4 |= (1ULL << 10); // Set OSXMMEXCPT (SIMD exception support)
+        __asm__ volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
+    }
+
 	// ── NEW ──────────────────────────────────────
 	init_gdt();
+	syscall_init();
 	print((char*)"GDT loaded.");
 	init_idt();
 	init_irq();              // remap PIC, mask all IRQ lines
 	init_timer(1000);        // PIT at 1000 Hz → 1 ms tick
+
+
 	__asm__ volatile ("sti"); // enable hardware interrupts
+	calibrate_tsc_pit();
 	print((char*)"Interrupts enabled. Timer running.");
 	// ── END NEW ──────────────────────────────────────
 
@@ -112,10 +198,59 @@ extern "C" void kmain(void) {
 
 	HHDM = hhdm_req.response->offset;
 
+	// Disable SMEP and SMAP so kernel can access user-mapped memory.
+	{
+		uint64_t cr4;
+		__asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+		cr4 &= ~(1ULL << 20); // Clear SMEP
+		cr4 &= ~(1ULL << 21); // Clear SMAP
+		__asm__ volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
+	}
+
 	print((char*)"Setting up memory management");
 	init_physical_allocator();
 	map_hhdm_usable(PRESENT | WRITABLE);
-	print((char*)"Mapped the entire ram");
+	
+	// Explicitly map the framebuffer in our new page tables if it's not already covered
+	// by the usable RAM map. This ensures sys_write works from user tasks.
+	if (fb_req.response && fb_req.response->framebuffer_count > 0) {
+		struct limine_framebuffer *f = fb_req.response->framebuffers[0];
+		uint64_t phys = (uint64_t)f->address - HHDM;
+		uint64_t size = f->pitch * f->height;
+		// Map it into the HHDM range explicitly with Write-Combining (WC) enabled via PCD bit.
+		// PCD (bit 4) selects PAT entry that is typically WC on modern x86.
+		uint64_t flags = PRESENT | WRITABLE | (1ULL << 4); 
+		for (uint64_t offset = 0; offset < size; offset += 4096) {
+			map_page((uint64_t)f->address + offset, phys + offset, flags);
+		}
+	}
+
+	init_heap();
+    
+    // Allocate backbuffer for double buffering + huge scrollback history
+    if (fb_req.response && fb_req.response->framebuffer_count > 0) {
+        fb = fb_req.response->framebuffers[0];
+        
+        // 2000 lines @ 10px each = 20,000 pixels high
+        g_term_buf_height = 20000;
+        if (g_term_buf_height < fb->height) g_term_buf_height = fb->height;
+        
+        g_backbuffer = (uint8_t*)kmalloc(g_term_buf_height * fb->pitch);
+        if (g_backbuffer) {
+            memset(g_backbuffer, 0, g_term_buf_height * fb->pitch);
+        }
+
+        g_master_backbuffer = (uint8_t*)kmalloc(fb->height * fb->pitch);
+        if (g_master_backbuffer) {
+            memset(g_master_backbuffer, 0, fb->height * fb->pitch);
+            
+            g_needs_refresh = true;
+        }
+    }
+
+	ramfs_init();
+	ramfs_mount_klog();
+	scheduler_init();
 
 	if (!rsdp_req.response) hcf();
 	uint64_t rsdp_va = (uint64_t)rsdp_req.response->address;
@@ -263,16 +398,16 @@ extern "C" void kmain(void) {
 		for (int j = 0; j < 4096; j++) buf[j] = 0;
 		uint64_t buf_phys = (uint64_t)buf - HHDM;
 
-		volatile TRB* trb = &hd->kbd_ring->trb[hd->kbd_ring->enq];
+		volatile TRB* trb = &hd->hub_ring->trb[hd->hub_ring->enq];
 		trb->parameter = buf_phys;
 		trb->status    = 1;   // 1 byte status-change bitmap (covers up to 7 ports)
-		trb->control   = (1u << 10) | (1u << 5) | (hd->kbd_ring->pcs & 1u);
+		trb->control   = (1u << 10) | (1u << 5) | (hd->hub_ring->pcs & 1u);
 
-		if (++hd->kbd_ring->enq == LINK_INDEX) {
-			hd->kbd_ring->trb[LINK_INDEX].control =
-				(TRB_TYPE_LINK << 10) | (1u << 1) | (hd->kbd_ring->pcs & 1u);
-			hd->kbd_ring->enq = 0;
-			hd->kbd_ring->pcs ^= 1;
+		if (++hd->hub_ring->enq == LINK_INDEX) {
+			hd->hub_ring->trb[LINK_INDEX].control =
+				(TRB_TYPE_LINK << 10) | (1u << 1) | (hd->hub_ring->pcs & 1u);
+			hd->hub_ring->enq = 0;
+			hd->hub_ring->pcs ^= 1;
 		}
 
 		doorbell32[hd->slot_id] = hub_dcis[h];
@@ -280,55 +415,31 @@ extern "C" void kmain(void) {
 		to_str(hd->slot_id, str); print(str);
 	}
 
-	// ── Wait for a keyboard if none was found ────────────────────────────────
-	//
-	// Hub TRBs are now armed above so all four hotplug cases work:
-	//
-	//   1. Root-port keyboard unplug/replug → PSC event (type 34) → restart.
-	//
-	//   2. Hub-connected keyboard unplug/replug → hub fires interrupt IN
-	//      (type 32, code 1/13) → restart.
-	//
-	//   3. Empty hub plugged in → same as case 2: hub fires interrupt IN
-	//      for its downstream port connecting → restart → keyboard found.
-	//
-	//   4. Empty hub unplugged → xHCI aborts pending interrupt IN TRB with
-	//      error (type 32, code != 1/13) OR root port fires PSC (type 34)
-	//      → both handled below → restart.
-	//
-	// A 300ms settle delay before each restart gives PORTSC time to stabilise
-	// after a reconnect on the same port — without it setupUSB runs in ~50ms,
-	// still sees CCS=0, finds nothing, and we block here again with no pending
-	// events (the reconnect PSC was already consumed during the scan).
-	// 300ms matches Linux hub_port_debounce() and costs nothing on normal boot.
-	if (keyboard_count == 0) {
-		print((char*)"No keyboard found. Waiting for hotplug event...");
+	print((char*)"[init] Decoupled terminal boot.");
+	static bool init_started = false;
+	if (!init_started && module_req.response && module_req.response->module_count > 0) {
+		struct limine_file *module = module_req.response->modules[0];
+		Task* init_task = execve_memory((const uint8_t*)module->address);
+		if (init_task) {
+			// Phase 9: initialize WM and register post-flip chrome hook
+			wm_init();
+			g_pre_flip_hook = nullptr; // Phase 18: handled by wm_compose_full
+			g_post_flip_hook = nullptr;
 
-		while (true) {
-			USB_Response r = get_usb_response(100000);
-			if (!r.gotresponse) continue;
-
-			// Root-port connect/disconnect → PSC event
-			if (r.type == 34) {
-				print((char*)"PSC event — re-enumerating.");
-				tsc_delay_ms(300);
-				goto restart;
-			}
-
-			// Hub slot Transfer Event (any code) → downstream port changed
-			// state, or hub itself was unplugged.  Both need re-enumeration.
-			if (r.type == 32) {
-				uint32_t slot = (r.ctrl >> 24) & 0xFF;
-				for (int h = 0; h < hub_count; h++) {
-					if (hubs[h]->slot_id == slot) {
-						print((char*)"Hub event while waiting — re-enumerating.");
-						tsc_delay_ms(300);
-						goto restart;
-					}
-				}
-				// Transfer event from some other slot — ignore.
-			}
+			// Re-enable the shell task — it now runs "inside" the WM window
+			scheduler_add_task(init_task);
+			init_started = true;
+			g_klog_bypass_framebuffer = true;
+			print((char*)"[wm] Shell task started inside WM frame.");
+		} else {
+			print((char*)"[init] Failed to load ELF module.");
 		}
+	}
+
+	// ── Wait for a keyboard ONLY if we need to enumerate first pass ─────────
+	// We no longer block indefinitely here. The main loop will handle hotplug.
+	if (keyboard_count == 0) {
+		print((char*)"No keyboard found yet. Proceeding to background polling...");
 	}
 
 	// ── TSC-based repeat thresholds ───────────────────────────────────────────
@@ -338,7 +449,7 @@ extern "C" void kmain(void) {
 	//   repeat_period = 40  ms  (25 repeats / sec)
 	//
 	// We convert to TSC ticks so timing is correct regardless of loop speed.
-	uint64_t tsc_hz = get_tsc_freq_hz();
+	// tsc_hz is already calibrated via calibrate_tsc_pit() earlier in kmain.
 
 	// Print so you can verify CPUID gave a sensible value.
 	print((char*)"TSC freq (Hz):"); to_str(tsc_hz, str); print(str);
@@ -379,34 +490,59 @@ extern "C" void kmain(void) {
 		do { stale = get_usb_response(1); } while (stale.gotresponse);
 	}
 
-	// ── Queue one initial TRB per keyboard ───────────────────────────────────
-	// enumerate_device_after_address intentionally does NOT ring the doorbell
-	// or queue a TRB, because any resulting transfer event would be thrown away
-	// by the command-completion polling loops inside enumeration.  We do it
-	// here, after all enumeration is finished, so every event lands in the
-	// main loop below where we can actually handle it.
 	for (int k = 0; k < keyboard_count; k++) {
 		USBDevice* kd = keyboards[k];
+		for (int i = 0; i < kd->interface_count; i++) {
+			HIDInterface* hi = &kd->interfaces[i];
+			if (hi->type != 1) continue;
 
-		volatile uint8_t* buf = (volatile uint8_t*)alloc_table();
-		for (int j = 0; j < 4096; j++) buf[j] = 0;
-		uint64_t buf_phys = (uint64_t)buf - HHDM;
+			volatile uint8_t* buf = (volatile uint8_t*)alloc_table();
+			for (int j = 0; j < 4096; j++) buf[j] = 0;
+			uint64_t buf_phys = (uint64_t)buf - HHDM;
 
-		volatile TRB* trb = &kd->kbd_ring->trb[kd->kbd_ring->enq];
-		trb->parameter = buf_phys;
-		trb->status    = 8;
-		trb->control   = (1u << 10) | (1u << 5) | (kd->kbd_ring->pcs & 1u);
+			volatile TRB* trb = &hi->ring->trb[hi->ring->enq];
+			trb->parameter = buf_phys;
+			trb->status    = (uint32_t)hi->mps;
+			trb->control   = (1u << 10) | (1u << 5) | (hi->ring->pcs & 1u);
 
-		if (++kd->kbd_ring->enq == LINK_INDEX) {
-			kd->kbd_ring->trb[LINK_INDEX].control =
-				(TRB_TYPE_LINK << 10) | (1u << 1) | (kd->kbd_ring->pcs & 1u);
-			kd->kbd_ring->enq = 0;
-			kd->kbd_ring->pcs ^= 1;
+			if (++hi->ring->enq == LINK_INDEX) {
+				hi->ring->trb[LINK_INDEX].control =
+					(TRB_TYPE_LINK << 10) | (1u << 1) | (hi->ring->pcs & 1u);
+				hi->ring->enq = 0;
+				hi->ring->pcs ^= 1;
+			}
+
+			uint8_t kbd_dci = hi->ep_num * 2 + 1;
+			doorbell32[kd->slot_id] = kbd_dci;
 		}
+	}
 
-		doorbell32[kd->slot_id] = 3;   // Ring EP1 IN (DCI=3)
-		print((char*)"Queued initial TRB for keyboard slot:");
-		to_str(kd->slot_id, str); print(str);
+	// ── Queue one initial TRB per mouse ──────────────────────────────────────
+	for (int m = 0; m < mouse_count; m++) {
+		USBDevice* md = mice[m];
+		for (int i = 0; i < md->interface_count; i++) {
+			HIDInterface* hi = &md->interfaces[i];
+			if (hi->type != 2) continue;
+
+			volatile uint8_t* buf = (volatile uint8_t*)alloc_table();
+			for (int j = 0; j < 4096; j++) buf[j] = 0;
+			uint64_t buf_phys = (uint64_t)buf - HHDM;
+
+			volatile TRB* trb = &hi->ring->trb[hi->ring->enq];
+			trb->parameter = buf_phys;
+			trb->status    = (uint32_t)hi->mps;
+			trb->control   = (1u << 10) | (1u << 5) | (hi->ring->pcs & 1u);
+
+			if (++hi->ring->enq == LINK_INDEX) {
+				hi->ring->trb[LINK_INDEX].control =
+					(TRB_TYPE_LINK << 10) | (1u << 1) | (hi->ring->pcs & 1u);
+				hi->ring->enq = 0;
+				hi->ring->pcs ^= 1;
+			}
+
+			uint8_t mouse_dci = hi->ep_num * 2 + 1;
+			doorbell32[md->slot_id] = mouse_dci;
+		}
 	}
 
 	// NOTE: Hub TRBs were already queued before the keyboard_count == 0 block
@@ -416,13 +552,26 @@ extern "C" void kmain(void) {
 
 	print((char*)"Press any key...");
 
+	// Terminal task is now started early, above the repeat threshold calculation.
+	// This ensures it survives disconnect/restart cycles.
+
 	uint32_t event_count = 0;
 
-	while (true) {
+	// --- PHASE 18.5: GUARANTEED FULL-SCREEN SYNC ---
+	// Before we enter the reactive loop, ensure the VERY FIRST frame captures the whole screen.
+	g_dirty_min_x = 0;
+	g_dirty_max_x = fb->width - 1;
+	g_dirty_min_y = 0;
+	g_dirty_max_y = fb->height - 1;
+	g_needs_refresh = true;
 
-		// ── Process one pending USB event (non-blocking) ──────────────────────
-		USB_Response resp = get_usb_response(1);
-		if (resp.gotresponse) {
+	while (true) {
+		event_count = 0;
+		// ── Drain ALL pending USB events to handle 1000Hz HID traffic ─────────
+		while (true) {
+			USB_Response resp = get_usb_response(1);
+			if (!resp.gotresponse) break;
+
 			event_count++;
 
 			// ── Port Status Change (type 34) ─────────────────────────────────
@@ -465,15 +614,15 @@ extern "C" void kmain(void) {
 
 						// Re-queue the status-change TRB so the pipe stays armed.
 						USBDevice* hd     = hubs[which_hub];
-						volatile TRB* nxt = &hd->kbd_ring->trb[hd->kbd_ring->enq];
+						volatile TRB* nxt = &hd->hub_ring->trb[hd->hub_ring->enq];
 						nxt->parameter = ((volatile TRB*)(HHDM + trb_ptr))->parameter;
 						nxt->status    = 1;
-						nxt->control   = (1u << 10) | (1u << 5) | (hd->kbd_ring->pcs & 1u);
-						if (++hd->kbd_ring->enq == LINK_INDEX) {
-							hd->kbd_ring->trb[LINK_INDEX].control =
-								(TRB_TYPE_LINK << 10) | (1u << 1) | (hd->kbd_ring->pcs & 1u);
-							hd->kbd_ring->enq = 0;
-							hd->kbd_ring->pcs ^= 1;
+						nxt->control   = (1u << 10) | (1u << 5) | (hd->hub_ring->pcs & 1u);
+						if (++hd->hub_ring->enq == LINK_INDEX) {
+							hd->hub_ring->trb[LINK_INDEX].control =
+								(TRB_TYPE_LINK << 10) | (1u << 1) | (hd->hub_ring->pcs & 1u);
+							hd->hub_ring->enq = 0;
+							hd->hub_ring->pcs ^= 1;
 						}
 						doorbell32[hd->slot_id] = hub_dcis[which_hub];
 
@@ -500,9 +649,38 @@ extern "C" void kmain(void) {
 					uint64_t          report_phys   = completed_trb->parameter;
 					volatile uint8_t* report        = (volatile uint8_t*)(HHDM + report_phys);
 
+					uint32_t dci_from_event = (resp.ctrl >> 16) & 0x1F;
+
 					int which_kbd = -1;
+					HIDInterface* k_hi = nullptr;
 					for (int k = 0; k < keyboard_count; k++) {
-						if (keyboards[k]->slot_id == slot_from_event) { which_kbd = k; break; }
+						if (keyboards[k]->slot_id == slot_from_event) {
+							for (int i=0; i<keyboards[k]->interface_count; i++) {
+								if (keyboards[k]->interfaces[i].type == 1 && 
+									(keyboards[k]->interfaces[i].ep_num*2+1) == dci_from_event) {
+									which_kbd = k;
+									k_hi = &keyboards[k]->interfaces[i];
+									break;
+								}
+							}
+						}
+						if (which_kbd >= 0) break;
+					}
+
+					int which_mouse = -1;
+					HIDInterface* m_hi = nullptr;
+					for (int m = 0; m < mouse_count; m++) {
+						if (mice[m]->slot_id == slot_from_event) {
+							for (int i=0; i<mice[m]->interface_count; i++) {
+								if (mice[m]->interfaces[i].type == 2 && 
+									(mice[m]->interfaces[i].ep_num*2+1) == dci_from_event) {
+									which_mouse = m;
+									m_hi = &mice[m]->interfaces[i];
+									break;
+								}
+							}
+						}
+						if (which_mouse >= 0) break;
 					}
 
 					if (which_kbd >= 0) {
@@ -532,61 +710,214 @@ extern "C" void kmain(void) {
 								// Fresh press: record TSC time and emit immediately.
 								key_down_at[k][key] = now;
 								bool shift = (modifiers & 0x22u) != 0;
-								char c = shift ? hid_to_ascii_shift[key] : hid_to_ascii[key];
-								if (c) {
-									char msg[2] = { c, '\0' };
-									print((char*)"Key:"); print(msg);
+								if (key >= 0x4F && key <= 0x52) {
+									// Shift + Up/Down = Hardware Scrollback
+									if (shift && key == 0x52) term_scroll_view(-1);
+									else if (shift && key == 0x51) term_scroll_view(1);
+									else {
+										// Regular Arrow = Shell Navigation
+										tty_input('\x1b'); tty_input('[');
+										char arrow_codes[] = {'C', 'D', 'B', 'A'};
+										tty_input(arrow_codes[key - 0x4F]);
+									}
+								} else {
+									char c = shift ? hid_to_ascii_shift[key] : hid_to_ascii[key];
+									if (c) tty_input(c);
 								}
 							}
 						}
-
 						for (int j = 0; j < 6; j++) last_keys[k][j] = report[2 + j];
 						last_mods[k] = modifiers;
 
 						// ── Re-queue transfer TRB ──────────────────────────────
-						USBDevice*    kd      = keyboards[k];
-						volatile TRB* new_trb = &kd->kbd_ring->trb[kd->kbd_ring->enq];
+						volatile TRB* new_trb = &k_hi->ring->trb[k_hi->ring->enq];
 						new_trb->parameter = report_phys;
-						new_trb->status    = 8;
-						new_trb->control   = (1u << 10) | (1u << 5) | (kd->kbd_ring->pcs & 1u);
+						new_trb->status    = (uint32_t)k_hi->mps;
+						new_trb->control   = (1u << 10) | (1u << 5) | (k_hi->ring->pcs & 1u);
 
-						// Write link TRB with OLD pcs before flipping — if we
-						// flip first the controller sees the wrong cycle bit,
-						// thinks the ring is empty, and stops after 255 entries.
-						if (++kd->kbd_ring->enq == LINK_INDEX) {
-							kd->kbd_ring->trb[LINK_INDEX].control =
-								(TRB_TYPE_LINK << 10) | (1u << 1) | (kd->kbd_ring->pcs & 1u);
-							kd->kbd_ring->enq = 0;
-							kd->kbd_ring->pcs ^= 1;
+						if (++k_hi->ring->enq == LINK_INDEX) {
+							k_hi->ring->trb[LINK_INDEX].control =
+								(TRB_TYPE_LINK << 10) | (1u << 1) | (k_hi->ring->pcs & 1u);
+							k_hi->ring->enq = 0;
+							k_hi->ring->pcs ^= 1;
+						}
+						doorbell32[slot_from_event] = dci_from_event;
+					} else if (which_mouse >= 0) {
+						int m = which_mouse;
+						bool report_changed = false;
+						static uint8_t last_mouse_report[4] = {0,0,0,0};
+						for (int i = 0; i < 4; i++) {
+							if (last_mouse_report[i] != report[i]) {
+								report_changed = true;
+								last_mouse_report[i] = report[i];
+							}
 						}
 
-						doorbell32[kd->slot_id] = 3;   // Ring EP1 IN (DCI=3)
-					}
-
-				} else {
-					// ── Transfer error on a keyboard slot → device disconnected ──
-					//
-					// When the keyboard is unplugged, the xHCI aborts the pending
-					// interrupt-IN TRB and posts a Transfer Event with an error code
-					// (typically 4 = USB Transaction Error, or 26 = Stopped).
-					// Some controllers emit this INSTEAD OF or BEFORE the PSC event,
-					// so we treat any error on a keyboard's slot as a disconnect
-					// signal and trigger a full re-enumeration.
-					// 300ms settle delay for same reason as PSC handler above.
-					uint32_t err_slot = slot_from_event;
-					for (int k = 0; k < keyboard_count; k++) {
-						if (keyboards[k]->slot_id == err_slot) {
-							print((char*)"Transfer error on keyboard slot, code:");
-							to_str(code, str); print(str);
-							print((char*)"Triggering re-enumeration.");
-							tsc_delay_ms(300);
-							needsResetting = true;
-							break;
+						// Optimized Heuristic: 
+						// 1. Shift if explicitly Report Protocol (0).
+						// 2. Shift if a composite device (I > 1) with small packets (MPS 8, likely Trackpad)
+						//    and common Report IDs (0x01/0x02). This ignores gaming mice (MPS 32/64).
+						uint8_t* data = (uint8_t*)report;
+						bool shifted = false;
+						if (m_hi->protocol == 0 || (mice[m]->interface_count > 1 && m_hi->mps == 8 && (report[0] == 0x01 || report[0] == 0x02))) {
+							data++;
+							shifted = true;
 						}
+
+						// --- PHASE 18.5: CLEAN UNIFIED DIRTY TRACKING ---
+						// The cursor never touches dirty rects. It goes straight to VRAM via
+						// wm_overlay_update() at the bottom of this block. The compositor only
+						// runs when scene content changes, not for cursor movement or dragging.
+						{
+							int8_t dx = (int8_t)data[1];
+							int8_t dy = (int8_t)data[2];
+
+							g_mouse_prev_buttons = g_mouse_buttons;
+							g_mouse_buttons      = data[0];
+							bool btn_held     = (g_mouse_buttons  & 1);
+							bool btn_was_held = (g_mouse_prev_buttons & 1);
+							bool mouse_press  = btn_held && !btn_was_held;
+							bool mouse_release= !btn_held && btn_was_held;
+
+							// 1. Move cursor (clamped to screen)
+							g_mouse_x += dx;
+							g_mouse_y += dy;
+							if (g_mouse_x < 0) g_mouse_x = 0;
+							if (g_mouse_x >= (int32_t)fb->width)  g_mouse_x = fb->width  - 1;
+							if (g_mouse_y < 0) g_mouse_y = 0;
+							if (g_mouse_y >= (int32_t)fb->height) g_mouse_y = fb->height - 1;
+
+							// 2. Start drag / Raise / Close / Taskbar: hit-test Z-stack on fresh click
+							if (mouse_press) {
+								int32_t mx = g_mouse_x, my = g_mouse_y;
+								
+								// Taskbar / Start button
+								if (my >= (int32_t)fb->height - (int32_t)g_taskbar_h) {
+									if (mx >= 6 && mx <= 98) {
+										// Start button
+										term_clear_screen();
+										term_write_string((char*)"[SYSTEM] Start Menu coming soon...\r\n");
+									} else {
+										// Task buttons — mirror the draw layout exactly
+										const int32_t WBTN_W = 124, WBTN_GAP = 4;
+										int32_t cur_x = 6 + 92 + 10;  // sb_x + sb_w + gap
+										for (int idx = 0; idx < 3; idx++) {
+											if (!g_win_visible[idx]) { continue; }
+											if (mx >= cur_x && mx < cur_x + WBTN_W) {
+												wm_raise_window(idx);
+												break;
+											}
+											cur_x += WBTN_W + WBTN_GAP;
+										}
+									}
+								} else {
+									int idx = wm_find_top_window(mx, my);
+									if (idx != -1) {
+										wm_raise_window(idx); // Move to top
+										if (wm_is_in_close(idx, mx, my)) {
+											wm_close_window(idx);
+										} else if (wm_is_in_title(idx, mx, my)) {
+											// Start dragging the topmost window
+											if (idx == WIN_TERM) {
+												wm_ghost_dragging_term = true; g_dragging_term = true;
+												wm_drag_term_offx = mx - (int32_t)g_term_ox;
+												wm_drag_term_offy = my - (int32_t)g_term_oy;
+											} else if (idx == WIN_TEST) {
+												wm_ghost_dragging_test = true; g_dragging_test = true;
+												wm_drag_test_offx = mx - test_x;
+												wm_drag_test_offy = my - test_y;
+											} else if (idx == WIN_RAIN) {
+												wm_ghost_dragging_rain = true; g_dragging_rain = true;
+												wm_drag_rain_offx = mx - rain_x;
+												wm_drag_rain_offy = my - rain_y;
+											}
+										}
+									}
+								}
+							}
+
+							// 3. Update ghost position while dragging (zero cost — just two int adds)
+							if (wm_ghost_dragging_term) {
+								wm_ghost_term_ox = g_mouse_x - wm_drag_term_offx;
+								wm_ghost_term_oy = g_mouse_y - wm_drag_term_offy;
+							}
+							if (wm_ghost_dragging_test) {
+								wm_ghost_test_ox = g_mouse_x - wm_drag_test_offx;
+								wm_ghost_test_oy = g_mouse_y - wm_drag_test_offy;
+							}
+							if (wm_ghost_dragging_rain) {
+								wm_ghost_rain_ox = g_mouse_x - wm_drag_rain_offx;
+								wm_ghost_rain_oy = g_mouse_y - wm_drag_rain_offy;
+							}
+
+							// 4. Commit on release: NOW the window actually moves, triggering one recompose
+							if (mouse_release) {
+								if (wm_ghost_dragging_term) {
+									g_term_ox = (uint32_t)wm_ghost_term_ox;
+									g_term_oy = (uint32_t)wm_ghost_term_oy;
+									wm_ghost_dragging_term = false;
+									g_dragging_term        = false;
+									// Full screen dirty: old location + new location both need repaint
+									g_dirty_min_x = 0; g_dirty_max_x = fb->width  - 1;
+									g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
+									g_needs_refresh = true;
+								}
+								if (wm_ghost_dragging_test) {
+									test_x = wm_ghost_test_ox;
+									test_y = wm_ghost_test_oy;
+									wm_ghost_dragging_test = false;
+									g_dragging_test        = false;
+									g_dirty_min_x = 0; g_dirty_max_x = fb->width  - 1;
+									g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
+									g_needs_refresh = true;
+								}
+								if (wm_ghost_dragging_rain) {
+									rain_x = wm_ghost_rain_ox;
+									rain_y = wm_ghost_rain_oy;
+									wm_ghost_dragging_rain = false;
+									g_dragging_rain        = false;
+									g_dirty_min_x = 0; g_dirty_max_x = fb->width  - 1;
+									g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
+									g_needs_refresh = true;
+								}
+							}
+
+							// Re-queue transfer TRB
+							volatile TRB* new_trb = &m_hi->ring->trb[m_hi->ring->enq];
+							new_trb->parameter = report_phys;
+							new_trb->status    = (uint32_t)m_hi->mps;
+							new_trb->control   = (1u << 10) | (1u << 5) | (m_hi->ring->pcs & 1u);
+
+							if (++m_hi->ring->enq == LINK_INDEX) {
+								m_hi->ring->trb[LINK_INDEX].control =
+									(TRB_TYPE_LINK << 10) | (1u << 1) | (m_hi->ring->pcs & 1u);
+								m_hi->ring->enq = 0;
+								m_hi->ring->pcs ^= 1;
+							}
+							doorbell32[slot_from_event] = dci_from_event;
+						}
+					} else {
+						// ── Transfer error on a keyboard slot → device disconnected ──
+						uint32_t err_slot = slot_from_event;
+						for (int k = 0; k < keyboard_count; k++) {
+							if (keyboards[k]->slot_id == err_slot) {
+								print((char*)"Transfer error on keyboard slot, code:");
+								to_str(code, str); print(str);
+								tsc_delay_ms(300);
+								needsResetting = true;
+								break;
+							}
+						}
+						if (needsResetting) break;
 					}
-					if (needsResetting) break;
 				}
 			}
+		}
+
+		// 5. Immediate overlay update — cursor + ghost outline, no compositor.
+		//    Throttle: only one repo-stamp after draining the entire USB event batch.
+		if (event_count > 0) {
+			wm_overlay_update(g_mouse_x, g_mouse_y, g_mouse_buttons);
 		}
 
 		// ── PORTSC disconnect polling ─────────────────────────────────────────
@@ -634,11 +965,69 @@ extern "C" void kmain(void) {
 
 				last_repeat_fire[k][key] = now;
 
-				char c = shift ? hid_to_ascii_shift[key] : hid_to_ascii[key];
-				if (c) {
-					char msg[2] = { c, '\0' };
-					print((char*)"Key:"); print(msg);
+				if (key >= 0x4F && key <= 0x52) {
+					if (shift && key == 0x52) term_scroll_view(-1);
+					else if (shift && key == 0x51) term_scroll_view(1);
+					else {
+						tty_input('\x1b'); tty_input('[');
+						char arrow_codes[] = {'C', 'D', 'B', 'A'};
+						tty_input(arrow_codes[key - 0x4F]);
+					}
+				} else {
+					char c = shift ? hid_to_ascii_shift[key] : hid_to_ascii[key];
+					if (c) tty_input(c);
 				}
+			}
+		}
+
+		// --- PHASE 18.5: ATOMIC 60Hz COMPOSITOR ---
+		// 60Hz scene compositor — runs ONLY when content changed (text, scroll,
+		// drag committed). Cursor movement never reaches here anymore.
+		static uint64_t last_compose_tsc = 0;
+		static uint32_t boot_sync_frames = 30;
+
+		if (g_needs_refresh || boot_sync_frames > 0 || true) {
+			uint64_t now_refresh = rdtsc();
+			if (now_refresh - last_compose_tsc > (tsc_hz / 60)) {
+				last_compose_tsc = now_refresh;
+				g_needs_refresh  = false;
+
+				// Drive rainbow animation: 4 pixels per frame
+				rain_scroll += 4;
+				// Force refresh because the rainbow window is always moving
+				bool animation_active = true; 
+
+				__asm__ volatile("cli");
+				uint32_t fx1 = g_dirty_min_x, fx2 = g_dirty_max_x;
+				uint32_t fy1 = g_dirty_min_y, fy2 = g_dirty_max_y;
+				g_dirty_min_y = fb->height; g_dirty_max_y = 0;
+				g_dirty_min_x = fb->width;  g_dirty_max_x = 0;
+				__asm__ volatile("sti");
+
+				if (boot_sync_frames > 0) {
+					fx1 = 0; fx2 = fb->width - 1;
+					fy1 = 0; fy2 = fb->height - 1;
+					boot_sync_frames--;
+				}
+				
+				// If animating, only dirty the rainbow window region to save bandwidth.
+				if (animation_active) {
+					uint32_t rx1 = rain_x > 0 ? (uint32_t)rain_x : 0;
+					uint32_t rx2 = (uint32_t)(rain_x + rain_w);
+					int32_t  ry1_s = rain_y - 28;
+					uint32_t ry1 = ry1_s > 0 ? (uint32_t)ry1_s : 0;
+					uint32_t ry2 = (uint32_t)(rain_y + rain_h);
+					
+					if (rx1 < fx1) fx1 = rx1;
+					if (rx2 > fx2) fx2 = rx2;
+					if (ry1 < fy1) fy1 = ry1;
+					if (ry2 > fy2) fy2 = ry2;
+				}
+
+				wm_compose_dirty(fx1, fx2, fy1, fy2);
+				// wm_compose_dirty calls wm_overlay_reapply internally — no extra call needed
+
+				term_dirty_reset();
 			}
 		}
 	}

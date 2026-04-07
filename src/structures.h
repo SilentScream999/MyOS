@@ -80,7 +80,7 @@ enum PageFlags : uint64_t {
 // pcie
 
 
-uint64_t PCI_ECAM_VA_BASE = 0xFFFF'8000'0000'0000ULL;
+uint64_t PCI_ECAM_VA_BASE = 0xFFFF'A000'0000'0000ULL;
 uint64_t PCI_ECAM_SEG_STRIDE = 0x10000000ULL;
 
 uint64_t PCI_MMIO_VA_BASE = 0xFFFF'9000'0000'0000ULL;
@@ -135,16 +135,27 @@ struct USBSetupPacket {
 	uint16_t wLength;
 } __attribute__((packed));
 
+struct HIDInterface {
+	uint8_t  ep_num;
+	uint16_t mps;
+	struct Ring* ring;
+	uint8_t  type;     // 1=kbd, 2=mouse
+	uint8_t  protocol; // 1=boot kbd, 2=boot mouse, 0=none/report
+};
+
 struct USBDevice {
 	uint8_t slot_id;
 	uint8_t port_num;     // port number on *parent* hub/root (1-based)
 	uint8_t root_port_num;   // 1-based root port this device is on; 0 if behind a hub
 	uint32_t speed;
 	struct Ring* ep0_ring;
-	struct Ring* kbd_ring;
+	struct Ring* hub_ring;
+	
+	HIDInterface interfaces[4];
+	int interface_count;
+
 	volatile uint64_t* device_ctx;
 	bool is_hub;
-	bool is_keyboard;
 	uint64_t ep0_ring_phys;
 	uint64_t dev_ctx_phys;
 };

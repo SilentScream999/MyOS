@@ -268,10 +268,14 @@ static bool hub_get_port_status(USBDevice &hub, uint16_t port, uint8_t* status4)
 	return true;
 }
 
-/* ── Keyboard / hub arrays ────────────────────────────────── */
+/* ── Keyboard / mouse / hub arrays ────────────────────────── */
 #define MAX_KEYBOARDS 8
 static  USBDevice*    keyboards[MAX_KEYBOARDS];
 static  int           keyboard_count = 0;
+
+#define MAX_MICE 8
+static  USBDevice*    mice[MAX_MICE];
+static  int           mouse_count = 0;
 
 // Each registered hub gets a slot here so kmain can queue and service
 // its status-change interrupt endpoint — exactly like Linux hub_activate()
@@ -373,35 +377,61 @@ static void enumerate_device_after_address(
 		return;
 	}
 
-	/* ── Step 5: identify hub / HID keyboard ── */
-	bool found_keyboard = false;
+	/* ── Step 5: identify hub / HID interfaces ── */
 	bool found_hub      = (dev_class == 0x09);
-	uint8_t kbd_iface   = 0;
 	uint8_t cfg_val     = config_buf[5];
 
 	int  idx      = 0;
 	int  conf_len = (int)((uint16_t)config_buf[2] | ((uint16_t)config_buf[3] << 8));
+	
+	dev->interface_count = 0;
+	bool current_iface_is_hid = false;
+	uint8_t current_iface_num = 0;
+	uint8_t current_iface_protocol = 0;
+
 	while (idx + 2 < conf_len) {
 		uint8_t blen  = config_buf[idx];
 		uint8_t btype = config_buf[idx + 1];
 		if (blen == 0) break;
-		if (btype == 4 && idx + 9 <= conf_len) {
-			if (config_buf[idx+5] == 0x03 &&
-				config_buf[idx+7] == 0x01) {
-				found_keyboard = true;
-				kbd_iface = config_buf[idx + 2];
-				break;
+		
+		if (btype == 4 && idx + 9 <= conf_len) { // Interface Descriptor
+			current_iface_is_hid = (config_buf[idx + 5] == 0x03);
+			current_iface_num = config_buf[idx + 2];
+			current_iface_protocol = config_buf[idx + 7];
+			if (config_buf[idx + 5] == 0x09) found_hub = true;
+		} 
+		else if (btype == 5 && idx + 7 <= conf_len) { // Endpoint Descriptor
+			uint8_t addr = config_buf[idx + 2];
+			uint8_t attr = config_buf[idx + 3];
+			uint16_t mps = (uint16_t)config_buf[idx + 4] | ((uint16_t)config_buf[idx + 5] << 8);
+			
+			if (current_iface_is_hid && (addr & 0x80u) && (attr & 0x03u) == 0x03) { // Interrupt IN
+				if (dev->interface_count < 4) {
+					HIDInterface* hi = &dev->interfaces[dev->interface_count++];
+					hi->ep_num = addr & 0x0F;
+					hi->mps = mps;
+					hi->protocol = current_iface_protocol;
+					hi->ring = nullptr;
+					
+					// Type mapping: Protocol 1 = Keyboard, anything else HID = Mouse fallback
+					if (current_iface_protocol == 1) hi->type = 1;
+					else hi->type = 2;
+
+					char dstr[64];
+					print((char*)"[USB] HID Inf found. Type:");
+					to_str(hi->type, dstr); print(dstr);
+					print((char*)" Prot:"); to_str(hi->protocol, dstr); print(dstr);
+					print((char*)" MPS:"); to_str(hi->mps, dstr); print(dstr);
+				}
 			}
-			if (config_buf[idx+5] == 0x09) found_hub = true;
 		}
 		idx += blen;
 	}
 
-	dev->is_keyboard = found_keyboard;
-	dev->is_hub      = found_hub;
+	dev->is_hub = found_hub;
 
-	if (!found_keyboard && !found_hub) {
-		print((char*)"Device is neither keyboard nor hub; disabling slot.");
+	if (dev->interface_count == 0 && !found_hub) {
+		print((char*)"Device has no HID interfaces nor hub; disabling slot.");
 
 		// Issue Disable Slot so the xHC stops all activity on this slot and
 		// frees its resources.  Without this, the device (e.g. a USB boot
@@ -420,7 +450,7 @@ static void enumerate_device_after_address(
 		}
 		// Clear DCBAA entry so the slot is fully released.
 		g_dcbaa[dev->slot_id] = 0;
-		print((char*)"Slot disabled for non-keyboard device.");
+		print((char*)"Slot disabled for non-supported device.");
 		return;
 	}
 
@@ -499,7 +529,7 @@ static void enumerate_device_after_address(
 		// ── Configure the endpoint via Configure Endpoint command ──
 		struct Ring* hub_ring = (struct Ring*)alloc_table();
 		ring_init(hub_ring);
-		dev->kbd_ring = hub_ring;   // reuse field — it's just a Ring*
+		dev->hub_ring = hub_ring;
 
 		volatile uint64_t* ictx2      = alloc_table();
 		uint64_t           ictx2_phys = (uint64_t)ictx2 - HHDM;
@@ -578,72 +608,80 @@ static void enumerate_device_after_address(
 		return;
 	}
 
-	/* ── Keyboard-specific setup ── */
+	/* ── HID-specific setup (Keyboard & Mouse) ── */
 
-	{
+
+
+	for (int i = 0; i < dev->interface_count; i++) {
+		HIDInterface* hi = &dev->interfaces[i];
 		USBSetupPacket bp = {};
 		bp.bmRequestType = 0x21;
 		bp.bRequest      = 0x0B;
-		bp.wValue        = 0;
-		bp.wIndex        = kbd_iface;
+		bp.wValue        = 0; // Boot Protocol (if supported)
+		bp.wIndex        = i; // Assume interface num = index in simpler devices
 		bp.wLength       = 0;
 		volatile uint8_t* tmp = (volatile uint8_t*)alloc_table();
 		do_control_transfer(*dev, &bp, tmp, 0);
-		print((char*)"SET_PROTOCOL (Boot) sent");
-	}
-
-	{
+		
 		USBSetupPacket si = {};
 		si.bmRequestType = 0x21;
 		si.bRequest      = 0x0A;
-		// wValue high byte = idle duration in 4ms units.
-		// 0  = only send on change (we never get USB ticks while key is held).
-		// 2  = resend every 8ms while any key is held, giving a reliable
-		//      hardware-driven tick for repeat counting without needing a CPU timer.
-		si.wValue        = (2u << 8);   // 2 × 4ms = 8ms
-		si.wIndex        = kbd_iface;
+		si.wValue        = 0;
+		si.wIndex        = i;
 		si.wLength       = 0;
-		volatile uint8_t* tmp = (volatile uint8_t*)alloc_table();
 		do_control_transfer(*dev, &si, tmp, 0);
-		print((char*)"SET_IDLE sent (8ms interval)");
 	}
 
-	/* ── Configure interrupt IN endpoint (EP1 IN, DCI=3) ── */
-	struct Ring* kbd_ring = (struct Ring*)alloc_table();
-	ring_init(kbd_ring);
-	dev->kbd_ring = kbd_ring;
+	/* ── Configure interrupt IN endpoints ── */
 
-	volatile uint64_t* ictx2      = alloc_table();
-	uint64_t           ictx2_phys = (uint64_t)ictx2 - HHDM;
+	volatile uint64_t* ictx2 = alloc_table();
+	uint64_t ictx2_phys = (uint64_t)ictx2 - HHDM;
 	for (int j = 0; j < 512; j++) ictx2[j] = 0;
 
 	volatile InputControlCtx* icc2 = (volatile InputControlCtx*)ictx2;
 	icc2->drop_flags = 0;
-	icc2->add_flags  = (1u << 0) | (1u << 3);
+	icc2->add_flags  = (1u << 0);
+	
+	uint8_t max_dci = 1;
+	for (int i = 0; i < dev->interface_count; i++) {
+		HIDInterface* hi = &dev->interfaces[i];
+		struct Ring* r = (struct Ring*)alloc_table();
+		ring_init(r);
+		hi->ring = r;
+		
+		uint8_t dci = hi->ep_num * 2 + 1;
+		icc2->add_flags = icc2->add_flags | (1u << dci);
+		if (dci > max_dci) max_dci = dci;
+	}
 
-	volatile uint32_t* dev_slot_out  = (volatile uint32_t*)((uint64_t)dev->device_ctx);
-	volatile uint32_t* dev_ep0_out   = (volatile uint32_t*)((uint64_t)dev->device_ctx + ctx_stride);
+	volatile uint32_t* dev_slot_out = (volatile uint32_t*)((uint64_t)dev->device_ctx);
+	volatile uint32_t* dev_ep0_out  = (volatile uint32_t*)((uint64_t)dev->device_ctx + ctx_stride);
 
 	volatile uint32_t* in_slot2 = (volatile uint32_t*)((uint64_t)ictx2 + ctx_stride);
 	volatile uint32_t* in_ep02  = (volatile uint32_t*)((uint64_t)ictx2 + ctx_stride * 2);
-	volatile uint32_t* in_ep1   = (volatile uint32_t*)((uint64_t)ictx2 + ctx_stride * 4);
 
 	int dws = (int)(ctx_stride / 4);
 	for (int j = 0; j < dws; j++) {
 		in_slot2[j] = dev_slot_out[j];
 		in_ep02[j]  = dev_ep0_out[j];
-		in_ep1[j]   = 0;
 	}
 
-	in_slot2[0] = (in_slot2[0] & ~(0x1Fu << 27)) | (3u << 27);
+	in_slot2[0] = (in_slot2[0] & ~(0x1Fu << 27)) | ((uint32_t)max_dci << 27);
 
 	uint8_t interval = (dev->speed >= 4) ? 0u : 3u;
-	in_ep1[0] = ((uint32_t)interval << 16);
-	in_ep1[1] = (3u << 1) | (7u << 3) | (8u << 16);
-	uint64_t deq = kbd_ring->phys | 1u;
-	in_ep1[2] = (uint32_t)(deq & 0xFFFFFFFFu);
-	in_ep1[3] = (uint32_t)(deq >> 32);
-	in_ep1[4] = 8;
+
+	for (int i = 0; i < dev->interface_count; i++) {
+		HIDInterface* hi = &dev->interfaces[i];
+		uint8_t dci = hi->ep_num * 2 + 1;
+		volatile uint32_t* in_hi_ep = (volatile uint32_t*)((uint64_t)ictx2 + ctx_stride * ((uint64_t)dci + 1u));
+		for (int j = 0; j < dws; j++) in_hi_ep[j] = 0;
+		in_hi_ep[0] = ((uint32_t)interval << 16);
+		in_hi_ep[1] = (3u << 1) | (7u << 3) | ((uint32_t)hi->mps << 16);
+		uint64_t deq = hi->ring->phys | 1u;
+		in_hi_ep[2] = (uint32_t)(deq & 0xFFFFFFFFu);
+		in_hi_ep[3] = (uint32_t)(deq >> 32);
+		in_hi_ep[4] = (uint32_t)hi->mps;
+	}
 
 	ring_push_cmd(&cr, (12u << 10) | (dev->slot_id << 24), ictx2_phys, 0);
 	doorbell32[0] = 0;
@@ -658,24 +696,20 @@ static void enumerate_device_after_address(
 		uint32_t code = (resp.event->status >> 24) & 0xFF;
 		if (code != 1) {
 			print((char*)"Configure Endpoint failed, code:");
+			char str[64];
 			to_str(code, str); print(str);
 			return;
 		}
-		print((char*)"Configured EP1 IN for keyboard.");
+		print((char*)"Configured IN endpoints for HID interface(s).");
 	}
 
-	// ── Do NOT queue the initial TRB here ─────────────────────────────────
-	// Any transfer event generated during enumeration would be silently
-	// discarded by the command-completion loops (for(;;) waiting on type 33)
-	// that follow this call.  The TRB would be consumed with no re-queue,
-	// leaving kmain's main loop waiting forever for an event that never comes.
-	// kmain queues one TRB per keyboard after all enumeration is done.
-
-	if (keyboard_count < MAX_KEYBOARDS) {
-		keyboards[keyboard_count++] = dev;
-		print((char*)"Registered a keyboard.");
-	} else {
-		print((char*)"Keyboard array full.");
+	for (int i = 0; i < dev->interface_count; i++) {
+		HIDInterface* hi = &dev->interfaces[i];
+		if (hi->type == 1) {
+			if (keyboard_count < MAX_KEYBOARDS) keyboards[keyboard_count++] = dev;
+		} else {
+			if (mouse_count < MAX_MICE) mice[mouse_count++] = dev;
+		}
 	}
 }
 
@@ -699,7 +733,7 @@ static void configure_hub_slot(USBDevice* hub, uint8_t num_ports, struct Ring& c
 	for (int d = 0; d < dws; d++) in_slot[d] = out_slot[d];
 
 	// Set Hub bit in DW0[26]
-	in_slot[0] |= (1u << 26);
+	in_slot[0] = in_slot[0] | (1u << 26);
 
 	// Number of Ports lives in DW1[31:24], NOT DW1[15:8].
 	// DW1[15:8] is the low byte of Max Exit Latency — corrupting that field
@@ -1007,8 +1041,8 @@ static void enumerate_hub_children(
 		child->device_ctx    = dev_ctx;
 		child->dev_ctx_phys  = dev_ctx_phys;
 		child->is_hub        = false;
-		child->is_keyboard   = false;
-		child->kbd_ring      = nullptr;
+		child->interface_count = 0;
+		child->hub_ring      = nullptr;
 
 		enumerate_device_after_address(child, ops, nullptr, cr, g_hcc1, 0, 0);
 		if (needsResetting) return;
@@ -1032,6 +1066,9 @@ static void setupUSB(uint64_t usb_virt_base, uint8_t usb_start,
 	// are orphaned when the controller resets, so they must not be used again.
 	keyboard_count = 0;
 	for (int k = 0; k < MAX_KEYBOARDS; k++) keyboards[k] = nullptr;
+	
+	mouse_count = 0;
+	for (int m = 0; m < MAX_MICE; m++) mice[m] = nullptr;
 
 	// Reset hub list for the same reason.
 	hub_count = 0;
@@ -1295,8 +1332,8 @@ static void setupUSB(uint64_t usb_virt_base, uint8_t usb_start,
 		newdev->root_port_num      = (uint8_t)(i + 1);  // directly on a root port
 		newdev->speed              = speed;
 		newdev->is_hub             = false;
-		newdev->is_keyboard        = false;
-		newdev->kbd_ring           = nullptr;
+		newdev->interface_count    = 0;
+		newdev->hub_ring           = nullptr;
 
 		struct Ring* ep0           = (struct Ring*)alloc_table();
 		ring_init(ep0);

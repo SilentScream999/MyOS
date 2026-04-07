@@ -156,10 +156,19 @@ void kpanic(const char* name, ExceptionFrame* f) {
     print((char*)"RDX:    "); to_hex(f->rdx,         buf); print(buf);
 
     // CR2 holds the faulting virtual address for page faults.
-    // Harmlessly stale for other exception types.
     uint64_t cr2;
     __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
     print((char*)"CR2:    "); to_hex(cr2, buf); print(buf);
+
+    if (f->vector == 14) {
+        uint64_t err = f->error_code;
+        print((char*)"PF ERR: [P="); if (err & (1u << 0)) print((char*)"1"); else print((char*)"0");
+        print((char*)", W/R=");      if (err & (1u << 1)) print((char*)"W"); else print((char*)"R");
+        print((char*)", U/S=");      if (err & (1u << 2)) print((char*)"U"); else print((char*)"S");
+        print((char*)", RSVD=");     if (err & (1u << 3)) print((char*)"1"); else print((char*)"0");
+        print((char*)", I/D=");      if (err & (1u << 4)) print((char*)"I"); else print((char*)"D");
+        print((char*)"]");
+    }
 
     print((char*)"------------------------------");
     print((char*)"System halted.");

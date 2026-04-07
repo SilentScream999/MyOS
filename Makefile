@@ -16,7 +16,7 @@ LDFLAGS=-nostdlib -z max-page-size=0x1000
 SRC=src/kernel.cpp
 OBJ=$(SRC:.cpp=.o)
 
-all: myos
+all: myos init.elf
 
 myos: $(OBJ) linker.ld
 	$(LD) $(LDFLAGS) -T linker.ld -o $@ $(OBJ)
@@ -24,11 +24,22 @@ myos: $(OBJ) linker.ld
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -I. -c $< -o $@
 
+USER_CFLAGS = -O0 -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
+              -mno-red-zone -target x86_64-elf -fno-builtin \
+              -fno-unwind-tables -fno-asynchronous-unwind-tables
+
+user/init.o: user/init.c
+	$(CC) $(USER_CFLAGS) -I. -c $< -o $@
+
+init.elf: user/init.o
+	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
+
 iso: all
 	rm -rf iso_root
 	mkdir -p iso_root/boot
 
 	cp myos iso_root/boot/
+	cp init.elf iso_root/boot/
 	cp limine.conf iso_root/               # <-- config must be named limine.conf
 	cp limine/limine-bios.sys iso_root/boot/
 	cp limine/limine-bios-cd.bin limine/limine-uefi-cd.bin iso_root/
@@ -57,4 +68,4 @@ run: iso
 
 
 clean:
-	rm -rf iso_root $(OBJ) myos myos.iso
+	rm -rf iso_root $(OBJ) user/init.o myos myos.iso init.elf

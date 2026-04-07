@@ -2,10 +2,29 @@
 #define helpers_h
 
 #include "structures.h"
+#include "string.h"
 #include "framebufferstuff.h"
 
 static inline void hcf() {
 	for (;;) { __asm__ __volatile__("hlt"); }
+}
+
+static inline int strcmp(const char* s1, const char* s2) {
+	while (*s1 && (*s1 == *s2)) {
+		s1++;
+		s2++;
+	}
+	return *(const unsigned char*)s1 - *(const unsigned char*)s2;
+}
+
+static inline int strncmp(const char* s1, const char* s2, uint64_t n) {
+	if (n == 0) return 0;
+	while (n-- > 0 && *s1 && (*s1 == *s2)) {
+		if (n == 0) return 0;
+		s1++;
+		s2++;
+	}
+	return *(const unsigned char*)s1 - *(const unsigned char*)s2;
 }
 
 inline volatile uint32_t* pci_cfg_ptr32(uint64_t virt_base, uint8_t start_bus, uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off) {

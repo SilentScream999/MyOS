@@ -86,31 +86,31 @@ Framebuffer output is already working and used for early debugging.
 
 ## Timer System
 
-* [ ] PIT or APIC timer setup
-* [ ] Global tick counter
-* [ ] Basic sleep/delay functions
+* [x] PIT or APIC timer setup
+* [x] Global tick counter
+* [x] Basic sleep/delay functions
 ---
 
 # 🧠 PHASE 2 — MEMORY MANAGEMENT
 
 ## Physical Memory Manager (PMM)
 
-* [ ] Parse Limine memory map
-* [ ] Frame allocator (bitmap or stack)
-* [ ] alloc_frame / free_frame
+* [x] Parse Limine memory map
+* [x] Frame allocator (bitmap or stack)
+* [x] alloc_frame / free_frame
 
 ## Virtual Memory Manager (VMM)
 
-* [ ] Page table manager (4-level paging)
-* [ ] map_page / unmap_page
-* [ ] Kernel heap region setup
-* [ ] User vs kernel memory separation prep
+* [x] Page table manager (4-level paging)
+* [x] map_page / unmap_page
+* [x] Kernel heap region setup
+* [x] User vs kernel memory separation prep
 
 ## Kernel Heap
 
-* [ ] kmalloc / kfree
-* [ ] bump allocator → slab allocator later
-* [ ] Heap built on VMM
+* [x] kmalloc / kfree
+* [x] bump allocator → slab allocator later
+* [x] Heap built on VMM
 
 ---
 
@@ -118,19 +118,19 @@ Framebuffer output is already working and used for early debugging.
 
 ## Task Model
 
-* [ ] PCB (PID, registers, stack, state, page table)
+* [x] PCB (PID, registers, stack, state, page table)
 
 ## Context Switching
 
-* [ ] Save/restore CPU state
-* [ ] Stack switching
-* [ ] CR3 switching
+* [x] Save/restore CPU state
+* [x] Stack switching
+* [x] CR3 switching
 
 ## Scheduler
 
-* [ ] Round-robin scheduler (single core first)
-* [ ] Task queue system
-* [ ] Timer-driven scheduling (later)
+* [x] Round-robin scheduler (single core first)
+* [x] Task queue system
+* [x] Timer-driven scheduling (later)
 
 ---
 
@@ -138,19 +138,19 @@ Framebuffer output is already working and used for early debugging.
 
 ## Syscall Interface
 
-* [ ] syscall/sysret entry
-* [ ] syscall dispatcher
+* [x] syscall/sysret entry
+* [x] syscall dispatcher
 
 ## Minimal Syscalls
 
-* [ ] sys_write
-* [ ] sys_exit
-* [ ] sys_getpid
+* [x] sys_write
+* [x] sys_exit
+* [x] sys_getpid
 
 ## User Mode Prep
 
-* [ ] Ring 3 transition
-* [ ] User stack setup
+* [x] Ring 3 transition
+* [x] User stack setup
 
 ---
 
@@ -169,60 +169,112 @@ Framebuffer output is already working and used for early debugging.
 
 * [ ] ext2 or custom filesystem
 
----
-
-# 🔴 PHASE 6 — ELF LOADER + USERSPACE
-
-## ELF Loader
-
-* [ ] ELF64 parsing
-* [ ] segment mapping
-* [ ] entry execution
-
-## Process Execution
-
-* [ ] execve-style loading
-* [ ] user address space setup
-
-## First Userspace Programs
-
-* [ ] init
-* [ ] echo
-* [ ] minimal shell
+# 🔴 PHASE 6 — ELF LOADER + USERSPACE [COMPLETED]
+  
+* [x] ELF64 parsing
+* [x] segment mapping
+* [x] entry execution
+* [x] execve-style loading
+* [x] user address space setup
+* [x] Ring 3 transition (IRETQ/SYSRETQ stable)
+* [x] first init program running and using syscalls
 
 ---
 
-# 🟤 PHASE 7 — TERMINAL (USERSpace)
+# 🟤 PHASE 7 — TERMINAL & TTY [COMPLETED]
 
 ## Kernel TTY
 
-* [ ] /dev/tty abstraction
-* [ ] input buffer system
+* [x] /dev/tty abstraction (tty.h buffer & line discipline)
+* [x] input buffer system handling USB scancodes
 
 ## Userspace Terminal
 
-* [ ] framebuffer terminal emulator
-* [ ] reads from TTY
+* [x] framebuffer terminal emulator (terminal.h)
+* [x] reads from TTY (via updated sys_read)
+* [x] ANSI escape sequence support (\e[2J, \e[H)
+* [x] Margin support to prevent screen clipping
 
 ## Shell
 
-* [ ] command parser
-* [ ] program execution
-* [ ] basic built-ins
+* [x] command parser (in user/init.c)
+* [x] program execution (future/execve)
+* [x] basic built-ins (clear, exit/disabled, shutdown)
 
 ---
 
-# 🟢 PHASE 8 — DEVICE DRIVERS
+# 🟢 PHASE 8 — DEVICE DRIVERS & KERNEL POLISH [COMPLETED]
+
+## Persistent Terminal & Kernel Logging
+
+* [x] Terminal loads independently of keyboard connection
+* [x] All hardware/kernel `print()` logs redirected to `bootlog.txt`
+* [x] `open bootlog` command to view logs in the shell
 
 ## Input
 
-* [x] USB keyboard (XHCI working)
-* [ ] input event system
+* [x] USB keyboard (XHCI working, hub support, arrow keys, key repeat)
+* [x] Raw mode TTY (`SYS_TTYRAW`) for interactive line input
+* [ ] input event system abstraction
 
-## Graphics / IO
+## Rendering Engine (Speed King)
+
+* [x] 64KB circular kernel log buffer
+* [x] Double-buffering with backbuffer + dirty-line tracking
+* [x] SSE non-temporal store acceleration (MOVNTDQ)
+* [x] Sub-millisecond partial screen flips
+
+## Shell UX
+
+* [x] Underscore cursor (VRAM-transient, no ghost artifacts)
+* [x] Command history (Up/Down arrows)
+* [x] Shift+Arrow hardware scrollback
+* [x] Green command highlighting (real-time, pre-Enter)
+
+---
+
+# 🖥️ PHASE 9 — VISUAL DESKTOP
+
+The next big milestone: a real graphical desktop environment running on top of our kernel.
+
+## Window Manager
+
+* [ ] Framebuffer surface / canvas abstraction
+* [ ] Draggable window regions with title bars
+* [ ] Z-order layering (front/back window management)
+* [ ] Mouse input (USB HID mouse driver)
+
+## UI Rendering
+
+* [ ] Filled rectangle + rounded corner primitives
+* [ ] Font rendering at multiple sizes
+* [ ] Icon/sprite blitting system
+* [ ] Desktop wallpaper / background
+
+## Desktop Shell
+
+* [ ] Taskbar with clock and running app list
+* [ ] Right-click context menu
+* [ ] App launcher / start menu
+* [ ] File browser (backed by VFS)
+
+## First Apps
+
+* [ ] Terminal emulator window (port existing TTY shell)
+* [ ] Simple text editor
+* [ ] System info viewer
+
+---
+
+# 🔮 FUTURE REFERENCE — Lower-Level Infrastructure
+
+* [ ] Device Drivers (PCI/SATA/NVMe)
+* [ ] More syscalls (open, close, fork, waitpid)
+* [ ] Proper VFS with real storage backing
+* [ ] Dynamic Memory Management improvements
+
+## Graphics / IO (Remaining)
 
 * [ ] framebuffer abstraction layer
 * [ ] PCI enumeration
 * [ ] storage drivers (SATA/NVMe later)
-
----
