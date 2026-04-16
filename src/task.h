@@ -62,7 +62,8 @@ struct Task {
     // ── Identity ──────────────────────────────────────────────────────────────
     pid_t     pid;
     TaskState state;
-    uint8_t   _pad[3];
+    bool      yielded;     // true if task voluntarily called yield()
+    uint8_t   _pad[2];
 
     // ── Saved CPU context ─────────────────────────────────────────────────────
     // After a context switch OUT, the stack contains (from high to low):
@@ -93,6 +94,9 @@ struct Task {
     // ── Userspace Context ─────────────────────────────────────────────────────
     uint64_t user_entry;
     uint64_t user_stack;
+
+    // ── Sleep / Block state ───────────────────────────────────────────────────
+    uint64_t wake_at_tick;  // Tick count when this task should be unblocked; 0 = manual unblock
 };
 
 // ── Global PID counter ─────────────────────────────────────────────────────────

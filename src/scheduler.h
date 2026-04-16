@@ -43,6 +43,7 @@
 // ──────────────────────────────────────────────────────────────────────────────
 
 #include "task.h"
+#include "gdt.h"
 #include "helpers.h"
 
 // ── Scheduler configuration ───────────────────────────────────────────────────
@@ -52,11 +53,17 @@
 
 // ── Module state ───────────────────────────────────────────────────────────────
 
-static Task*    g_current_task    = nullptr;
-static Task*    g_task_list       = nullptr;   // head of circular run-queue
-static uint32_t g_tick_counter    = 0;
-static bool     g_scheduler_ready = false;
+Task*    g_current_task    = nullptr;
+Task*    g_task_list       = nullptr;   // head of circular run-queue
+bool     g_scheduler_ready = false;
 static uint64_t g_kernel_cr3      = 0;         // master kernel PML4 physical address
+static uint32_t g_tick_counter    = 0;         // added back for time-slice tracking
+
+// CPU idle cycle tracker (accumulates TSC cycles spent in hlt each window)
+extern volatile uint64_t g_idle_tsc_accum;
+
+// Forward declaration from timer.h (cannot include timer.h here due to circular deps)
+extern volatile uint64_t g_tick_count;
 
 // ── switch_context ────────────────────────────────────────────────────────────
 // Low-level kernel context switch.
@@ -120,6 +127,10 @@ static void switch_context(uint64_t* old_rsp_out, uint64_t new_rsp, uint64_t new
 
 static void scheduler_add_task(Task* t) {
     if (!t) return;
+    
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+
     t->state = TaskState::READY;
 
     if (!g_task_list) {
@@ -130,6 +141,8 @@ static void scheduler_add_task(Task* t) {
         t->next           = g_task_list->next;
         g_task_list->next = t;
     }
+
+    __asm__ volatile("push %0; popfq" :: "r"(rflags) : "memory", "cc");
 }
 
 // ── scheduler_reap_dead ───────────────────────────────────────────────────────
@@ -164,34 +177,77 @@ static void scheduler_reap_dead() {
     }
 }
 
-// ── schedule ──────────────────────────────────────────────────────────────────
-// Round-robin: find the next READY task and switch to it.
-// Returns without switching if no other task is ready.
-
 static void schedule() {
     if (!g_scheduler_ready || !g_task_list) return;
 
+    // Prevent re-entrancy: save interrupt state and disable interrupts
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+
     scheduler_reap_dead();
+
+    // Check for any tasks that need to be unblocked
+    Task* scan = g_task_list;
+    do {
+        if (scan->state == TaskState::BLOCKED && scan->wake_at_tick > 0) {
+            if (g_tick_count >= scan->wake_at_tick) {
+                scan->state = TaskState::READY;
+                scan->wake_at_tick = 0;
+            }
+        }
+        scan = scan->next;
+    } while (scan != g_task_list);
 
     // Search starting from the task AFTER the current one.
     Task* start = g_current_task ? g_current_task->next : g_task_list;
     Task* next  = start;
-
     uint32_t guard = 0;
+
+    // --- PRIORITY BOOST FOR COMPOSITOR (PID 1) ---
+    // If the compositor is ready, it should almost always run immediately to maintain 60FPS.
+    Task* comp = g_task_list;
+    do {
+        if (comp->pid == 1 && comp->state == TaskState::READY) {
+            next = comp;
+            goto switch_now;
+        }
+        comp = comp->next;
+    } while (comp != g_task_list);
+
     do {
         if (next->state == TaskState::READY) break;
         next = next->next;
-        if (++guard > 1024) return;   // corrupted list guard
+        if (++guard > 1024) {
+            // list corruption
+            __asm__ volatile("push %0; popfq" :: "r"(rflags) : "memory", "cc");
+            return;
+        }
     } while (next != start);
 
+switch_now:
+
     // Nothing to switch to.
-    if (next == g_current_task || next->state != TaskState::READY) return;
+    if (next == g_current_task || next->state != TaskState::READY) {
+        if (g_current_task && g_current_task->yielded) {
+             g_current_task->yielded = false;
+             // Voluntary yield with no one else ready: idle until next interrupt.
+             uint64_t t0;
+             __asm__ volatile("rdtsc; shl $32, %%rdx; or %%rdx, %%rax" : "=a"(t0) :: "rdx");
+             __asm__ volatile("sti; hlt; cli");
+             uint64_t t1;
+             __asm__ volatile("rdtsc; shl $32, %%rdx; or %%rdx, %%rax" : "=a"(t1) :: "rdx");
+             __sync_fetch_and_add(&g_idle_tsc_accum, t1 - t0);
+        }
+        __asm__ volatile("push %0; popfq" :: "r"(rflags) : "memory", "cc");
+        return;
+    }
 
     Task* old = g_current_task;
 
     if (old && old->state == TaskState::RUNNING)
         old->state = TaskState::READY;
     next->state    = TaskState::RUNNING;
+    next->yielded  = false; // always clear yielded flag when starting a turn
     g_current_task = next;
 
     // Update TSS.rsp[0] so hardware interrupts from Ring 3 land on this
@@ -201,14 +257,39 @@ static void schedule() {
     }
 
     switch_context(&old->saved_rsp, next->saved_rsp, next->cr3);
+    
     // Execution resumes here when the old task is scheduled back in.
+    // Restore the exactly matching interrupt state we had before yielding.
+    __asm__ volatile("push %0; popfq" :: "r"(rflags) : "memory", "cc");
 }
 
 // ── yield ─────────────────────────────────────────────────────────────────────
 // Voluntarily surrender the rest of the current time slice.
 
 static void yield() {
+    if (g_current_task) g_current_task->yielded = true;
     schedule();
+}
+
+// ── task_sleep_ms ─────────────────────────────────────────────────────────────
+// Block the current task for at least `ms` milliseconds.
+// Yields the CPU immediately.
+
+static void task_sleep_ms(uint64_t ms) {
+    if (!g_current_task) return;
+    g_current_task->wake_at_tick = g_tick_count + ms;
+    g_current_task->state = TaskState::BLOCKED;
+    while (g_current_task->state == TaskState::BLOCKED) {
+        schedule();
+        if (g_current_task->state == TaskState::BLOCKED) {
+            uint64_t t0;
+            __asm__ volatile("rdtsc; shl $32, %%rdx; or %%rdx, %%rax" : "=a"(t0) :: "rdx");
+            __asm__ volatile("hlt");
+            uint64_t t1;
+            __asm__ volatile("rdtsc; shl $32, %%rdx; or %%rdx, %%rax" : "=a"(t1) :: "rdx");
+            __sync_fetch_and_add(&g_idle_tsc_accum, t1 - t0);
+        }
+    }
 }
 
 // ── task_exit ─────────────────────────────────────────────────────────────────

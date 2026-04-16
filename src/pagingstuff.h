@@ -113,7 +113,8 @@ static int       pmm_region_count   = 0;
 static int       pmm_cur_region     = 0;
 
 // max_hhdm_size is used by map_hhdm_usable() to know how much RAM to map.
-static uint64_t max_hhdm_size = 0;
+static uint64_t max_hhdm_size      = 0;
+static uint64_t total_usable_ram   = 0;
 
 // ── init_physical_allocator ───────────────────────────────────────────────────
 // Parse the Limine memory map.  Register every USABLE region with the bump
@@ -131,6 +132,7 @@ void init_physical_allocator() {
         if (top > max_hhdm_size) max_hhdm_size = top;
 
         if (entry->type != LIMINE_MEMMAP_USABLE) continue;
+        total_usable_ram += entry->length;
         if (pmm_region_count >= PMM_MAX_REGIONS)  continue;
 
         // Skip conventional memory (below 1 MiB, physical 0x0–0xFFFFF).
@@ -215,6 +217,26 @@ void free_phys_page(uint64_t phys) {
     node->next         = pmm_free_head;
     pmm_free_head      = node;
     pmm_free_count++;
+}
+
+// ── Memory Usage Helpers ─────────────────────────────────────────────────────
+
+static inline uint64_t get_free_ram_count() {
+    uint64_t free = (uint64_t)pmm_free_count * PAGE_SIZE;
+    for (int i = pmm_cur_region; i < pmm_region_count; i++) {
+        free += (pmm_regions[i].end - pmm_regions[i].bump);
+    }
+    return free;
+}
+
+static inline uint64_t get_total_ram_count() {
+    return total_usable_ram;
+}
+
+static inline uint64_t get_mapped_ram_count() {
+    uint64_t free = get_free_ram_count();
+    if (free > total_usable_ram) return 0;
+    return total_usable_ram - free;
 }
 
 // ── alloc_table ───────────────────────────────────────────────────────────────

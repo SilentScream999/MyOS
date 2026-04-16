@@ -80,6 +80,11 @@ static void irq_register(uint8_t irq, irq_handler_t handler) {
     uint16_t port = (irq < 8u) ? PIC1_DATA : PIC2_DATA;
     uint8_t  bit  = (irq < 8u) ? irq : (uint8_t)(irq - 8u);
 
+    // If it's a slave IRQ, we MUST also unmask the cascade line (IRQ2) on the master.
+    if (irq >= 8u) {
+        outb(PIC1_DATA, (uint8_t)(inb(PIC1_DATA) & ~(1u << 2u)));
+    }
+
     // Clear the mask bit to enable the IRQ line.
     outb(port, (uint8_t)(inb(port) & ~(1u << bit)));
 }

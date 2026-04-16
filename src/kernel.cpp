@@ -47,10 +47,18 @@ static volatile struct limine_stack_size_request stack_size_req = {
 	.stack_size = 4 * 1024 * 1024
 };
 
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_smp_request smp_req = {
+    .id = LIMINE_SMP_REQUEST,
+    .revision = 0
+};
+
 __attribute__((used, section(".limine_requests_start")))
 static volatile LIMINE_REQUESTS_START_MARKER;
 __attribute__((used, section(".limine_requests_end")))
 static volatile LIMINE_REQUESTS_END_MARKER;
+
+struct limine_framebuffer *fb = nullptr;
 
 // ── TSC helpers ───────────────────────────────────────────────────────────────
 //
@@ -81,12 +89,10 @@ uint8_t* g_backbuffer = nullptr;
 uint8_t* g_master_backbuffer = nullptr;
 
 // Phase 11: Speed King globals
-uint32_t g_voffset = 0;
 volatile uint32_t g_dirty_min_y = 0xFFFFFFFF;
 volatile uint32_t g_dirty_max_y = 0;
 volatile uint32_t g_dirty_min_x = 0xFFFFFFFF;
 volatile uint32_t g_dirty_max_x = 0;
-int32_t  g_view_delta = 0;   // rows scrolled up from bottom (0=live, negative=scrolled back)
 
 // Phase 9: WM post-flip hook (set to wm_render_chrome once WM is active)
 post_flip_hook_fn g_post_flip_hook = nullptr;
@@ -98,8 +104,6 @@ uint32_t g_term_ox = 8;          // fallback: full-screen margin
 uint32_t g_term_oy = 8;
 uint32_t g_term_max_cols = 80;
 uint32_t g_term_max_rows = 24;
-uint32_t g_term_history_rows = 0; // lines typed since WM start
-uint32_t g_term_total_rows = 0;   // total capacity of backbuffer (rows)
 uint32_t g_term_buf_height = 0;   // virtual backbuffer pixel height
 
 int32_t g_mouse_x = 400;
@@ -107,14 +111,19 @@ int32_t g_mouse_y = 300;
 uint8_t g_mouse_buttons = 0;
 uint8_t g_mouse_prev_buttons = 0;
 uint64_t tsc_hz = 3000000000ULL; // Calibrated at boot
+volatile uint64_t g_idle_tsc_accum = 0;
+volatile uint64_t g_tick_count = 0;
 volatile bool g_needs_refresh = true;
 volatile bool wm_chrome_dirty = false;
 volatile bool g_dragging_test = false;
 volatile bool g_dragging_term = false;
 volatile bool g_dragging_rain = false;
+volatile bool g_dragging_log  = false;
 volatile uint32_t g_mouse_btns_prev = 0;
 
 #include "mouse.h"
+#include "synaptics.h"
+#include "ps2kb.h"
 
 // Phase 18: High-precision TSC calibration against PIT
 static void calibrate_tsc_pit() {
@@ -137,6 +146,267 @@ static void calibrate_tsc_pit() {
     
     char mstr[32];
     print((char*)" TSC Hz: "); to_str(tsc_hz, mstr); print(mstr);
+}
+
+// ── PAT / Write-Combining Setup ──────────────────────────────────────────────
+static void setup_pat() {
+    uint64_t pat = rdmsr(0x277);
+    // Entry 2 (PWT=0, PCD=1, PAT=0) -> value 0x01 (Write-Combining)
+    pat &= ~(0xFFULL << 16);
+    pat |=  (0x01ULL << 16);
+    wrmsr(0x277, pat);
+    print((char*)"[init] Framebuffer PAT Index 2 set to WC.");
+}
+
+uint64_t g_last_frame_ticks = 0;
+
+extern "C" void mouse_process_scroll(int8_t scroll_dy) {
+    if (!fb) return;
+    int32_t mx = g_mouse_x, my = g_mouse_y;
+    int idx = wm_find_top_window(mx, my);
+    if (idx == WIN_TERM) {
+        term_scroll_view(scroll_dy);
+    } else if (idx == WIN_LOG) {
+        wm_log_scroll(scroll_dy);
+    }
+}
+
+extern "C" void mouse_process_input(int8_t dx, int8_t dy, uint8_t buttons) {
+    if (!fb) return;
+
+    g_mouse_prev_buttons = (uint8_t)g_mouse_buttons;
+    g_mouse_buttons      = buttons;
+    bool btn_held     = (g_mouse_buttons  & 1);
+    bool btn_was_held = (g_mouse_prev_buttons & 1);
+    bool mouse_press  = btn_held && !btn_was_held;
+    bool mouse_release= !btn_held && btn_was_held;
+
+    // 1. Move cursor (clamped to screen)
+    g_mouse_x += dx;
+    g_mouse_y += dy;
+    if (dx != 0 || dy != 0 || buttons != g_mouse_prev_buttons) g_needs_refresh = true;
+
+    if (g_mouse_x < 0) g_mouse_x = 0;
+    if (g_mouse_x >= (int32_t)fb->width)  g_mouse_x = fb->width  - 1;
+    if (g_mouse_y < 0) g_mouse_y = 0;
+    if (g_mouse_y >= (int32_t)fb->height) g_mouse_y = fb->height - 1;
+
+    // 2. Start drag / Raise / Close / Taskbar: hit-test Z-stack on fresh click
+    if (mouse_press) {
+        int32_t mx = g_mouse_x, my = g_mouse_y;
+        
+        // Taskbar / Start button
+        if (my >= (int32_t)fb->height - (int32_t)g_taskbar_h) {
+            if (mx >= 6 && mx <= (int32_t)(6 + g_sb_w)) {
+                // Start button
+                term_clear_screen();
+                term_write_string((char*)"[SYSTEM] Start Menu coming soon...\r\n");
+            } else {
+                // Task buttons — mirror the draw layout exactly
+                const int32_t WBTN_GAP = 4;
+                int32_t cur_x = 6 + g_sb_w + 10;  // sb_x + g_sb_w + gap
+                for (int idx = 0; idx < 4; idx++) {
+                    if (!g_win_visible[idx]) { continue; }
+                    if (mx >= cur_x && mx < cur_x + (int32_t)g_wbtn_w) {
+                        wm_raise_window(idx);
+                        break;
+                    }
+                    cur_x += g_wbtn_w + WBTN_GAP;
+                }
+            }
+        }
+ else {
+            int idx = wm_find_top_window(mx, my);
+            if (idx != -1) {
+                wm_raise_window(idx); // Move to top
+                if (wm_is_in_close(idx, mx, my)) {
+                    wm_close_window(idx);
+                } else if (wm_is_in_title(idx, mx, my)) {
+                    // Start dragging the topmost window
+                    if (idx == WIN_TERM) {
+                        wm_ghost_dragging_term = true; g_dragging_term = true;
+                        wm_drag_term_offx = mx - (int32_t)g_term_ox;
+                        wm_drag_term_offy = my - (int32_t)g_term_oy;
+                    } else if (idx == WIN_TEST) {
+                        wm_ghost_dragging_test = true; g_dragging_test = true;
+                        wm_drag_test_offx = mx - test_x;
+                        wm_drag_test_offy = my - test_y;
+                    } else if (idx == WIN_RAIN) {
+                        wm_ghost_dragging_rain = true; g_dragging_rain = true;
+                        wm_drag_rain_offx = mx - rain_x;
+                        wm_drag_rain_offy = my - rain_y;
+                    } else if (idx == WIN_LOG) {
+                        wm_ghost_dragging_log = true; g_dragging_log = true;
+                        wm_drag_log_offx = mx - log_win_x;
+                        wm_drag_log_offy = my - log_win_y;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Update ghost position while dragging (zero cost — just two int adds)
+    if (wm_ghost_dragging_term) {
+        wm_ghost_term_ox = g_mouse_x - wm_drag_term_offx;
+        wm_ghost_term_oy = g_mouse_y - wm_drag_term_offy;
+    }
+    if (wm_ghost_dragging_test) {
+        wm_ghost_test_ox = g_mouse_x - wm_drag_test_offx;
+        wm_ghost_test_oy = g_mouse_y - wm_drag_test_offy;
+    }
+    if (wm_ghost_dragging_rain) {
+        wm_ghost_rain_ox = g_mouse_x - wm_drag_rain_offx;
+        wm_ghost_rain_oy = g_mouse_y - wm_drag_rain_offy;
+    }
+    if (wm_ghost_dragging_log) {
+        wm_ghost_log_ox = g_mouse_x - wm_drag_log_offx;
+        wm_ghost_log_oy = g_mouse_y - wm_drag_log_offy;
+    }
+
+    // 4. Commit on release: NOW the window actually moves, triggering one recompose
+    if (mouse_release) {
+        if (wm_ghost_dragging_term) {
+            g_term_ox = (uint32_t)wm_ghost_term_ox;
+            g_term_oy = (uint32_t)wm_ghost_term_oy;
+            wm_ghost_dragging_term = false;
+            g_dragging_term        = false;
+            // Full screen dirty: old location + new location both need repaint
+            g_dirty_min_x = 0; g_dirty_max_x = fb->width  - 1;
+            g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
+            g_needs_refresh = true;
+        }
+        if (wm_ghost_dragging_test) {
+            test_x = wm_ghost_test_ox;
+            test_y = wm_ghost_test_oy;
+            wm_ghost_dragging_test = false;
+            g_dragging_test        = false;
+            g_dirty_min_x = 0; g_dirty_max_x = fb->width  - 1;
+            g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
+            g_needs_refresh = true;
+        }
+        if (wm_ghost_dragging_rain) {
+            rain_x = wm_ghost_rain_ox;
+            rain_y = wm_ghost_rain_oy;
+            wm_ghost_dragging_rain = false;
+            g_dragging_rain        = false;
+            g_dirty_min_x = 0; g_dirty_max_x = fb->width  - 1;
+            g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
+            g_needs_refresh = true;
+        }
+        if (wm_ghost_dragging_log) {
+            log_win_x = wm_ghost_log_ox;
+            log_win_y = wm_ghost_log_oy;
+            wm_ghost_dragging_log = false;
+            g_dragging_log        = false;
+            g_dirty_min_x = 0; g_dirty_max_x = fb->width  - 1;
+            g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
+            g_needs_refresh = true;
+        }
+    }
+}
+
+void compositor_thread_main() {
+    uint64_t target_tsc = rdtsc(); // Start cadence from current time
+    static uint64_t last_hud_tick     = 0;
+    static uint32_t boot_sync_frames = 30;
+
+    while (true) {
+        uint64_t frame_interval = (tsc_hz / 60);
+        target_tsc += frame_interval;
+
+        // Run one frame of compositor logic
+        uint64_t now_refresh = rdtsc();
+        
+        // If rainbow window is visible, always force a refresh for animation
+        if (g_win_visible[WIN_RAIN]) {
+            g_needs_refresh = true;
+        }
+
+        // Periodic HUD update: ensure Core0 stats refresh every 1 second
+        if (now_refresh - last_hud_tick > tsc_hz) {
+            last_hud_tick = now_refresh;
+            g_needs_refresh = true;
+
+            // Explicitly 'dirty' the HUD area (top-right strip)
+            uint32_t hud_left = fb->width > 400 ? fb->width - 400 : 0;
+            if (hud_left < g_dirty_min_x) g_dirty_min_x = hud_left;
+            if (fb->width > g_dirty_max_x) g_dirty_max_x = fb->width - 1;
+            if (0 < g_dirty_min_y) g_dirty_min_y = 0;
+            if (60 > g_dirty_max_y) g_dirty_max_y = 60;
+        }
+
+        if (g_needs_refresh || boot_sync_frames > 0) {
+            g_needs_refresh  = false;
+
+            // Drain and render any pending terminal output
+            term_process_ring_buffer();
+
+            // Drive rainbow animation: 4 pixels per frame (rock solid now)
+            if (g_win_visible[WIN_RAIN]) {
+                rain_scroll += 4;
+                // Mark rainbow area as dirty
+                extern int32_t rain_x, rain_y, rain_w, rain_h;
+                uint32_t rx1 = (uint32_t)rain_x, rx2 = (uint32_t)(rain_x + rain_w);
+                uint32_t ry1 = (uint32_t)(rain_y - 28), ry2 = (uint32_t)(rain_y + rain_h);
+                if (rx1 < g_dirty_min_x) g_dirty_min_x = rx1;
+                if (rx2 > g_dirty_max_x) g_dirty_max_x = rx2;
+                if (ry1 < g_dirty_min_y) g_dirty_min_y = ry1;
+                if (ry2 > g_dirty_max_y) g_dirty_max_y = ry2;
+            }
+            bool animation_active = g_win_visible[WIN_RAIN]; 
+
+            __asm__ volatile("cli");
+            uint32_t fx1 = g_dirty_min_x, fx2 = g_dirty_max_x;
+            uint32_t fy1 = g_dirty_min_y, fy2 = g_dirty_max_y;
+            g_dirty_min_y = fb->height; g_dirty_max_y = 0;
+            g_dirty_min_x = fb->width;  g_dirty_max_x = 0;
+            __asm__ volatile("sti");
+
+            if (boot_sync_frames > 0) {
+                fx1 = 0; fx2 = fb->width - 1;
+                fy1 = 0; fy2 = fb->height - 1;
+                boot_sync_frames--;
+            }
+            
+            // If animating, only dirty the rainbow window region to save bandwidth.
+            if (animation_active) {
+                uint32_t rx1 = rain_x > 0 ? (uint32_t)rain_x : 0;
+                uint32_t rx2 = (uint32_t)(rain_x + rain_w);
+                int32_t  ry1_s = rain_y - 28;
+                uint32_t ry1 = ry1_s > 0 ? (uint32_t)ry1_s : 0;
+                uint32_t ry2 = (uint32_t)(rain_y + rain_h);
+                
+                if (rx1 < fx1) fx1 = rx1;
+                if (rx2 > fx2) fx2 = rx2;
+                if (ry1 < fy1) fy1 = ry1;
+                if (ry2 > fy2) fy2 = ry2;
+            }
+
+            uint64_t t_start = rdtsc();
+            wm_compose_dirty(fx1, fx2, fy1, fy2);
+            uint64_t t_end = rdtsc();
+            g_last_frame_ticks = t_end - t_start;
+            
+            term_dirty_reset();
+        }
+
+        // --- DRIFT-FREE SLEEP ---
+        uint64_t final_now = rdtsc();
+        if (final_now < target_tsc) {
+            uint64_t diff = target_tsc - final_now;
+            uint32_t ms_to_sleep = (uint32_t)(diff * 1000 / tsc_hz);
+            if (ms_to_sleep > 0) {
+                task_sleep_ms(ms_to_sleep);
+            } else {
+                yield(); // Too close for ms sleep; just yield the rest of the tick
+            }
+        } else {
+            // Work took longer than 16.6ms (frame miss). 
+            // Reset target to catch up and prevent "spiral of death"
+            target_tsc = final_now;
+            yield();
+        }
+    }
 }
 
 extern "C" void kmain(void) {
@@ -171,6 +441,8 @@ extern "C" void kmain(void) {
 
 	__asm__ volatile ("sti"); // enable hardware interrupts
 	calibrate_tsc_pit();
+	synaptics_init();
+	ps2kb_init();
 	print((char*)"Interrupts enabled. Timer running.");
 	// ── END NEW ──────────────────────────────────────
 
@@ -210,6 +482,7 @@ extern "C" void kmain(void) {
 	print((char*)"Setting up memory management");
 	init_physical_allocator();
 	map_hhdm_usable(PRESENT | WRITABLE);
+	setup_pat();
 	
 	// Explicitly map the framebuffer in our new page tables if it's not already covered
 	// by the usable RAM map. This ensures sys_write works from user tasks.
@@ -232,9 +505,9 @@ extern "C" void kmain(void) {
         fb = fb_req.response->framebuffers[0];
         
         // 2000 lines @ 10px each = 20,000 pixels high
-        g_term_buf_height = 20000;
+        // Optimized backbuffer size: 1000px height is plenty for our 600px window
+        g_term_buf_height = 1000;
         if (g_term_buf_height < fb->height) g_term_buf_height = fb->height;
-        
         g_backbuffer = (uint8_t*)kmalloc(g_term_buf_height * fb->pitch);
         if (g_backbuffer) {
             memset(g_backbuffer, 0, g_term_buf_height * fb->pitch);
@@ -251,6 +524,20 @@ extern "C" void kmain(void) {
 	ramfs_init();
 	ramfs_mount_klog();
 	scheduler_init();
+    // Initializing graphical UI components
+    wm_init();     // Initialize window manager and UI scaling first
+    wm_log_init(); // Then initialize the log buffer with the correct scaled dimensions
+    
+    // Spawn compositor thread extremely early so it guarantees 60fps
+    // screen refreshes regardless of whether USB enumeration blocks.
+    scheduler_add_task(task_create(compositor_thread_main));
+
+    if (smp_req.response) {
+        char cstr[32];
+        print((char*)"[cpu] Detected cores: ");
+        to_str(smp_req.response->cpu_count, cstr);
+        print(cstr); print((char*)"\r\n");
+    }
 
 	if (!rsdp_req.response) hcf();
 	uint64_t rsdp_va = (uint64_t)rsdp_req.response->address;
@@ -421,8 +708,7 @@ extern "C" void kmain(void) {
 		struct limine_file *module = module_req.response->modules[0];
 		Task* init_task = execve_memory((const uint8_t*)module->address);
 		if (init_task) {
-			// Phase 9: initialize WM and register post-flip chrome hook
-			wm_init();
+			// Phase 9: register post-flip chrome hook
 			g_pre_flip_hook = nullptr; // Phase 18: handled by wm_compose_full
 			g_post_flip_hook = nullptr;
 
@@ -567,6 +853,7 @@ extern "C" void kmain(void) {
 
 	while (true) {
 		event_count = 0;
+
 		// ── Drain ALL pending USB events to handle 1000Hz HID traffic ─────────
 		while (true) {
 			USB_Response resp = get_usb_response(1);
@@ -710,9 +997,13 @@ extern "C" void kmain(void) {
 								// Fresh press: record TSC time and emit immediately.
 								key_down_at[k][key] = now;
 								bool shift = (modifiers & 0x22u) != 0;
+								bool ctrl  = (modifiers & 0x11u) != 0;
 								if (key >= 0x4F && key <= 0x52) {
-									// Shift + Up/Down = Hardware Scrollback
-									if (shift && key == 0x52) term_scroll_view(-1);
+									// Ctrl + Up/Down = Log window scroll
+									if (ctrl && key == 0x52) wm_log_scroll(-1);
+									else if (ctrl && key == 0x51) wm_log_scroll(1);
+									// Shift + Up/Down = Terminal Scrollback
+									else if (shift && key == 0x52) term_scroll_view(-1);
 									else if (shift && key == 0x51) term_scroll_view(1);
 									else {
 										// Regular Arrow = Shell Navigation
@@ -771,131 +1062,24 @@ extern "C" void kmain(void) {
 						{
 							int8_t dx = (int8_t)data[1];
 							int8_t dy = (int8_t)data[2];
+							uint8_t buttons = data[0];
 
-							g_mouse_prev_buttons = g_mouse_buttons;
-							g_mouse_buttons      = data[0];
-							bool btn_held     = (g_mouse_buttons  & 1);
-							bool btn_was_held = (g_mouse_prev_buttons & 1);
-							bool mouse_press  = btn_held && !btn_was_held;
-							bool mouse_release= !btn_held && btn_was_held;
-
-							// 1. Move cursor (clamped to screen)
-							g_mouse_x += dx;
-							g_mouse_y += dy;
-							if (g_mouse_x < 0) g_mouse_x = 0;
-							if (g_mouse_x >= (int32_t)fb->width)  g_mouse_x = fb->width  - 1;
-							if (g_mouse_y < 0) g_mouse_y = 0;
-							if (g_mouse_y >= (int32_t)fb->height) g_mouse_y = fb->height - 1;
-
-							// 2. Start drag / Raise / Close / Taskbar: hit-test Z-stack on fresh click
-							if (mouse_press) {
-								int32_t mx = g_mouse_x, my = g_mouse_y;
-								
-								// Taskbar / Start button
-								if (my >= (int32_t)fb->height - (int32_t)g_taskbar_h) {
-									if (mx >= 6 && mx <= 98) {
-										// Start button
-										term_clear_screen();
-										term_write_string((char*)"[SYSTEM] Start Menu coming soon...\r\n");
-									} else {
-										// Task buttons — mirror the draw layout exactly
-										const int32_t WBTN_W = 124, WBTN_GAP = 4;
-										int32_t cur_x = 6 + 92 + 10;  // sb_x + sb_w + gap
-										for (int idx = 0; idx < 3; idx++) {
-											if (!g_win_visible[idx]) { continue; }
-											if (mx >= cur_x && mx < cur_x + WBTN_W) {
-												wm_raise_window(idx);
-												break;
-											}
-											cur_x += WBTN_W + WBTN_GAP;
-										}
-									}
-								} else {
-									int idx = wm_find_top_window(mx, my);
-									if (idx != -1) {
-										wm_raise_window(idx); // Move to top
-										if (wm_is_in_close(idx, mx, my)) {
-											wm_close_window(idx);
-										} else if (wm_is_in_title(idx, mx, my)) {
-											// Start dragging the topmost window
-											if (idx == WIN_TERM) {
-												wm_ghost_dragging_term = true; g_dragging_term = true;
-												wm_drag_term_offx = mx - (int32_t)g_term_ox;
-												wm_drag_term_offy = my - (int32_t)g_term_oy;
-											} else if (idx == WIN_TEST) {
-												wm_ghost_dragging_test = true; g_dragging_test = true;
-												wm_drag_test_offx = mx - test_x;
-												wm_drag_test_offy = my - test_y;
-											} else if (idx == WIN_RAIN) {
-												wm_ghost_dragging_rain = true; g_dragging_rain = true;
-												wm_drag_rain_offx = mx - rain_x;
-												wm_drag_rain_offy = my - rain_y;
-											}
-										}
-									}
-								}
-							}
-
-							// 3. Update ghost position while dragging (zero cost — just two int adds)
-							if (wm_ghost_dragging_term) {
-								wm_ghost_term_ox = g_mouse_x - wm_drag_term_offx;
-								wm_ghost_term_oy = g_mouse_y - wm_drag_term_offy;
-							}
-							if (wm_ghost_dragging_test) {
-								wm_ghost_test_ox = g_mouse_x - wm_drag_test_offx;
-								wm_ghost_test_oy = g_mouse_y - wm_drag_test_offy;
-							}
-							if (wm_ghost_dragging_rain) {
-								wm_ghost_rain_ox = g_mouse_x - wm_drag_rain_offx;
-								wm_ghost_rain_oy = g_mouse_y - wm_drag_rain_offy;
-							}
-
-							// 4. Commit on release: NOW the window actually moves, triggering one recompose
-							if (mouse_release) {
-								if (wm_ghost_dragging_term) {
-									g_term_ox = (uint32_t)wm_ghost_term_ox;
-									g_term_oy = (uint32_t)wm_ghost_term_oy;
-									wm_ghost_dragging_term = false;
-									g_dragging_term        = false;
-									// Full screen dirty: old location + new location both need repaint
-									g_dirty_min_x = 0; g_dirty_max_x = fb->width  - 1;
-									g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
-									g_needs_refresh = true;
-								}
-								if (wm_ghost_dragging_test) {
-									test_x = wm_ghost_test_ox;
-									test_y = wm_ghost_test_oy;
-									wm_ghost_dragging_test = false;
-									g_dragging_test        = false;
-									g_dirty_min_x = 0; g_dirty_max_x = fb->width  - 1;
-									g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
-									g_needs_refresh = true;
-								}
-								if (wm_ghost_dragging_rain) {
-									rain_x = wm_ghost_rain_ox;
-									rain_y = wm_ghost_rain_oy;
-									wm_ghost_dragging_rain = false;
-									g_dragging_rain        = false;
-									g_dirty_min_x = 0; g_dirty_max_x = fb->width  - 1;
-									g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
-									g_needs_refresh = true;
-								}
-							}
-
-							// Re-queue transfer TRB
-							volatile TRB* new_trb = &m_hi->ring->trb[m_hi->ring->enq];
-							new_trb->parameter = report_phys;
-							new_trb->status    = (uint32_t)m_hi->mps;
-							new_trb->control   = (1u << 10) | (1u << 5) | (m_hi->ring->pcs & 1u);
-
-							if (++m_hi->ring->enq == LINK_INDEX) {
-								m_hi->ring->trb[LINK_INDEX].control =
-									(TRB_TYPE_LINK << 10) | (1u << 1) | (m_hi->ring->pcs & 1u);
-								m_hi->ring->enq = 0;
-								m_hi->ring->pcs ^= 1;
-							}
-							doorbell32[slot_from_event] = dci_from_event;
+                            mouse_process_input(dx, dy, buttons);
 						}
+
+						// Re-queue transfer TRB
+						volatile TRB* new_trb = &m_hi->ring->trb[m_hi->ring->enq];
+						new_trb->parameter = report_phys;
+						new_trb->status    = (uint32_t)m_hi->mps;
+						new_trb->control   = (1u << 10) | (1u << 5) | (m_hi->ring->pcs & 1u);
+
+						if (++m_hi->ring->enq == LINK_INDEX) {
+							m_hi->ring->trb[LINK_INDEX].control =
+								(TRB_TYPE_LINK << 10) | (1u << 1) | (m_hi->ring->pcs & 1u);
+							m_hi->ring->enq = 0;
+							m_hi->ring->pcs ^= 1;
+						}
+						doorbell32[slot_from_event] = dci_from_event;
 					} else {
 						// ── Transfer error on a keyboard slot → device disconnected ──
 						uint32_t err_slot = slot_from_event;
@@ -914,11 +1098,9 @@ extern "C" void kmain(void) {
 			}
 		}
 
-		// 5. Immediate overlay update — cursor + ghost outline, no compositor.
-		//    Throttle: only one repo-stamp after draining the entire USB event batch.
-		if (event_count > 0) {
-			wm_overlay_update(g_mouse_x, g_mouse_y, g_mouse_buttons);
-		}
+		// Cursor coordinates and drag tracking are updated above.
+		// Actual VRAM rendering is deferred to the 60 Hz compositor thread
+		// to avoid exhausting PCIe transaction limits with 1000 Hz micro-writes.
 
 		// ── PORTSC disconnect polling ─────────────────────────────────────────
 		//
@@ -966,7 +1148,10 @@ extern "C" void kmain(void) {
 				last_repeat_fire[k][key] = now;
 
 				if (key >= 0x4F && key <= 0x52) {
-					if (shift && key == 0x52) term_scroll_view(-1);
+					bool ctrl2 = (last_mods[k] & 0x11u) != 0;
+					if (ctrl2 && key == 0x52) wm_log_scroll(-1);
+					else if (ctrl2 && key == 0x51) wm_log_scroll(1);
+					else if (shift && key == 0x52) term_scroll_view(-1);
 					else if (shift && key == 0x51) term_scroll_view(1);
 					else {
 						tty_input('\x1b'); tty_input('[');
@@ -980,56 +1165,10 @@ extern "C" void kmain(void) {
 			}
 		}
 
-		// --- PHASE 18.5: ATOMIC 60Hz COMPOSITOR ---
-		// 60Hz scene compositor — runs ONLY when content changed (text, scroll,
-		// drag committed). Cursor movement never reaches here anymore.
-		static uint64_t last_compose_tsc = 0;
-		static uint32_t boot_sync_frames = 30;
-
-		if (g_needs_refresh || boot_sync_frames > 0 || true) {
-			uint64_t now_refresh = rdtsc();
-			if (now_refresh - last_compose_tsc > (tsc_hz / 60)) {
-				last_compose_tsc = now_refresh;
-				g_needs_refresh  = false;
-
-				// Drive rainbow animation: 4 pixels per frame
-				rain_scroll += 4;
-				// Force refresh because the rainbow window is always moving
-				bool animation_active = true; 
-
-				__asm__ volatile("cli");
-				uint32_t fx1 = g_dirty_min_x, fx2 = g_dirty_max_x;
-				uint32_t fy1 = g_dirty_min_y, fy2 = g_dirty_max_y;
-				g_dirty_min_y = fb->height; g_dirty_max_y = 0;
-				g_dirty_min_x = fb->width;  g_dirty_max_x = 0;
-				__asm__ volatile("sti");
-
-				if (boot_sync_frames > 0) {
-					fx1 = 0; fx2 = fb->width - 1;
-					fy1 = 0; fy2 = fb->height - 1;
-					boot_sync_frames--;
-				}
-				
-				// If animating, only dirty the rainbow window region to save bandwidth.
-				if (animation_active) {
-					uint32_t rx1 = rain_x > 0 ? (uint32_t)rain_x : 0;
-					uint32_t rx2 = (uint32_t)(rain_x + rain_w);
-					int32_t  ry1_s = rain_y - 28;
-					uint32_t ry1 = ry1_s > 0 ? (uint32_t)ry1_s : 0;
-					uint32_t ry2 = (uint32_t)(rain_y + rain_h);
-					
-					if (rx1 < fx1) fx1 = rx1;
-					if (rx2 > fx2) fx2 = rx2;
-					if (ry1 < fy1) fy1 = ry1;
-					if (ry2 > fy2) fy2 = ry2;
-				}
-
-				wm_compose_dirty(fx1, fx2, fy1, fy2);
-				// wm_compose_dirty calls wm_overlay_reapply internally — no extra call needed
-
-				term_dirty_reset();
-			}
-		}
+        // Standardize input polling to ~125Hz. This reduces scheduler thrashing
+        // and gives the high-priority compositor more airtime during input-heavy
+        // tasks like scrolling.
+        task_sleep_ms(8);
 	}
 
 	// A disconnect or PSC event caused break — go back and re-enumerate

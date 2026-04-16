@@ -50,11 +50,10 @@
 // PIT input frequency (Hz) — fixed by hardware.
 #define PIT_BASE_HZ   1193182ULL
 
-// ── Global tick counter ────────────────────────────────────────────────────────
 // Incremented once per tick; at 1000 Hz this is a millisecond counter.
 // Declared volatile so the compiler never caches it in a register.
-
-static volatile uint64_t g_tick_count = 0;
+// Defined in kernel.cpp
+extern volatile uint64_t g_tick_count;
 
 // ── timer_irq_handler ─────────────────────────────────────────────────────────
 // Called by exception_dispatch() on every IRQ 0 (PIT channel 0 interrupt).
@@ -115,9 +114,13 @@ static void init_timer(uint32_t hz) {
 // Interrupts must be enabled for this to advance.
 
 static void sleep_ms(uint64_t ms) {
-    uint64_t target = g_tick_count + ms;
-    while (g_tick_count < target) {
-        __asm__ volatile ("pause");
+    if (g_scheduler_ready) {
+        task_sleep_ms(ms);
+    } else {
+        uint64_t target = g_tick_count + ms;
+        while (g_tick_count < target) {
+            __asm__ volatile ("pause");
+        }
     }
 }
 

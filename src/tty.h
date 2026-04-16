@@ -87,8 +87,9 @@ static size_t tty_read(char* buf, size_t count) {
 
 // TTY write: shell output path. Snaps view to live and draws cursor after flush.
 static size_t tty_write(const char* buf, size_t count) {
-    if (g_view_delta != 0) {
-        g_view_delta = 0;    // snap back to live view on any shell output
+    if (g_term_view_offset != 0) {
+        g_term_view_offset = 0;    // snap back to live view on any shell output
+        term_sync_backbuffer();    // Repopulate pixel buffer
         term_dirty_all();
     }
     term_write(buf, count);  // writes chars, flips backbuffer → VRAM

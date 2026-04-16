@@ -10,16 +10,13 @@ extern "C" {
     #include "../limine.h"
 }
 
-static struct limine_framebuffer *fb;
+extern struct limine_framebuffer *fb;
 extern uint8_t* g_backbuffer;
 extern uint8_t* g_master_backbuffer;
-extern uint32_t g_voffset;
 extern volatile uint32_t g_dirty_min_y;
 extern volatile uint32_t g_dirty_max_y;
 extern volatile uint32_t g_dirty_min_x;
 extern volatile uint32_t g_dirty_max_x;
-extern int32_t  g_view_delta;   // rows scrolled (0=live, negative=up)
-extern uint32_t g_term_buf_height; // pixels in virtual backbuffer (e.g. 20000)
 extern uint32_t g_term_ox;        // terminal window X offset
 extern uint32_t g_term_oy;        // terminal window Y offset
 extern uint32_t g_term_max_cols;  // terminal character width
@@ -28,6 +25,7 @@ extern volatile bool g_needs_refresh;
 extern volatile bool wm_chrome_dirty;
 extern volatile bool g_dragging_test;
 extern volatile bool g_dragging_term;
+extern volatile bool g_dragging_log;
 static inline void wm_dirty_chrome() { wm_chrome_dirty = true; g_needs_refresh = true; }
 
 
@@ -63,51 +61,21 @@ typedef void (*pre_flip_hook_fn)();
 extern pre_flip_hook_fn g_pre_flip_hook;
 
 static inline void term_flip() {
-    if (!g_backbuffer || !fb) return;
-    if (g_dirty_min_y > g_dirty_max_y) return;
-
-    uint32_t min = g_dirty_min_y;
-    uint32_t max = g_dirty_max_y;
-    if (max >= fb->height) max = fb->height - 1;
-
-    // g_view_delta is in rows (negative = scrolled up).
-    // Add it to the backbuffer lookup so the display shows an earlier part of the ring.
-    int32_t delta_px = g_view_delta * 10;   // convert rows→pixels
-
-    if (g_pre_flip_hook) g_pre_flip_hook();
-
-    uint32_t term_bottom = g_term_oy + g_term_max_rows * 10;
-    for (uint32_t y = min; y <= max; y++) {
-        // Essential: only blit from backbuffer if the line is inside the terminal window
-        if (y < g_term_oy || y >= term_bottom) continue;
-
-        // Where this screen row maps to in the circular backbuffer
-        int32_t src = (int32_t)(y + g_voffset) + delta_px;
-        // Keep positive and in range (using the virtual buffer height)
-        src = ((src % (int32_t)g_term_buf_height) + (int32_t)g_term_buf_height) % (int32_t)g_term_buf_height;
-        
-        uint32_t x_off = g_term_ox;
-        uint32_t width_px = g_term_max_cols * 8;
-        
-        memcpy_vram_sse((uint8_t*)fb->address + y * fb->pitch + x_off * 4,
-                        g_backbuffer + (uint32_t)src * fb->pitch + x_off * 4,
-                        width_px * 4);
-    }
+    // REDUNDANT: term_flip used to blit directly to VRAM, causing major CPU lag.
+    // The compositor (wm.h) now handles blitting the terminal from g_backbuffer
+    // into the unified pipeline at a steady 60Hz. Disabling this saves ~50% bus traffic.
     term_dirty_reset();
-    if (g_post_flip_hook) g_post_flip_hook();
+    g_needs_refresh = true;
 }
 
-// Writes a pixel to the circular terminal backbuffer at window-relative (rx, ry)
 static inline void putp(uint32_t rx, uint32_t ry, uint32_t argb) {
     if (!g_backbuffer) {
         volatile uint32_t *vram = (volatile uint32_t *)fb->address;
         vram[ry * (fb->pitch / 4) + rx] = argb;
         return;
     }
-    // Mapping through circular vertical offset
-    uint32_t real_y = (ry + g_voffset) % g_term_buf_height;
 	uint32_t *base = (uint32_t *)g_backbuffer;
-	base[real_y * (fb->pitch / 4) + rx] = argb;
+	base[ry * (fb->pitch / 4) + rx] = argb;
 }
 
 static inline void fill_screen_fast(uint32_t argb) {
@@ -121,10 +89,10 @@ static inline void fill_screen_fast(uint32_t argb) {
         return;
     }
     if (argb == 0) {
-        memset(g_backbuffer, 0, g_term_buf_height * fb->pitch);
+        memset_32(g_backbuffer, 0, (g_term_max_rows * 10) * (fb->pitch / 4));
     } else {
         uint32_t* base = (uint32_t*)g_backbuffer;
-        uint64_t count = (g_term_buf_height * fb->pitch) / 4;
+        uint64_t count = ((uint64_t)g_term_max_rows * 10 * fb->pitch) / 4;
         for (uint64_t i = 0; i < count; i++) base[i] = argb;
     }
     term_dirty_all();
@@ -140,8 +108,7 @@ static void draw_char(int x, int y, char c, uint32_t color) {
     
     for (int row = 0; row < 8; row++) {
         uint8_t bits = glyph[row];
-        uint32_t real_y = (y + row + g_voffset) % g_term_buf_height;
-        uint32_t* row_base = base + real_y * pitch32 + x;
+        uint32_t* row_base = base + (y + row) * pitch32 + x;
         for (int col = 0; col < 8; col++) {
             if (bits & (1 << col)) row_base[col] = color;
         }

@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include "scheduler.h"
 
 #include "structures.h"
 #include "pagingstuff.h"
@@ -61,11 +62,17 @@ static uint64_t _usb_tsc_hz(void) {
 }
 
 // Accurate millisecond delay — call from anywhere in usbhelpers.h
-static void tsc_delay_ms(uint32_t ms) {
-    static uint64_t hz = 0;
-    if (!hz) hz = _usb_tsc_hz();
-    uint64_t end = _usb_rdtsc() + hz * (uint64_t)ms / 1000ULL;
-    while (_usb_rdtsc() < end) { __asm__ volatile ("pause"); }
+static void tsc_delay_ms(uint64_t ms) {
+    if (g_scheduler_ready) {
+        task_sleep_ms(ms);
+        return;
+    }
+	uint64_t hz = _usb_tsc_hz();
+	uint64_t start = _usb_rdtsc();
+	uint64_t end = start + (hz / 1000) * ms;
+	while (_usb_rdtsc() < end) {
+		__asm__ volatile ("pause");
+	}
 }
 
 /* ── Ring helpers ─────────────────────────────────────────── */
