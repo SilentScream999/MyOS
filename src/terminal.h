@@ -7,8 +7,8 @@
 
 // Runtime-configurable terminal window origin and bounds.
 // Set by the WM before the shell starts (in kernel.cpp / wm_init).
-extern uint32_t g_term_ox;
-extern uint32_t g_term_oy;
+extern int32_t g_term_ox;
+extern int32_t g_term_oy;
 extern uint32_t g_term_max_cols;
 extern uint32_t g_term_max_rows;
 static uint32_t g_term_scrolled_rows = 0; // lines that have scrolled off the top of the screen

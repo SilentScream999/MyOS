@@ -25,6 +25,7 @@ static const char ps2_set1_shift_map[] = {
 
 static bool ps2_shift_held = false;
 static bool ps2_ctrl_held  = false;
+static bool ps2_alt_held   = false;
 static bool ps2_e0_prefix  = false;
 
 // ── IRQ1 Handler ─────────────────────────────────────────────────────────────
@@ -50,6 +51,10 @@ void ps2kb_irq_handler() {
     // Ctrl Key tracking (Set 1: 0x1D)
     if (scancode == 0x1D) { ps2_ctrl_held = true; return; }
     if (scancode == 0x9D) { ps2_ctrl_held = false; return; }
+
+    // Alt Key tracking (Set 1: 0x38, E0 0x38 for right alt)
+    if (scancode == 0x38) { ps2_alt_held = true; return; }
+    if (scancode == 0xB8) { ps2_alt_held = false; return; }
 
     // Arrow Keys (Set 1 scancodes: 0x48=Up, 0x50=Down, 0x4B=Left, 0x4D=Right)
     if (scancode == 0x48) { // Up

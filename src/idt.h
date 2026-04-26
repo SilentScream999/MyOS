@@ -131,49 +131,8 @@ static void idt_set_gate(uint8_t vector, void* handler,
 
 // ── kpanic ────────────────────────────────────────────────────────────────────
 // Displays the exception name and all saved registers, then halts permanently.
-// Never returns.
-static __attribute__((noinline))
-void kpanic(const char* name, ExceptionFrame* f) {
-    char buf[32];
-
-    print((char*)"");
-    print((char*)"==============================");
-    print((char*)"     *** KERNEL PANIC ***     ");
-    print((char*)"==============================");
-    print((char*)name);
-    print((char*)"------------------------------");
-
-    print((char*)"RIP:    "); to_hex(f->rip,        buf); print(buf);
-    print((char*)"CS:     "); to_hex(f->cs,          buf); print(buf);
-    print((char*)"RFLAGS: "); to_hex(f->rflags,      buf); print(buf);
-    print((char*)"RSP:    "); to_hex(f->rsp,         buf); print(buf);
-    print((char*)"SS:     "); to_hex(f->ss,          buf); print(buf);
-    print((char*)"ERR:    "); to_hex(f->error_code,  buf); print(buf);
-    print((char*)"VEC:    "); to_hex(f->vector,      buf); print(buf);
-    print((char*)"RAX:    "); to_hex(f->rax,         buf); print(buf);
-    print((char*)"RBX:    "); to_hex(f->rbx,         buf); print(buf);
-    print((char*)"RCX:    "); to_hex(f->rcx,         buf); print(buf);
-    print((char*)"RDX:    "); to_hex(f->rdx,         buf); print(buf);
-
-    // CR2 holds the faulting virtual address for page faults.
-    uint64_t cr2;
-    __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-    print((char*)"CR2:    "); to_hex(cr2, buf); print(buf);
-
-    if (f->vector == 14) {
-        uint64_t err = f->error_code;
-        print((char*)"PF ERR: [P="); if (err & (1u << 0)) print((char*)"1"); else print((char*)"0");
-        print((char*)", W/R=");      if (err & (1u << 1)) print((char*)"W"); else print((char*)"R");
-        print((char*)", U/S=");      if (err & (1u << 2)) print((char*)"U"); else print((char*)"S");
-        print((char*)", RSVD=");     if (err & (1u << 3)) print((char*)"1"); else print((char*)"0");
-        print((char*)", I/D=");      if (err & (1u << 4)) print((char*)"I"); else print((char*)"D");
-        print((char*)"]");
-    }
-
-    print((char*)"------------------------------");
-    print((char*)"System halted.");
-    hcf();
-}
+// Implementation in kernel.cpp to access VRAM helpers.
+extern "C" void kpanic(const char* name, ExceptionFrame* f);
 
 // ── Exception name table ──────────────────────────────────────────────────────
 static const char* const exception_names[32] = {

@@ -5,7 +5,7 @@
 #include "irq.h"
 #include "helpers.h"
 
-extern "C" void mouse_process_input(int8_t dx, int8_t dy, uint8_t buttons);
+extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons);
 extern "C" void mouse_process_scroll(int8_t scroll_dy);
 
 // ── Port Definitions ─────────────────────────────────────────────────────────

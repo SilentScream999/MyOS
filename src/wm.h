@@ -52,6 +52,153 @@ static uint32_t g_taskbar_h = 40; // Default, will be recalculated in wm_init
 static uint32_t g_sb_w = 92;
 static uint32_t g_wbtn_w = 124;
 
+// Optional precomputed wallpaper backing store (same size as framebuffer).
+// When present, the compositor samples wallpaper pixels from this buffer
+// instead of a flat teal fill for the desktop background.
+static uint32_t* g_wallpaper = nullptr;
+
+static inline uint32_t wm_wallpaper_sample(uint32_t x, uint32_t y) {
+    // Fallback color if framebuffer is not ready
+    if (!fb) return 0xFF008080;
+
+    // Radial "sunrise" gradient with a soft vignette and scanline bands.
+    // All integer math: no libm or floating point required.
+    uint32_t W = fb->width;
+    uint32_t H = fb->height;
+    uint32_t cx = W / 2;
+    uint32_t cy = (H * 3) / 5; // Slightly below center for a horizon feel
+
+    int32_t dx = (int32_t)x - (int32_t)cx;
+    int32_t dy = (int32_t)y - (int32_t)cy;
+    uint64_t dist2 = (uint64_t)dx * (uint64_t)dx + (uint64_t)dy * (uint64_t)dy;
+    uint64_t max_dx = (uint64_t)cx * (uint64_t)cx;
+    uint64_t max_dy = (uint64_t)cy * (uint64_t)cy;
+    uint64_t max_dist2 = max_dx + max_dy;
+    if (max_dist2 == 0) max_dist2 = 1;
+
+    // 0 (center) → 255 (far corners)
+    uint32_t t = (uint32_t)((dist2 * 255) / max_dist2);
+    if (t > 255) t = 255;
+
+    // Base gradient: deep blue at bottom → purple/azure toward top
+    // Interpolate between two ARGB colors purely in integer space.
+    uint32_t top_col    = 0xFF3A2F6C; // near zenith
+    uint32_t bottom_col = 0xFF071726; // horizon band
+
+    // Flip t so center is brightest
+    uint32_t u = 255 - t;
+
+    uint8_t r_top = (uint8_t)((top_col    >> 16) & 0xFF);
+    uint8_t g_top = (uint8_t)((top_col    >>  8) & 0xFF);
+    uint8_t b_top = (uint8_t)((top_col         ) & 0xFF);
+    uint8_t r_bot = (uint8_t)((bottom_col >> 16) & 0xFF);
+    uint8_t g_bot = (uint8_t)((bottom_col >>  8) & 0xFF);
+    uint8_t b_bot = (uint8_t)((bottom_col      ) & 0xFF);
+
+    uint8_t r = (uint8_t)(r_bot + ((int32_t)(r_top - r_bot) * (int32_t)u) / 255);
+    uint8_t g = (uint8_t)(g_bot + ((int32_t)(g_top - g_bot) * (int32_t)u) / 255);
+    uint8_t b = (uint8_t)(b_bot + ((int32_t)(b_top - b_bot) * (int32_t)u) / 255);
+
+    // Vertical vignette: darken top/bottom edges slightly
+    uint32_t vy = (y * 255) / (H ? H : 1);
+    uint32_t v_factor = 220 + (vy > 128 ? (vy - 128) : (128 - vy)) / 6;
+    if (v_factor > 255) v_factor = 255;
+    r = (uint8_t)((uint32_t)r * v_factor / 255);
+    g = (uint8_t)((uint32_t)g * v_factor / 255);
+    b = (uint8_t)((uint32_t)b * v_factor / 255);
+
+    // Subtle scanline banding: every 3rd line is slightly darker
+    if ((y % 3u) == 0u) {
+        r = (uint8_t)((uint32_t)r * 230 / 255);
+        g = (uint8_t)((uint32_t)g * 230 / 255);
+        b = (uint8_t)((uint32_t)b * 230 / 255);
+    }
+
+    return 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
+static inline void wm_init_wallpaper() {
+    // If a raw wallpaper was already provided (e.g., from a Limine module),
+    // keep it and skip the procedural generator.
+    if (g_wallpaper) return;
+    if (!fb) return;
+    uint32_t W = fb->width;
+    uint32_t H = fb->height;
+    if (!W || !H) return;
+
+    uint64_t total_px = (uint64_t)W * (uint64_t)H;
+    g_wallpaper = (uint32_t*)kmalloc(total_px * sizeof(uint32_t));
+    if (!g_wallpaper) return;
+
+    for (uint32_t y = 0; y < H; y++) {
+        uint32_t* row = g_wallpaper + (uint64_t)y * W;
+        for (uint32_t x = 0; x < W; x++) {
+            row[x] = wm_wallpaper_sample(x, y);
+        }
+    }
+}
+
+// Load wallpaper pixels from a raw BGRA buffer (width * height * 4 bytes),
+// typically provided by a Limine module or a ramfs-backed file.
+static inline void wm_load_wallpaper_from_raw(const uint8_t* data, uint64_t size_bytes) {
+    if (!fb || !data) return;
+    const uint32_t dst_w = fb->width;
+    const uint32_t dst_h = fb->height;
+    if (!dst_w || !dst_h) return;
+
+    const uint64_t expected = (uint64_t)dst_w * (uint64_t)dst_h * 4ULL;
+
+    if (!g_wallpaper) {
+        g_wallpaper = (uint32_t*)kmalloc(expected);
+        if (!g_wallpaper) return;
+    }
+
+    // Format A (legacy): raw pixel bytes only, must exactly match framebuffer size.
+    if (size_bytes == expected) {
+        memcpy(g_wallpaper, data, expected);
+        return;
+    }
+
+    // Format B (preferred): simple header + pixel bytes, allows scaling to current mode.
+    //
+    // Layout (little-endian):
+    //   0x00: char magic[4] = "WRAW"
+    //   0x04: uint32 src_w
+    //   0x08: uint32 src_h
+    //   0x0C: uint32 format (0 = BGRA8888)
+    //   0x10: uint8  pixels[src_w * src_h * 4]
+    //
+    if (size_bytes >= 16 &&
+        data[0] == 'W' && data[1] == 'R' && data[2] == 'A' && data[3] == 'W') {
+        const uint32_t src_w = *(const uint32_t*)(data + 4);
+        const uint32_t src_h = *(const uint32_t*)(data + 8);
+        const uint32_t fmt   = *(const uint32_t*)(data + 12);
+        if (fmt != 0) return;
+        if (!src_w || !src_h) return;
+
+        const uint64_t src_bytes = (uint64_t)src_w * (uint64_t)src_h * 4ULL;
+        if (size_bytes < 16ULL + src_bytes) return;
+
+        const uint8_t* src = data + 16;
+
+        // Nearest-neighbor scale into ARGB words (src is BGRA bytes).
+        for (uint32_t y = 0; y < dst_h; y++) {
+            const uint32_t sy = (uint32_t)(((uint64_t)y * (uint64_t)src_h) / (uint64_t)dst_h);
+            const uint8_t* src_row = src + (uint64_t)sy * (uint64_t)src_w * 4ULL;
+            uint32_t* dst_row = g_wallpaper + (uint64_t)y * (uint64_t)dst_w;
+            for (uint32_t x = 0; x < dst_w; x++) {
+                const uint32_t sx = (uint32_t)(((uint64_t)x * (uint64_t)src_w) / (uint64_t)dst_w);
+                const uint8_t* p = src_row + (uint64_t)sx * 4ULL; // BGRA
+                // Pack to 0xAARRGGBB (little-endian-compatible with the rest of the WM).
+                dst_row[x] = 0xFF000000u | ((uint32_t)p[2] << 16) | ((uint32_t)p[1] << 8) | (uint32_t)p[0];
+            }
+        }
+        return;
+    }
+
+    // Anything else: ignore (prevents the "wrap/tile" corruption when sizes differ).
+}
+
 // ── WIN_LOG: independent scrollable text window ──────────────────────────────
 #define LOG_WIN_LINES 150
 #define LOG_WIN_COLS  100
@@ -148,6 +295,49 @@ static void wm_log_init() {
     wm_log_render_to_buffer();
 }
 
+void wm_log_append(const char* s) {
+    if (!s) return;
+    
+    // 1. Shift existing lines up if buffer is full
+    if (g_log_line_count >= LOG_WIN_LINES) {
+        memmove(g_log_buf[0], g_log_buf[1], (LOG_WIN_LINES - 1) * (LOG_WIN_COLS + 1));
+        g_log_line_count = LOG_WIN_LINES - 1;
+    }
+    
+    // 2. Copy the new line
+    char* dst = g_log_buf[g_log_line_count];
+    uint32_t i = 0;
+    while (s[i] && i < LOG_WIN_COLS) {
+        if (s[i] == '\n' || s[i] == '\r') break; // single line only
+        dst[i] = s[i];
+        i++;
+    }
+    dst[i] = '\0';
+    g_log_line_count++;
+    
+    // 3. Auto-scroll to bottom
+    int32_t max_scroll = (int32_t)g_log_line_count - (int32_t)g_log_rows_visible;
+    if (max_scroll < 0) max_scroll = 0;
+    log_win_scroll = max_scroll;
+    
+    // 4. Force a render to the log window's backbuffer
+    log_last_rendered_scroll = -1; // force full refresh
+    wm_log_render_to_buffer();
+
+    // 5. Mark regions dirty
+    g_needs_refresh = true;
+    if (fb) {
+        uint32_t lx1 = (uint32_t)(log_win_x > 0 ? log_win_x - 4 : 0);
+        uint32_t lx2 = (uint32_t)(log_win_x + g_log_win_cols * LOG_CHAR_W + 8);
+        uint32_t ly1 = (uint32_t)(log_win_y > 32 ? log_win_y - 32 : 0);
+        uint32_t ly2 = (uint32_t)(log_win_y + g_log_rows_visible * LOG_CHAR_H + 8);
+        if (lx1 < g_dirty_min_x) g_dirty_min_x = lx1;
+        if (lx2 > g_dirty_max_x) g_dirty_max_x = lx2;
+        if (ly1 < g_dirty_min_y) g_dirty_min_y = ly1;
+        if (ly2 > g_dirty_max_y) g_dirty_max_y = ly2;
+    }
+}
+
 static void wm_log_scroll(int delta) {
     log_win_scroll += delta;
     if (log_win_scroll < 0) log_win_scroll = 0;
@@ -172,7 +362,8 @@ static void wm_log_scroll(int delta) {
     }
 }
 
-extern uint32_t g_term_ox, g_term_oy, g_term_max_cols, g_term_max_rows;
+extern int32_t g_term_ox, g_term_oy;
+extern uint32_t g_term_max_cols, g_term_max_rows;
 
 struct WinRect {
     int32_t x1, y1, x2, y2;
@@ -714,6 +905,10 @@ static inline void wm_init() {
         g_rainbow_lut[i] = wm_rainbow_color(i * 2);
     }
 
+    // Precompute a wallpaper image the size of the framebuffer so the
+    // compositor can punch window holes in it efficiently.
+    wm_init_wallpaper();
+
     // Note: Terminal state initialized in terminal.h / term_clear_screen
     if (g_backbuffer) memset_32(g_backbuffer, 0, (g_term_max_rows * 10) * (fb->pitch / 4));
     term_dirty_all();
@@ -792,9 +987,13 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
     uint64_t t0 = rdtsc_val();
     uint64_t t1, t2, t3;
 
-    // Stage 1: Teal desktop (Hole-punched)
+    // Stage 1: Desktop wallpaper (hole-punched)
     for (uint32_t y = min_y; y <= max_y; y++) {
         uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
+        uint32_t* wrow = nullptr;
+        if (g_wallpaper && y < fb->height) {
+            wrow = g_wallpaper + (uint64_t)y * fb->width;
+        }
         if (y >= fb->height - g_taskbar_h) continue; // Taskbar area
 
         // Collect opaque spans for this scanline
@@ -826,11 +1025,22 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
             spans[j + 1] = key;
         }
 
-        // Draw the gaps between spans
+        // Draw the gaps between spans (desktop background)
         int32_t current_x = min_x;
         for (int i = 0; i < num_spans; i++) {
             if (current_x < spans[i].x1) {
-                memset_32(drow + current_x, 0xFF008080, spans[i].x1 - current_x);
+                int32_t gap = spans[i].x1 - current_x;
+                if (gap > 0) {
+                    if (wrow) {
+                        memcpy_vram_sse_headless(
+                            (uint8_t*)(drow + current_x),
+                            (uint8_t*)(wrow + current_x),
+                            (uint32_t)gap * 4
+                        );
+                    } else {
+                        memset_32(drow + current_x, 0xFF008080, gap);
+                    }
+                }
             }
             if (current_x < spans[i].x2) {
                 current_x = spans[i].x2;
@@ -839,7 +1049,18 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         
         // Draw any remaining background after the last span
         if (current_x <= (int32_t)max_x) {
-            memset_32(drow + current_x, 0xFF008080, max_x - current_x + 1);
+            uint32_t gap = max_x - (uint32_t)current_x + 1;
+            if (gap > 0) {
+                if (wrow) {
+                    memcpy_vram_sse_headless(
+                        (uint8_t*)(drow + current_x),
+                        (uint8_t*)(wrow + current_x),
+                        gap * 4
+                    );
+                } else {
+                    memset_32(drow + current_x, 0xFF008080, gap);
+                }
+            }
         }
     }
     
@@ -859,8 +1080,8 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         if (dr1 >= dr2) continue;
 
         if (idx == WIN_TERM) {
-            uint32_t wx = g_term_ox, wy = g_term_oy;
-            uint32_t ww = g_term_max_cols * 8, wh = g_term_max_rows * 10;
+            int32_t wx = g_term_ox, wy = g_term_oy;
+            int32_t ww = (int32_t)g_term_max_cols * 8, wh = (int32_t)g_term_max_rows * 10;
             wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, "Terminal", false, min_y, max_y);
             for (int32_t y = dr1; y < dr2; y++) {
                 uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
@@ -882,9 +1103,15 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                             if (e_x > w_end) memset_32(drow + w_end, 0xFFBBBBBB, e_x - w_end);
                         }
                     }
-                    if (y >= (int32_t)wy && y < (int32_t)(wy + wh)) {
-                        int32_t ry = (int32_t)(y - wy);
-                        memcpy_vram_sse_headless(drow + wx, (uint32_t*)(g_backbuffer + (uint64_t)ry * fb->pitch), ww * 4);
+                    if (y >= wy && y < wy + wh) {
+                        int32_t ry = y - wy;
+                        int32_t twx = wx; if (twx < 0) twx = 0;
+                        int32_t tww = ww; if (wx < 0) tww += wx;
+                        if (twx + tww > (int32_t)fb->width) tww = (int32_t)fb->width - twx;
+                        if (tww > 0) {
+                            uint32_t src_off = (wx < 0) ? (uint32_t)(-wx) : 0;
+                            memcpy_vram_sse_headless(drow + twx, (uint32_t*)(g_backbuffer + (uint64_t)ry * fb->pitch) + src_off, tww * 4);
+                        }
                     }
                 }
             }
@@ -917,7 +1144,7 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         } else if (idx == WIN_LOG) {
             int32_t lw = (int32_t)g_log_win_cols * LOG_CHAR_W;
             int32_t lh = (int32_t)g_log_rows_visible * LOG_CHAR_H;
-            wm_draw_window_chrome(r.x1, r.y1, lw + (int32_t)(g_border + g_pad) * 2, lh + (int32_t)(g_title_h + g_border * 2 + g_pad * 2), "Scroll Test", true, min_y, max_y); 
+            wm_draw_window_chrome(r.x1, r.y1, lw + (int32_t)(g_border + g_pad) * 2, lh + (int32_t)(g_title_h + g_border * 2 + g_pad * 2), "Boot Log", true, min_y, max_y); 
 
             for (int32_t y = dr1; y < dr2; y++) {
                 uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
@@ -953,11 +1180,20 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                 uint32_t bw = g_log_win_cols * LOG_CHAR_W;
                 uint32_t bh = g_log_rows_visible * LOG_CHAR_H;
                 for (uint32_t r = 0; r < bh; r++) {
-                    int32_t s_ry = log_win_y + r;
+                    int32_t s_ry = log_win_y + (int32_t)r;
                     if (s_ry < (int32_t)min_y || s_ry > (int32_t)max_y) continue;
-                    uint8_t* dst = g_master_backbuffer + (uint64_t)s_ry * fb->pitch + (uint64_t)log_win_x * 4;
-                    uint8_t* src = (uint8_t*)(lbb + (uint64_t)r * stride);
-                    memcpy_vram_sse_headless(dst, src, bw * 4);
+                    if (s_ry < 0 || (uint32_t)s_ry >= fb->height) continue;
+
+                    int32_t lwx = log_win_x; if (lwx < 0) lwx = 0;
+                    int32_t lww = (int32_t)bw; if (log_win_x < 0) lww += log_win_x;
+                    if (lwx + lww > (int32_t)fb->width) lww = (int32_t)fb->width - lwx;
+                    
+                    if (lww > 0) {
+                        uint32_t src_off_x = (log_win_x < 0) ? (uint32_t)(-log_win_x) : 0;
+                        uint8_t* dst = g_master_backbuffer + (uint64_t)s_ry * fb->pitch + (uint64_t)lwx * 4;
+                        uint8_t* src = (uint8_t*)(lbb + (uint64_t)r * stride) + src_off_x * 4;
+                        memcpy_vram_sse_headless(dst, src, lww * 4);
+                    }
                 }
             }
 
@@ -1078,7 +1314,7 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         }
 
         // ── Window task buttons ───────────────────────────────────────────────
-        const char* win_labels[4] = { "Terminal", "Visual Test", "Rainbow", "Scroll Test" };
+        const char* win_labels[4] = { "Terminal", "Visual Test", "Rainbow", "Boot Log" };
         const int32_t WBTN_GAP = (int32_t)(4 * fb->height) / 1080;
         int32_t cur_x = sb_x + g_sb_w + (int32_t)(10 * fb->height) / 1080;
         int32_t active_idx = g_win_order[3];   // topmost window

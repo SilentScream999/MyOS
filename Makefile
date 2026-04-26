@@ -40,6 +40,8 @@ iso: all
 
 	cp myos iso_root/boot/
 	cp init.elf iso_root/boot/
+	# Optional (ignored if missing): raw BGRA wallpaper module
+	cp wallpaper.raw iso_root/boot/ || true
 	cp limine.conf iso_root/               # <-- config must be named limine.conf
 	cp limine/limine-bios.sys iso_root/boot/
 	cp limine/limine-bios-cd.bin limine/limine-uefi-cd.bin iso_root/

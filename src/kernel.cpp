@@ -76,6 +76,190 @@ static inline uint64_t rdtsc() {
 	return ((uint64_t)hi << 32) | lo;
 }
 
+// ── Boot splash (loading screen) ─────────────────────────────────────────────
+// For testing, this intentionally loops forever so you can observe animation.
+static inline void vram_putpx(uint32_t x, uint32_t y, uint32_t argb) {
+	if (!fb || !fb->address) return;
+	if (x >= fb->width || y >= fb->height) return;
+	uint32_t* row = (uint32_t*)((uint8_t*)fb->address + (uint64_t)y * fb->pitch);
+	row[x] = argb;
+}
+
+static inline void vram_fill(uint32_t argb) {
+	if (!fb || !fb->address) return;
+	for (uint32_t y = 0; y < fb->height; y++) {
+		uint32_t* row = (uint32_t*)((uint8_t*)fb->address + (uint64_t)y * fb->pitch);
+		memset_32(row, argb, fb->width);
+	}
+	vram_fence();
+}
+
+static inline void vram_fill_circle(int32_t cx, int32_t cy, int32_t r, uint32_t argb) {
+	if (!fb || !fb->address) return;
+	int32_t r2 = r * r;
+	for (int32_t dy = -r; dy <= r; dy++) {
+		int32_t y = cy + dy;
+		if (y < 0 || (uint32_t)y >= fb->height) continue;
+		uint32_t* row = (uint32_t*)((uint8_t*)fb->address + (uint64_t)y * fb->pitch);
+		for (int32_t dx = -r; dx <= r; dx++) {
+			if (dx*dx + dy*dy > r2) continue;
+			int32_t x = cx + dx;
+			if (x < 0 || (uint32_t)x >= fb->width) continue;
+			row[x] = argb;
+		}
+	}
+}
+
+static inline void vram_draw_char_8x8(int32_t x, int32_t y, char c, uint32_t argb) {
+	if (!fb || !fb->address) return;
+	if (c < 0 || c > 127) return;
+	const uint8_t* glyph = font8x8_basic[(uint8_t)c];
+	for (int32_t r = 0; r < 8; r++) {
+		int32_t yy = y + r;
+		if (yy < 0 || (uint32_t)yy >= fb->height) continue;
+		uint32_t* row = (uint32_t*)((uint8_t*)fb->address + (uint64_t)yy * fb->pitch);
+		uint8_t bits = glyph[r];
+		for (int32_t b = 0; b < 8; b++) {
+			if (!(bits & (1u << b))) continue;
+			int32_t xx = x + b;
+			if (xx < 0 || (uint32_t)xx >= fb->width) continue;
+			row[xx] = argb;
+		}
+	}
+}
+
+static inline void vram_draw_string_8x8(int32_t x, int32_t y, const char* s, uint32_t argb) {
+	int32_t cx = x;
+	for (int i = 0; s && s[i]; i++) {
+		vram_draw_char_8x8(cx, y, s[i], argb);
+		cx += 8;
+	}
+}
+
+// 0..64 quarter-wave sine lookup (sin(0..pi/2)), scaled to Q15 (32767 = 1.0).
+// Generated once and hardcoded to avoid floating point / libm.
+static const int16_t k_sin_q15_qtr[65] = {
+	0, 804, 1608, 2410, 3212, 4011, 4808, 5602,
+	6393, 7180, 7962, 8740, 9512, 10279, 11039, 11793,
+	12539, 13279, 14010, 14732, 15446, 16151, 16846, 17530,
+	18204, 18868, 19519, 20159, 20787, 21403, 22005, 22594,
+	23170, 23732, 24279, 24812, 25330, 25833, 26319, 26790,
+	27245, 27683, 28105, 28510, 28898, 29269, 29622, 29957,
+	30275, 30574, 30855, 31118, 31362, 31588, 31794, 31982,
+	32151, 32301, 32431, 32543, 32635, 32708, 32761, 32767,
+	32767
+};
+
+static inline int16_t sin_q15_u8(uint8_t a) {
+	// Map a in [0,255] to sin(2pi * a/256) in Q15.
+	uint8_t q = (a >> 6) & 3;     // quadrant 0..3
+	uint8_t o = a & 63;           // offset within quadrant (0..63)
+	uint8_t idx = (q & 1) ? (uint8_t)(64 - o) : o;
+	int16_t v = k_sin_q15_qtr[idx];
+	return (q >= 2) ? (int16_t)-v : v;
+}
+
+static inline int16_t cos_q15_u8(uint8_t a) {
+	return sin_q15_u8((uint8_t)(a + 64)); // +pi/2
+}
+
+extern volatile bool g_desktop_ready;  // defined later in this TU
+
+static void boot_loading_screen_until_ready() {
+	if (!fb || !fb->address) return;
+
+	// Static background (Windows-like dark blue/black)
+	const uint32_t bg = 0xFF0A0F1E;
+
+	const int32_t cx = (int32_t)fb->width / 2;
+	const int32_t cy = (int32_t)fb->height / 2;
+	const int32_t radius = 24;
+	const int32_t dot_r = 3;
+
+	// Angle in "turn/256" units, but with fractional precision (Q16.16).
+	uint32_t ang_fp = 0;
+	uint8_t speed_phase = 0;
+
+	uint64_t target = rdtsc();
+	uint64_t step = (tsc_hz ? (tsc_hz / 60) : 50000000ULL);
+
+	while (!g_desktop_ready) {
+		// Clear frame
+		vram_fill(bg);
+
+		// Windows 11-ish spinner:
+		// - A short arc ("half circle") of dots
+		// - Smooth rotation
+		// - Speed varies: accelerates then decelerates (sinusoidal speed curve)
+		//
+		// Speed curve: omega = base + amp * (0.5 + 0.5*sin())
+		// (implemented in integer math, Q16.16 on angle)
+		{
+			int16_t s = sin_q15_u8(speed_phase);        // [-32767, 32767]
+			uint32_t ease = (uint32_t)(s + 32767);      // [0, 65534]
+			// base/amp in (turn/256) per frame, expressed in Q16.16
+			uint32_t omega_base = (2u << 16);           // ~2/256 turns per frame
+			uint32_t omega_amp  = (5u << 16);           // add up to ~5/256 turns per frame
+			uint32_t omega = omega_base + (uint32_t)((omega_amp * ease) / 65534u);
+			ang_fp += omega;
+			speed_phase = (uint8_t)(speed_phase + 3);   // controls accel/decel cadence
+		}
+
+		uint8_t ang_u8 = (uint8_t)(ang_fp >> 16);
+
+		// Dot arc: 8 dots spanning ~180 degrees (pi = 128 in u8-turns)
+		const uint32_t dot_count = 8;
+		const uint32_t arc_span = 128; // half circle
+
+		for (uint32_t i = 0; i < dot_count; i++) {
+			// Position along arc: head at i=0, tail at i=dot_count-1
+			uint32_t off = (dot_count <= 1) ? 0 : (i * arc_span) / (dot_count - 1);
+
+			// Per-dot "ease": give each dot a slightly different phase so it
+			// accelerates/decelerates a bit independently (Windows 11-ish feel).
+			//
+			// Keep wobble subtle and monotonic so dots never cross.
+			// wobble is scaled down near the head/tail to preserve the arc endpoints.
+			uint8_t dot_phase = (uint8_t)(speed_phase + (uint8_t)(i * 19u));
+			int16_t wob = sin_q15_u8(dot_phase); // [-32767, 32767]
+			uint32_t edge = (i <= (dot_count - 1u) / 2u) ? i : (dot_count - 1u - i);
+			// edge in [0..3] for dot_count=8 → scale factor in [0..255]
+			uint32_t edge_scale = (dot_count <= 1) ? 0u : (edge * 255u) / ((dot_count - 1u) / 2u);
+			// amplitude in angle-units (0..255 is full circle); keep small (~6 units).
+			int32_t wob_amp = (int32_t)(6 * (int32_t)edge_scale) / 255;
+			int32_t wob_u8 = (int32_t)((int32_t)wob * wob_amp / 32767);
+
+			uint8_t a = (uint8_t)(ang_u8 + (uint8_t)off + (uint8_t)wob_u8);
+
+			int16_t cs = cos_q15_u8(a);
+			int16_t sn = sin_q15_u8(a);
+			int32_t px = cx + (int32_t)((int64_t)cs * radius / 32767);
+			int32_t py = cy + (int32_t)((int64_t)sn * radius / 32767);
+
+			// Brightness falloff along the arc (visual head brightest).
+			// If the arc direction appears reversed, invert the gradient.
+			uint32_t j = (dot_count - 1u) - i;
+			uint32_t v = (j == 0) ? 255 :
+			             (j == 1) ? 210 :
+			             (j == 2) ? 170 :
+			             (j == 3) ? 135 :
+			             (j == 4) ? 110 :
+			             (j == 5) ? 95  :
+			             (j == 6) ? 82  : 70;
+			uint32_t col = 0xFF000000 | (v << 16) | (v << 8) | v;
+			vram_fill_circle(px, py, dot_r, col);
+		}
+
+		vram_fence();
+
+		// 60Hz-ish pacing using TSC (good enough for splash)
+		target += step;
+		while (rdtsc() < target) {
+			__asm__ volatile("pause");
+		}
+	}
+}
+
 // ── Syscall globals ───────────────────────────────────────────────────────────
 alignas(16) uint8_t g_syscall_kstack[64u * 1024u];
 uint64_t g_saved_user_rsp = 0;
@@ -100,8 +284,8 @@ pre_flip_hook_fn  g_pre_flip_hook  = nullptr;
 static uint64_t last_mouse_flip_tsc = 0;
 
 // Phase 9: Terminal window origin + size (set by wm_init)
-uint32_t g_term_ox = 8;          // fallback: full-screen margin
-uint32_t g_term_oy = 8;
+int32_t g_term_ox = 8;          // fallback: full-screen margin
+int32_t g_term_oy = 8;
 uint32_t g_term_max_cols = 80;
 uint32_t g_term_max_rows = 24;
 uint32_t g_term_buf_height = 0;   // virtual backbuffer pixel height
@@ -114,6 +298,7 @@ uint64_t tsc_hz = 3000000000ULL; // Calibrated at boot
 volatile uint64_t g_idle_tsc_accum = 0;
 volatile uint64_t g_tick_count = 0;
 volatile bool g_needs_refresh = true;
+volatile bool g_desktop_ready = false;
 volatile bool wm_chrome_dirty = false;
 volatile bool g_dragging_test = false;
 volatile bool g_dragging_term = false;
@@ -171,7 +356,7 @@ extern "C" void mouse_process_scroll(int8_t scroll_dy) {
     }
 }
 
-extern "C" void mouse_process_input(int8_t dx, int8_t dy, uint8_t buttons) {
+extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
     if (!fb) return;
 
     g_mouse_prev_buttons = (uint8_t)g_mouse_buttons;
@@ -266,8 +451,8 @@ extern "C" void mouse_process_input(int8_t dx, int8_t dy, uint8_t buttons) {
     // 4. Commit on release: NOW the window actually moves, triggering one recompose
     if (mouse_release) {
         if (wm_ghost_dragging_term) {
-            g_term_ox = (uint32_t)wm_ghost_term_ox;
-            g_term_oy = (uint32_t)wm_ghost_term_oy;
+            g_term_ox = wm_ghost_term_ox;
+            g_term_oy = wm_ghost_term_oy;
             wm_ghost_dragging_term = false;
             g_dragging_term        = false;
             // Full screen dirty: old location + new location both need repaint
@@ -386,6 +571,9 @@ void compositor_thread_main() {
             wm_compose_dirty(fx1, fx2, fy1, fy2);
             uint64_t t_end = rdtsc();
             g_last_frame_ticks = t_end - t_start;
+
+			// signal the splash to exit after the first frame lands
+            if (!g_desktop_ready) g_desktop_ready = true;
             
             term_dirty_reset();
         }
@@ -523,6 +711,25 @@ extern "C" void kmain(void) {
 
 	ramfs_init();
 	ramfs_mount_klog();
+
+    // Optional wallpaper module: if a second Limine module is present,
+    // treat it as a raw BGRA wallpaper and also expose it as /wallpaper.raw.
+    if (module_req.response && module_req.response->module_count > 1) {
+        struct limine_file* wmod  = module_req.response->modules[1];
+        uint64_t            wsize = wmod->size;
+        const uint8_t*      wdata = (const uint8_t*)wmod->address;
+
+        // Mirror into ramfs so userspace can read it as /wallpaper.raw.
+        file wf;
+        if (vfs_open("/wallpaper.raw", 0, &wf) == 0) {
+            vfs_write(&wf, wdata, wsize);
+            vfs_close(&wf);
+        }
+
+        // Feed raw pixels directly into the WM wallpaper buffer.
+        wm_load_wallpaper_from_raw(wdata, wsize);
+    }
+
 	scheduler_init();
     // Initializing graphical UI components
     wm_init();     // Initialize window manager and UI scaling first
@@ -531,6 +738,8 @@ extern "C" void kmain(void) {
     // Spawn compositor thread extremely early so it guarantees 60fps
     // screen refreshes regardless of whether USB enumeration blocks.
     scheduler_add_task(task_create(compositor_thread_main));
+
+	boot_loading_screen_until_ready();
 
     if (smp_req.response) {
         char cstr[32];
@@ -617,36 +826,49 @@ extern "C" void kmain(void) {
 		map_ecam_region(phys_base, virt_base, ecam_size);
 		print((char*)"Mapped...");
 
-		for (uint8_t bus = start; bus <= end; bus++) {
+		for (uint16_t bus = start; bus <= end; bus++) {
 			for (uint8_t dev = 0; dev < 32; dev++) {
-				for (uint8_t fn = 0; fn < 8; fn++) {
+				uint32_t id0 = pci_cfg_read32(virt_base, start, bus, dev, 0, 0x00);
+				if (id0 == 0xFFFFFFFF) continue;
+				
+				uint8_t header_type = (pci_cfg_read32(virt_base, start, bus, dev, 0, 0x0C) >> 16) & 0xFF;
+				int max_fn = (header_type & 0x80) ? 8 : 1;
+
+				for (uint8_t fn = 0; fn < max_fn; fn++) {
 					uint32_t id = pci_cfg_read32(virt_base, start, bus, dev, fn, 0x00);
 					if (id == 0xFFFFFFFF) continue;
 					uint32_t class_reg = pci_cfg_read32(virt_base, start, bus, dev, fn, 0x08);
 					if (((class_reg >> 24) & 0xFF) == 0x0C &&
 					    ((class_reg >> 16) & 0xFF) == 0x03) {
-						usb_virt_base = virt_base;
-						usb_start = start; usb_bus = bus;
-						usb_dev = dev;     usb_fn  = fn;
-						usb_prog_if = (class_reg >> 8) & 0xFF;
-						usb_found   = true;
-						print((char*)"Found a USB controller!");
-						break;
+						
+						uint8_t prog_if = (class_reg >> 8) & 0xFF;
+						if (prog_if == 0x30) {
+						    if (xhci_count < MAX_CONTROLLERS) {
+							    xhci_hc[xhci_count].virt_base = virt_base;
+							    xhci_hc[xhci_count].bus = bus;
+							    xhci_hc[xhci_count].dev = dev;
+							    xhci_hc[xhci_count].fn = fn;
+							    xhci_count++;
+							    print((char*)"Found an xHCI controller!");
+							} else {
+							    print((char*)"Found xHCI controller but array is full, skipping...");
+							}
+						} else {
+							print((char*)"Found non-xHCI USB controller, skipping...");
+						}
 					}
 				}
-				if (usb_found) break;
 			}
-			if (usb_found) break;
 		}
-		if (usb_found) break;
 	}
 
-	if (!usb_found) { print((char*)"Could not find a USB controller!"); hcf(); }
+	if (xhci_count == 0) { print((char*)"Could not find any xHCI USB controller!"); hcf(); }
+
+    for (int c = 0; c < xhci_count; c++) {
+        xhci_hc[c].needsResetting = true;
+    }
 
 	char str[64];
-	to_hex(usb_prog_if, str); print((char*)"Prog_If:"); print(str);
-
-	portfailed = (volatile bool*)alloc_table();
 
 	// ── Outer restart loop ───────────────────────────────────────────────────
 	// When the main loop detects a disconnect or Port Status Change, it sets
@@ -654,12 +876,22 @@ extern "C" void kmain(void) {
 	// re-enumerate all ports, reinitialise per-keyboard state, re-queue TRBs,
 	// and re-enter the main loop.
 	restart:
-	// Clear portfailed so every port gets a fresh attempt on each restart.
-	for (int _p = 0; _p < 4096; _p++) ((volatile uint8_t*)portfailed)[_p] = 0;
-
-	needsResetting = true;
-	while (needsResetting)
-		setupUSB(usb_virt_base, usb_start, usb_bus, usb_dev, usb_fn, usb_prog_if);
+    for (int c = 0; c < xhci_count; c++) {
+        if (xhci_hc[c].portfailed) {
+            for (int _p = 0; _p < 4096; _p++) xhci_hc[c].portfailed[_p] = 0;
+        }
+    }
+    
+	bool any_reset = true;
+	while (any_reset) {
+        any_reset = false;
+        for (int c = 0; c < xhci_count; c++) {
+            if (xhci_hc[c].needsResetting) {
+                setupUSB(&xhci_hc[c]);
+                if (xhci_hc[c].needsResetting) any_reset = true;
+            }
+        }
+    }
 
 	// ── Queue hub status-change TRBs BEFORE the keyboard_count == 0 check ───
 	//
@@ -697,7 +929,7 @@ extern "C" void kmain(void) {
 			hd->hub_ring->pcs ^= 1;
 		}
 
-		doorbell32[hd->slot_id] = hub_dcis[h];
+		hd->hc->doorbell32[hd->slot_id] = hub_dcis[h];
 		print((char*)"Queued status-change TRB for hub slot:");
 		to_str(hd->slot_id, str); print(str);
 	}
@@ -772,8 +1004,10 @@ extern "C" void kmain(void) {
 	// We do this BEFORE queueing keyboard TRBs so we can't accidentally
 	// discard a real event.
 	{
-		USB_Response stale;
-		do { stale = get_usb_response(1); } while (stale.gotresponse);
+        for (int c = 0; c < xhci_count; c++) {
+		    USB_Response stale;
+		    do { stale = get_usb_response(&xhci_hc[c], 1); } while (stale.gotresponse);
+		}
 	}
 
 	for (int k = 0; k < keyboard_count; k++) {
@@ -799,7 +1033,7 @@ extern "C" void kmain(void) {
 			}
 
 			uint8_t kbd_dci = hi->ep_num * 2 + 1;
-			doorbell32[kd->slot_id] = kbd_dci;
+			kd->hc->doorbell32[kd->slot_id] = kbd_dci;
 		}
 	}
 
@@ -827,7 +1061,7 @@ extern "C" void kmain(void) {
 			}
 
 			uint8_t mouse_dci = hi->ep_num * 2 + 1;
-			doorbell32[md->slot_id] = mouse_dci;
+			md->hc->doorbell32[md->slot_id] = mouse_dci;
 		}
 	}
 
@@ -856,23 +1090,28 @@ extern "C" void kmain(void) {
 
 		// ── Drain ALL pending USB events to handle 1000Hz HID traffic ─────────
 		while (true) {
-			USB_Response resp = get_usb_response(1);
-			if (!resp.gotresponse) break;
+            bool any_resp = false;
+            for (int ctrl_idx = 0; ctrl_idx < xhci_count; ctrl_idx++) {
+                if (xhci_hc[ctrl_idx].needsResetting) continue;
+			    // 0ms timeout: fast-poll the event ring without busy-waiting.
+			    USB_Response resp = get_usb_response(&xhci_hc[ctrl_idx], 0);
+			    if (!resp.gotresponse) continue;
 
-			event_count++;
+                any_resp = true;
+			    event_count++;
 
 			// ── Port Status Change (type 34) ─────────────────────────────────
 			// A PSC event means something changed on a root port — a device was
 			// connected, disconnected, or reset.  Trigger a full re-enumeration.
-			// 300ms settle delay gives PORTSC time to stabilise on same-port
+			// 150ms settle delay gives PORTSC time to stabilise on same-port
 			// reconnects before setupUSB scans it.
 			if (resp.type == 34) {
 				uint32_t port_id = (resp.event->parameter >> 24) & 0xFF;
 				print((char*)"PSC event on port:");
 				to_str(port_id, str); print(str);
-				tsc_delay_ms(300);
-				needsResetting = true;
-				break;
+				tsc_delay_ms(150);
+				xhci_hc[ctrl_idx].needsResetting = true;
+				goto restart;
 			}
 
 			if (resp.type == 32) {   // Transfer Event
@@ -893,7 +1132,7 @@ extern "C" void kmain(void) {
 				{
 					int which_hub = -1;
 					for (int h = 0; h < hub_count; h++) {
-						if (hubs[h]->slot_id == slot_from_event) { which_hub = h; break; }
+						if (hubs[h]->slot_id == slot_from_event && hubs[h]->hc == &xhci_hc[ctrl_idx]) { which_hub = h; break; }
 					}
 
 					if (which_hub >= 0 && (code == 1 || code == 13)) {
@@ -911,20 +1150,20 @@ extern "C" void kmain(void) {
 							hd->hub_ring->enq = 0;
 							hd->hub_ring->pcs ^= 1;
 						}
-						doorbell32[hd->slot_id] = hub_dcis[which_hub];
+						hd->hc->doorbell32[hd->slot_id] = hub_dcis[which_hub];
 
-						tsc_delay_ms(300);
-						needsResetting = true;
-						break;
+						tsc_delay_ms(150);
+						xhci_hc[ctrl_idx].needsResetting = true;
+						goto restart;
 					}
 
 					// Transfer error on a hub slot → hub itself disconnected.
 					if (which_hub >= 0 && code != 1 && code != 13) {
 						print((char*)"Hub transfer error, code:");
 						to_str(code, str); print(str);
-						tsc_delay_ms(300);
-						needsResetting = true;
-						break;
+						tsc_delay_ms(150);
+						xhci_hc[ctrl_idx].needsResetting = true;
+						goto restart;
 					}
 				}
 
@@ -941,7 +1180,7 @@ extern "C" void kmain(void) {
 					int which_kbd = -1;
 					HIDInterface* k_hi = nullptr;
 					for (int k = 0; k < keyboard_count; k++) {
-						if (keyboards[k]->slot_id == slot_from_event) {
+						if (keyboards[k]->slot_id == slot_from_event && keyboards[k]->hc == &xhci_hc[ctrl_idx]) {
 							for (int i=0; i<keyboards[k]->interface_count; i++) {
 								if (keyboards[k]->interfaces[i].type == 1 && 
 									(keyboards[k]->interfaces[i].ep_num*2+1) == dci_from_event) {
@@ -957,7 +1196,7 @@ extern "C" void kmain(void) {
 					int which_mouse = -1;
 					HIDInterface* m_hi = nullptr;
 					for (int m = 0; m < mouse_count; m++) {
-						if (mice[m]->slot_id == slot_from_event) {
+						if (mice[m]->slot_id == slot_from_event && mice[m]->hc == &xhci_hc[ctrl_idx]) {
 							for (int i=0; i<mice[m]->interface_count; i++) {
 								if (mice[m]->interfaces[i].type == 2 && 
 									(mice[m]->interfaces[i].ep_num*2+1) == dci_from_event) {
@@ -975,6 +1214,10 @@ extern "C" void kmain(void) {
 						uint8_t modifiers = report[0];
 						uint64_t now      = rdtsc();
 
+						// Mark device as a dongle if it's sending keyboard traffic
+						// (Razer dongles flood the interface during mouse movement).
+						keyboards[k]->is_dongle = true;
+
 						// ── Mark released keys ────────────────────────────────
 						for (int j = 0; j < 6; j++) {
 							uint8_t old = last_keys[k][j];
@@ -990,8 +1233,11 @@ extern "C" void kmain(void) {
 						}
 
 						// ── Emit and timestamp newly-pressed keys ─────────────
-						for (int b = 2; b < 8; b++) {
-							uint8_t key = report[b];
+						// Razer dongles (4 interfaces) send Battery/DPI data over 
+						// the keyboard channel. We suppress terminal typing for them.
+						if (keyboards[k]->interface_count != 4) {
+							for (int b = 2; b < 8; b++) {
+								uint8_t key = report[b];
 							if (key == 0) continue;
 							if (key_down_at[k][key] == 0) {
 								// Fresh press: record TSC time and emit immediately.
@@ -1017,6 +1263,7 @@ extern "C" void kmain(void) {
 								}
 							}
 						}
+						}
 						for (int j = 0; j < 6; j++) last_keys[k][j] = report[2 + j];
 						last_mods[k] = modifiers;
 
@@ -1032,39 +1279,59 @@ extern "C" void kmain(void) {
 							k_hi->ring->enq = 0;
 							k_hi->ring->pcs ^= 1;
 						}
-						doorbell32[slot_from_event] = dci_from_event;
+						keyboards[k]->hc->doorbell32[slot_from_event] = dci_from_event;
 					} else if (which_mouse >= 0) {
 						int m = which_mouse;
-						bool report_changed = false;
-						static uint8_t last_mouse_report[4] = {0,0,0,0};
-						for (int i = 0; i < 4; i++) {
-							if (last_mouse_report[i] != report[i]) {
-								report_changed = true;
-								last_mouse_report[i] = report[i];
-							}
-						}
 
-						// Optimized Heuristic: 
-						// 1. Shift if explicitly Report Protocol (0).
-						// 2. Shift if a composite device (I > 1) with small packets (MPS 8, likely Trackpad)
-						//    and common Report IDs (0x01/0x02). This ignores gaming mice (MPS 32/64).
+						// Report ID skip heuristic:
+						// Protocol 0 (Report Protocol) always has a Report ID prefix byte.
+						// Composite devices with small MPS may also use Report IDs.
 						uint8_t* data = (uint8_t*)report;
 						bool shifted = false;
-						if (m_hi->protocol == 0 || (mice[m]->interface_count > 1 && m_hi->mps == 8 && (report[0] == 0x01 || report[0] == 0x02))) {
+						if (m_hi->protocol == 0 || (mice[m]->interface_count > 1 && m_hi->mps <= 8 && (report[0] == 0x01 || report[0] == 0x02))) {
 							data++;
 							shifted = true;
 						}
 
-						// --- PHASE 18.5: CLEAN UNIFIED DIRTY TRACKING ---
-						// The cursor never touches dirty rects. It goes straight to VRAM via
-						// wm_overlay_update() at the bottom of this block. The compositor only
-						// runs when scene content changes, not for cursor movement or dragging.
+						// Parse mouse report: Report Protocol mice (like wireless
+						// gaming dongles) often use 16-bit LE X/Y deltas.
+						// We use 16-bit parsing if Protocol != 2 (Boot) OR if MPS > 8 
+						// (high-res gaming mice often claim Boot mode but send larger reports).
 						{
-							int8_t dx = (int8_t)data[1];
-							int8_t dy = (int8_t)data[2];
 							uint8_t buttons = data[0];
+							int16_t dx, dy;
+							int8_t scroll = 0;
 
-                            mouse_process_input(dx, dy, buttons);
+							// Auto-switcher: Use extended 16-bit path if we established this is a Razer Dongle.
+							// We match the Razer's exact physical USB profile (MPS=64, 4 Interfaces) 
+							// plus the keyboard traffic fingerprint so we don't accidentally
+							// apply this layout to standard composite trackpad keyboards.
+							bool is_razer_wireless = (mice[m]->is_dongle && m_hi->mps == 64 && mice[m]->interface_count == 4);
+							if (m_hi->protocol != 2 || is_razer_wireless) {
+								if (m_hi->mps >= 8) {
+									// Wireless Razer Dongle (Extended 16-bit layout)
+									// [0] Buttons
+									// [1/2] Padding
+									// [3] Scroll
+									// [4/5] X (16-bit LE)
+									// [6/7] Y (16-bit LE)
+									dx = (int16_t)((uint16_t)data[4] | ((uint16_t)data[5] << 8));
+									dy = (int16_t)((uint16_t)data[6] | ((uint16_t)data[7] << 8));
+									scroll = (int8_t)data[3];
+								}
+							} else {
+								// Wired Razer Mouse / Standard Boot Protocol
+								// [0] Buttons
+								// [1] X (8-bit signed)
+								// [2] Y (8-bit signed)
+								// [3] Scroll (8-bit signed)
+								dx = (int16_t)(int8_t)data[1];
+								dy = (int16_t)(int8_t)data[2];
+								if (m_hi->mps >= 4) scroll = (int8_t)data[3];
+							}
+
+							mouse_process_input(dx, dy, buttons);
+							if (scroll != 0) mouse_process_scroll(-scroll);
 						}
 
 						// Re-queue transfer TRB
@@ -1079,88 +1346,92 @@ extern "C" void kmain(void) {
 							m_hi->ring->enq = 0;
 							m_hi->ring->pcs ^= 1;
 						}
-						doorbell32[slot_from_event] = dci_from_event;
+						mice[m]->hc->doorbell32[slot_from_event] = dci_from_event;
 					} else {
 						// ── Transfer error on a keyboard slot → device disconnected ──
 						uint32_t err_slot = slot_from_event;
 						for (int k = 0; k < keyboard_count; k++) {
-							if (keyboards[k]->slot_id == err_slot) {
+							if (keyboards[k]->slot_id == err_slot && keyboards[k]->hc == &xhci_hc[ctrl_idx]) {
 								print((char*)"Transfer error on keyboard slot, code:");
 								to_str(code, str); print(str);
-								tsc_delay_ms(300);
-								needsResetting = true;
+								// STABILITY FIX: We intentionally do NOT reset the controller here.
+								// Transient transfer errors on keyboards should not sever the entire
+								// USB subsystem. The port will remain active.
 								break;
 							}
 						}
-						if (needsResetting) break;
 					}
 				}
 			}
+        } // closes for loop
+        if (!any_resp) break;
 		}
-
-		// Cursor coordinates and drag tracking are updated above.
 		// Actual VRAM rendering is deferred to the 60 Hz compositor thread
 		// to avoid exhausting PCIe transaction limits with 1000 Hz micro-writes.
 
-		// ── PORTSC disconnect polling ─────────────────────────────────────────
-		//
-		// Some xHCI controllers do not reliably generate a PSC event when a
-		// device is unplugged from the same port it was originally enumerated on.
-		// As a safety net we poll the PORTSC register directly: if CCS (bit 0)
-		// is 0 on any keyboard's root port, the device is gone.
-		//
-		// IMPORTANT: only poll keyboards that are directly on a root port
-		// (root_port_num != 0).  For hub-connected keyboards, port_num is the
-		// hub's downstream port number, NOT a root port index.
+		// ── Universal PORTSC Hotplug Polling (Software PSC) ───────────────────
+		// The AMD B850 chipset drops hardware PSC interrupts for ports that are
+		// disabled (PED=0) but still powered, completely missing device removals
+		// and re-insertions. We manually poll the CCS bit of all root ports every
+		// frame. If any port's physical connection state changes, we trigger a
+		// controller reset to safely handle the hotplug.
+        for (int ctrl_idx = 0; ctrl_idx < xhci_count; ctrl_idx++) {
+            XHCIController* hc = &xhci_hc[ctrl_idx];
+            if (hc->needsResetting) continue;
+            
+            uint32_t current_ccs = 0;
+            for (uint8_t p = 0; p < hc->max_ports && p < 32; p++) {
+                volatile uint32_t* portsc = (volatile uint32_t*)((uintptr_t)hc->ops + 0x400 + p * 0x10);
+                if (*portsc & 1u) current_ccs |= (1u << p);
+            }
+            
+            if (current_ccs != hc->last_ccs) {
+                print((char*)"Root port CCS changed. Triggering software hotplug event.");
+                hc->last_ccs = current_ccs;
+                tsc_delay_ms(150);
+                hc->needsResetting = true;
+                goto restart;
+            }
+        }
+
+		// ── Software Typematic Repeat ─────────────────────────────────────────────
+		// USB keyboards do not repeat keys in hardware when SET_IDLE is configured
+		// to 0. We implement standard 500ms delay + 30ms repeat rate in software.
+		uint64_t current_tsc = rdtsc();
+		uint64_t ms_to_tsc = _usb_tsc_hz() / 1000;
+		uint64_t repeat_delay_tsc = 500 * ms_to_tsc;
+		uint64_t repeat_rate_tsc  = 30 * ms_to_tsc;
+
 		for (int k = 0; k < keyboard_count; k++) {
-			uint8_t rp = keyboards[k]->root_port_num;
-			if (rp == 0) continue;   // hub child — skip PORTSC poll
-			volatile uint32_t* portsc = (volatile uint32_t*)(
-				(uintptr_t)g_ops + 0x400 + (uint32_t)(rp - 1) * 0x10);
-			if (!(*portsc & 1u)) {   // CCS = 0: no device on this port
-				print((char*)"Keyboard disconnected (PORTSC poll), port:");
-				to_str(rp, str); print(str);
-				tsc_delay_ms(300);
-				needsResetting = true;
-				break;
-			}
-		}
-		if (needsResetting) break;
-
-		// ── Software key-repeat (mirrors Linux input_repeat_key()) ───────────
-		//
-		// Runs every iteration so repeat timing tracks wall-clock time via TSC,
-		// not USB event arrival rate.
-		uint64_t now = rdtsc();
-
-		for (int k = 0; k < keyboard_count; k++) {
-			bool shift = (last_mods[k] & 0x22u) != 0;
-
-			for (int key = 1; key < 256; key++) {
-				uint64_t down_at = key_down_at[k][key];
-				if (down_at == 0) continue;   // key is up
-
-				if (now - down_at < REPEAT_DELAY) continue;   // initial delay
-
-				uint64_t fire_at = last_repeat_fire[k][key];
-				if (fire_at != 0 && now - fire_at < REPEAT_PERIOD) continue;
-
-				last_repeat_fire[k][key] = now;
-
-				if (key >= 0x4F && key <= 0x52) {
-					bool ctrl2 = (last_mods[k] & 0x11u) != 0;
-					if (ctrl2 && key == 0x52) wm_log_scroll(-1);
-					else if (ctrl2 && key == 0x51) wm_log_scroll(1);
-					else if (shift && key == 0x52) term_scroll_view(-1);
-					else if (shift && key == 0x51) term_scroll_view(1);
-					else {
-						tty_input('\x1b'); tty_input('[');
-						char arrow_codes[] = {'C', 'D', 'B', 'A'};
-						tty_input(arrow_codes[key - 0x4F]);
+			if (keyboards[k]->interface_count == 4) continue; // Skip phantom dongles
+			for (int key = 2; key < 256; key++) {
+				uint64_t down_time = key_down_at[k][key];
+				if (down_time != 0) {
+					if ((current_tsc - down_time) > repeat_delay_tsc) {
+						if (last_repeat_fire[k][key] == 0 || (current_tsc - last_repeat_fire[k][key]) > repeat_rate_tsc) {
+							last_repeat_fire[k][key] = current_tsc;
+							
+							// Repeat key emission
+							uint8_t modifiers = last_mods[k];
+							bool shift = (modifiers & 0x22u) != 0;
+							bool ctrl  = (modifiers & 0x11u) != 0;
+							
+							if (key >= 0x4F && key <= 0x52) {
+								if (ctrl && key == 0x52) wm_log_scroll(-1);
+								else if (ctrl && key == 0x51) wm_log_scroll(1);
+								else if (shift && key == 0x52) term_scroll_view(-1);
+								else if (shift && key == 0x51) term_scroll_view(1);
+								else {
+									tty_input('\x1b'); tty_input('[');
+									char arrow_codes[] = {'C', 'D', 'B', 'A'};
+									tty_input(arrow_codes[key - 0x4F]);
+								}
+							} else {
+								char c = shift ? hid_to_ascii_shift[key] : hid_to_ascii[key];
+								if (c) tty_input(c);
+							}
+						}
 					}
-				} else {
-					char c = shift ? hid_to_ascii_shift[key] : hid_to_ascii[key];
-					if (c) tty_input(c);
 				}
 			}
 		}
@@ -1170,8 +1441,65 @@ extern "C" void kmain(void) {
         // tasks like scrolling.
         task_sleep_ms(8);
 	}
+}
 
-	// A disconnect or PSC event caused break — go back and re-enumerate
-	// all ports.  Without this goto the kernel entry point returns into nothing.
-	goto restart;
+extern "C" void kpanic(const char* name, ExceptionFrame* f) {
+    // 1. Silence the system
+    __asm__ volatile("cli");
+
+    // 2. Graphical BSOD: MyOS "Deep Space" theme
+    uint32_t myos_panic_bg = 0xFF141414; // Ultra dark/black
+    vram_fill(myos_panic_bg);
+
+    // 3. Header
+    int32_t x = 100;
+    int32_t y = 100;
+
+    vram_draw_char_8x8(x, y, ':', 0xFFFF0000);
+    vram_draw_char_8x8(x + 8, y, '(', 0xFFFF0000);
+    y += 40;
+
+    vram_draw_string_8x8(x, y, "--- !!! MyOS CRITICAL SYSTEM FAILURE !!! ---", 0xFFFF0000); // Red alert
+    y += 40;
+
+    vram_draw_string_8x8(x, y, "The kernel has encountered an unrecoverable exception.", 0xFFFFFFFF);
+    y += 20;
+    vram_draw_string_8x8(x, y, "Execution was halted to protect the filesystem and hardware state.", 0xFFFFFFFF);
+    y += 60;
+
+    vram_draw_string_8x8(x, y, "FAULT_ID: ", 0xFFBBBBBB);
+    vram_draw_string_8x8(x + 10*8, y, name, 0xFF00AAFF); // Cyan error name
+    y += 40;
+
+    // 4. Register State
+    char buf[32];
+    auto dump_reg = [&](const char* rname, uint64_t val) {
+        vram_draw_string_8x8(x, y, rname, 0xFFAAAAAA);
+        to_hex(val, buf);
+        vram_draw_string_8x8(x + 9*8, y, buf, 0xFFFFFFFF);
+        y += 12;
+    };
+
+    if (f) {
+        dump_reg("INST_PTR:", f->rip);
+        dump_reg("ERR_CODE:", f->error_code);
+        dump_reg("STACK_P: ", f->rsp);
+        dump_reg("RAX:     ", f->rax);
+        dump_reg("RBX:     ", f->rbx);
+        dump_reg("RCX:     ", f->rcx);
+        dump_reg("RDX:     ", f->rdx);
+        dump_reg("FLAGS:   ", f->rflags);
+        
+        uint64_t cr2;
+        __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+        if (f->vector == 14) dump_reg("V_ADDR:  ", cr2); // Faulting addr for Page Fault
+    } else {
+        vram_draw_string_8x8(x, y, "[ NO EXCEPTION FRAME ]", 0xFFFFAAAA);
+    }
+
+    y += 40;
+    vram_draw_string_8x8(x, y, "SYSTEM HALTED. PLEASE RESTART MANUALLY.", 0xFFFF5555);
+
+    vram_fence();
+    hcf();
 }

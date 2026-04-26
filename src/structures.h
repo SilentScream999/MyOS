@@ -90,18 +90,6 @@ uint64_t USB_VA_BASE = (PCI_MMIO_VA_BASE + 0x0010'0000ULL);
 // usb
 
 
-struct XHCIOpRegs {
-	volatile uint32_t usbcmd;
-	volatile uint32_t usbsts;
-	volatile uint32_t pagesize;
-	volatile uint8_t  reserved1[8];
-	volatile uint32_t dnctrl;
-	volatile uint64_t crcr;
-	volatile uint8_t  reserved2[16];
-	volatile uint64_t dcbaap;
-	volatile uint32_t config;
-};
-
 struct TRB {
 	uint64_t parameter;
 	uint32_t status;
@@ -119,6 +107,45 @@ struct Ring {
 	uint64_t phys;
 	uint32_t enq;
 	uint8_t  pcs;
+};
+
+struct XHCIOpRegs {
+	volatile uint32_t usbcmd;
+	volatile uint32_t usbsts;
+	volatile uint32_t pagesize;
+	volatile uint8_t  reserved1[8];
+	volatile uint32_t dnctrl;
+	volatile uint64_t crcr;
+	volatile uint8_t  reserved2[16];
+	volatile uint64_t dcbaap;
+	volatile uint32_t config;
+};
+
+struct XHCIController {
+    volatile uint32_t*  doorbell32;
+    volatile uint64_t*  dcbaa;
+    uint32_t            hcc1;
+    volatile XHCIOpRegs* ops;
+    uint8_t             max_ports;
+
+    volatile struct TRB* er_virt;
+    uint8_t             ccs;
+    uint8_t             erdp_index;
+    volatile uint64_t*  erdp;
+    uint64_t            er_phys;
+
+    volatile bool*      portfailed;
+    bool                needsResetting;
+    
+    struct Ring         cr;
+    uint32_t            global_port_index;
+    
+    // Hardware base addressing tracking
+    uint64_t            virt_base;
+    uint8_t             bus, dev, fn;
+
+    // Software hotplug tracking
+    uint32_t            last_ccs;
 };
 
 struct InputControlCtx {
@@ -141,6 +168,7 @@ struct HIDInterface {
 	struct Ring* ring;
 	uint8_t  type;     // 1=kbd, 2=mouse
 	uint8_t  protocol; // 1=boot kbd, 2=boot mouse, 0=none/report
+	uint8_t  iface_num;
 };
 
 struct USBDevice {
@@ -156,8 +184,10 @@ struct USBDevice {
 
 	volatile uint64_t* device_ctx;
 	bool is_hub;
+	bool is_dongle;
 	uint64_t ep0_ring_phys;
 	uint64_t dev_ctx_phys;
+	struct XHCIController* hc;
 };
 
 struct USB_Response {

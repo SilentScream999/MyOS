@@ -17,8 +17,8 @@ extern volatile uint32_t g_dirty_min_y;
 extern volatile uint32_t g_dirty_max_y;
 extern volatile uint32_t g_dirty_min_x;
 extern volatile uint32_t g_dirty_max_x;
-extern uint32_t g_term_ox;        // terminal window X offset
-extern uint32_t g_term_oy;        // terminal window Y offset
+extern int32_t g_term_ox;        // terminal window X offset
+extern int32_t g_term_oy;        // terminal window Y offset
 extern uint32_t g_term_max_cols;  // terminal character width
 extern uint32_t g_term_max_rows;  // terminal row height
 extern volatile bool g_needs_refresh;
@@ -29,20 +29,45 @@ extern volatile bool g_dragging_log;
 static inline void wm_dirty_chrome() { wm_chrome_dirty = true; g_needs_refresh = true; }
 
 
-static inline void term_dirty_rect(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2) {
-    if (x1 < g_dirty_min_x) g_dirty_min_x = x1;
-    if (x2 > g_dirty_max_x) g_dirty_max_x = x2;
-    if (y1 < g_dirty_min_y) g_dirty_min_y = y1;
-    if (y2 > g_dirty_max_y) g_dirty_max_y = y2;
+static inline void term_dirty_rect(int32_t x1, int32_t y1, int32_t x2, int32_t y2) {
+    if (!fb) return;
+    
+    // Clamp to screen boundaries before updating unsigned dirty coords
+    uint32_t ux1 = (x1 < 0) ? 0 : (uint32_t)x1;
+    uint32_t uy1 = (y1 < 0) ? 0 : (uint32_t)y1;
+    uint32_t ux2 = (x2 < 0) ? 0 : (uint32_t)x2;
+    uint32_t uy2 = (y2 < 0) ? 0 : (uint32_t)y2;
+    
+    if (ux1 > fb->width) ux1 = fb->width;
+    if (ux2 > fb->width) ux2 = fb->width;
+    if (uy1 > fb->height) uy1 = fb->height;
+    if (uy2 > fb->height) uy2 = fb->height;
+
+    if (ux1 < g_dirty_min_x) g_dirty_min_x = ux1;
+    if (ux2 > g_dirty_max_x) g_dirty_max_x = ux2;
+    if (uy1 < g_dirty_min_y) g_dirty_min_y = uy1;
+    if (uy2 > g_dirty_max_y) g_dirty_max_y = uy2;
 }
 
 static inline void term_dirty_all() {
     if (!fb) return;
-    uint32_t x1 = g_term_ox;
-    uint32_t y1 = (g_term_oy > 30) ? g_term_oy - 30 : 0;
-    uint32_t x2 = g_term_ox + g_term_max_cols * 8 + 10;
-    uint32_t y2 = g_term_oy + g_term_max_rows * 10 + 10;
-    term_dirty_rect(x1, y1, x2, y2);
+    int32_t x1 = g_term_ox;
+    int32_t y1 = g_term_oy - 30;
+    int32_t x2 = g_term_ox + (int32_t)g_term_max_cols * 8 + 10;
+    int32_t y2 = g_term_oy + (int32_t)g_term_max_rows * 10 + 10;
+    
+    // Clamp to screen for the dirty rect logic (which uses uint32 internally)
+    uint32_t ux1 = (x1 < 0) ? 0 : (uint32_t)x1;
+    uint32_t uy1 = (y1 < 0) ? 0 : (uint32_t)y1;
+    uint32_t ux2 = (x2 < 0) ? 0 : (uint32_t)x2;
+    uint32_t uy2 = (y2 < 0) ? 0 : (uint32_t)y2;
+    
+    if (ux1 > fb->width) ux1 = fb->width;
+    if (ux2 > fb->width) ux2 = fb->width;
+    if (uy1 > fb->height) uy1 = fb->height;
+    if (uy2 > fb->height) uy2 = fb->height;
+    
+    term_dirty_rect(ux1, uy1, ux2, uy2);
     g_needs_refresh = true;
 }
 
@@ -117,12 +142,16 @@ static void draw_char(int x, int y, char c, uint32_t color) {
     term_dirty_rect(x, y, x + 8, y + 8);
 }
 
+extern void wm_log_append(const char* s);
+
 static int current_print_line = 0;
 static int max_print_lines = 0;
 
 static void print(char* buffer) {
     klog_print(buffer);
     klog_putc('\n');
+
+    wm_log_append(buffer);
 
     if (g_klog_bypass_framebuffer) return;
 

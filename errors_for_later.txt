@@ -1,0 +1,5 @@
+Known Issue: Race condition mid-enumeration
+When a problematic device (like a USB boot drive that fails config descriptor reads) is plugged in exactly during the root port scanning pass, its hardware-level link training and initial EP0 traffic can monopolize the xHCI bus scheduler before the cleanup code can disable the port/slot. This can cause transient starvation of descriptor reads for HID devices on other ports. Plugging the device in when the system is settled allows the PSC-driven restart to handle it cleanly via the established cleanup path.
+
+Feature Request: Boot Drive Detection
+Implement a system to detect which USB device is the boot drive so we can handle it specifically or exempt it from certain polling/cleanup routines later on.
