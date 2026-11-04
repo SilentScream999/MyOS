@@ -54,6 +54,10 @@ using pid_t = uint32_t;
 
 #define TASK_DEFAULT_STACK_PAGES  4u
 
+// ── Per-task kernel stack tracking for syscalls ──────────────────────────────
+extern uint64_t g_current_kstack_top;
+extern uint64_t g_user_rsp_scratch;
+
 // ── PCB ────────────────────────────────────────────────────────────────────────
 // Keep this struct small — it lives in the kernel heap and is iterated every
 // scheduler tick.

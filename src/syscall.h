@@ -81,14 +81,12 @@ static inline uint64_t rdmsr(uint32_t msr) {
     return ((uint64_t)hi << 32) | lo;
 }
 
-// ── Syscall kernel stack ──────────────────────────────────────────────────────
-
-#define SYSCALL_KSTACK_SIZE (64u * 1024u)
-extern uint8_t g_syscall_kstack[SYSCALL_KSTACK_SIZE];
-extern uint64_t g_saved_user_rsp;
-
-#define SYSCALL_KSTACK_TOP \
-    ((uint64_t)(g_syscall_kstack + SYSCALL_KSTACK_SIZE) - 8u)
+// ── Syscall kernel stack tracking ─────────────────────────────────────────────
+// Every user task has its own private kernel stack allocated in its Task PCB.
+// g_current_kstack_top is maintained by the scheduler so syscall_entry switches
+// directly to the current task's private kernel stack.
+// g_user_rsp_scratch is a temporary stash used ONLY while interrupts are disabled
+// before user RSP is pushed onto the task's private stack.
 
 
 // ── Syscall numbers ───────────────────────────────────────────────────────────
@@ -354,19 +352,20 @@ uint64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, ui
 __asm__ (
     ".globl syscall_entry\n"
     "syscall_entry:\n"
-    // 1. Save user RSP to a global slot.
-    "movq %rsp, g_saved_user_rsp(%rip)\n"
+    // 1. Interrupts are disabled on entry (MSR_SFMASK cleared IF).
+    // Stash user RSP in scratch while switching to the task's private kernel stack.
+    "movq %rsp, g_user_rsp_scratch(%rip)\n"
 
-    // 2. Switch to the dedicated kernel syscall stack.
-    //    We calculate the top: g_syscall_kstack + 64KB - 8
-    "leaq g_syscall_kstack(%rip), %rsp\n"
-    "addq $65528, %rsp\n"  // 64*1024 - 8
+    // 2. Switch to the current task's private kernel stack.
+    "movq g_current_kstack_top(%rip), %rsp\n"
 
-    "sti\n"   // ← RE-ENABLE INTERRUPTS — we're on the kernel stack now, it's safe
+    // 3. Push user RSP onto THIS task's private stack.
+    // User RSP is now safely preserved per-task on its own stack frame.
+    "pushq g_user_rsp_scratch(%rip)\n"
 
-    // 3. Push user state for safe keeping.
-    "pushq %r11\n"   // user RFLAGS
-    "pushq %rcx\n"   // user RIP
+    // 4. Push user register state for safe keeping.
+    "pushq %r11\n"   // user RFLAGS (from SYSCALL)
+    "pushq %rcx\n"   // user RIP (from SYSCALL)
     "pushq %rbp\n"
     "pushq %rbx\n"
     "pushq %r15\n"
@@ -374,7 +373,14 @@ __asm__ (
     "pushq %r13\n"
     "pushq %r12\n"
 
-    // 4. Pass arguments to C++ dispatcher.
+    // 5. 16-byte stack alignment:
+    // We pushed 9 items (9 * 8 = 72 bytes). Sub 8 bytes makes it 80 bytes (80 % 16 == 0).
+    "subq $8, %rsp\n"
+
+    // 6. Re-enable interrupts: we are securely on this task's private kernel stack.
+    "sti\n"
+
+    // 7. Pass arguments to C++ dispatcher (SysV AMD64 ABI).
     // nr:RAX -> RDI
     // a1:RDI -> RSI, a2:RSI -> RDX, a3:RDX -> RCX, a4:R10 -> R8, a5:R8 -> R9
     "movq %r8,  %r9\n"
@@ -385,7 +391,13 @@ __asm__ (
     "movq %rax, %rdi\n"
     "call syscall_dispatch\n"
 
-    // 5. Restore user state.
+    // 8. Disable interrupts before restoring user state to prevent stack corruption.
+    "cli\n"
+
+    // 9. Remove 16-byte alignment padding.
+    "addq $8, %rsp\n"
+
+    // 10. Restore user register state from the private stack.
     "popq %r12\n"
     "popq %r13\n"
     "popq %r14\n"
@@ -395,10 +407,10 @@ __asm__ (
     "popq %rcx\n"   // restored user RIP
     "popq %r11\n"   // restored user RFLAGS
 
-    // 6. Restore user stack.
-    "movq g_saved_user_rsp(%rip), %rsp\n"
+    // 11. Restore user stack pointer directly from the private stack.
+    "popq %rsp\n"
 
-    // 7. Return to Ring 3.
+    // 12. Return to Ring 3.
     "sysretq\n"
 );
 
@@ -424,7 +436,7 @@ static void syscall_init() {
     wrmsr(MSR_SFMASK, 1u << 9);
 
     // TSS.rsp[0]: kernel stack for hardware interrupts arriving in ring 3.
-    g_tss.rsp[0] = SYSCALL_KSTACK_TOP;
+    g_tss.rsp[0] = g_current_kstack_top;
 
     print((char*)"[syscall] SYSCALL/SYSRET armed.");
 }

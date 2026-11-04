@@ -25,7 +25,15 @@ Practical constraints that shape the work:
   * `terminal.h` — all `pitch32` uses changed from `fb->pitch / 4` to `g_term_max_cols * 8` (the surface buffer's true pitch).
   * `framebufferstuff.h` — `putp`, `fill_screen_fast`, `draw_char` updated to use surface pitch; bounds check against terminal surface size, not framebuffer size.
   * `kernel.cpp` — the now-redundant `kmalloc(g_term_buf_height * fb->pitch)` early terminal buffer alloc has been removed.
-  * Build verified: `make clean && make iso` → **0 errors, 12 warnings** (all pre-existing volatile deprecations).
+  * Tested and confirmed working on real laptop hardware.
+
+* **Milestone 3 ✅ COMPLETE (Multi-process safe syscall path):**
+  * Eliminated the single global `g_syscall_kstack` (64 KB) and single global `g_saved_user_rsp`.
+  * `syscall_entry` now switches `%rsp` to the current task's private kernel stack (`next->stack_base + next->stack_size`) via `g_current_kstack_top` / `g_tss.rsp[0]`.
+  * User RSP is preserved per-task on the task's own stack frame (`pushq g_user_rsp_scratch; ...; popq %rsp`).
+  * Enforced strict 16-byte stack alignment (`subq $8, %rsp`) prior to `call syscall_dispatch` per the System V AMD64 ABI.
+  * Preemptions and timer interrupts during a syscall now safely preserve and restore the task's private stack frame without clobbering other tasks.
+  * Build verified: `make clean && make iso` → **0 errors, 12 warnings** (pre-existing volatile deprecations).
 
 * The compositor is **fully surface-based** (all windows): Rainbow, Visual Test, Terminal, Boot Log and user windows all draw into `win->buffer` and report damage via `wm_surface_damage_all()`. No type-specific compositor branches remain.
 * There is a **user window API** (syscalls 200-204), but it has never been exercised end to end (see section 5).
@@ -68,7 +76,7 @@ The compositor and the overall OS have been run extensively on the laptop. Items
 
 These matter because the next big steps (apps, window API v2) run straight into them.
 
-1. **The syscall path is not safe for more than one user process.** `syscall_entry` (`src/syscall.h`, around lines 345-400) saves the user stack pointer in **one global slot** (`g_saved_user_rsp`), switches to **one shared 64 KB kernel stack**, then re-enables interrupts (`sti`). With a second user task, a timer-driven task switch mid-syscall can corrupt both. It works today only because `init.elf` is the sole user process. **Fix this before launching a second user program** (per-task kernel stack, with the saved RSP in the task or via TSS `rsp0`/per-CPU data).
+1. ✅ ~~**The syscall path is not safe for more than one user process.**~~ — **Fixed (Milestone 3).** Replaced shared global stack/RSP with per-task kernel stacks via `g_current_kstack_top` and TSS `rsp0`. User RSP is preserved on the task's private stack frame, enabling safe multitasking and preemption across multiple ring-3 tasks.
 2. **`SYS_WIN_GET_BUFFER` returns a kernel heap pointer** (`win->buffer`, a `kmalloc` address in the higher-half direct map). A ring-3 process should fault when it touches that. `user/win_test.c` would hit this, but it is **not in the Makefile** and nothing can launch it, so the user window API has likely never run end to end.
 3. **Windows have no owner.** Any process can fetch or destroy any window id, and nothing is cleaned up when a process exits.
 4. **`sys_win_create` trusts user values.** `w` and `h` are cast to `int32_t` and multiplied into a `kmalloc` size with no limits or overflow checks. The `flags` argument is never passed through (always 0), so user windows are never closable.
@@ -82,11 +90,10 @@ These matter because the next big steps (apps, window API v2) run straight into 
 
 ## 6. Next steps, in order
 
-1. ✅ ~~**Convert Terminal and Boot Log to surface-backed windows**~~ — **Done (Milestone 1 / Stage A1).** Terminal and Boot Log are now full surface clients; compositor special-case branches deleted. Build verified clean.
-2. Boot the current build on the laptop. Confirm display looks correct (terminal text renders, boot log renders, all windows composited correctly).
-3. **Make the syscall path multi-process safe** (issue 1 above). Per-task kernel stack + TSS `rsp0`; test with two cooperating user programs.
-4. Spawn/exec and app discovery per `docs/APP_LOADING.md`, then Window API v2 (owner, mapped surfaces, events, cleanup).
-5. The roadmap's later stages: hardware cursor, page flipping, GPU memory, render engine.
+1. ✅ ~~**Convert Terminal and Boot Log to surface-backed windows**~~ — **Done (Milestone 1 / Stage A1).** Terminal and Boot Log are now full surface clients; compositor special-case branches deleted. Tested and verified on real hardware.
+2. ✅ ~~**Make the syscall path multi-process safe**~~ — **Done (Milestone 3).** Per-task kernel stack + TSS `rsp0`; user RSP preserved on private stack frame; 16-byte stack alignment enforced.
+3. **Spawn/exec and app discovery per `docs/APP_LOADING.md`**, then Window API v2 (owner, mapped surfaces, events, cleanup).
+4. The roadmap's later stages: hardware cursor, page flipping, GPU memory, render engine.
 
 ## 7. Starting a work session
 

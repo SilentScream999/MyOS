@@ -250,11 +250,12 @@ switch_now:
     next->yielded  = false; // always clear yielded flag when starting a turn
     g_current_task = next;
 
-    // Update TSS.rsp[0] so hardware interrupts from Ring 3 land on this
-    // task's private kernel stack, not the shared syscall stack.
+    // Update TSS.rsp[0] and g_current_kstack_top so hardware interrupts and syscalls
+    // from Ring 3 land on this task's private kernel stack.
     if (next->stack_size > 0 && next->stack_base) {
-        g_tss.rsp[0] = (uint64_t)(next->stack_base + next->stack_size);
+        g_current_kstack_top = (uint64_t)(next->stack_base + next->stack_size);
     }
+    g_tss.rsp[0] = g_current_kstack_top;
 
     switch_context(&old->saved_rsp, next->saved_rsp, next->cr3);
     

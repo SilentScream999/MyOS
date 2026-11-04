@@ -262,8 +262,9 @@ static void boot_loading_screen_until_ready() {
 }
 
 // ── Syscall globals ───────────────────────────────────────────────────────────
-alignas(16) uint8_t g_syscall_kstack[64u * 1024u];
-uint64_t g_saved_user_rsp = 0;
+alignas(16) static uint8_t g_boot_kstack[4096];
+uint64_t g_current_kstack_top = (uint64_t)(g_boot_kstack + sizeof(g_boot_kstack));
+uint64_t g_user_rsp_scratch = 0;
 
 // ── klog globals ──────────────────────────────────────────────────────────────
 #include "klog.h"
