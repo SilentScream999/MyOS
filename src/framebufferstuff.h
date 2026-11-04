@@ -109,8 +109,9 @@ static inline void putp(uint32_t rx, uint32_t ry, uint32_t argb) {
         vram[ry * (fb->pitch / 4) + rx] = argb;
         return;
     }
-	uint32_t *base = (uint32_t *)g_backbuffer;
-	base[ry * (fb->pitch / 4) + rx] = argb;
+    uint32_t *base = (uint32_t *)g_backbuffer;
+    uint32_t pitch32 = g_term_max_cols ? (g_term_max_cols * 8) : (fb ? fb->pitch / 4 : 800);
+    base[ry * pitch32 + rx] = argb;
 }
 
 static inline void fill_screen_fast(uint32_t argb) {
@@ -123,23 +124,25 @@ static inline void fill_screen_fast(uint32_t argb) {
         }
         return;
     }
-    if (argb == 0) {
-        memset_32(g_backbuffer, 0, (g_term_max_rows * 10) * (fb->pitch / 4));
-    } else {
-        uint32_t* base = (uint32_t*)g_backbuffer;
-        uint64_t count = ((uint64_t)g_term_max_rows * 10 * fb->pitch) / 4;
-        for (uint64_t i = 0; i < count; i++) base[i] = argb;
-    }
+    uint32_t pitch32 = g_term_max_cols ? (g_term_max_cols * 8) : (fb ? fb->pitch / 4 : 800);
+    uint64_t count = (uint64_t)g_term_max_rows * 10 * pitch32;
+    uint32_t clr = (argb == 0) ? 0xFF0A0A14 : argb;
+    uint32_t* base = (uint32_t*)g_backbuffer;
+    for (uint64_t i = 0; i < count; i++) base[i] = clr;
     term_dirty_all();
 }
 
 static void draw_char(int x, int y, char c, uint32_t color) {
-    if (x < 0 || y < 0 || x + 8 > fb->width || y + 8 > fb->height) return;
+    if (x < 0 || y < 0) return;
     if (!g_backbuffer) return;
     
+    uint32_t pitch32 = g_term_max_cols ? (g_term_max_cols * 8) : (fb ? fb->pitch / 4 : 800);
+    uint32_t term_w_px = g_term_max_cols * 8;
+    uint32_t term_h_px = g_term_max_rows * 10;
+    if ((uint32_t)(x + 8) > term_w_px || (uint32_t)(y + 8) > term_h_px) return;
+
     const uint8_t* glyph = font8x8_basic[(int)c];
     uint32_t* base = (uint32_t*)g_backbuffer;
-    uint32_t pitch32 = fb->pitch / 4;
     
     for (int row = 0; row < 8; row++) {
         uint8_t bits = glyph[row];
@@ -149,7 +152,7 @@ static void draw_char(int x, int y, char c, uint32_t color) {
         }
     }
 
-    term_dirty_rect(x, y, x + 8, y + 8);
+    term_dirty_rect(g_term_ox + x, g_term_oy + y, g_term_ox + x + 8, g_term_oy + y + 8);
 }
 
 extern void wm_log_append(const char* s);

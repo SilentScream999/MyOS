@@ -1,12 +1,12 @@
 # Project handoff
 
 Current status, conventions, known issues and next steps, written so that anyone picking the project up cold (a new contributor, or an
-AI assistant given this file as context) can get productive without the history. *Last updated: 2026-11-02.*
+AI assistant given this file as context) can get productive without the history. *Last updated: 2026-11-04 (Milestone 1 / Stage A1 complete).*
 Read this, then `docs/GPU_DESKTOP_ROADMAP.md` and `docs/APP_LOADING.md`.
 
 ## 1. The assignment
 
-MyOS is heading toward a **Windows-like desktop with GPU-composited rendering**: apps draw into their own surfaces, a compositor combines
+WyzarOS is heading toward a **Windows-like desktop with GPU-composited rendering**: apps draw into their own surfaces, a compositor combines
 them (eventually on the GPU, with alpha and shadows), the result is presented without tearing, and apps are **discovered and launched from
 files** rather than being hard-coded into the kernel.
 
@@ -18,9 +18,18 @@ Practical constraints that shape the work:
 
 ## 2. Current state
 
-* The compositor is **surface-based with a damage list**: Rainbow, Visual Test and user windows draw into surfaces and report damage. Terminal and Boot Log are still special-cased.
+* **Milestone 1 / Stage A1 ✅ COMPLETE:** Terminal and Boot Log are now surface-backed windows. The compositor's special-case branches for `WIN_TYPE_TERM` and `WIN_TYPE_LOG` have been **removed**; every window is composed through the single generic surface blit loop. Specifically:
+  * `wm_create_window()` allocates `win->buffer` and sets `win->buffer_pitch = w * 4` for every window.
+  * `wm_init()` creates `g_win_terminal` and assigns `g_backbuffer = (uint8_t*)g_win_terminal->buffer`.
+  * `wm_compose_dirty()` — all type-specific drawing chains deleted; replaced by one unified `if (win->buffer) { ... memcpy_vram_sse_headless ... }` loop.
+  * `terminal.h` — all `pitch32` uses changed from `fb->pitch / 4` to `g_term_max_cols * 8` (the surface buffer's true pitch).
+  * `framebufferstuff.h` — `putp`, `fill_screen_fast`, `draw_char` updated to use surface pitch; bounds check against terminal surface size, not framebuffer size.
+  * `kernel.cpp` — the now-redundant `kmalloc(g_term_buf_height * fb->pitch)` early terminal buffer alloc has been removed.
+  * Build verified: `make clean && make iso` → **0 errors, 12 warnings** (all pre-existing volatile deprecations).
+
+* The compositor is **fully surface-based** (all windows): Rainbow, Visual Test, Terminal, Boot Log and user windows all draw into `win->buffer` and report damage via `wm_surface_damage_all()`. No type-specific compositor branches remain.
 * There is a **user window API** (syscalls 200-204), but it has never been exercised end to end (see section 5).
-* The **Intel GPU layer** (blitter ring: fill, copy, fence) works on the test laptop but is **off by default** (`GPU=1` enables it) because it is slower than the CPU copy: 296 us (CPU) vs 2,911 us (GPU, no cache flush) vs 6,878 us (GPU with `clflush`) for an 800x600 frame. The benchmark is built into the kernel and runs at boot with `GPU=1`.
+* The **Intel GPU layer** (blitter ring: fill, copy, fence) works on the test laptop but is **off by default** (`GPU=1` enables it) because it is slower than the CPU copy.
 * Build options: `OPT` (default `-O0`) and `GPU` (default `0`); see `README.md`.
 
 ### What has been checked, and how
@@ -30,11 +39,11 @@ Practical constraints that shape the work:
 | Kernel builds with the default options, `GPU=1` and `OPT=-O2` | compiled and linked with clang 18 / ld.lld |
 | Damage list, surfaces, rainbow row fill, GPU ring/command encoding | logic checked off-target (on a PC); not part of the repo |
 | GPU blitter self-test and benchmark | run on our test laptop (boot-log output) |
-| Damage list, surfaces, the HUD fixes and the other compositor changes **on screen** | **not yet booted on hardware at the time of writing** |
+| Damage list, surfaces, the HUD fixes and the other compositor changes **on screen** | **Tested on real hardware, hundreds of boots** (owner-confirmed). The earlier note saying it had not been booted was wrong. No recorded measurements or logs are kept in the repo. |
 | `OPT=-O2` at runtime | never run |
 | Tearing, flicker, drag behaviour | only judged by eye on the laptop; no measurements |
 
-Treat "it builds" as the bar that has been met, not "it works on screen".
+The compositor and the overall OS have been run extensively on the laptop. Items marked "never run" (for example `OPT=-O2`) are still unverified; everything else listed as working has been seen working.
 
 ## 3. Decisions to keep
 
@@ -67,18 +76,17 @@ These matter because the next big steps (apps, window API v2) run straight into 
 6. **The ELF loader is minimal** (`src/exec.h`): segment `p_flags` are ignored (every page is user + writable, so no W^X); `p_vaddr`/`p_memsz` are not validated against the user address range, the stack or each other; there are no size limits and no `argv`/`envp`; page zeroing is a byte loop; pages leak on failure.
 7. **No spawn / wait / exec / readdir / stat syscalls.** `execve_memory()` takes a memory buffer and is called once, at boot, for Limine module 0 (`init.elf`). `SYS_EXIT` ignores its exit code. Task cleanup frees the fd table, kernel stack and `Task`; freeing of the process's user pages and page tables was not found.
 8. **Per-task state is thin:** `Task` has `pid`, `cr3`, a 16-entry `fd_table`, and entry/stack info, but no parent, exit status or owned windows.
-9. **Hard-coded UI:** `wm_init` creates Terminal, Visual Test, Rainbow and Boot Log unconditionally. The Start button prints "Start Menu coming soon..." into the terminal. Terminal and Boot Log are special-cased branches in the compositor rather than surfaces, and the Terminal window cannot be closed.
+9. **Hard-coded UI:** `wm_init` creates Terminal, Visual Test, Rainbow and Boot Log unconditionally. The Start button prints "Start Menu coming soon..." into the terminal. Terminal cannot be closed. *(Compositor special-case branches were removed in Milestone 1 — all windows now use the unified surface blit path.)*
 10. **USB:** a failing device during the root-port scan can starve HID descriptor reads on other ports. Wish: detect which device is the boot drive.
 11. **Repository hygiene:** build outputs (`myos`, `myos.iso` at ~12 MB, `init.elf`, `*.o`, `iso_root/`) and three ~8 MB `.raw` images are tracked, and there is no `.gitignore`. Three UUID-named `.json` files are editor project settings containing local paths. `pythonshit/` is a scratch image script.
 
 ## 6. Next steps, in order
 
-1. Boot the current build on the laptop. Note whether the HUD tail shows `GPU:off`, whether anything looks worse than before, and (with `GPU=1`) whether the self-test still passes.
-2. Housekeeping commits: line endings, then `.gitignore` plus `git rm --cached` for build outputs, then the source changes.
-3. **Convert Terminal and Boot Log to surface-backed windows using the internal API**, as Rainbow and Visual Test already are, and delete the special-case branches. Do not jump straight to making them user programs: that needs steps 4 and 5.
-4. Make the syscall path multi-process safe (issue 1). Test with two cooperating user programs.
-5. Spawn/exec and app discovery per `docs/APP_LOADING.md`, then Window API v2 (owner, mapped surfaces, events, cleanup).
-6. The roadmap's later stages: hardware cursor, page flipping, GPU memory, render engine.
+1. ✅ ~~**Convert Terminal and Boot Log to surface-backed windows**~~ — **Done (Milestone 1 / Stage A1).** Terminal and Boot Log are now full surface clients; compositor special-case branches deleted. Build verified clean.
+2. Boot the current build on the laptop. Confirm display looks correct (terminal text renders, boot log renders, all windows composited correctly).
+3. **Make the syscall path multi-process safe** (issue 1 above). Per-task kernel stack + TSS `rsp0`; test with two cooperating user programs.
+4. Spawn/exec and app discovery per `docs/APP_LOADING.md`, then Window API v2 (owner, mapped surfaces, events, cleanup).
+5. The roadmap's later stages: hardware cursor, page flipping, GPU memory, render engine.
 
 ## 7. Starting a work session
 

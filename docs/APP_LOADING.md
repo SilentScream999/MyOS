@@ -32,7 +32,7 @@ creating thread/process**, input arrives as messages in the owner's queue, and w
 **What to take from it:** apps are described by data; a *launcher* (the shell) reads that data and asks the kernel to create a process; the kernel's job
 is just "load this image into a new address space and run it"; the GUI API ties windows to processes.
 
-## 2. Where MyOS is today
+## 2. Where WyzarOS is today
 
 | Layer | Today |
 |---|---|
@@ -51,7 +51,7 @@ The kernel should not know what Calculator is. Two nuances:
 
 ## 3. Proposed design
 
-Keep it small: static ELF programs, no dynamic linking, and a tiny shared C library for syscall and window helpers (MyOS's "user32/kernel32").
+Keep it small: static ELF programs, no dynamic linking, and a tiny shared C library for syscall and window helpers (WyzarOS's "user32/kernel32").
 
 ### 3.1 Packaging: one `initrd` module
 Instead of one Limine module per program, build **one archive** (a plain `tar`/ustar file) holding `/bin`, `/apps` and assets, and pass it as a single
@@ -88,7 +88,7 @@ A normal user program (`/apps/launcher`) or, initially, kernel code that reads `
 * **Events:** a per-window queue of input events (key, mouse move/button, focus, close request, resize) read through a `SYS_WIN_POLL` or blocking wait, plus a focus model in the compositor.
 * **Design surfaces knowing they will later become GPU-visible buffers** (page-aligned, contiguous or described by a page list). See `docs/GPU_DESKTOP_ROADMAP.md`.
 
-### 3.7 A tiny user library (`libmyos`)
+### 3.7 A tiny user library (`libwyzar`)
 Syscall wrappers, window/surface helpers, text drawing (reusing the 8x8 font) and an event-loop helper, statically linked into each app. This replaces the
 copy-pasted wrappers in `init.c` and `win_test.c`. Add the user-program build rules to the Makefile (today only `init.elf` is built; `win_test.c` is not).
 

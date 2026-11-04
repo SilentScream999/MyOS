@@ -1,4 +1,4 @@
-# MyOS Window Management API
+# WyzarOS Window Management API
 
 *Last updated: 2026-11-02.* This documents what the kernel **does today**, including its problems, so nothing gets built on wrong assumptions.
 The planned redesign (owner, mapped surfaces, events) is in `docs/APP_LOADING.md` section 3.6.

@@ -5,7 +5,7 @@ LD=ld.lld
 LIMINE_BIN = limine/limine
 
 # Optimization level for the KERNEL. Default is -O0.
-# Try:  rm -f src/*.o myos && make myos OPT=-O2
+# Try:  rm -f src/*.o wyzar && make wyzar OPT=-O2
 OPT ?= -O0
 
 CFLAGS = $(OPT) -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
@@ -25,9 +25,12 @@ LDFLAGS=-nostdlib -z max-page-size=0x1000
 SRC=src/kernel.cpp
 OBJ=$(SRC:.cpp=.o)
 
-all: myos init.elf
+all: wyzar init.elf
 
-myos: $(OBJ) linker.ld
+# Backward compatibility alias
+myos: wyzar
+
+wyzar: $(OBJ) linker.ld
 	$(LD) $(LDFLAGS) -T linker.ld -o $@ $(OBJ)
 
 # Track header dependencies (wm.h, intel_gpu.h, ...) so editing a header rebuilds the kernel.
@@ -50,7 +53,7 @@ iso: all
 	rm -rf iso_root
 	mkdir -p iso_root/boot
 
-	cp myos iso_root/boot/
+	cp wyzar iso_root/boot/
 	cp init.elf iso_root/boot/
 	# Optional (ignored if missing): raw BGRA wallpaper module
 	cp wallpaper.raw iso_root/boot/ || true
@@ -62,9 +65,9 @@ iso: all
 	  -no-emul-boot -boot-load-size 4 -boot-info-table \
 	  --efi-boot limine-uefi-cd.bin \
 	  -efi-boot-part --efi-boot-image --protective-msdos-label \
-	  iso_root -o myos.iso
+	  iso_root -o wyzar.iso
 
-	-$(LIMINE_BIN) bios-install myos.iso || limine/limine.exe bios-install myos.iso || true
+	-$(LIMINE_BIN) bios-install wyzar.iso || limine/limine.exe bios-install wyzar.iso || true
 
 
 run: iso
@@ -72,7 +75,7 @@ run: iso
 		-machine q35 \
 		-m 512M \
 		-bios OVMF.fd \
-		-cdrom myos.iso \
+		-cdrom wyzar.iso \
 		-no-reboot \
 		-no-shutdown \
 		-device qemu-xhci,id=xhci \
@@ -82,4 +85,4 @@ run: iso
 
 
 clean:
-	rm -rf iso_root $(OBJ) $(OBJ:.o=.d) user/init.o myos myos.iso init.elf
+	rm -rf iso_root $(OBJ) $(OBJ:.o=.d) user/init.o wyzar wyzar.iso myos myos.iso init.elf

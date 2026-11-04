@@ -1,10 +1,10 @@
-# MyOS
+# WyzarOS
 
 A hobby 64-bit x86 operating system: C++ kernel, C userspace, booted by [Limine](https://github.com/limine-bootloader/limine).
 It has a framebuffer desktop (window manager, CPU compositor, taskbar, mouse cursor), USB (xHCI) and PS/2 input,
 preemptive multitasking, an ELF loader and a ring-3 shell.
 
-*Last updated: 2026-11-02.* New here? Start with **[docs/AI_HANDOFF.md](docs/AI_HANDOFF.md)** for the current status, conventions and known issues.
+*Last updated: 2026-11-04.* New here? Start with **[docs/AI_HANDOFF.md](docs/AI_HANDOFF.md)** for the current status, conventions and known issues.
 
 The long-term goal is a **Windows-like, GPU-composited desktop**. Where we are on that road, and what comes next, is in
 [docs/GPU_DESKTOP_ROADMAP.md](docs/GPU_DESKTOP_ROADMAP.md). How programs should be started (instead of being hard-coded) is in
@@ -23,11 +23,11 @@ The Makefile calls `clang`, `clang++` and `ld.lld` directly.
 
 **Build and run**
 
-    make clean && make iso          # builds myos, init.elf and myos.iso
+    make clean && make iso          # builds wyzar, init.elf and wyzar.iso
     make run                        # QEMU (needs OVMF.fd in the project root; it is not in the repo)
 
 QEMU has **no Intel GPU**, so anything GPU-related (the `GPU:` boot-log lines and the HUD GPU status) can only be tested by booting
-`myos.iso` on real hardware. Our test machine is an Intel Gen9 laptop (Skylake/Kaby Lake class, HD 620).
+`wyzar.iso` on real hardware. Our test machine is an Intel Gen9 laptop (Skylake/Kaby Lake class, HD 620).
 
 **Build options** (pass them on the build command, and run `make clean` when you change them):
 

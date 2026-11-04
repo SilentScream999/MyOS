@@ -682,14 +682,7 @@ extern "C" void kmain(void) {
     if (fb_req.response && fb_req.response->framebuffer_count > 0) {
         fb = fb_req.response->framebuffers[0];
         
-        // 2000 lines @ 10px each = 20,000 pixels high
-        // Optimized backbuffer size: 1000px height is plenty for our 600px window
-        g_term_buf_height = 1000;
-        if (g_term_buf_height < fb->height) g_term_buf_height = fb->height;
-        g_backbuffer = (uint8_t*)kmalloc(g_term_buf_height * fb->pitch);
-        if (g_backbuffer) {
-            memset(g_backbuffer, 0, g_term_buf_height * fb->pitch);
-        }
+        // Terminal buffer is now allocated on demand as g_win_terminal's surface in wm_init()
 
         // Page-aligned: the GPU maps this buffer page-by-page into the GGTT and the PRM
         // requires 64-byte-aligned linear surface bases. kmalloc only guarantees 16 bytes.
@@ -1453,9 +1446,9 @@ extern "C" void kpanic(const char* name, ExceptionFrame* f) {
     // 1. Silence the system
     __asm__ volatile("cli");
 
-    // 2. Graphical BSOD: MyOS "Deep Space" theme
-    uint32_t myos_panic_bg = 0xFF141414; // Ultra dark/black
-    vram_fill(myos_panic_bg);
+    // 2. Graphical BSOD: WyzarOS "Deep Space" theme
+    uint32_t wyzar_panic_bg = 0xFF141414; // Ultra dark/black
+    vram_fill(wyzar_panic_bg);
 
     // 3. Header
     int32_t x = 100;
@@ -1465,7 +1458,7 @@ extern "C" void kpanic(const char* name, ExceptionFrame* f) {
     vram_draw_char_8x8(x + 8, y, '(', 0xFFFF0000);
     y += 40;
 
-    vram_draw_string_8x8(x, y, "--- !!! MyOS CRITICAL SYSTEM FAILURE !!! ---", 0xFFFF0000); // Red alert
+    vram_draw_string_8x8(x, y, "--- !!! WyzarOS CRITICAL SYSTEM FAILURE !!! ---", 0xFFFF0000); // Red alert
     y += 40;
 
     vram_draw_string_8x8(x, y, "The kernel has encountered an unrecoverable exception.", 0xFFFFFFFF);

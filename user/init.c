@@ -119,7 +119,7 @@ static void redraw_line(const char* buf, int len) {
 void _start() {
     print("\x1b[2J\x1b[H"); 
     print("\n----------------------------------------\n");
-    print("Welcome to MyOS Interactive Terminal!\n");
+    print("Welcome to WyzarOS Interactive Terminal!\n");
     print("Shift + Up/Down: Hardware Scrollback\n");
     print("Up/Down: Command History\n");
     print("----------------------------------------\n");
@@ -129,7 +129,7 @@ void _start() {
 
     while(1) {
         sys_ttyraw(1);          // Enter raw/interactive mode BEFORE the prompt
-        print("\nshell> ");     // tty_raw_mode=1 → cursor appears here, nowhere during init
+        print("\nwyzar> ");     // tty_raw_mode=1 → cursor appears here, nowhere during init
         pos = 0;
         history_index = -1;
 
@@ -188,6 +188,11 @@ void _start() {
 
         if (streq(buf, "clear", 5)) {
             print("\x1b[2J\x1b[H");
+        } else if (streq(buf, "bsod", 4)) {
+            // Deliberately trigger an Invalid Opcode exception (#UD) from ring-3.
+            // The kernel's IDT handler will catch it and display the WyzarOS panic screen.
+            print("Triggering BSOD...\n");
+            __asm__ volatile ("ud2");
         } else if (streq(buf, "shutdown", 8)) {
             sys_shutdown();
         } else if (streq(buf, "restart", 7)) {

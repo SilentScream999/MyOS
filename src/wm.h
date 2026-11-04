@@ -75,6 +75,10 @@ struct Window {
 static Window* g_window_list[MAX_WINDOWS];
 static int     g_window_order[MAX_WINDOWS];
 static int     g_window_count = 0;
+static Window* g_win_terminal = nullptr;
+static Window* g_win_log = nullptr;
+static Window* g_win_test = nullptr;
+static Window* g_win_rain = nullptr;
 
 static uint32_t g_title_h = 28;
 static uint32_t g_border  = 2;
@@ -87,6 +91,25 @@ static uint32_t g_pad     = 2;
 #define WIN_TYPE_RAIN 2
 #define WIN_TYPE_LOG  3
 #define WIN_TYPE_USER 10
+
+// ─── Window surfaces: damage API ────────────────────────────────────────────
+// A client draws into win->buffer (its SURFACE, origin = top-left of the client area), then calls
+// wm_surface_damage*() with the rectangle that changed. The compositor never needs to know what
+// the client is: damage is converted to a screen dirty-rect and every window is composed the same way.
+static inline void wm_surface_damage(Window* win, int32_t x1, int32_t y1, int32_t x2, int32_t y2) {
+    if (!win || !win->visible || !fb) return;
+    int32_t sx1, sy1, sx2, sy2;
+    if (!surface_damage_to_screen(win->x, win->y, win->w, win->h, x1, y1, x2, y2,
+                                  (int32_t)fb->width, (int32_t)fb->height, &sx1, &sy1, &sx2, &sy2)) return;
+    uint32_t ux1 = (uint32_t)sx1, ux2 = (uint32_t)sx2 - 1;
+    uint32_t uy1 = (uint32_t)sy1, uy2 = (uint32_t)sy2;
+    if (uy2 > fb->height - 1) uy2 = fb->height - 1;
+    wm_dirty_add(ux1, ux2, uy1, uy2);
+    g_needs_refresh = true;
+}
+static inline void wm_surface_damage_all(Window* win) {
+    if (win) wm_surface_damage(win, 0, 0, win->w, win->h);
+}
 
 static uint32_t test_w, test_h;
 static uint32_t rain_w, rain_h;
@@ -261,75 +284,19 @@ static uint32_t g_log_line_count = 0;
 static uint32_t* g_log_win_backbuffer = nullptr;
 static int32_t  log_last_rendered_scroll = -1;
 
-static inline void ghost_term_frame(int32_t ox, int32_t oy,
-                                     int32_t* fx, int32_t* fy,
-                                     int32_t* fw, int32_t* fh) {
-    uint32_t content_w = g_term_max_cols * 8;
-    uint32_t content_h = g_term_max_rows * 10;
-    *fx = ox - (int32_t)(g_border + g_pad);
-    *fy = oy - (int32_t)(g_title_h + g_border + g_pad);
-    *fw = (int32_t)content_w + (int32_t)(g_border + g_pad) * 2;
-    *fh = (int32_t)content_h + (int32_t)(g_border * 2 + g_title_h + g_pad * 2);
-}
-
-static inline void ghost_test_frame(int32_t ox, int32_t oy,
-                                     int32_t* fx, int32_t* fy,
-                                     int32_t* fw, int32_t* fh) {
-    *fx = ox; *fy = oy - (int32_t)g_title_h; *fw = test_w; *fh = test_h + (int32_t)g_title_h;
-}
-
-static inline void ghost_rain_frame(int32_t ox, int32_t oy,
-                                     int32_t* fx, int32_t* fy,
-                                     int32_t* fw, int32_t* fh) {
-    *fx = ox; *fy = oy - (int32_t)g_title_h; *fw = rain_w; *fh = rain_h + (int32_t)g_title_h;
-}
-
-static inline void ghost_log_frame(int32_t ox, int32_t oy,
-                                     int32_t* fx, int32_t* fy,
-                                     int32_t* fw, int32_t* fh) {
-    int32_t lw = (int32_t)g_log_win_cols * LOG_CHAR_W;
-    int32_t lh = (int32_t)g_log_rows_visible * LOG_CHAR_H;
-    *fx = ox - (int32_t)(g_border + g_pad);
-    *fy = oy - (int32_t)(g_title_h + g_border + g_pad);
-    *fw = lw + (int32_t)(g_border + g_pad) * 2;
-    *fh = lh + (int32_t)(g_border * 2 + g_title_h + g_pad * 2);
-}
-
 static inline void wm_get_win_rect(Window* win, WinRect* r) {
     r->visible = win->visible;
-    if (win->is_system && win->type == WIN_TYPE_TERM) {
-        uint32_t wx = win->x, wy = win->y;
-        uint32_t ww = g_term_max_cols * 8, wh = g_term_max_rows * 10;
-        r->x1 = (wx > (uint32_t)(g_border + g_pad)) ? wx - g_border - g_pad : 0;
-        r->x2 = wx + ww + g_border + g_pad;
-        r->y1 = (wy > (uint32_t)(g_border + g_title_h + g_pad)) ? (int32_t)(wy - g_border - g_title_h - g_pad) : 0;
-        r->y2 = (int32_t)(wy + wh + g_border + g_pad);
-    } else if (win->is_system && win->type == WIN_TYPE_LOG) {
-        int32_t lw = (int32_t)g_log_win_cols * LOG_CHAR_W;
-        int32_t lh = (int32_t)g_log_rows_visible * LOG_CHAR_H; 
-        r->x1 = win->x - (int32_t)(g_border + g_pad);
-        r->y1 = win->y - (int32_t)(g_title_h + g_border + g_pad);
-        r->x2 = win->x + lw + (int32_t)(g_border + g_pad);
-        r->y2 = win->y + lh + (int32_t)(g_border + g_pad);
-    } else {
-        r->x1 = win->x; r->y1 = win->y - (int32_t)g_title_h;
-        r->x2 = win->x + (int32_t)win->w; r->y2 = win->y + (int32_t)win->h;
-    }
+    r->x1 = win->x;
+    r->y1 = win->y - (int32_t)g_title_h;
+    r->x2 = win->x + (int32_t)win->w;
+    r->y2 = win->y + (int32_t)win->h;
 }
 
 static inline void wm_get_win_rect_from_pos(Window* win, int32_t x, int32_t y, int32_t* fx, int32_t* fy, int32_t* fw, int32_t* fh) {
-    if (win->is_system && win->type == WIN_TYPE_TERM) {
-        ghost_term_frame(x, y, fx, fy, fw, fh);
-    } else if (win->is_system && win->type == WIN_TYPE_LOG) {
-        ghost_log_frame(x, y, fx, fy, fw, fh);
-    } else if (win->is_system && win->type == WIN_TYPE_RAIN) {
-        ghost_rain_frame(x, y, fx, fy, fw, fh);
-    } else if (win->is_system && win->type == WIN_TYPE_TEST) {
-        ghost_test_frame(x, y, fx, fy, fw, fh);
-    } else {
-        *fx = x; *fy = y - (int32_t)g_title_h;
-        *fw = win->w; *fh = win->h + (int32_t)g_title_h;
-    }
+    *fx = x;
+    *fy = y - (int32_t)g_title_h;
+    *fw = win->w;
+    *fh = win->h + (int32_t)g_title_h;
 }
 
 static void wm_log_render_line_to_buffer(int32_t line_idx, int32_t buffer_row) {
@@ -406,9 +373,14 @@ static void wm_log_init() {
     g_log_line_count = LOG_WIN_LINES;
     
     g_log_stride = g_log_win_cols * LOG_CHAR_W;
-    uint32_t total_px = g_log_stride * (g_log_rows_visible * LOG_CHAR_H);
-    g_log_win_backbuffer = (uint32_t*)kmalloc(total_px * 4);
+    if (g_win_log && g_win_log->buffer) {
+        g_log_win_backbuffer = g_win_log->buffer;
+    } else {
+        uint32_t total_px = g_log_stride * (g_log_rows_visible * LOG_CHAR_H);
+        g_log_win_backbuffer = (uint32_t*)kmalloc(total_px * 4);
+    }
     wm_log_render_to_buffer();
+    if (g_win_log) wm_surface_damage_all(g_win_log);
 }
 
 void wm_log_append(const char* s) {
@@ -440,18 +412,9 @@ void wm_log_append(const char* s) {
     log_last_rendered_scroll = -1; // force full refresh
     wm_log_render_to_buffer();
 
-    // 5. Mark regions dirty
-    g_needs_refresh = true;
-    for (int i = 0; i < g_window_count; i++) {
-        Window* win = g_window_list[i];
-        if (win && win->type == WIN_TYPE_LOG) {
-            WinRect r; wm_get_win_rect(win, &r);
-            if (r.x1 >= 0 && (uint32_t)r.x1 < g_dirty_min_x) g_dirty_min_x = (uint32_t)r.x1;
-            if (r.x2 >= 0 && (uint32_t)r.x2 > g_dirty_max_x) g_dirty_max_x = (uint32_t)r.x2;
-            if (r.y1 >= 0 && (uint32_t)r.y1 < g_dirty_min_y) g_dirty_min_y = (uint32_t)r.y1;
-            if (r.y2 >= 0 && (uint32_t)r.y2 > g_dirty_max_y) g_dirty_max_y = (uint32_t)r.y2;
-            break;
-        }
+    // 5. Mark log window surface dirty
+    if (g_win_log) {
+        wm_surface_damage_all(g_win_log);
     }
 }
 
@@ -465,19 +428,10 @@ static void wm_log_scroll(int delta) {
     // Prerender to backbuffer
     wm_log_render_to_buffer();
 
-    // Mark log window area dirty
-    for (int i = 0; i < g_window_count; i++) {
-        Window* win = g_window_list[i];
-        if (win && win->type == WIN_TYPE_LOG) {
-            WinRect r; wm_get_win_rect(win, &r);
-            if (r.x1 >= 0 && (uint32_t)r.x1 < g_dirty_min_x) g_dirty_min_x = (uint32_t)r.x1;
-            if (r.x2 >= 0 && (uint32_t)r.x2 > g_dirty_max_x) g_dirty_max_x = (uint32_t)r.x2;
-            if (r.y1 >= 0 && (uint32_t)r.y1 < g_dirty_min_y) g_dirty_min_y = (uint32_t)r.y1;
-            if (r.y2 >= 0 && (uint32_t)r.y2 > g_dirty_max_y) g_dirty_max_y = (uint32_t)r.y2;
-            break;
-        }
+    // Mark log window surface dirty
+    if (g_win_log) {
+        wm_surface_damage_all(g_win_log);
     }
-    g_needs_refresh = true;
 }
 
 
@@ -870,15 +824,10 @@ static inline Window* wm_create_window(const char* title, int32_t x, int32_t y, 
     win->is_system = is_system;
     win->type = type;
     
-    // Surface-backed windows: every user window, plus built-ins that act as clients (rainbow, visual test).
-    if (!is_system || type == WIN_TYPE_RAIN || type == WIN_TYPE_TEST) {
-        win->buffer = (uint32_t*)kmalloc((uint64_t)w * h * 4);
-        if (win->buffer) memset(win->buffer, 0, (uint64_t)w * h * 4);
-        win->buffer_pitch = w * 4;
-    } else {
-        win->buffer = nullptr;
-        win->buffer_pitch = 0;
-    }
+    // Surface-backed windows: EVERY window owns a surface buffer covering its client area.
+    win->buffer = (uint32_t*)kmalloc((uint64_t)w * h * 4);
+    if (win->buffer) memset(win->buffer, 0, (uint64_t)w * h * 4);
+    win->buffer_pitch = w * 4;
     
     int idx = g_window_count;
     g_window_list[idx] = win;
@@ -889,33 +838,10 @@ static inline Window* wm_create_window(const char* title, int32_t x, int32_t y, 
     return win;
 }
 
-// ─── Window surfaces: damage API ────────────────────────────────────────────
-// A client draws into win->buffer (its SURFACE, origin = top-left of the client area), then calls
-// wm_surface_damage*() with the rectangle that changed. The compositor never needs to know what
-// the client is: damage is converted to a screen dirty-rect and every window is composed the same way.
 static inline Window* wm_find_window(int id) {
     for (int i = 0; i < g_window_count; i++)
         if (g_window_list[i] && g_window_list[i]->id == id) return g_window_list[i];
     return nullptr;
-}
-
-// Damage in SURFACE coordinates, x2/y2 exclusive. Safe for any input (clipped to surface and screen).
-static inline void wm_surface_damage(Window* win, int32_t x1, int32_t y1, int32_t x2, int32_t y2) {
-    if (!win || !win->visible || !fb) return;
-    int32_t sx1, sy1, sx2, sy2;
-    if (!surface_damage_to_screen(win->x, win->y, win->w, win->h, x1, y1, x2, y2,
-                                  (int32_t)fb->width, (int32_t)fb->height, &sx1, &sy1, &sx2, &sy2)) return;
-    // The compositor's dirty bounds: x is INCLUSIVE; max_y must be the EXCLUSIVE bottom edge because the
-    // Stage 2 window loop composes rows < max_y (Stage 1 and the flip use <= max_y). Passing the last
-    // damaged row instead would leave it stale and flicker a 1px line.
-    uint32_t ux1 = (uint32_t)sx1, ux2 = (uint32_t)sx2 - 1;
-    uint32_t uy1 = (uint32_t)sy1, uy2 = (uint32_t)sy2;
-    if (uy2 > fb->height - 1) uy2 = fb->height - 1;
-    wm_dirty_add(ux1, ux2, uy1, uy2);   // separate rect: not unioned with unrelated damage (e.g. the HUD)
-    g_needs_refresh = true;
-}
-static inline void wm_surface_damage_all(Window* win) {
-    if (win) wm_surface_damage(win, 0, 0, win->w, win->h);
 }
 
 // The rainbow as a CLIENT: draws its own surface, reports damage. (If it has no surface because the
@@ -1069,25 +995,30 @@ static inline void wm_init() {
     g_log_win_cols = g_term_max_cols;
     g_log_rows_visible = g_term_max_rows;
 
-    wm_win_w = test_w + (g_border + g_pad) * 2;
-    wm_win_h = test_h + g_border * 2 + g_title_h + g_pad * 2;
+    wm_win_w = test_w;
+    wm_win_h = test_h + g_title_h;
     
-    wm_win_x = (fb->width > wm_win_w) ? (fb->width - wm_win_w) / 2 : 0;
-    wm_win_y = (fb->height > wm_win_h) ? (fb->height - wm_win_h) / 2 : 0;
+    wm_win_x = (fb->width > test_w) ? (fb->width - test_w) / 2 : 0;
+    wm_win_y = (fb->height > (test_h + g_title_h + g_taskbar_h)) ? (fb->height - (test_h + g_title_h + g_taskbar_h)) / 2 : 0;
 
-    int32_t tox = (int32_t)wm_win_x + (int32_t)(g_border + g_pad);
-    int32_t toy = (int32_t)wm_win_y + (int32_t)(g_border + g_title_h + g_pad);
+    int32_t term_x = (int32_t)wm_win_x;
+    int32_t term_y = (int32_t)wm_win_y + (int32_t)g_title_h;
 
     // Synchronize legacy globals used by terminal.h and framebufferstuff.h
-    g_term_ox = tox;
-    g_term_oy = toy;
+    g_term_ox = term_x;
+    g_term_oy = term_y;
     // g_term_max_cols/rows already set above
 
-    // Create initial windows using the new API
-    wm_create_window("Terminal", tox, toy, (int32_t)test_w, (int32_t)test_h, false, true, WIN_TYPE_TERM);
-    wm_test_render(wm_create_window("Visual Test", (int32_t)wm_win_x + 50, (int32_t)wm_win_y + 50, (int32_t)test_w, (int32_t)test_h, true, true, WIN_TYPE_TEST));
-    wm_create_window("Rainbow Animation", (int32_t)wm_win_x + 100, (int32_t)wm_win_y + 100, (int32_t)test_w, (int32_t)test_h, true, true, WIN_TYPE_RAIN);
-    wm_create_window("Boot Log", (int32_t)wm_win_x + 150, (int32_t)wm_win_y + 150, (int32_t)test_w, (int32_t)test_h, true, true, WIN_TYPE_LOG);
+    // Create initial windows using the unified surface API
+    g_win_terminal = wm_create_window("Terminal", term_x, term_y, (int32_t)test_w, (int32_t)test_h, false, true, WIN_TYPE_TERM);
+    if (g_win_terminal) {
+        g_backbuffer = (uint8_t*)g_win_terminal->buffer;
+        memset_32(g_win_terminal->buffer, 0xFF0A0A14, (uint64_t)test_w * test_h);
+    }
+    g_win_test = wm_create_window("Visual Test", (int32_t)wm_win_x + 50, (int32_t)wm_win_y + 50 + (int32_t)g_title_h, (int32_t)test_w, (int32_t)test_h, true, true, WIN_TYPE_TEST);
+    wm_test_render(g_win_test);
+    g_win_rain = wm_create_window("Rainbow Animation", (int32_t)wm_win_x + 100, (int32_t)wm_win_y + 100 + (int32_t)g_title_h, (int32_t)test_w, (int32_t)test_h, true, true, WIN_TYPE_RAIN);
+    g_win_log = wm_create_window("Boot Log", (int32_t)wm_win_x + 150, (int32_t)wm_win_y + 150 + (int32_t)g_title_h, (int32_t)test_w, (int32_t)test_h, true, true, WIN_TYPE_LOG);
 
     for (int i = 0; i < 360; i++) {
         g_rainbow_lut[i] = wm_rainbow_color(i * 2);
@@ -1096,7 +1027,6 @@ static inline void wm_init() {
 
     wm_init_wallpaper();
 
-    if (g_backbuffer) memset_32(g_backbuffer, 0, (g_term_max_rows * 10) * (fb->pitch / 4));
     term_dirty_all();
 }
 
@@ -1233,140 +1163,19 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         if (dr2 > (int32_t)(fb->height - g_taskbar_h)) dr2 = fb->height - g_taskbar_h;
         if (dr1 >= dr2) continue;
 
-        if (win->is_system && win->type == WIN_TYPE_TERM) {
-            int32_t wx = win->x, wy = win->y;
-            int32_t ww = (int32_t)g_term_max_cols * 8, wh = (int32_t)g_term_max_rows * 10;
-            wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, false, min_y, max_y);
-            for (int32_t y = dr1; y < dr2; y++) {
-                uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
-                if (y >= r.y1 + (int32_t)g_title_h) {
-                    int32_t s_x = r.x1; if (s_x < 0) s_x = 0;
-                    int32_t e_x = r.x2; if (e_x > (int32_t)fb->width) e_x = fb->width;
-                    if (e_x > s_x) {
-                        bool in_text_rows = (y >= (int32_t)wy && y < (int32_t)(wy + wh));
-                        bool in_text_cols_zone = ((int32_t)wx > s_x || e_x > (int32_t)(wx + ww));
-
-                        if (!in_text_rows || !in_text_cols_zone) {
-                            memset_32(drow + s_x, 0xFFBBBBBB, e_x - s_x);
-                        } else {
-                            if ((int32_t)wx > s_x) memset_32(drow + s_x, 0xFFBBBBBB, wx - s_x);
-                            int32_t w_end = wx + ww;
-                            if (e_x > w_end) memset_32(drow + w_end, 0xFFBBBBBB, e_x - w_end);
-                        }
-                    }
-                    if (y >= wy && y < wy + wh) {
-                        int32_t ry = y - wy;
-                        int32_t twx = wx; if (twx < 0) twx = 0;
-                        int32_t tww = ww; if (wx < 0) tww += wx;
-                        if (twx + tww > (int32_t)fb->width) tww = (int32_t)fb->width - twx;
-                        if (tww > 0) {
-                            uint32_t src_off = (wx < 0) ? (uint32_t)(-wx) : 0;
-                            memcpy_vram_sse_headless(drow + twx, (uint32_t*)(g_backbuffer + (uint64_t)ry * fb->pitch) + src_off, tww * 4);
-                        }
-                    }
-                }
-            }
-        } else if (win->is_system && win->type == WIN_TYPE_TEST && !win->buffer) {   // fallback only
-            wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, true, min_y, max_y);
+        // Unified surface compositor: every window (system or user) is backed by its surface buffer
+        wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, win->closable, min_y, max_y);
+        if (win->buffer) {
             for (int32_t y = dr1; y < dr2; y++) {
                 if (y < r.y1 + (int32_t)g_title_h) continue;
                 uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
-                int32_t s_x = r.x1; if (s_x < 0) s_x = 0;
-                int32_t e_x = r.x2; if (e_x > (int32_t)fb->width) e_x = fb->width;
-                if (e_x > s_x) {
-                    for (int32_t cx = s_x; cx < e_x; ) {
-                        uint32_t span_w = 50 - ((cx - r.x1) % 50);
-                        if (cx + span_w > (uint32_t)e_x) span_w = e_x - cx;
-                        uint32_t c = (((cx - r.x1) / 50) % 2 == ((y - (r.y1 + (int32_t)g_title_h)) / 50) % 2) ? 0xFFEEEEEE : 0xFFDDDDDD;
-                        memset_32(drow + cx, c, span_w);
-                        cx += span_w;
-                    }
-                }
-            }
-        } else if (win->is_system && win->type == WIN_TYPE_RAIN && !win->buffer) {   // fallback only: normally the generic surface path below draws it
-            wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, true, min_y, max_y);
-            uint64_t rain_t0 = rdtsc_val();
-            // Build the first visible row once, then replicate it (see wm_fill_rainbow_row).
-            uint32_t* rain_first = nullptr;
-            int32_t   rain_w = 0;
-            for (int32_t y = dr1; y < dr2; y++) {
-                if (y < r.y1 + (int32_t)g_title_h) continue;
-                uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
-                int32_t s_x = r.x1; if (s_x < 0) s_x = 0;
-                int32_t e_x = r.x2; if (e_x > (int32_t)fb->width) e_x = fb->width;
-                if (e_x > s_x) {
-                    if (!rain_first) {
-                        rain_w = e_x - s_x;
-                        rain_first = drow + s_x;
-                        wm_fill_rainbow_row(rain_first, rain_w, rain_scroll, (uint32_t)(s_x - r.x1));
-                    } else {
-                        memcpy(drow + s_x, rain_first, (uint64_t)rain_w * 4);
-                    }
-                }
-            }
-            g_time_rain_ticks += rdtsc_val() - rain_t0;
-        } else if (win->is_system && win->type == WIN_TYPE_LOG) {
-            int32_t lw = (int32_t)g_log_win_cols * LOG_CHAR_W;
-            int32_t lh = (int32_t)g_log_rows_visible * LOG_CHAR_H;
-            wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, true, min_y, max_y); 
-
-            for (int32_t y = dr1; y < dr2; y++) {
-                uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
-                if (y >= r.y1 + (int32_t)g_title_h) {
-                    int32_t s_x = r.x1; if (s_x < 0) s_x = 0;
-                    int32_t e_x = r.x2; if (e_x > (int32_t)fb->width) e_x = fb->width;
-                    if (e_x > s_x) {
-                        bool in_text_rows = (y >= win->y && y < win->y + lh);
-                        bool in_text_cols_zone = ((int32_t)win->x > s_x || e_x > (int32_t)(win->x + lw));
-
-                        if (!in_text_rows || !in_text_cols_zone) {
-                            memset_32(drow + s_x, 0xFFBBBBBB, e_x - s_x);
-                        } else {
-                            if ((int32_t)win->x > s_x) memset_32(drow + s_x, 0xFFBBBBBB, win->x - s_x);
-                            int32_t w_end = win->x + lw;
-                            if (e_x > w_end) memset_32(drow + w_end, 0xFFBBBBBB, e_x - w_end);
-                            int32_t tx1 = win->x; if (tx1 < s_x) tx1 = s_x;
-                            int32_t tx2 = win->x + lw; if (tx2 > e_x) tx2 = e_x;
-                            if (tx1 < tx2) memset_32(drow + tx1, 0xFF0a0a14, tx2 - tx1);
-                        }
-                    }
-                }
-            }
-            uint32_t* lbb = g_log_win_backbuffer;
-            if (lbb) {
-                uint32_t stride = g_log_stride;
-                uint32_t bw = g_log_win_cols * LOG_CHAR_W;
-                uint32_t bh = g_log_rows_visible * LOG_CHAR_H;
-                for (uint32_t r = 0; r < bh; r++) {
-                    int32_t s_ry = win->y + (int32_t)r;
-                    if (s_ry < (int32_t)min_y || s_ry > (int32_t)max_y) continue;
-                    if (s_ry < 0 || (uint32_t)s_ry >= fb->height) continue;
-                    int32_t lwx = win->x; if (lwx < 0) lwx = 0;
-                    int32_t lww = (int32_t)bw; if (win->x < 0) lww += win->x;
-                    if (lwx + lww > (int32_t)fb->width) lww = (int32_t)fb->width - lwx;
-                    if (lww > 0) {
-                        uint32_t src_off_x = (win->x < 0) ? (uint32_t)(-win->x) : 0;
-                        uint8_t* dst = g_master_backbuffer + (uint64_t)s_ry * fb->pitch + (uint64_t)lwx * 4;
-                        uint8_t* src = (uint8_t*)(lbb + (uint64_t)r * stride) + src_off_x * 4;
-                        memcpy_vram_sse_headless(dst, src, lww * 4);
-                    }
-                }
-            }
-        } else {
-            // General window rendering from buffer
-            wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, win->closable, min_y, max_y);
-            if (win->buffer) {
-                for (int32_t y = dr1; y < dr2; y++) {
-                    if (y < r.y1 + (int32_t)g_title_h) continue;
-                    uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
-                    int32_t ry = y - (r.y1 + (int32_t)g_title_h);
-                    int32_t wx = r.x1; if (wx < 0) wx = 0;
-                    int32_t ww = (r.x2 - r.x1); if (r.x1 < 0) ww += r.x1;
-                    if (wx + ww > (int32_t)fb->width) ww = (int32_t)fb->width - wx;
-                    if (ww > 0) {
-                        uint32_t src_off = (r.x1 < 0) ? (uint32_t)(-r.x1) : 0;
-                        memcpy_vram_sse_headless(drow + wx, (uint32_t*)((uint8_t*)win->buffer + (uint64_t)ry * win->buffer_pitch) + src_off, ww * 4);
-                    }
+                int32_t ry = y - (r.y1 + (int32_t)g_title_h);
+                int32_t wx = r.x1; if (wx < 0) wx = 0;
+                int32_t ww = (r.x2 - r.x1); if (r.x1 < 0) ww += r.x1;
+                if (wx + ww > (int32_t)fb->width) ww = (int32_t)fb->width - wx;
+                if (ww > 0) {
+                    uint32_t src_off = (r.x1 < 0) ? (uint32_t)(-r.x1) : 0;
+                    memcpy_vram_sse_headless(drow + wx, (uint32_t*)((uint8_t*)win->buffer + (uint64_t)ry * win->buffer_pitch) + src_off, ww * 4);
                 }
             }
         }
