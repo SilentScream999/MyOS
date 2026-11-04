@@ -8,6 +8,7 @@
 #include "heap.h"
 #include "mouse.h"
 #include "string.h"
+#include "surface.h"
 
 #include "font8x8_basic.h"
 
@@ -35,6 +36,23 @@ static uint64_t g_time_win_ticks = 0;
 static uint64_t g_time_rain_ticks = 0;
 static uint64_t g_time_lock_ticks = 0;
 static uint64_t g_time_vram_ticks = 0;
+// Capacity (chars) of the top-right HUD line. The compositor thread dirties a region this wide once a second,
+// so EVERY part of the line is flipped to the screen, not just its right-hand end.
+#define HUD_MSG_CAP 200
+static uint64_t g_client_render_ticks = 0; // time the rainbow CLIENT spent drawing its own surface (outside the compositor)
+// Snapshot of the PREVIOUS frame's complete timings, taken at the end of wm_compose_dirty().
+// The HUD is built in the middle of a frame, so it must read these, not the live counters
+// (which are reset at frame start and only filled in after the HUD has been drawn).
+static uint64_t g_snap_bg = 0, g_snap_win = 0, g_snap_rain = 0, g_snap_lock = 0, g_snap_vram = 0;
+
+// HUD helper: append a TSC-tick duration as milliseconds with one decimal ("1.9").
+static char* hud_put_ms1(char* sp, uint64_t ticks) {
+    uint64_t t10 = tsc_hz ? (ticks * 10000ULL / tsc_hz) : 0;   // tenths of a millisecond
+    char tmp[24]; to_str(t10 / 10, tmp);
+    for (char* q = tmp; *q; ) *sp++ = *q++;
+    *sp++ = '.'; *sp++ = (char)('0' + (t10 % 10));
+    return sp;
+}
 
 struct Window {
     int id;
@@ -74,6 +92,7 @@ static uint32_t test_w, test_h;
 static uint32_t rain_w, rain_h;
 static uint32_t rain_scroll = 0;
 static uint32_t g_rainbow_lut[360];
+static uint32_t g_rainbow_wide[720]; // wide[j] = lut[j/2]: one entry per PIXEL, so a row is a plain cyclic window
 static uint32_t wm_win_x, wm_win_y, wm_win_w, wm_win_h;
 static uint32_t g_taskbar_h = 40; // Default, will be recalculated in wm_init
 static uint32_t g_sb_w = 92;
@@ -726,6 +745,20 @@ static inline uint32_t wm_rainbow_color(uint32_t x) {
     return 0xFF000000 | (r << 16) | (g << 8) | b;
 }
 
+// Fast path (exactly equivalent to wm_draw_rainbow_content):
+// pixel x of a rainbow row is g_rainbow_wide[(base_scroll + offset_x + x) % 720]. The colour
+// depends only on x and the scroll, never on y, so the compositor builds ONE row and copies it
+// to every other row instead of re-deriving ~600 identical rows per frame.
+static inline void wm_fill_rainbow_row(uint32_t* dst, int32_t w, uint32_t base_scroll, uint32_t offset_x) {
+    uint32_t pos = (uint32_t)(((uint64_t)base_scroll + offset_x) % 720u);
+    while (w > 0) {
+        uint32_t n = 720u - pos;
+        if (n > (uint32_t)w) n = (uint32_t)w;
+        memcpy(dst, &g_rainbow_wide[pos], (uint64_t)n * 4);
+        dst += n; w -= (int32_t)n; pos = 0;
+    }
+}
+
 static inline void wm_draw_rainbow_content(uint32_t* row, int32_t rw, uint32_t base_scroll, uint32_t offset_x) {
     uint32_t total = base_scroll + offset_x;
     uint32_t idx = (total / 2) % 360;
@@ -837,7 +870,8 @@ static inline Window* wm_create_window(const char* title, int32_t x, int32_t y, 
     win->is_system = is_system;
     win->type = type;
     
-    if (!is_system) {
+    // Surface-backed windows: every user window, plus built-ins that act as clients (rainbow, visual test).
+    if (!is_system || type == WIN_TYPE_RAIN || type == WIN_TYPE_TEST) {
         win->buffer = (uint32_t*)kmalloc((uint64_t)w * h * 4);
         if (win->buffer) memset(win->buffer, 0, (uint64_t)w * h * 4);
         win->buffer_pitch = w * 4;
@@ -853,6 +887,62 @@ static inline Window* wm_create_window(const char* title, int32_t x, int32_t y, 
     
     g_needs_refresh = true;
     return win;
+}
+
+// ─── Window surfaces: damage API ────────────────────────────────────────────
+// A client draws into win->buffer (its SURFACE, origin = top-left of the client area), then calls
+// wm_surface_damage*() with the rectangle that changed. The compositor never needs to know what
+// the client is: damage is converted to a screen dirty-rect and every window is composed the same way.
+static inline Window* wm_find_window(int id) {
+    for (int i = 0; i < g_window_count; i++)
+        if (g_window_list[i] && g_window_list[i]->id == id) return g_window_list[i];
+    return nullptr;
+}
+
+// Damage in SURFACE coordinates, x2/y2 exclusive. Safe for any input (clipped to surface and screen).
+static inline void wm_surface_damage(Window* win, int32_t x1, int32_t y1, int32_t x2, int32_t y2) {
+    if (!win || !win->visible || !fb) return;
+    int32_t sx1, sy1, sx2, sy2;
+    if (!surface_damage_to_screen(win->x, win->y, win->w, win->h, x1, y1, x2, y2,
+                                  (int32_t)fb->width, (int32_t)fb->height, &sx1, &sy1, &sx2, &sy2)) return;
+    // The compositor's dirty bounds: x is INCLUSIVE; max_y must be the EXCLUSIVE bottom edge because the
+    // Stage 2 window loop composes rows < max_y (Stage 1 and the flip use <= max_y). Passing the last
+    // damaged row instead would leave it stale and flicker a 1px line.
+    uint32_t ux1 = (uint32_t)sx1, ux2 = (uint32_t)sx2 - 1;
+    uint32_t uy1 = (uint32_t)sy1, uy2 = (uint32_t)sy2;
+    if (uy2 > fb->height - 1) uy2 = fb->height - 1;
+    wm_dirty_add(ux1, ux2, uy1, uy2);   // separate rect: not unioned with unrelated damage (e.g. the HUD)
+    g_needs_refresh = true;
+}
+static inline void wm_surface_damage_all(Window* win) {
+    if (win) wm_surface_damage(win, 0, 0, win->w, win->h);
+}
+
+// The rainbow as a CLIENT: draws its own surface, reports damage. (If it has no surface because the
+// allocation failed, the compositor's direct-draw branch still handles it and we dirty its whole rect.)
+static inline void wm_rain_render(Window* win) {
+    if (!win) return;
+    if (win->buffer) {
+        uint64_t t0 = rdtsc_val();
+        rainbow_render_surface(win->buffer, (uint32_t)win->w, (uint32_t)win->h, win->buffer_pitch, rain_scroll, g_rainbow_wide);
+        g_client_render_ticks = rdtsc_val() - t0;
+        wm_surface_damage_all(win);
+    } else {
+        WinRect r; wm_get_win_rect(win, &r);
+        if (r.x1 >= 0 && (uint32_t)r.x1 < g_dirty_min_x) g_dirty_min_x = (uint32_t)r.x1;
+        if (r.x2 >= 0 && (uint32_t)r.x2 > g_dirty_max_x) g_dirty_max_x = (uint32_t)r.x2;
+        if (r.y1 >= 0 && (uint32_t)r.y1 < g_dirty_min_y) g_dirty_min_y = (uint32_t)r.y1;
+        if (r.y2 >= 0 && (uint32_t)r.y2 > g_dirty_max_y) g_dirty_max_y = (uint32_t)r.y2;
+        g_needs_refresh = true;
+    }
+}
+
+// Visual Test as a CLIENT: draws its checkerboard once, then it is just another surface. If the surface
+// allocation failed the compositor's direct-draw branch still handles it.
+static inline void wm_test_render(Window* win) {
+    if (!win || !win->buffer) return;
+    checker_render_surface(win->buffer, (uint32_t)win->w, (uint32_t)win->h, win->buffer_pitch);
+    wm_surface_damage_all(win);
 }
 
 static inline void wm_destroy_window(int id) {
@@ -995,13 +1085,14 @@ static inline void wm_init() {
 
     // Create initial windows using the new API
     wm_create_window("Terminal", tox, toy, (int32_t)test_w, (int32_t)test_h, false, true, WIN_TYPE_TERM);
-    wm_create_window("Visual Test", (int32_t)wm_win_x + 50, (int32_t)wm_win_y + 50, (int32_t)test_w, (int32_t)test_h, true, true, WIN_TYPE_TEST);
+    wm_test_render(wm_create_window("Visual Test", (int32_t)wm_win_x + 50, (int32_t)wm_win_y + 50, (int32_t)test_w, (int32_t)test_h, true, true, WIN_TYPE_TEST));
     wm_create_window("Rainbow Animation", (int32_t)wm_win_x + 100, (int32_t)wm_win_y + 100, (int32_t)test_w, (int32_t)test_h, true, true, WIN_TYPE_RAIN);
     wm_create_window("Boot Log", (int32_t)wm_win_x + 150, (int32_t)wm_win_y + 150, (int32_t)test_w, (int32_t)test_h, true, true, WIN_TYPE_LOG);
 
     for (int i = 0; i < 360; i++) {
         g_rainbow_lut[i] = wm_rainbow_color(i * 2);
     }
+    for (int j = 0; j < 720; j++) g_rainbow_wide[j] = g_rainbow_lut[j / 2];
 
     wm_init_wallpaper();
 
@@ -1023,14 +1114,17 @@ static uint32_t g_overlay_backup[256];
 // Removed old fixed-window helpers
 
 
-static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
-                                     uint32_t min_y, uint32_t max_y) {
-    if (!fb || !fb->address || !g_backbuffer || !g_master_backbuffer) return;
+// Composes and flips ONE dirty rect. Returns true if it also ran the cursor/ghost-outline overlay.
+// When several rects are composed in one frame the caller passes do_overlay=true only for the LAST one:
+// the overlay draws straight onto VRAM, so a later flip would overwrite what an earlier overlay drew.
+static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
+                                     uint32_t min_y, uint32_t max_y, bool do_overlay = true) {
+    if (!fb || !fb->address || !g_backbuffer || !g_master_backbuffer) return false;
     if (min_x >= fb->width)  min_x = 0;
     if (max_x >= fb->width)  max_x = fb->width - 1;
     if (min_y >= fb->height) min_y = 0;
     if (max_y >= fb->height) max_y = fb->height - 1;
-    if (min_y > max_y || min_x > max_x) return;
+    if (min_y > max_y || min_x > max_x) return false;
 
     WinRect rects[MAX_WINDOWS];
     for (int i = 0; i < g_window_count; i++) {
@@ -1172,7 +1266,7 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                     }
                 }
             }
-        } else if (win->is_system && win->type == WIN_TYPE_TEST) {
+        } else if (win->is_system && win->type == WIN_TYPE_TEST && !win->buffer) {   // fallback only
             wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, true, min_y, max_y);
             for (int32_t y = dr1; y < dr2; y++) {
                 if (y < r.y1 + (int32_t)g_title_h) continue;
@@ -1189,15 +1283,28 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                     }
                 }
             }
-        } else if (win->is_system && win->type == WIN_TYPE_RAIN) {
+        } else if (win->is_system && win->type == WIN_TYPE_RAIN && !win->buffer) {   // fallback only: normally the generic surface path below draws it
             wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, true, min_y, max_y);
+            uint64_t rain_t0 = rdtsc_val();
+            // Build the first visible row once, then replicate it (see wm_fill_rainbow_row).
+            uint32_t* rain_first = nullptr;
+            int32_t   rain_w = 0;
             for (int32_t y = dr1; y < dr2; y++) {
                 if (y < r.y1 + (int32_t)g_title_h) continue;
                 uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
                 int32_t s_x = r.x1; if (s_x < 0) s_x = 0;
                 int32_t e_x = r.x2; if (e_x > (int32_t)fb->width) e_x = fb->width;
-                if (e_x > s_x) wm_draw_rainbow_content(drow + s_x, e_x - s_x, rain_scroll, (uint32_t)(s_x - r.x1));
+                if (e_x > s_x) {
+                    if (!rain_first) {
+                        rain_w = e_x - s_x;
+                        rain_first = drow + s_x;
+                        wm_fill_rainbow_row(rain_first, rain_w, rain_scroll, (uint32_t)(s_x - r.x1));
+                    } else {
+                        memcpy(drow + s_x, rain_first, (uint64_t)rain_w * 4);
+                    }
+                }
             }
+            g_time_rain_ticks += rdtsc_val() - rain_t0;
         } else if (win->is_system && win->type == WIN_TYPE_LOG) {
             int32_t lw = (int32_t)g_log_win_cols * LOG_CHAR_W;
             int32_t lh = (int32_t)g_log_rows_visible * LOG_CHAR_H;
@@ -1435,7 +1542,8 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         *d = '\0';
         
         uint32_t msg_len = strlen(ram_msg);
-        uint32_t rx = fb->width - (msg_len * 8) - 20;
+        uint32_t msg_px = msg_len * 8 + 20;
+        uint32_t rx = (fb->width > msg_px) ? fb->width - msg_px : 0;
         uint32_t ry = 20;
         
         // Draw background only if within dirty rect
@@ -1517,7 +1625,7 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         }
 
         // ── Task states & Frame time ──────────────────────────────────────────────
-        char states_buf[64];
+        char states_buf[160];
         char* sp = states_buf;
         *sp++ = ' '; *sp++ = '|'; *sp++ = ' ';
         if (g_task_list) {
@@ -1537,26 +1645,23 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         }
         
         *sp++ = '|'; *sp++ = ' '; *sp++ = 'F'; *sp++ = ':';
-        uint32_t frame_ms = 0;
-        if (tsc_hz > 0) frame_ms = (uint32_t)((g_last_frame_ticks * 1000) / tsc_hz);
-        to_str(frame_ms, sp); while(*sp) sp++;
+        sp = hud_put_ms1(sp, g_last_frame_ticks);
         *sp++ = 'm'; *sp++ = 's';
-        
-        *sp++ = ' '; *sp++ = '('; *sp++ = 'B'; *sp++ = ':';
-        to_str((uint32_t)(g_time_bg_ticks   * 1000 / tsc_hz), sp); while(*sp) sp++;
-        *sp++ = ' '; *sp++ = 'W'; *sp++ = ':';
-        to_str((uint32_t)(g_time_win_ticks  * 1000 / tsc_hz), sp); while(*sp) sp++;
-        *sp++ = ' '; *sp++ = 'r'; *sp++ = ':';
-        to_str((uint32_t)(g_time_rain_ticks * 1000 / tsc_hz), sp); while(*sp) sp++;
-        *sp++ = ' '; *sp++ = 'L'; *sp++ = ':';
-        to_str((uint32_t)(g_time_lock_ticks * 1000 / tsc_hz), sp); while(*sp) sp++;
-        *sp++ = ' '; *sp++ = 'V'; *sp++ = ':';
-        to_str((uint32_t)(g_time_vram_ticks * 1000 / tsc_hz), sp); while(*sp) sp++;
+        *sp++ = ' '; *sp++ = '('; *sp++ = 'B'; *sp++ = ':'; sp = hud_put_ms1(sp, g_snap_bg);
+        *sp++ = ' '; *sp++ = 'W'; *sp++ = ':'; sp = hud_put_ms1(sp, g_snap_win);
+        *sp++ = ' '; *sp++ = 'r'; *sp++ = ':'; sp = hud_put_ms1(sp, g_snap_rain);
+        *sp++ = ' '; *sp++ = 'L'; *sp++ = ':'; sp = hud_put_ms1(sp, g_snap_lock);
+        *sp++ = ' '; *sp++ = 'V'; *sp++ = ':'; sp = hud_put_ms1(sp, g_snap_vram);
+        {   // X = time inside wm_compose_dirty() that none of the B/W/V stage timers cover
+            uint64_t acc = g_snap_bg + g_snap_win + g_snap_vram;
+            uint64_t other = g_last_frame_ticks > acc ? g_last_frame_ticks - acc : 0;
+            *sp++ = ' '; *sp++ = 'X'; *sp++ = ':'; sp = hud_put_ms1(sp, other);
+        }
         *sp++ = ')'; *sp++ = ' ';
         *sp = '\0';
 
         // ── Build HUD string ────────────────────────────────────────────────
-        char cpu_msg[128];
+        char cpu_msg[HUD_MSG_CAP];
         char p1_str[8], tc_str[8], ut_str[8];
         to_str(g_cpu_usage_pct, p1_str);
         to_str(g_task_count, tc_str);
@@ -1572,6 +1677,8 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         p = " | Up:";  while(*p) *d++ = *p++;
         p = ut_str;   while(*p) *d++ = *p++;
         p = "s";      while(*p) *d++ = *p++;
+        p = " | ";    while(*p) *d++ = *p++;
+        p = g_gpu_status; while(*p && (d - cpu_msg) < (HUD_MSG_CAP - 2)) *d++ = *p++;
         *d = '\0';
 
         uint32_t msg_len = strlen(cpu_msg);
@@ -1601,7 +1708,7 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
     // Stage 3: Blit dirty rectangle to VRAM
     if (min_x > max_x || min_y > max_y) {
         vram_fence();
-        return;
+        return false;
     }
     uint32_t ptch = fb->pitch;
     uint32_t bw   = (max_x - min_x + 1) * 4;
@@ -1642,10 +1749,17 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
     if (max_x_aligned > fb->width) max_x_aligned = fb->width;
     uint32_t bw_aligned = (max_x_aligned - min_x_aligned) * 4;
 
-    for (uint32_t y = min_y; y <= max_y; y++) {
-        uint8_t* dst = (uint8_t*)fb->address + (uint64_t)y * ptch + (uint64_t)min_x_aligned * 4;
-        uint8_t* src = g_master_backbuffer   + (uint64_t)y * ptch + (uint64_t)min_x_aligned * 4;
-        memcpy_vram_sse_headless(dst, src, bw_aligned);
+    // GPU path: one blitter copy of the whole dirty rect (synchronous: returns after the
+    // fence, so the cursor restore below cannot race the blit). Falls back to the CPU
+    // loop if the hook is unset or the GPU reported a problem.
+    bool gpu_done = false;
+    if (g_gpu_flip_hook) gpu_done = g_gpu_flip_hook(min_x_aligned, min_y, max_x_aligned, max_y + 1);
+    if (!gpu_done) {
+        for (uint32_t y = min_y; y <= max_y; y++) {
+            uint8_t* dst = (uint8_t*)fb->address + (uint64_t)y * ptch + (uint64_t)min_x_aligned * 4;
+            uint8_t* src = g_master_backbuffer   + (uint64_t)y * ptch + (uint64_t)min_x_aligned * 4;
+            memcpy_vram_sse_headless(dst, src, bw_aligned);
+        }
     }
     __asm__ volatile("sfence" : : : "memory");
     t3 = rdtsc_val();
@@ -1653,6 +1767,8 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
     g_time_bg_ticks   = t1 - t0;
     g_time_win_ticks  = t2 - t1;
     g_time_vram_ticks = t3 - t2;
+    g_snap_bg = g_time_bg_ticks; g_snap_win = g_time_win_ticks; g_snap_rain = g_time_rain_ticks + g_client_render_ticks;
+    g_snap_lock = g_time_lock_ticks; g_snap_vram = g_time_vram_ticks;
 
     // ── Restore backbuffer cursor pixels ────────────────────────────────────
     // (master_backbuffer does not own cursor pixels; VRAM does)
@@ -1671,9 +1787,10 @@ static inline void wm_compose_dirty(uint32_t min_x, uint32_t max_x,
     // Ghost outlines are direct-VRAM-only (not baked into backbuffer).
     // NOTE: do NOT set ov_cx/ov_cy here — wm_overlay_update_unlocked needs
     // the OLD values to erase the previous cursor position from VRAM.
-    wm_overlay_update_unlocked(ccx, ccy, cmb);
+    if (do_overlay) wm_overlay_update_unlocked(ccx, ccy, cmb);
 
     __sync_lock_release(&g_vram_lock);
+    return do_overlay;
 }
 
 #endif // WM_H

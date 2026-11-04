@@ -108,6 +108,7 @@ extern uint64_t g_saved_user_rsp;
 #define SYS_WIN_SYNC      201u
 #define SYS_WIN_DESTROY   202u
 #define SYS_WIN_GET_BUFFER 203u
+#define SYS_WIN_DAMAGE     204u   // (win_id, x, y, w, h): part of the surface changed
 
 // ── string copying from user ──────────────────────────────────────────────────
 // For safety we should check if buf_va is within user limits.
@@ -267,8 +268,24 @@ static uint64_t sys_win_create(uint64_t title_va, uint64_t x, uint64_t y, uint64
 }
 
 // ── sys_win_sync ──────────────────────────────────────────────────────────────
+// Whole surface changed. (Before: only set g_needs_refresh, with NO dirty rect, so the compositor was never
+// told WHICH part of the screen to recompose.)
 static uint64_t sys_win_sync(uint64_t win_id) {
+    Window* win = wm_find_window((int)win_id);
+    if (win) wm_surface_damage_all(win);
     g_needs_refresh = true;
+    return 0;
+}
+
+// ── sys_win_damage ────────────────────────────────────────────────────────────
+// Partial update: only the given rectangle of the surface (surface coordinates) is recomposed.
+static uint64_t sys_win_damage(uint64_t win_id, uint64_t x, uint64_t y, uint64_t w, uint64_t h) {
+    if (x > 0x7FFFFFFFu || y > 0x7FFFFFFFu || w > 0x7FFFFFFFu || h > 0x7FFFFFFFu) return (uint64_t)-1;
+    Window* win = wm_find_window((int)win_id);
+    if (!win) return (uint64_t)-1;
+    wm_surface_damage(win, (int32_t)x, (int32_t)y,
+                      (int32_t)((x + w > 0x7FFFFFFFu) ? 0x7FFFFFFFu : x + w),
+                      (int32_t)((y + h > 0x7FFFFFFFu) ? 0x7FFFFFFFu : y + h));
     return 0;
 }
 
@@ -309,6 +326,7 @@ uint64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, ui
         case SYS_WIN_SYNC:   return sys_win_sync(a1);
         case SYS_WIN_DESTROY: return sys_win_destroy(a1);
         case SYS_WIN_GET_BUFFER: return sys_win_get_buffer(a1);
+        case SYS_WIN_DAMAGE: return sys_win_damage(a1, a2, a3, a4, a5);
         
         default:         return (uint64_t)-1;
     }

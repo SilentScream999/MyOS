@@ -4,12 +4,21 @@ LD=ld.lld
 
 LIMINE_BIN = limine/limine
 
-CFLAGS = -O0 -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
+# Optimization level for the KERNEL. Default is -O0.
+# Try:  rm -f src/*.o myos && make myos OPT=-O2
+OPT ?= -O0
+
+CFLAGS = $(OPT) -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
          -mno-red-zone -mcmodel=kernel -target x86_64-elf \
          -fno-builtin -fno-builtin-memset -fno-builtin-memcpy -fno-builtin-memmove \
          -fno-unwind-tables -fno-asynchronous-unwind-tables
 
-CXXFLAGS = $(CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -mno-red-zone
+# Intel GPU bring-up + self-test + benchmark at boot. OFF by default: on the Gen9 test laptop the CPU
+# copy (~0.3 ms) beats the GPU copy (~3 ms), and the self-test briefly draws test patterns on screen.
+# Developer use:  make clean && make GPU=1 iso
+GPU ?= 0
+
+CXXFLAGS = $(CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -mno-red-zone -DGPU_BRINGUP=$(GPU)
 
 LDFLAGS=-nostdlib -z max-page-size=0x1000
 
@@ -21,8 +30,11 @@ all: myos init.elf
 myos: $(OBJ) linker.ld
 	$(LD) $(LDFLAGS) -T linker.ld -o $@ $(OBJ)
 
+# Track header dependencies (wm.h, intel_gpu.h, ...) so editing a header rebuilds the kernel.
+-include $(OBJ:.o=.d)
+
 %.o: %.cpp
-	$(CXX) $(CXXFLAGS) -I. -c $< -o $@
+	$(CXX) $(CXXFLAGS) -MMD -MP -I. -c $< -o $@
 
 USER_CFLAGS = -O0 -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
               -mno-red-zone -target x86_64-elf -fno-builtin \
@@ -70,4 +82,4 @@ run: iso
 
 
 clean:
-	rm -rf iso_root $(OBJ) user/init.o myos myos.iso init.elf
+	rm -rf iso_root $(OBJ) $(OBJ:.o=.d) user/init.o myos myos.iso init.elf

@@ -18,6 +18,7 @@
 #include "exec.h"
 #include "graphics.h"
 #include "wm.h"
+#include "intel_gpu.h"
 
 __attribute__((used, section(".limine_requests")))
 static volatile LIMINE_BASE_REVISION(4);
@@ -277,9 +278,15 @@ volatile uint32_t g_dirty_min_y = 0xFFFFFFFF;
 volatile uint32_t g_dirty_max_y = 0;
 volatile uint32_t g_dirty_min_x = 0xFFFFFFFF;
 volatile uint32_t g_dirty_max_x = 0;
+DamageList g_damage;   // separate dirty rects; see damage.h
 
 // Phase 9: WM post-flip hook (set to wm_render_chrome once WM is active)
 post_flip_hook_fn g_post_flip_hook = nullptr;
+#ifndef GPU_BRINGUP
+#define GPU_BRINGUP 0   // set by the Makefile: make GPU=1
+#endif
+gpu_flip_hook_fn g_gpu_flip_hook = nullptr;
+char g_gpu_status[64] = "GPU:none";
 pre_flip_hook_fn  g_pre_flip_hook  = nullptr;
 static uint64_t last_mouse_flip_tsc = 0;
 
@@ -468,11 +475,11 @@ void compositor_thread_main() {
             g_needs_refresh = true;
 
             // Explicitly 'dirty' the HUD area (top-right strip)
-            uint32_t hud_left = fb->width > 400 ? fb->width - 400 : 0;
-            if (hud_left < g_dirty_min_x) g_dirty_min_x = hud_left;
-            if (fb->width > g_dirty_max_x) g_dirty_max_x = fb->width - 1;
-            if (0 < g_dirty_min_y) g_dirty_min_y = 0;
-            if (60 > g_dirty_max_y) g_dirty_max_y = 60;
+            // The HUD line can be up to HUD_MSG_CAP chars wide (8px each). A fixed-width strip would cover only the
+            // right-hand end (uptime) and leave the left part (CPU %) stale until the mouse moved.
+            uint32_t hud_px   = (uint32_t)HUD_MSG_CAP * 8 + 32;
+            uint32_t hud_left = fb->width > hud_px ? fb->width - hud_px : 0;
+            wm_dirty_add(hud_left, fb->width - 1, 0, 60);   // its own rect, not unioned with whatever else is dirty
         }
 
         if (g_needs_refresh || boot_sync_frames > 0) {
@@ -491,38 +498,68 @@ void compositor_thread_main() {
 
             if (rain_win) {
                 rain_scroll += 4;
-                WinRect r; wm_get_win_rect(rain_win, &r);
-                if (r.x1 >= 0 && (uint32_t)r.x1 < g_dirty_min_x) g_dirty_min_x = (uint32_t)r.x1;
-                if (r.x2 >= 0 && (uint32_t)r.x2 > g_dirty_max_x) g_dirty_max_x = (uint32_t)r.x2;
-                if (r.y1 >= 0 && (uint32_t)r.y1 < g_dirty_min_y) g_dirty_min_y = (uint32_t)r.y1;
-                if (r.y2 >= 0 && (uint32_t)r.y2 > g_dirty_max_y) g_dirty_max_y = (uint32_t)r.y2;
+                wm_rain_render(rain_win);   // client draws its surface + reports damage; compositor stays generic
             }
 
             __asm__ volatile("cli");
-            uint32_t fx1 = g_dirty_min_x, fx2 = g_dirty_max_x;
-            uint32_t fy1 = g_dirty_min_y, fy2 = g_dirty_max_y;
-            g_dirty_min_y = fb->height; g_dirty_max_y = 0;
-            g_dirty_min_x = fb->width;  g_dirty_max_x = 0;
-            __asm__ volatile("sti");
+			uint32_t fx1 = g_dirty_min_x, fx2 = g_dirty_max_x;
+			uint32_t fy1 = g_dirty_min_y, fy2 = g_dirty_max_y;
+			g_dirty_min_y = fb->height; g_dirty_max_y = 0;
+			g_dirty_min_x = fb->width;  g_dirty_max_x = 0;
+			// Take the rect list atomically with the legacy box. Copied field by field on purpose: a struct
+			// assignment makes the compiler emit a call to an external memcpy, which this kernel does not export.
+			DamageList frame_dmg;
+			frame_dmg.n = g_damage.n;
+			for (uint32_t di = 0; di < g_damage.n; di++) {
+				frame_dmg.r[di].x1 = g_damage.r[di].x1; frame_dmg.r[di].y1 = g_damage.r[di].y1;
+				frame_dmg.r[di].x2 = g_damage.r[di].x2; frame_dmg.r[di].y2 = g_damage.r[di].y2;
+			}
+			damage_clear(&g_damage);
+			__asm__ volatile("sti");
 
-            if (boot_sync_frames > 0) {
-                fx1 = 0; fx2 = fb->width - 1;
-                fy1 = 0; fy2 = fb->height - 1;
-                boot_sync_frames--;
-            }
-            
-            if (rain_win) {
-                WinRect r; wm_get_win_rect(rain_win, &r);
-                if (r.x1 >= 0 && (uint32_t)r.x1 < fx1) fx1 = (uint32_t)r.x1;
-                if (r.x2 >= 0 && (uint32_t)r.x2 > fx2) fx2 = (uint32_t)r.x2;
-                if (r.y1 >= 0 && (uint32_t)r.y1 < fy1) fy1 = (uint32_t)r.y1;
-                if (r.y2 >= 0 && (uint32_t)r.y2 > fy2) fy2 = (uint32_t)r.y2;
-            }
+			if (boot_sync_frames > 0) {
+				fx1 = 0; fx2 = fb->width - 1;
+				fy1 = 0; fy2 = fb->height - 1;
+				frame_dmg.n = 0;               // a full-screen compose covers every listed rect
+				boot_sync_frames--;
+			}
 
-            uint64_t t_start = rdtsc();
-            wm_compose_dirty(fx1, fx2, fy1, fy2);
-            uint64_t t_end = rdtsc();
-            g_last_frame_ticks = t_end - t_start;
+			// Compose each damaged region separately (HUD strip, animation, cursor ... are not
+			// merged into one giant box). The legacy box counts as one more rect when something wrote to it.
+			uint64_t t_start = rdtsc();
+			if (!g_pause_compositor) {
+				bool box_valid = (fx1 <= fx2 && fy1 <= fy2);
+				uint32_t total = frame_dmg.n + (box_valid ? 1u : 0u);
+				bool overlay_done = false;
+				uint64_t a_bg = 0, a_win = 0, a_rain = 0, a_lock = 0, a_vram = 0;
+				if (total == 0) {
+					// Nothing damaged (e.g. the mouse only moved): the compose call
+					// with an empty box runs the cursor / ghost-outline overlay update.
+					if (wm_compose_dirty(fx1, fx2, fy1, fy2, true)) overlay_done = true;
+					a_bg += g_time_bg_ticks; a_win += g_time_win_ticks; a_rain += g_time_rain_ticks;
+					a_lock += g_time_lock_ticks; a_vram += g_time_vram_ticks;
+				} else {
+					uint32_t idx = 0;
+					for (uint32_t i = 0; i < frame_dmg.n; i++, idx++) {
+						bool last = (idx == total - 1);
+						if (wm_compose_dirty(frame_dmg.r[i].x1, frame_dmg.r[i].x2, frame_dmg.r[i].y1, frame_dmg.r[i].y2, last)) overlay_done = true;
+						a_bg += g_time_bg_ticks; a_win += g_time_win_ticks; a_rain += g_time_rain_ticks;
+						a_lock += g_time_lock_ticks; a_vram += g_time_vram_ticks;
+					}
+					if (box_valid) {
+						if (wm_compose_dirty(fx1, fx2, fy1, fy2, true)) overlay_done = true;   // always the last one
+						a_bg += g_time_bg_ticks; a_win += g_time_win_ticks; a_rain += g_time_rain_ticks;
+						a_lock += g_time_lock_ticks; a_vram += g_time_vram_ticks;
+					}
+				}
+				// Safety net: the overlay (cursor, ghost outlines) must run exactly once per frame.
+				if (!overlay_done) wm_overlay_update(g_mouse_x, g_mouse_y, g_mouse_buttons);
+				// HUD shows the whole frame, not just the last rect.
+				g_snap_bg = a_bg; g_snap_win = a_win; g_snap_rain = a_rain + g_client_render_ticks;
+				g_snap_lock = a_lock; g_snap_vram = a_vram;
+			}
+			uint64_t t_end = rdtsc();
+			g_last_frame_ticks = t_end - t_start;
 
 			// signal the splash to exit after the first frame lands
             if (!g_desktop_ready) g_desktop_ready = true;
@@ -554,6 +591,7 @@ extern "C" void kmain(void) {
 	if (!fb_req.response || fb_req.response->framebuffer_count < 1) hcf();
 
 	fb = fb_req.response->framebuffers[0];
+	print_fb_pixel_format(); // confirm channel layout before trusting any hardcoded ARGB constant
 
     // --- SSE & SIMD Enablement (CR0, CR4) ---
     {
@@ -653,7 +691,12 @@ extern "C" void kmain(void) {
             memset(g_backbuffer, 0, g_term_buf_height * fb->pitch);
         }
 
-        g_master_backbuffer = (uint8_t*)kmalloc(fb->height * fb->pitch);
+        // Page-aligned: the GPU maps this buffer page-by-page into the GGTT and the PRM
+        // requires 64-byte-aligned linear surface bases. kmalloc only guarantees 16 bytes.
+        {
+            uint8_t* mb_raw = (uint8_t*)kmalloc((uint64_t)fb->height * fb->pitch + 4096);
+            g_master_backbuffer = mb_raw ? (uint8_t*)(((uint64_t)mb_raw + 4095) & ~4095ULL) : nullptr;
+        }
         if (g_master_backbuffer) {
             memset(g_master_backbuffer, 0, fb->height * fb->pitch);
             
@@ -776,7 +819,9 @@ extern "C" void kmain(void) {
 		uint64_t ecam_size = (uint64_t)(end - start + 1) * 0x100000ULL;
 		uint64_t virt_base = PCI_ECAM_VA_BASE + (uint64_t)seg * PCI_ECAM_SEG_STRIDE;
 		map_ecam_region(phys_base, virt_base, ecam_size);
-		print((char*)"Mapped...");
+        find_intel_gpu(virt_base, start, start, end);
+        if (g_igpu.found) map_intel_gpu_mmio();
+        print((char*)"Mapped...");
 
 		for (uint16_t bus = start; bus <= end; bus++) {
 			for (uint8_t dev = 0; dev < 32; dev++) {
@@ -812,6 +857,15 @@ extern "C" void kmain(void) {
 				}
 			}
 		}
+	}
+	if (g_igpu.found) {
+		// Full bring-up + self-test (fill, copy, 64x backbuffer flip). Never halts: on any
+		// failure the compositor simply keeps using the CPU copy path.
+#if GPU_BRINGUP
+		if (gpu_bringup() && g_gpu_flip_preferred) g_gpu_flip_hook = gpu_flip_rect;
+#else
+		gpu_status_set("GPU:off");   // found, but not initialised (see Makefile: GPU=1)
+#endif
 	}
 
 	if (xhci_count == 0) { print((char*)"Could not find any xHCI USB controller!"); hcf(); }

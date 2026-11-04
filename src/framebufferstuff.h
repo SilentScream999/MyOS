@@ -5,6 +5,7 @@
 #include "font8x8_basic.h"
 #include "string.h"
 #include "klog.h"
+#include "damage.h"
 
 extern "C" {
     #include "../limine.h"
@@ -22,6 +23,15 @@ extern int32_t g_term_oy;        // terminal window Y offset
 extern uint32_t g_term_max_cols;  // terminal character width
 extern uint32_t g_term_max_rows;  // terminal row height
 extern volatile bool g_needs_refresh;
+extern DamageList g_damage;     // separate dirty rects (see damage.h); the g_dirty_* box still exists for legacy writers
+
+// Mark a screen region dirty (min/max convention, same as the compositor). Interrupt-safe.
+static inline void wm_dirty_add(uint32_t min_x, uint32_t max_x, uint32_t min_y, uint32_t max_y) {
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    if (fb) damage_add_clipped(&g_damage, fb->width, fb->height, min_x, max_x, min_y, max_y);
+    if (flags & (1u << 9)) __asm__ volatile("sti" ::: "memory");
+}
 static inline void wm_dirty_chrome() { g_needs_refresh = true; }
 
 
@@ -39,10 +49,7 @@ static inline void term_dirty_rect(int32_t x1, int32_t y1, int32_t x2, int32_t y
     if (uy1 > fb->height) uy1 = fb->height;
     if (uy2 > fb->height) uy2 = fb->height;
 
-    if (ux1 < g_dirty_min_x) g_dirty_min_x = ux1;
-    if (ux2 > g_dirty_max_x) g_dirty_max_x = ux2;
-    if (uy1 < g_dirty_min_y) g_dirty_min_y = uy1;
-    if (uy2 > g_dirty_max_y) g_dirty_max_y = uy2;
+    wm_dirty_add(ux1, ux2, uy1, uy2);   // was: union into the single global box
 }
 
 static inline void term_dirty_all() {
@@ -75,6 +82,13 @@ static inline void term_dirty_reset() {
 // Used by the WM to paint title bar chrome without touching the backbuffer.
 typedef void (*post_flip_hook_fn)();
 extern post_flip_hook_fn g_post_flip_hook;
+
+// GPU flip hook: if set, wm_compose_dirty() asks the GPU to copy the dirty rect from
+// g_master_backbuffer to the screen. Returns true on success; false => CPU fallback.
+typedef bool (*gpu_flip_hook_fn)(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2);
+extern gpu_flip_hook_fn g_gpu_flip_hook;
+// Short GPU status shown in the HUD (benchmark result / which copy path is active).
+extern char g_gpu_status[64];
 
 // Pre-flip hook: called before every VRAM update.
 // Used by the WM to erase transient overlays (like the mouse pointer).

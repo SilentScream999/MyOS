@@ -1,280 +1,147 @@
-RUN IT AND FIND OUT!
+# MyOS
 
+A hobby 64-bit x86 operating system: C++ kernel, C userspace, booted by [Limine](https://github.com/limine-bootloader/limine).
+It has a framebuffer desktop (window manager, CPU compositor, taskbar, mouse cursor), USB (xHCI) and PS/2 input,
+preemptive multitasking, an ELF loader and a ring-3 shell.
 
-You will need WSL on Windows. Install it with Ubuntu-22.04 for the best outcome.
+*Last updated: 2026-11-02.* New here? Start with **[docs/AI_HANDOFF.md](docs/AI_HANDOFF.md)** for the current status, conventions and known issues.
 
-This project depends on Qemu, Xorriso, Make, and Clang++
-
-It is recommended that you work on this project using CodeWizard2 (Available at https://github.com/AdamJosephMather/CodeWizard2)
-
-**Important**: Limine is a little silly (We didn't link it properly) so we might link our own repo for usage with this OS or we'll fix it to link the official distro, depending on how we feel!
-
-
-Note:
-	
-	To get limine working, make sure to clone the BINARY branch into the limine folder! 
-	
-	Ex: git clone https://github.com/limine-bootloader/limine.git --branch=v11.1.0-binary --depth=1
-
-
-# 🧠 OS Development Roadmap (x86_64 Limine Kernel)
-
-## 🎯 Project Goal
-
-Build a modular 64-bit operating system kernel with:
-
-* hardware abstraction layer
-* memory management
-* multitasking (processes + scheduler)
-* syscall interface
-* ELF userspace execution
-* VFS + filesystem
-* eventual userspace terminal + shell
-
-Framebuffer output is already working and used for early debugging.
+The long-term goal is a **Windows-like, GPU-composited desktop**. Where we are on that road, and what comes next, is in
+[docs/GPU_DESKTOP_ROADMAP.md](docs/GPU_DESKTOP_ROADMAP.md). How programs should be started (instead of being hard-coded) is in
+[docs/APP_LOADING.md](docs/APP_LOADING.md).
 
 ---
 
-# 🟢 CURRENT STATUS (COMPLETED / IN PROGRESS)
+## Quick start
 
-### Boot & Output
+You need WSL on Windows (Ubuntu 22.04 works well) with `make`, `clang`, `clang++`, `ld.lld`, `xorriso` and `qemu-system-x86_64`.
+The Makefile calls `clang`, `clang++` and `ld.lld` directly.
 
-* [x] Limine bootloader integration
-* [x] 64-bit long mode kernel
-* [x] Framebuffer initialization
-* [x] On-screen debug output system
+**Limine:** clone the *binary* branch into the `limine/` folder:
 
-### Input
+    git clone https://github.com/limine-bootloader/limine.git --branch=v11.1.0-binary --depth=1 limine
 
-* [x] USB keyboard input via XHCI
+**Build and run**
 
----
+    make clean && make iso          # builds myos, init.elf and myos.iso
+    make run                        # QEMU (needs OVMF.fd in the project root; it is not in the repo)
 
-# 🔵 PHASE 1 — CPU + INTERRUPTS FOUNDATION
+QEMU has **no Intel GPU**, so anything GPU-related (the `GPU:` boot-log lines and the HUD GPU status) can only be tested by booting
+`myos.iso` on real hardware. Our test machine is an Intel Gen9 laptop (Skylake/Kaby Lake class, HD 620).
 
-## CPU Identification + Setup
+**Build options** (pass them on the build command, and run `make clean` when you change them):
 
-* [ ] CPUID implementation
-* [ ] CPU feature detection (SSE, APIC, etc.)
-* [ ] Per-core CPU info struct
-* [ ] Validate long mode and paging features
+| Option | Default | Meaning |
+|---|---|---|
+| `OPT=-O2` | `-O0` | Kernel optimisation level. `-O2` compiles and links but has **not** been run on hardware; test it on its own. |
+| `GPU=1` | `0` | Run the Intel GPU bring-up, self-test and benchmark at boot (briefly paints test squares). Off by default because the CPU copy is currently faster. |
 
-## GDT (Global Descriptor Table)
-
-* [x] 64-bit flat GDT setup
-* [x] Kernel + user segment preparation (ring 0 / ring 3)
-
-## IDT (Interrupt Descriptor Table)
-
-* [x] IDT setup
-
-* [x] Exception handlers:
-
-  * [x] Divide by zero
-  * [x] General protection fault
-  * [x] Page fault
-  * [x] Invalid opcode
-  * [x] Double fault
-
-* [x] Kernel panic system with framebuffer output
-
-## IRQ + Interrupt Handling
-
-* [x] IRQ remapping (PIC or APIC)
-* [x] Interrupt dispatcher system
-* [x] Pluggable IRQ handler system
-
-## Timer System
-
-* [x] PIT or APIC timer setup
-* [x] Global tick counter
-* [x] Basic sleep/delay functions
----
-
-# 🧠 PHASE 2 — MEMORY MANAGEMENT
-
-## Physical Memory Manager (PMM)
-
-* [x] Parse Limine memory map
-* [x] Frame allocator (bitmap or stack)
-* [x] alloc_frame / free_frame
-
-## Virtual Memory Manager (VMM)
-
-* [x] Page table manager (4-level paging)
-* [x] map_page / unmap_page
-* [x] Kernel heap region setup
-* [x] User vs kernel memory separation prep
-
-## Kernel Heap
-
-* [x] kmalloc / kfree
-* [x] bump allocator → slab allocator later
-* [x] Heap built on VMM
+The Makefile tracks header dependencies (`.d` files), so editing a header rebuilds the kernel. It does **not** notice changes to build
+options, hence the `make clean`.
 
 ---
 
-# 🟣 PHASE 3 — PROCESS SYSTEM
+## What works today
 
-## Task Model
+* **Boot:** Limine, 64-bit long mode, framebuffer, SSE enabled, on-screen kernel log (`print()` feeds a 64 KB log buffer, readable as `/bootlog.txt` and in the Boot Log window).
+* **CPU/interrupts:** GDT + TSS, IDT with naked stubs, 8259 PIC remap, PIT tick, TSC-based frame pacing.
+* **Memory:** Limine memory map, physical frame allocator, 4-level paging, higher-half direct map, growable kernel heap (`kmalloc`/`kfree`), per-process address spaces.
+* **Tasks:** PCB, context switch, round-robin **single-core** preemptive scheduler. Other cores are detected but never started.
+* **Syscalls:** `syscall`/`sysret` entry and a small dispatcher (table below).
+* **Userspace:** ELF64 loader (`execve_memory`) and ring-3 transition. The only user program is the shell (`user/init.c` -> `init.elf`), loaded from a Limine module at boot.
+* **Filesystem:** VFS layer plus an in-memory ramfs, currently holding `/bootlog.txt` and `/wallpaper.raw`.
+* **Terminal:** TTY with line discipline, framebuffer terminal emulator (ANSI subset), shell with history, scrollback and live command highlighting.
+* **Input:** xHCI USB (Intel port-routing support plus an AMD quirk workaround, hubs, connect detection), USB HID keyboard and mouse, PS/2 keyboard, Synaptics touchpad over PS/2 (see `src/SynapticsGuide.md`).
+* **Platform:** ACPI (shutdown/reboot), PCI ECAM mapping and enumeration.
+* **Desktop:** window manager with z-order, drag (ghost outline), close buttons, taskbar, HUD, wallpaper, mouse cursor.
+* **Compositor:** surface-backed windows, a damage-rect list, and the rainbow animation as a surface client (see below).
+* **Intel GPU (Gen9):** PCI discovery, MMIO + GGTT mapping, forcewake/reset, blitter (BCS) ring with fill/copy and a fence. The self-test and benchmark have run on our laptop, but the path is **off by default** (slower than the CPU copy).
 
-* [x] PCB (PID, registers, stack, state, page table)
+### How a frame is drawn
 
-## Context Switching
+The compositor thread (`compositor_thread_main` in `src/kernel.cpp`) runs at roughly 60 Hz on a TSC cadence. Each frame:
 
-* [x] Save/restore CPU state
-* [x] Stack switching
-* [x] CR3 switching
+1. Clients update their **surfaces** and report **damage** (`wm_surface_damage*`). The Rainbow and Visual Test windows are surface clients, as are user windows. Up to 8 separate dirty rects are tracked (`src/damage.h`); some writers still use one global box.
+2. For each damaged rect, `wm_compose_dirty()` (`src/wm.h`) builds the scene in the master backbuffer: Stage 1 wallpaper, Stage 2 windows back to front (chrome plus surface copy; **Terminal and Boot Log are still special-cased branches**), 2.5 taskbar, 2.6/2.7 RAM/CPU readouts.
+3. Stage 3 copies the rect to VRAM with the CPU (SSE non-temporal stores). An optional GPU-blitter hook exists but is only enabled if the boot benchmark shows it is faster.
+4. The cursor and drag-outline overlay is drawn **directly onto VRAM, once, after the last flip** of the frame.
 
-## Scheduler
+Conventions that are easy to get wrong: Stage 2 treats `max_y` as **exclusive**, while Stage 1 and the flip are **inclusive**. `wm_surface_damage()` converts for that reason.
 
-* [x] Round-robin scheduler (single core first)
-* [x] Task queue system
-* [x] Timer-driven scheduling (later)
+**HUD (top right):** `F:4.0ms (B:1.9 W:0.9 r:0.9 L:0.9 V:0.3 X:3.0)`. F is the whole `wm_compose_dirty()`; B background; W windows; V copy to screen; r time the rainbow client spent drawing (outside F); L lock wait; X time in the frame that B/W/V do not cover. `T:` is the number of tasks. The tail shows the GPU status (`GPU:off`, `GPU:none`, ...).
 
----
+### Syscalls
 
-# 🟠 PHASE 4 — SYSCALLS
+Convention: `rax` = number, arguments in `rdi, rsi, rdx, r10, r8`, result in `rax`.
 
-## Syscall Interface
+| # | Name | Notes |
+|---|---|---|
+| 0 / 1 / 2 / 3 | `READ` / `WRITE` / `OPEN` / `CLOSE` | fd 0/1 are the TTY; files go through the VFS |
+| 16 / 17 | `SCROLL` / `TTYRAW` | terminal scrollback, raw input mode |
+| 39 / 60 | `GETPID` / `EXIT` | the exit code is currently ignored |
+| 88 / 169 | `SHUTDOWN` / `REBOOT` | |
+| 200 | `WIN_CREATE(title, x, y, w, h)` | returns a window id; see `APIDocs/WindowAPI.md` for current problems |
+| 201 | `WIN_SYNC(id)` | damages the whole surface |
+| 202 | `WIN_DESTROY(id)` | |
+| 203 | `WIN_GET_BUFFER(id)` | returns the surface pointer (**see known issues**) |
+| 204 | `WIN_DAMAGE(id, x, y, w, h)` | partial update |
 
-* [x] syscall/sysret entry
-* [x] syscall dispatcher
-
-## Minimal Syscalls
-
-* [x] sys_write
-* [x] sys_exit
-* [x] sys_getpid
-
-## User Mode Prep
-
-* [x] Ring 3 transition
-* [x] User stack setup
-
----
-
-# 🟡 PHASE 5 — VFS + FILESYSTEM
-
-## VFS
-
-* [ ] open / read / write / close abstraction
-* [ ] path resolution
-
-## Ramdisk FS
-
-* [ ] in-memory filesystem backend
-
-## Future FS
-
-* [ ] ext2 or custom filesystem
-
-# 🔴 PHASE 6 — ELF LOADER + USERSPACE [COMPLETED]
-  
-* [x] ELF64 parsing
-* [x] segment mapping
-* [x] entry execution
-* [x] execve-style loading
-* [x] user address space setup
-* [x] Ring 3 transition (IRETQ/SYSRETQ stable)
-* [x] first init program running and using syscalls
+There is **no** spawn/exec, wait, directory listing, stat or input-event syscall yet.
 
 ---
 
-# 🟤 PHASE 7 — TERMINAL & TTY [COMPLETED]
+## Source map
 
-## Kernel TTY
-
-* [x] /dev/tty abstraction (tty.h buffer & line discipline)
-* [x] input buffer system handling USB scancodes
-
-## Userspace Terminal
-
-* [x] framebuffer terminal emulator (terminal.h)
-* [x] reads from TTY (via updated sys_read)
-* [x] ANSI escape sequence support (\e[2J, \e[H)
-* [x] Margin support to prevent screen clipping
-
-## Shell
-
-* [x] command parser (in user/init.c)
-* [x] program execution (future/execve)
-* [x] basic built-ins (clear, exit/disabled, shutdown)
-
----
-
-# 🟢 PHASE 8 — DEVICE DRIVERS & KERNEL POLISH [COMPLETED]
-
-## Persistent Terminal & Kernel Logging
-
-* [x] Terminal loads independently of keyboard connection
-* [x] All hardware/kernel `print()` logs redirected to `bootlog.txt`
-* [x] `open bootlog` command to view logs in the shell
-
-## Input
-
-* [x] USB keyboard (XHCI working, hub support, arrow keys, key repeat)
-* [x] Raw mode TTY (`SYS_TTYRAW`) for interactive line input
-* [ ] input event system abstraction
-
-## Rendering Engine (Speed King)
-
-* [x] 64KB circular kernel log buffer
-* [x] Double-buffering with backbuffer + dirty-line tracking
-* [x] SSE non-temporal store acceleration (MOVNTDQ)
-* [x] Sub-millisecond partial screen flips
-
-## Shell UX
-
-* [x] Underscore cursor (VRAM-transient, no ghost artifacts)
-* [x] Command history (Up/Down arrows)
-* [x] Shift+Arrow hardware scrollback
-* [x] Green command highlighting (real-time, pre-Enter)
+| Path | What it is |
+|---|---|
+| `src/kernel.cpp` | `kmain`, boot sequence, compositor thread, input glue, starts `init.elf` |
+| `src/wm.h` | window manager and CPU compositor, HUD, taskbar, wallpaper |
+| `src/framebufferstuff.h`, `src/damage.h`, `src/surface.h` | dirty tracking; damage rect list and surface helpers (pure, no kernel dependencies) |
+| `src/graphics.h`, `src/font8x8_basic.h` | render-target abstraction, bitmap font |
+| `src/terminal.h`, `src/tty.h`, `src/klog.h` | terminal emulator, TTY line discipline, kernel log |
+| `src/syscall.h`, `src/exec.h`, `src/elf.h` | syscall entry/dispatch, ELF loader |
+| `src/task.h`, `src/scheduler.h` | PCB, scheduler |
+| `src/pagingstuff.h`, `src/heap.h`, `src/structures.h`, `src/helpers.h`, `src/string.h` | memory management and utilities |
+| `src/gdt.h`, `src/idt.h`, `src/irq.h`, `src/timer.h`, `src/acpi.h` | CPU tables, interrupts, timers, ACPI |
+| `src/usbhelpers.h`, `src/mouse.h`, `src/ps2kb.h`, `src/synaptics.h` | xHCI/USB HID, mouse state and cursor, PS/2 keyboard, touchpad |
+| `src/vfs.h`, `src/ramfs.h` | VFS and ramdisk |
+| `src/intel_gpu.h`, `src/gpu_cmds.h` | Intel Gen9 kernel glue; command/ring encoding (pure, no kernel dependencies) |
+| `user/init.c` | the shell (the only program built into the ISO) |
+| `user/win_test.c` | window API demo; **not built by the Makefile** and nothing can launch it yet |
+| `tools/` | image conversion scripts |
+| `APIDocs/WindowAPI.md` | window syscall documentation |
+| `docs/` | handoff, GPU roadmap, app-loading design |
 
 ---
 
-# 🖥️ PHASE 9 — VISUAL DESKTOP
+## Known gaps and issues
 
-The next big milestone: a real graphical desktop environment running on top of our kernel.
+Details, with file pointers, are in [docs/AI_HANDOFF.md](docs/AI_HANDOFF.md). In short:
 
-## Window Manager
-
-* [ ] Framebuffer surface / canvas abstraction
-* [ ] Draggable window regions with title bars
-* [ ] Z-order layering (front/back window management)
-* [ ] Mouse input (USB HID mouse driver)
-
-## UI Rendering
-
-* [ ] Filled rectangle + rounded corner primitives
-* [ ] Font rendering at multiple sizes
-* [ ] Icon/sprite blitting system
-* [ ] Desktop wallpaper / background
-
-## Desktop Shell
-
-* [ ] Taskbar with clock and running app list
-* [ ] Right-click context menu
-* [ ] App launcher / start menu
-* [ ] File browser (backed by VFS)
-
-## First Apps
-
-* [ ] Terminal emulator window (port existing TTY shell)
-* [ ] Simple text editor
-* [ ] System info viewer
+* **Apps are hard-coded.** Terminal, Visual Test, Rainbow and Boot Log are created in `wm_init`; the Start button only prints "coming soon". Nothing can start a second user program.
+* **Not safe for more than one user process yet:** the syscall entry path uses one global saved-RSP slot and one shared kernel stack.
+* **The user window API probably cannot work from ring 3 as written** (it returns a kernel heap pointer; no ownership; no input events). It has not been exercised end to end.
+* **No per-pixel alpha** anywhere in the compositor.
+* **Tearing and cursor flicker are unresolved.** The cause has not been established; see the roadmap.
+* **USB:** a failing device (for example a boot drive that fails descriptor reads) plugged in during the root-port scan can starve HID descriptor reads on other ports. Plug it in once the system has settled. Related wish: detect which USB device is the boot drive.
 
 ---
 
-# 🔮 FUTURE REFERENCE — Lower-Level Infrastructure
+## Roadmap
 
-* [ ] Device Drivers (PCI/SATA/NVMe)
-* [ ] More syscalls (open, close, fork, waitpid)
-* [ ] Proper VFS with real storage backing
-* [ ] Dynamic Memory Management improvements
+Ordered by dependency. Each step should be bootable and testable on its own.
 
-## Graphics / IO (Remaining)
+1. Make **every** window surface-backed (Terminal, Boot Log), then delete the special-case compositor branches.
+2. **Multi-process safety, spawn/exec, app discovery** (`/apps`, manifests). See `docs/APP_LOADING.md`.
+3. **Window API v2:** owner process, user-mapped surfaces, input events, cleanup on exit.
+4. **CPU compositor features:** alpha, shadows, retained layers.
+5. **Display control:** hardware cursor plane, then page flipping at vblank.
+6. **GPU:** memory manager, interrupts, render engine, then a client API.
 
-* [ ] framebuffer abstraction layer
-* [ ] PCI enumeration
-* [ ] storage drivers (SATA/NVMe later)
+---
+
+## Notes
+
+* Recommended editor: [CodeWizard2](https://github.com/AdamJosephMather/CodeWizard2).
+* The `limine/` folder should be the official *binary* branch. (We may later link our own repo instead.)
+* Build artifacts (`myos`, `myos.iso`, `init.elf`, `*.o`, `iso_root/`) and the large `.raw` images are currently tracked in git; a `.gitignore` is recommended.
