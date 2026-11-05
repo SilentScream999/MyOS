@@ -56,25 +56,37 @@ void ps2kb_irq_handler() {
     if (scancode == 0x38) { ps2_alt_held = true; return; }
     if (scancode == 0xB8) { ps2_alt_held = false; return; }
 
+    uint32_t mods = (ps2_ctrl_held ? WIN_MOD_CTRL : 0) |
+                    (ps2_shift_held ? WIN_MOD_SHIFT : 0) |
+                    (ps2_alt_held ? WIN_MOD_ALT : 0);
+    g_kbd_modifiers = mods;
+
     // Arrow Keys (Set 1 scancodes: 0x48=Up, 0x50=Down, 0x4B=Left, 0x4D=Right)
-    if (scancode == 0x48) { // Up
-        if (ps2_ctrl_held)       wm_log_scroll(-1);
-        else if (ps2_shift_held) term_scroll_view(-1);
-        else { tty_input('\x1b'); tty_input('['); tty_input('A'); }
-        return;
-    }
-    if (scancode == 0x50) { // Down
-        if (ps2_ctrl_held)       wm_log_scroll(1);
-        else if (ps2_shift_held) term_scroll_view(1);
-        else { tty_input('\x1b'); tty_input('['); tty_input('B'); }
-        return;
-    }
-    if (scancode == 0x4B) { // Left
-        tty_input('\x1b'); tty_input('['); tty_input('D');
-        return;
-    }
-    if (scancode == 0x4D) { // Right
-        tty_input('\x1b'); tty_input('['); tty_input('C');
+    if (scancode == 0x48 || scancode == 0x50 || scancode == 0x4B || scancode == 0x4D) {
+        Window* focused = wm_find_window(g_focused_win_id);
+        if (focused && focused->is_system && focused->type == WIN_TYPE_TERM) {
+            if (ps2_shift_held && scancode == 0x48)      term_scroll_view(-1);
+            else if (ps2_shift_held && scancode == 0x50) term_scroll_view(1);
+            else {
+                tty_input('\x1b'); tty_input('[');
+                if (scancode == 0x48)      tty_input('A');
+                else if (scancode == 0x50) tty_input('B');
+                else if (scancode == 0x4D) tty_input('C');
+                else if (scancode == 0x4B) tty_input('D');
+            }
+        } else if (focused && focused->is_system && focused->type == WIN_TYPE_LOG) {
+            if (scancode == 0x48) wm_log_scroll(-1);
+            else if (scancode == 0x50) wm_log_scroll(1);
+        } else if (focused && !focused->is_system) {
+            WinEvent ev;
+            ev.type = WIN_EVENT_KEY_DOWN;
+            ev.x = 0; ev.y = 0;
+            char arrow_ch = (scancode == 0x48 ? 'A' : (scancode == 0x50 ? 'B' : (scancode == 0x4D ? 'C' : 'D')));
+            ev.key = 0x1000 + arrow_ch;
+            ev.mods = mods;
+            ev.delta = 0;
+            wm_win_push_event(focused, ev);
+        }
         return;
     }
 
@@ -83,7 +95,7 @@ void ps2kb_irq_handler() {
 
     if (scancode < (uint8_t)sizeof(ps2_set1_map)) {
         char c = ps2_shift_held ? ps2_set1_shift_map[scancode] : ps2_set1_map[scancode];
-        if (c) tty_input(c);
+        wm_dispatch_key(c, scancode, true, mods);
     }
 }
 

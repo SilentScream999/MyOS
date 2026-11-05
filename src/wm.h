@@ -54,6 +54,30 @@ static char* hud_put_ms1(char* sp, uint64_t ticks) {
     return sp;
 }
 
+#define WIN_MOD_CTRL  (1u << 0)
+#define WIN_MOD_SHIFT (1u << 1)
+#define WIN_MOD_ALT   (1u << 2)
+#define WIN_MOD_GUI   (1u << 3)
+
+#define WIN_EVENT_NONE         0u
+#define WIN_EVENT_MOUSE_DOWN   1u
+#define WIN_EVENT_MOUSE_UP     2u
+#define WIN_EVENT_MOUSE_MOVE   3u
+#define WIN_EVENT_MOUSE_SCROLL 4u
+#define WIN_EVENT_KEY_DOWN     5u
+#define WIN_EVENT_KEY_UP       6u
+
+struct WinEvent {
+    uint32_t type;    // WIN_EVENT_*
+    int32_t  x;       // client-relative x
+    int32_t  y;       // client-relative y
+    uint32_t key;     // ASCII or scancode / button (1=L, 2=R, 4=M)
+    uint32_t mods;    // WIN_MOD_*
+    int32_t  delta;   // scroll dy (+1 or -1)
+};
+
+#define WIN_EVENT_QUEUE_SIZE 64
+
 struct Window {
     int id;
     char title[64];
@@ -74,6 +98,11 @@ struct Window {
     int32_t drag_off_x, drag_off_y;
     int32_t last_ghost_fx, last_ghost_fy, last_ghost_fw, last_ghost_fh;
     bool last_ghost_active;
+
+    // Per-window event queue
+    WinEvent event_queue[WIN_EVENT_QUEUE_SIZE];
+    uint32_t event_head;
+    uint32_t event_tail;
 };
 
 #define USER_WIN_BASE   0x0000600000000000ULL
@@ -87,6 +116,28 @@ static Window* g_win_terminal = nullptr;
 static Window* g_win_log = nullptr;
 static Window* g_win_test = nullptr;
 static Window* g_win_rain = nullptr;
+
+static int      g_focused_win_id = -1;
+static uint32_t g_kbd_modifiers = 0;
+
+static inline bool wm_win_push_event(Window* win, const WinEvent& ev) {
+    if (!win) return false;
+    uint32_t next_head = (win->event_head + 1) % WIN_EVENT_QUEUE_SIZE;
+    if (next_head == win->event_tail) {
+        win->event_tail = (win->event_tail + 1) % WIN_EVENT_QUEUE_SIZE;
+    }
+    win->event_queue[win->event_head] = ev;
+    win->event_head = next_head;
+    return true;
+}
+
+static inline bool wm_win_pop_event(Window* win, WinEvent* out_ev) {
+    if (!win || !out_ev) return false;
+    if (win->event_head == win->event_tail) return false;
+    *out_ev = win->event_queue[win->event_tail];
+    win->event_tail = (win->event_tail + 1) % WIN_EVENT_QUEUE_SIZE;
+    return true;
+}
 
 static uint32_t g_title_h = 28;
 static uint32_t g_border  = 2;
@@ -519,22 +570,28 @@ static inline void wm_draw_string(uint32_t x, uint32_t y, const char* s, uint32_
     }
 }
 
-static inline void wm_draw_window_chrome(int32_t x, int32_t y, int32_t w, int32_t h, const char* title, bool closable, int32_t min_y, int32_t max_y) {
+static inline void wm_draw_window_chrome(int32_t x, int32_t y, int32_t w, int32_t h, const char* title, bool closable, int32_t min_y, int32_t max_y, bool focused = false) {
     if (!g_master_backbuffer) return;
-    // Title bar background (dark grey)
+    // Title bar background: active blue accent if focused, muted dark grey if inactive
+    uint32_t bar_clr  = focused ? 0xFF2A4268 : 0xFF22242B;
+    uint32_t bar_line = focused ? 0xFF4A6898 : 0xFF2D3039;
     for (int32_t ty = y; ty < y + (int32_t)g_title_h; ty++) {
         if (ty < 0 || (uint32_t)ty >= fb->height) continue;
         if (ty < min_y || ty > max_y) continue; // Respect dirty rect
         uint32_t* row = (uint32_t*)(g_master_backbuffer + (uint64_t)ty * fb->pitch);
         int32_t start_x = x; if (start_x < 0) start_x = 0;
         int32_t end_x = x + w; if (end_x > (int32_t)fb->width) end_x = fb->width;
-        if (end_x > start_x) memset_32(row + start_x, 0xFF333333, end_x - start_x);
+        if (end_x > start_x) {
+            uint32_t c = (ty == y) ? bar_line : bar_clr;
+            memset_32(row + start_x, c, end_x - start_x);
+        }
     }
     // Title text (Vertically centered)
     uint32_t char_h = (8 * g_font_scale_100) / 100;
     int32_t text_y = y + (int32_t)(g_title_h - char_h) / 2;
+    uint32_t text_clr = focused ? 0xFFFFFFFF : 0xFF9094A0;
     if (text_y + (int32_t)char_h >= min_y && text_y <= max_y)
-        wm_draw_string(x + 10, (uint32_t)text_y, title, 0xFFFFFFFF, g_font_scale_100);
+        wm_draw_string(x + 10, (uint32_t)text_y, title, text_clr, g_font_scale_100);
     
     // Close button (Scaled with title bar)
     int32_t btn_pad = (int32_t)(4 * g_title_h) / 42;
@@ -791,13 +848,19 @@ static inline int wm_find_top_window(int32_t mx, int32_t my) {
 }
 
 static inline void wm_raise_window(int idx) {
+    if (idx < 0 || idx >= g_window_count) return;
+    Window* win = g_window_list[idx];
+    if (win) g_focused_win_id = win->id;
     int old_pos = -1;
     for (int i = 0; i < g_window_count; i++) if (g_window_order[i] == idx) old_pos = i;
-    if (old_pos == -1 || old_pos == g_window_count - 1) return;
-    for (int i = old_pos; i < g_window_count - 1; i++) g_window_order[i] = g_window_order[i+1];
-    g_window_order[g_window_count - 1] = idx;
-    g_dirty_min_x = 0; g_dirty_max_x = fb->width - 1;
-    g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
+    if (old_pos != -1 && old_pos < g_window_count - 1) {
+        for (int i = old_pos; i < g_window_count - 1; i++) g_window_order[i] = g_window_order[i+1];
+        g_window_order[g_window_count - 1] = idx;
+    }
+    if (fb) {
+        g_dirty_min_x = 0; g_dirty_max_x = fb->width - 1;
+        g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
+    }
     g_needs_refresh = true;
 }
 
@@ -829,8 +892,21 @@ static inline void wm_close_window(int idx) {
     Window* win = g_window_list[idx];
     if (win->is_system && win->type == WIN_TYPE_TERM) return; // Terminal is immortal
     win->visible = false;
-    g_dirty_min_x = 0; g_dirty_max_x = fb->width - 1;
-    g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
+    if (g_focused_win_id == win->id) {
+        g_focused_win_id = -1;
+        for (int s = g_window_count - 1; s >= 0; s--) {
+            int o_idx = g_window_order[s];
+            Window* w = g_window_list[o_idx];
+            if (w && w->visible) {
+                g_focused_win_id = w->id;
+                break;
+            }
+        }
+    }
+    if (fb) {
+        g_dirty_min_x = 0; g_dirty_max_x = fb->width - 1;
+        g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
+    }
     g_needs_refresh = true;
 }
 
@@ -891,6 +967,42 @@ static inline Window* wm_find_window(int id) {
     return nullptr;
 }
 
+extern void tty_input(char c);
+extern void term_write_string(char* s);
+
+static inline void wm_dispatch_key(char c, uint32_t scancode, bool is_down, uint32_t mods) {
+    g_kbd_modifiers = mods;
+    if (!is_down) return;
+
+    // Focus-based routing
+    Window* focused = wm_find_window(g_focused_win_id);
+    if (!focused) {
+        // Nothing selected / Desktop has focus: don't route to any window
+        return;
+    }
+
+    if (focused->is_system && focused->type == WIN_TYPE_TERM) {
+        if (c) tty_input(c);
+        return;
+    }
+
+    if (focused->is_system && focused->type == WIN_TYPE_LOG) {
+        if (c == 'j') wm_log_scroll(1);
+        else if (c == 'k') wm_log_scroll(-1);
+        return;
+    }
+
+    // Focused is a GUI / User window!
+    WinEvent ev;
+    ev.type = WIN_EVENT_KEY_DOWN;
+    ev.x = 0;
+    ev.y = 0;
+    ev.key = c ? (uint32_t)(uint8_t)c : scancode;
+    ev.mods = mods;
+    ev.delta = 0;
+    wm_win_push_event(focused, ev);
+}
+
 // The rainbow as a CLIENT: draws its own surface, reports damage. (If it has no surface because the
 // allocation failed, the compositor's direct-draw branch still handles it and we dirty its whole rect.)
 static inline void wm_rain_render(Window* win) {
@@ -919,6 +1031,18 @@ static inline void wm_test_render(Window* win) {
 }
 
 static inline void wm_destroy_window(int id) {
+    if (g_focused_win_id == id) {
+        g_focused_win_id = -1;
+        for (int s = g_window_count - 1; s >= 0; s--) {
+            int o_idx = g_window_order[s];
+            Window* w = g_window_list[o_idx];
+            if (w && w->visible && w->id != id) {
+                g_focused_win_id = w->id;
+                break;
+            }
+        }
+    }
+
     int idx = -1;
     for (int i = 0; i < g_window_count; i++) {
         if (g_window_list[i] && g_window_list[i]->id == id) {
@@ -1091,6 +1215,12 @@ static inline void wm_init() {
     g_win_rain = wm_create_window("Rainbow Animation", (int32_t)wm_win_x + 100, (int32_t)wm_win_y + 100 + (int32_t)g_title_h, (int32_t)test_w, (int32_t)test_h, true, true, WIN_TYPE_RAIN);
     g_win_log = wm_create_window("Boot Log", (int32_t)wm_win_x + 150, (int32_t)wm_win_y + 150 + (int32_t)g_title_h, (int32_t)test_w, (int32_t)test_h, true, true, WIN_TYPE_LOG);
 
+    // Default focus to Terminal and raise it to top of stack
+    if (g_win_terminal) {
+        wm_raise_window(0); // Terminal is first window created (index 0)
+        g_focused_win_id = g_win_terminal->id;
+    }
+
     for (int i = 0; i < 360; i++) {
         g_rainbow_lut[i] = wm_rainbow_color(i * 2);
     }
@@ -1235,7 +1365,7 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         if (dr1 >= dr2) continue;
 
         // Unified surface compositor: every window (system or user) is backed by its surface buffer
-        wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, win->closable, min_y, max_y);
+        wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, win->closable, min_y, max_y, win->id == g_focused_win_id);
         if (win->buffer) {
             for (int32_t y = dr1; y < dr2; y++) {
                 if (y < r.y1 + (int32_t)g_title_h) continue;
@@ -1372,7 +1502,7 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         for (int idx = 0; idx < g_window_count; idx++) {
             Window* win = g_window_list[idx];
             if (!win || !win->visible) continue;
-            bool active = (idx == active_idx);
+            bool active = (win->id == g_focused_win_id);
 
             uint32_t top_c  = active ? 0xFF3d4d80 : 0xFF23283d;
             uint32_t bot_c  = active ? 0xFF28366a : 0xFF181c30;

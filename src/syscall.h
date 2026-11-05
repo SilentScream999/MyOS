@@ -110,6 +110,7 @@ static inline uint64_t rdmsr(uint32_t msr) {
 #define SYS_WIN_DESTROY   202u
 #define SYS_WIN_GET_BUFFER 203u
 #define SYS_WIN_DAMAGE     204u   // (win_id, x, y, w, h): part of the surface changed
+#define SYS_WIN_POLL_EVENT 205u
 
 // ── string copying from user ──────────────────────────────────────────────────
 // For safety we should check if buf_va is within user limits.
@@ -320,6 +321,18 @@ static uint64_t sys_win_get_buffer(uint64_t win_id) {
     return (uint64_t)win->buffer;
 }
 
+// ── sys_win_poll_event ────────────────────────────────────────────────────────
+static uint64_t sys_win_poll_event(uint64_t win_id, uint64_t ev_va) {
+    if (!ev_va) return 0;
+    Window* win = wm_find_window((int)win_id);
+    if (!win) return 0;
+    WinEvent ev;
+    if (!wm_win_pop_event(win, &ev)) return 0;
+    WinEvent* u_ev = (WinEvent*)ev_va;
+    *u_ev = ev;
+    return 1;
+}
+
 // ── syscall_dispatch ──────────────────────────────────────────────────────────
 // Called from the naked entry stub.  Returns the value to place in RAX.
 
@@ -395,6 +408,7 @@ uint64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, ui
         case SYS_WIN_DESTROY: return sys_win_destroy(a1);
         case SYS_WIN_GET_BUFFER: return sys_win_get_buffer(a1);
         case SYS_WIN_DAMAGE: return sys_win_damage(a1, a2, a3, a4, a5);
+        case SYS_WIN_POLL_EVENT: return sys_win_poll_event(a1, a2);
         
         default:         return (uint64_t)-1;
     }

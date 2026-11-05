@@ -359,6 +359,15 @@ extern "C" void mouse_process_scroll(int8_t scroll_dy) {
             term_scroll_view(scroll_dy);
         } else if (win->is_system && win->type == WIN_TYPE_LOG) {
             wm_log_scroll(scroll_dy);
+        } else {
+            WinEvent ev;
+            ev.type = WIN_EVENT_MOUSE_SCROLL;
+            ev.x = mx - win->x;
+            ev.y = my - win->y;
+            ev.key = 0;
+            ev.mods = g_kbd_modifiers;
+            ev.delta = scroll_dy;
+            wm_win_push_event(win, ev);
         }
     }
 }
@@ -418,7 +427,22 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
                     win->ghost_y = win->y;
                     win->drag_off_x = mx - win->x;
                     win->drag_off_y = my - win->y;
+                } else {
+                    WinEvent ev;
+                    ev.type = WIN_EVENT_MOUSE_DOWN;
+                    ev.x = mx - win->x;
+                    ev.y = my - win->y;
+                    ev.key = 1; // Left button
+                    ev.mods = g_kbd_modifiers;
+                    ev.delta = 0;
+                    wm_win_push_event(win, ev);
                 }
+            } else {
+                // Clicked on desktop background
+                g_focused_win_id = -1;
+                g_dirty_min_x = 0; g_dirty_max_x = fb->width - 1;
+                g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
+                g_needs_refresh = true;
             }
         }
     }
@@ -433,6 +457,7 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
     }
 
     if (mouse_release) {
+        bool dragged = false;
         for (int i = 0; i < g_window_count; i++) {
             Window* win = g_window_list[i];
             if (win && win->ghost_dragging) {
@@ -443,9 +468,27 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
                     g_term_oy = win->y;
                 }
                 win->ghost_dragging = false;
+                dragged = true;
                 g_dirty_min_x = 0; g_dirty_max_x = fb->width - 1;
                 g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
                 g_needs_refresh = true;
+            }
+        }
+        if (!dragged) {
+            int32_t mx = g_mouse_x, my = g_mouse_y;
+            int idx = wm_find_top_window(mx, my);
+            if (idx != -1) {
+                Window* win = g_window_list[idx];
+                if (!wm_is_in_title(idx, mx, my) && !wm_is_in_close(idx, mx, my)) {
+                    WinEvent ev;
+                    ev.type = WIN_EVENT_MOUSE_UP;
+                    ev.x = mx - win->x;
+                    ev.y = my - win->y;
+                    ev.key = 1;
+                    ev.mods = g_kbd_modifiers;
+                    ev.delta = 0;
+                    wm_win_push_event(win, ev);
+                }
             }
         }
     }
@@ -1270,22 +1313,40 @@ extern "C" void kmain(void) {
 								key_down_at[k][key] = now;
 								bool shift = (modifiers & 0x22u) != 0;
 								bool ctrl  = (modifiers & 0x11u) != 0;
+								bool alt   = (modifiers & 0x44u) != 0;
+								uint32_t mods = (ctrl ? WIN_MOD_CTRL : 0) | (shift ? WIN_MOD_SHIFT : 0) | (alt ? WIN_MOD_ALT : 0);
+								g_kbd_modifiers = mods;
+
 								if (key >= 0x4F && key <= 0x52) {
-									// Ctrl + Up/Down = Log window scroll
-									if (ctrl && key == 0x52) wm_log_scroll(-1);
-									else if (ctrl && key == 0x51) wm_log_scroll(1);
-									// Shift + Up/Down = Terminal Scrollback
-									else if (shift && key == 0x52) term_scroll_view(-1);
-									else if (shift && key == 0x51) term_scroll_view(1);
-									else {
-										// Regular Arrow = Shell Navigation
-										tty_input('\x1b'); tty_input('[');
+									Window* focused = wm_find_window(g_focused_win_id);
+									if (focused && focused->is_system && focused->type == WIN_TYPE_TERM) {
+										// Shift + Up/Down = Terminal Scrollback
+										if (shift && key == 0x52) term_scroll_view(-1);
+										else if (shift && key == 0x51) term_scroll_view(1);
+										else {
+											// Regular Arrow = Shell Navigation
+											tty_input('\x1b'); tty_input('[');
+											char arrow_codes[] = {'C', 'D', 'B', 'A'};
+											tty_input(arrow_codes[key - 0x4F]);
+										}
+									} else if (focused && focused->is_system && focused->type == WIN_TYPE_LOG) {
+										// Boot Log focused: Up/Down scrolls log
+										if (key == 0x52) wm_log_scroll(-1);
+										else if (key == 0x51) wm_log_scroll(1);
+									} else if (focused && !focused->is_system) {
+										// User GUI window focused: send arrow event
+										WinEvent ev;
+										ev.type = WIN_EVENT_KEY_DOWN;
+										ev.x = 0; ev.y = 0;
 										char arrow_codes[] = {'C', 'D', 'B', 'A'};
-										tty_input(arrow_codes[key - 0x4F]);
+										ev.key = 0x1000 + arrow_codes[key - 0x4F];
+										ev.mods = mods;
+										ev.delta = 0;
+										wm_win_push_event(focused, ev);
 									}
 								} else {
 									char c = shift ? hid_to_ascii_shift[key] : hid_to_ascii[key];
-									if (c) tty_input(c);
+									wm_dispatch_key(c, key, true, mods);
 								}
 							}
 						}
@@ -1441,20 +1502,40 @@ extern "C" void kmain(void) {
 							uint8_t modifiers = last_mods[k];
 							bool shift = (modifiers & 0x22u) != 0;
 							bool ctrl  = (modifiers & 0x11u) != 0;
+							bool alt   = (modifiers & 0x44u) != 0;
+							uint32_t mods = (ctrl ? WIN_MOD_CTRL : 0) | (shift ? WIN_MOD_SHIFT : 0) | (alt ? WIN_MOD_ALT : 0);
+							g_kbd_modifiers = mods;
 							
 							if (key >= 0x4F && key <= 0x52) {
-								if (ctrl && key == 0x52) wm_log_scroll(-1);
-								else if (ctrl && key == 0x51) wm_log_scroll(1);
-								else if (shift && key == 0x52) term_scroll_view(-1);
-								else if (shift && key == 0x51) term_scroll_view(1);
-								else {
-									tty_input('\x1b'); tty_input('[');
+								Window* focused = wm_find_window(g_focused_win_id);
+								if (focused && focused->is_system && focused->type == WIN_TYPE_TERM) {
+									// Shift + Up/Down = Terminal Scrollback
+									if (shift && key == 0x52) term_scroll_view(-1);
+									else if (shift && key == 0x51) term_scroll_view(1);
+									else {
+										// Regular Arrow = Shell Navigation
+										tty_input('\x1b'); tty_input('[');
+										char arrow_codes[] = {'C', 'D', 'B', 'A'};
+										tty_input(arrow_codes[key - 0x4F]);
+									}
+								} else if (focused && focused->is_system && focused->type == WIN_TYPE_LOG) {
+									// Boot Log focused: Up/Down scrolls log
+									if (key == 0x52) wm_log_scroll(-1);
+									else if (key == 0x51) wm_log_scroll(1);
+								} else if (focused && !focused->is_system) {
+									// User GUI window focused: send arrow event
+									WinEvent ev;
+									ev.type = WIN_EVENT_KEY_DOWN;
+									ev.x = 0; ev.y = 0;
 									char arrow_codes[] = {'C', 'D', 'B', 'A'};
-									tty_input(arrow_codes[key - 0x4F]);
+									ev.key = 0x1000 + arrow_codes[key - 0x4F];
+									ev.mods = mods;
+									ev.delta = 0;
+									wm_win_push_event(focused, ev);
 								}
 							} else {
 								char c = shift ? hid_to_ascii_shift[key] : hid_to_ascii[key];
-								if (c) tty_input(c);
+								wm_dispatch_key(c, key, true, mods);
 							}
 						}
 					}

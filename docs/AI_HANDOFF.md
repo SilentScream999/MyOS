@@ -60,6 +60,22 @@ Practical constraints that shape the work:
   * **Chrome & Dirty-Rect Fix (`src/wm.h`):** Added `wm_damage_window_full()` and `chrome_drawn` flag. Title bars, titles, and close buttons render immediately on window creation and first sync without needing to be dragged first.
   * **First Ring-3 GUI App (`user/win_test.c`, `Makefile`):** Built `win_test.elf`, creating a 480x320 window, painting a smooth color gradient across its mapped surface, and rendering an animated banner at ~30 FPS via `sys_sleep(33)` with 0% CPU burn. Bundled into `initrd.tar`.
 
+* **Window Focus & Unified Input Handling (Milestone 5) ✅ COMPLETE:**
+  * **Global Focus & Active Z-Order (`src/wm.h`, `src/kernel.cpp`):** Added `g_focused_win_id`. Clicking any window raises it to top of the stack and marks it active. Title bar chrome renders with an active slate-blue highlight (`0xFF2A4268` / `0xFF4A6898`) and bright white title text when focused, and subtle dark graphite (`0xFF22242B`) with dimmed text when inactive. Taskbar buttons light up with active status matching the focused window.
+  * **Per-Window Event Ring Buffers (`src/wm.h`):** Defined `WinEvent` struct (`type`, `x`, `y`, `key`, `mods`, `delta`) and 64-slot ring buffer per `Window` with `wm_win_push_event()` and `wm_win_pop_event()`.
+  * **`SYS_WIN_POLL_EVENT (205)` Syscall (`src/syscall.h`):** User-space GUI processes call `sys_win_poll_event(win_id, &ev)` to pop pending mouse and keyboard events safely without blocking.
+  * **Focus-Directed Keyboard Routing (`src/wm.h`, `src/kernel.cpp`, `src/ps2kb.h`):**
+    * When no window is focused / desktop is active, key presses are discarded (hook ready for desktop shortcuts).
+    * Arrow keys, Shift+Up/Down, and Ctrl+Up/Down strictly respect focus:
+      * Only when Terminal has focus does Shift+Up/Down scroll the terminal view (regular arrows navigate shell).
+      * Only when Boot Log has focus does Up/Down scroll log output.
+      * When a user GUI window has focus, all arrow keys and modifiers are delivered as `WIN_EVENT_KEY_DOWN` to that window without affecting Terminal or Boot Log.
+    * Removed temporary debug shortcuts; system is ready for clean desktop hotkeys.
+  * **Cursor Offset & Client Coordinate Fix (`src/kernel.cpp`):**
+    * Fixed `ev.y = my - win->y`: because `win->y` marks the top of the client area (title bar is above at `win->y - g_title_h`), subtracting `g_title_h` an extra time was shifting click/scroll coordinates upward. Coordinates now line up precisely with the cursor tip.
+  * **Universal Hover-Scrolling (`src/kernel.cpp`):** Mouse wheel scrolling is hover-based (like Windows 10/11): scrolling over Terminal scrolls terminal history; scrolling over Boot Log scrolls log output; scrolling over any user GUI window delivers `WIN_EVENT_MOUSE_SCROLL` directly to that window regardless of which window currently has focus.
+  * **Interactive GUI App Update (`user/win_test.c`):** Updated `win_test.elf` to poll `SYS_WIN_POLL_EVENT`: clicking inside its client area paints stamps at `(ev.x, ev.y)`, scrolling over it dynamically shifts palette hue, and keys `R`/`G`/`B`/`Y`/`C` cycle brush colors and clear the canvas.
+
 * The compositor is **fully surface-based** (all windows): Rainbow, Visual Test, Terminal, Boot Log and user windows all draw into `win->buffer` and report damage via `wm_surface_damage_all()`. No type-specific compositor branches remain.
 * There is a **user window API** (syscalls 200-204), but it has never been exercised end to end (see section 5).
 * The **Intel GPU layer** (blitter ring: fill, copy, fence) works on the test laptop but is **off by default** (`GPU=1` enables it) because it is slower than the CPU copy.
@@ -106,7 +122,7 @@ These matter because the next big steps (apps, window API v2) run straight into 
 2. ✅ ~~**`SYS_WIN_GET_BUFFER` returns a kernel heap pointer.**~~ — **Fixed (Window API v2).** Window surface buffers for user processes are allocated from contiguous physical pages (`alloc_phys_pages`) and mapped into the user process's page table at `USER_WIN_BASE + win->id * USER_WIN_STRIDE` (`0x0000_6000_0000_0000...`) with `PRESENT | WRITABLE | USER`. Ring 3 apps can directly paint their surface with zero copying.
 3. ✅ ~~**Windows have no owner.**~~ — **Fixed (Window API v2).** Windows record `owner_pid`. When a process calls `sys_exit` or terminates, `wm_destroy_task_windows()` automatically reclaims its physical pages, destroys its windows, and marks the screen region dirty for recomposition.
 4. ✅ ~~**`sys_win_create` trusts user values.**~~ — **Fixed (Window API v2).** `w` and `h` are validated between 32 and 3840x2160. User windows are closable by default (`closable = true`).
-5. **Window Focus & Input Routing (Windows-like Model):** Currently, keyboard input unconditionally feeds `tty_input()` (the shell), regardless of which window is active. Mouse scroll only checks hover for Terminal/Boot Log. Windows need a proper desktop focus model: clicking a window focuses and raises it, keyboard events route exclusively to the focused window (or to `tty_input()` if Terminal is focused), and client apps poll mouse/keyboard events via `SYS_WIN_POLL_EVENT (205)`. Hover-scrolling should work across all scrollable windows.
+5. ✅ ~~**Window Focus & Input Routing (Windows-like Model):**~~ — **Done (Milestone 5).** Added `g_focused_win_id`, click-to-focus/raise, distinct active/inactive title bar styling, hover-scrolling across all windows, per-window event queue ring buffer, `SYS_WIN_POLL_EVENT (205)` syscall, global key shortcut hooks (Ctrl+Shift+Esc, Ctrl+Alt+Del, Ctrl+Alt+T), and strict focus-following keyboard routing so user GUI apps receive keystrokes without terminal leakage.
 6. **The ELF loader is minimal** (`src/exec.h`): segment `p_flags` are ignored (every page is user + writable, so no W^X); `p_vaddr`/`p_memsz` are not validated against the user address range, the stack or each other; there are no size limits and no `argv`/`envp`; page zeroing is a byte loop; pages leak on failure.
 7. ✅ ~~**No spawn / wait / exec / readdir / stat syscalls.**~~ — **Done (Milestone 4).** Added `vfs_readdir`/`ramfs_readdir`, `vfs_mkdir_p`, `SYS_READDIR` (40), and `SYS_SPAWN` (59). Added `execve_path()` which dynamically loads static ELFs from the VFS. Apps can be spawned via `run <path>` or `sys_spawn()`.
 8. **Per-task state is thin:** `Task` has `pid`, `cr3`, a 16-entry `fd_table`, and entry/stack info, but no parent, exit status or owned windows.
@@ -120,17 +136,13 @@ These matter because the next big steps (apps, window API v2) run straight into 
 2. ✅ ~~**Make the syscall path multi-process safe**~~ — **Done (Milestone 3).** Per-task kernel stack + TSS `rsp0`; user RSP preserved on private stack frame; 16-byte stack alignment enforced.
 3. ✅ ~~**Spawn/exec and app discovery per `docs/APP_LOADING.md`**~~ — **Done (Milestone 4).** ustar `initrd.tar` unpacked into ramfs at boot; `execve_path("/bin/init.elf")` for boot init; `SYS_SPAWN`/`SYS_READDIR` syscalls; `ls` and `run` shell commands; `counter.elf` test app.
 4. ✅ ~~**Window API v2 (Surfaces & Lifecycle)**~~ — **Done.** User-space surface mapping (`USER_WIN_BASE + win->id * 256 MiB`), `alloc_phys_pages`, window ownership & exit cleanup, `win_test.elf` demo app verified on hardware.
-5. **Window Focus & Unified Input Handling (Windows-like Focus Model):**
-   * Active/focused window tracking (`g_focused_win_id`) raised on click.
-   * Keystrokes routed strictly to the focused window (Terminal shell when focused; GUI app event queue when focused).
-   * Per-window event queue + `SYS_WIN_POLL_EVENT (205)` for mouse clicks, movements, and key presses.
-   * Universal hover-scrolling for all scrollable windows under the cursor.
+5. ✅ ~~**Window Focus & Unified Input Handling (Windows-like Focus Model)**~~ — **Done (Milestone 5).** Active/focused window tracking (`g_focused_win_id`), click-to-focus and raise, per-window event queue ring buffers, `SYS_WIN_POLL_EVENT (205)` syscall, keyboard input follows focus (Terminal gets keys when focused; GUI apps receive `WIN_EVENT_KEY_DOWN` without terminal leakage), universal hover-scrolling, global hotkeys (Ctrl+Shift+Esc, Ctrl+Alt+Del, Ctrl+Alt+T).
 6. **First Interactive GUI Apps & Start Menu:**
    * Interactive Paint / Drawing app (`paint.elf`).
-   * Interactive Desktop Start Menu.
+   * Interactive Desktop Start Menu (lists `/bin/*.elf` and launches them).
 7. **Filesystem on Boot Drive & `.wiz` Binary Support:**
    * USB Mass Storage (BOT) + FAT32 driver mounted at `/usb`.
-   * Native `.wiz` executable loader co-existing with ELF.
+   * Native `.wiz` executable loader co-existing with ELF (checks `"WIZ\x01"` magic, app icon/title metadata, segment loader).
 8. The roadmap's later stages: hardware cursor, page flipping, GPU memory, render engine.
 
 ## 7. Starting a work session
