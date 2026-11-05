@@ -43,14 +43,22 @@ Practical constraints that shape the work:
   * **Dynamic Process Loading & Spawning (`src/exec.h`, `src/syscall.h`):**
     * Implemented `execve_path(const char* path)`: opens and loads any static ELF from VFS into an isolated user address space and user stack.
     * Kernel `kmain` boots `/bin/init.elf` via `execve_path("/bin/init.elf")` with module fallback.
-    * Added syscalls: `SYS_READDIR` (40) and `SYS_SPAWN` (59).
+    * Added syscalls: `SYS_READDIR` (40), `SYS_SPAWN` (59), and `SYS_SLEEP` (35).
   * **Test Program & Interactive Shell Commands (`user/counter.c`, `user/init.c`):**
-    * Created `user/counter.c`: prints PID from `SYS_GETPID`, counts 5 ticks with interleaved delays, and exits via `SYS_EXIT(0)`.
-    * Extended `user/init.c` shell with `ls [path]`, `run <path>`, and `help`.
+    * Created `user/counter.c`: prints PID from `SYS_GETPID`, counts 5 ticks using `sys_sleep(500)` (0% CPU burn), and exits via `SYS_EXIT(0)`.
+    * Extended `user/init.c` shell with `ls [path]`, `run <path>`, and `help`. Safeguarded against spawning duplicate init shells.
   * **Build System & Packaging (`Makefile`, `limine.conf`):**
     * `Makefile` compiles `user/counter.c` -> `counter.elf`, creates `initrd_root/bin/` with `init.elf`, `counter.elf`, and `wallpaper.raw`, archives into `initrd.tar`, and bundles into ISO.
     * Both `initrd.tar` and fallback modules loaded via `limine.conf`.
     * Build verified with `wsl make clean && wsl make iso` → **0 errors**.
+
+* **Window API v2 (Surface Mapping & Lifecycles) ✅ COMPLETE:**
+  * **Contiguous Physical Allocator (`src/pagingstuff.h`):** Added `alloc_phys_pages(count)` to allocate zeroed, contiguous physical 4 KiB frames for window backing surfaces.
+  * **User-Space Surface Mapping (`src/wm.h`, `src/syscall.h`):** Assigned user windows a dedicated virtual address space: `USER_WIN_BASE (0x0000_6000_0000_0000) + win_id * 256 MiB`. In `sys_win_create`, the physical pages are mapped directly into the calling task's PML4 (`g_current_task->cr3`) with `PRESENT | WRITABLE | USER`. Ring 3 apps paint surfaces with zero copying.
+  * **Window Ownership & Task Cleanup (`src/wm.h`, `src/syscall.h`):** Every window tracks `owner_pid`. When a user application exits or calls `sys_exit`, `wm_destroy_task_windows(pid)` automatically frees physical pages, destroys window structures, and flags the screen dirty for instant recomposition.
+  * **Input Validation & Closable Windows (`src/wm.h`):** Window dimensions are strictly bounded (`32 <= w, h <= 3840, 2160`). All user windows are closable with the red 'X' button by default.
+  * **Chrome & Dirty-Rect Fix (`src/wm.h`):** Added `wm_damage_window_full()` and `chrome_drawn` flag. Title bars, titles, and close buttons render immediately on window creation and first sync without needing to be dragged first.
+  * **First Ring-3 GUI App (`user/win_test.c`, `Makefile`):** Built `win_test.elf`, creating a 480x320 window, painting a smooth color gradient across its mapped surface, and rendering an animated banner at ~30 FPS via `sys_sleep(33)` with 0% CPU burn. Bundled into `initrd.tar`.
 
 * The compositor is **fully surface-based** (all windows): Rainbow, Visual Test, Terminal, Boot Log and user windows all draw into `win->buffer` and report damage via `wm_surface_damage_all()`. No type-specific compositor branches remain.
 * There is a **user window API** (syscalls 200-204), but it has never been exercised end to end (see section 5).
@@ -77,6 +85,7 @@ The compositor and the overall OS have been run extensively on the laptop. Items
 3. **Keep logic separate from hardware access.** New logic (blending, damage handling, command/state encoding) goes in small headers with no kernel dependencies, like `damage.h`, `surface.h` and `gpu_cmds.h`, so it can be reviewed and checked off-target. Keep the hardware glue thin.
 4. **Hardware-touching code must fail safe:** validate what it reads, fall back to the CPU path, and never loop forever on hardware state.
 5. **Write down what you could not verify.** Mark hypotheses as hypotheses (the roadmap's claims log shows the style).
+6. **Executable Formats:** Standard static ELF (`.elf`) remains the permanent base format for compatibility with clang/GCC/lld toolchains. A future native `.wiz` binary format (magic `"WIZ\x01"`, app title, icon, segments) will co-exist alongside ELF in `src/exec.h` as an optional lightweight container, never replacing ELF.
 
 ## 4. Rules and gotchas
 
@@ -97,7 +106,7 @@ These matter because the next big steps (apps, window API v2) run straight into 
 2. ✅ ~~**`SYS_WIN_GET_BUFFER` returns a kernel heap pointer.**~~ — **Fixed (Window API v2).** Window surface buffers for user processes are allocated from contiguous physical pages (`alloc_phys_pages`) and mapped into the user process's page table at `USER_WIN_BASE + win->id * USER_WIN_STRIDE` (`0x0000_6000_0000_0000...`) with `PRESENT | WRITABLE | USER`. Ring 3 apps can directly paint their surface with zero copying.
 3. ✅ ~~**Windows have no owner.**~~ — **Fixed (Window API v2).** Windows record `owner_pid`. When a process calls `sys_exit` or terminates, `wm_destroy_task_windows()` automatically reclaims its physical pages, destroys its windows, and marks the screen region dirty for recomposition.
 4. ✅ ~~**`sys_win_create` trusts user values.**~~ — **Fixed (Window API v2).** `w` and `h` are validated between 32 and 3840x2160. User windows are closable by default (`closable = true`).
-5. **No input for windows.** There is no event syscall and no focus model. Keyboard input reaches programs only through the TTY (fd 0); mouse input is handled entirely inside the kernel compositor.
+5. **Window Focus & Input Routing (Windows-like Model):** Currently, keyboard input unconditionally feeds `tty_input()` (the shell), regardless of which window is active. Mouse scroll only checks hover for Terminal/Boot Log. Windows need a proper desktop focus model: clicking a window focuses and raises it, keyboard events route exclusively to the focused window (or to `tty_input()` if Terminal is focused), and client apps poll mouse/keyboard events via `SYS_WIN_POLL_EVENT (205)`. Hover-scrolling should work across all scrollable windows.
 6. **The ELF loader is minimal** (`src/exec.h`): segment `p_flags` are ignored (every page is user + writable, so no W^X); `p_vaddr`/`p_memsz` are not validated against the user address range, the stack or each other; there are no size limits and no `argv`/`envp`; page zeroing is a byte loop; pages leak on failure.
 7. ✅ ~~**No spawn / wait / exec / readdir / stat syscalls.**~~ — **Done (Milestone 4).** Added `vfs_readdir`/`ramfs_readdir`, `vfs_mkdir_p`, `SYS_READDIR` (40), and `SYS_SPAWN` (59). Added `execve_path()` which dynamically loads static ELFs from the VFS. Apps can be spawned via `run <path>` or `sys_spawn()`.
 8. **Per-task state is thin:** `Task` has `pid`, `cr3`, a 16-entry `fd_table`, and entry/stack info, but no parent, exit status or owned windows.
@@ -109,8 +118,20 @@ These matter because the next big steps (apps, window API v2) run straight into 
 
 1. ✅ ~~**Convert Terminal and Boot Log to surface-backed windows**~~ — **Done (Milestone 1 / Stage A1).** Terminal and Boot Log are now full surface clients; compositor special-case branches deleted. Tested and verified on real hardware.
 2. ✅ ~~**Make the syscall path multi-process safe**~~ — **Done (Milestone 3).** Per-task kernel stack + TSS `rsp0`; user RSP preserved on private stack frame; 16-byte stack alignment enforced.
-3. ✅ ~~**Spawn/exec and app discovery per `docs/APP_LOADING.md`**~~ — **Done (Milestone 4).** ustar `initrd.tar` unpacked into ramfs at boot; `execve_path("/bin/init.elf")` for boot init; `SYS_SPAWN`/`SYS_READDIR` syscalls; `ls` and `run` shell commands; `counter.elf` test app. Next: Window API v2 (owner, mapped surfaces, events, cleanup).
-4. The roadmap's later stages: hardware cursor, page flipping, GPU memory, render engine.
+3. ✅ ~~**Spawn/exec and app discovery per `docs/APP_LOADING.md`**~~ — **Done (Milestone 4).** ustar `initrd.tar` unpacked into ramfs at boot; `execve_path("/bin/init.elf")` for boot init; `SYS_SPAWN`/`SYS_READDIR` syscalls; `ls` and `run` shell commands; `counter.elf` test app.
+4. ✅ ~~**Window API v2 (Surfaces & Lifecycle)**~~ — **Done.** User-space surface mapping (`USER_WIN_BASE + win->id * 256 MiB`), `alloc_phys_pages`, window ownership & exit cleanup, `win_test.elf` demo app verified on hardware.
+5. **Window Focus & Unified Input Handling (Windows-like Focus Model):**
+   * Active/focused window tracking (`g_focused_win_id`) raised on click.
+   * Keystrokes routed strictly to the focused window (Terminal shell when focused; GUI app event queue when focused).
+   * Per-window event queue + `SYS_WIN_POLL_EVENT (205)` for mouse clicks, movements, and key presses.
+   * Universal hover-scrolling for all scrollable windows under the cursor.
+6. **First Interactive GUI Apps & Start Menu:**
+   * Interactive Paint / Drawing app (`paint.elf`).
+   * Interactive Desktop Start Menu.
+7. **Filesystem on Boot Drive & `.wiz` Binary Support:**
+   * USB Mass Storage (BOT) + FAT32 driver mounted at `/usb`.
+   * Native `.wiz` executable loader co-existing with ELF.
+8. The roadmap's later stages: hardware cursor, page flipping, GPU memory, render engine.
 
 ## 7. Starting a work session
 
