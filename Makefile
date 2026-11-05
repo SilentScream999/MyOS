@@ -25,7 +25,7 @@ LDFLAGS=-nostdlib -z max-page-size=0x1000
 SRC=src/kernel.cpp
 OBJ=$(SRC:.cpp=.o)
 
-all: wyzar init.elf counter.elf initrd.tar
+all: wyzar init.elf counter.elf win_test.elf initrd.tar
 
 # Backward compatibility alias
 myos: wyzar
@@ -55,11 +55,18 @@ user/counter.o: user/counter.c
 counter.elf: user/counter.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
-initrd.tar: init.elf counter.elf
+user/win_test.o: user/win_test.c
+	$(CC) $(USER_CFLAGS) -I. -c $< -o $@
+
+win_test.elf: user/win_test.o
+	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
+
+initrd.tar: init.elf counter.elf win_test.elf
 	rm -rf initrd_root
 	mkdir -p initrd_root/bin
 	cp init.elf initrd_root/bin/
 	cp counter.elf initrd_root/bin/
+	cp win_test.elf initrd_root/bin/
 	if [ -f wallpaper.raw ]; then cp wallpaper.raw initrd_root/; fi
 	tar -cf initrd.tar --format=ustar -C initrd_root .
 
@@ -100,4 +107,4 @@ run: iso
 
 
 clean:
-	rm -rf iso_root initrd_root $(OBJ) $(OBJ:.o=.d) user/init.o user/counter.o wyzar wyzar.iso myos myos.iso init.elf counter.elf initrd.tar
+	rm -rf iso_root initrd_root $(OBJ) $(OBJ:.o=.d) user/init.o user/counter.o user/win_test.o wyzar wyzar.iso myos myos.iso init.elf counter.elf win_test.elf initrd.tar

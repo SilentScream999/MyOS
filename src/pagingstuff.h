@@ -206,6 +206,32 @@ uint64_t alloc_phys_page() {
     return 0;   // unreachable
 }
 
+// ── alloc_phys_pages ──────────────────────────────────────────────────────────
+// Allocate `count` contiguous 4 KiB physical pages.
+// Zero-initialized via HHDM before returning.
+
+uint64_t alloc_phys_pages(uint64_t count) {
+    if (count == 0) return 0;
+    if (count == 1) return alloc_phys_page();
+
+    uint64_t size = count * PAGE_SIZE;
+    while (pmm_cur_region < pmm_region_count) {
+        PMMRegion& r = pmm_regions[pmm_cur_region];
+        if (r.bump + size <= r.end) {
+            uint64_t addr = r.bump;
+            r.bump += size;
+            uint8_t* va = (uint8_t*)(HHDM + addr);
+            for (uint64_t i = 0; i < size; i++) va[i] = 0;
+            return addr;
+        }
+        pmm_cur_region++;
+    }
+
+    print((char*)"PMM: OUT OF CONTIGUOUS MEMORY!");
+    hcf();
+    return 0;
+}
+
 // ── free_phys_page ────────────────────────────────────────────────────────────
 // Return a page to the PMM freelist.
 // `phys` must be a PAGE_SIZE-aligned physical address previously returned by

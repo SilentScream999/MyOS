@@ -224,7 +224,10 @@ static uint64_t sys_getpid() {
 // ── sys_exit ──────────────────────────────────────────────────────────────────
 
 [[noreturn]] static void sys_exit(uint64_t /*code*/) {
-    if (g_current_task) task_exit();   // marks DEAD + schedule() — no return
+    if (g_current_task) {
+        wm_destroy_task_windows(g_current_task->pid);
+        task_exit();   // marks DEAD + schedule() — no return
+    }
     hcf();
 }
 
@@ -262,9 +265,22 @@ static uint64_t sys_ttyraw(uint64_t raw) {
 static uint64_t sys_win_create(uint64_t title_va, uint64_t x, uint64_t y, uint64_t w, uint64_t h, uint64_t flags) {
     char title[64];
     copy_string_from_user(title, title_va, sizeof(title));
-    bool closable = (flags & 1);
-    Window* win = wm_create_window(title, (int32_t)x, (int32_t)y, (int32_t)w, (int32_t)h, closable);
+    bool closable = true; // All user windows are closable
+    pid_t owner = g_current_task ? g_current_task->pid : 0;
+    Window* win = wm_create_window(title, (int32_t)x, (int32_t)y, (int32_t)w, (int32_t)h, closable, false, WIN_TYPE_USER, owner);
     if (!win) return 0;
+
+    // Map window surface pages into user process address space (Ring 3 accessible)
+    if (g_current_task && g_current_task->cr3 && win->buffer_phys) {
+        uint64_t user_va = USER_WIN_BASE + (uint64_t)win->id * USER_WIN_STRIDE;
+        win->user_va = user_va;
+        for (uint64_t p = 0; p < win->buffer_pages; p++) {
+            uint64_t v  = user_va + p * PAGE_SIZE;
+            uint64_t pa = win->buffer_phys + p * PAGE_SIZE;
+            map_page_in(g_current_task->cr3, v, pa, PRESENT | WRITABLE | USER);
+            __asm__ volatile("invlpg (%0)" :: "r"(v) : "memory");
+        }
+    }
     return (uint64_t)win->id;
 }
 
@@ -298,12 +314,10 @@ static uint64_t sys_win_destroy(uint64_t win_id) {
 
 // ── sys_win_get_buffer ────────────────────────────────────────────────────────
 static uint64_t sys_win_get_buffer(uint64_t win_id) {
-    for (int i = 0; i < g_window_count; i++) {
-        if (g_window_list[i] && g_window_list[i]->id == (int)win_id) {
-            return (uint64_t)g_window_list[i]->buffer;
-        }
-    }
-    return 0;
+    Window* win = wm_find_window((int)win_id);
+    if (!win) return 0;
+    if (win->user_va) return win->user_va;
+    return (uint64_t)win->buffer;
 }
 
 // ── syscall_dispatch ──────────────────────────────────────────────────────────

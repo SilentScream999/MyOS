@@ -60,8 +60,13 @@ struct Window {
     int32_t x, y, w, h;
     uint32_t* buffer;
     uint32_t buffer_pitch;
+    uint64_t buffer_phys;   // physical base address of surface
+    uint64_t buffer_pages;  // number of 4K pages
+    uint64_t user_va;       // virtual address mapped into user space
+    pid_t    owner_pid;     // task PID that owns this window
     bool visible;
     bool closable;
+    bool chrome_drawn;
     bool is_system; // If true, handled specially (e.g. Terminal, Rain)
     int type;      // For system windows
     bool ghost_dragging;
@@ -70,6 +75,9 @@ struct Window {
     int32_t last_ghost_fx, last_ghost_fy, last_ghost_fw, last_ghost_fh;
     bool last_ghost_active;
 };
+
+#define USER_WIN_BASE   0x0000600000000000ULL
+#define USER_WIN_STRIDE 0x0000000010000000ULL // 256 MiB per window ID
 
 #define MAX_WINDOWS 32
 static Window* g_window_list[MAX_WINDOWS];
@@ -107,8 +115,30 @@ static inline void wm_surface_damage(Window* win, int32_t x1, int32_t y1, int32_
     wm_dirty_add(ux1, ux2, uy1, uy2);
     g_needs_refresh = true;
 }
+static inline void wm_damage_window_full(Window* win) {
+    if (!win || !win->visible || !fb) return;
+    int32_t x1 = win->x;
+    int32_t y1 = win->y - (int32_t)g_title_h;
+    int32_t x2 = win->x + win->w;
+    int32_t y2 = win->y + win->h;
+    if (x1 < 0) x1 = 0;
+    if (y1 < 0) y1 = 0;
+    if (x2 > (int32_t)fb->width) x2 = (int32_t)fb->width;
+    if (y2 > (int32_t)fb->height) y2 = (int32_t)fb->height;
+    if (x2 > x1 && y2 > y1) {
+        wm_dirty_add((uint32_t)x1, (uint32_t)(x2 - 1), (uint32_t)y1, (uint32_t)(y2 - 1));
+        g_needs_refresh = true;
+    }
+}
+
 static inline void wm_surface_damage_all(Window* win) {
-    if (win) wm_surface_damage(win, 0, 0, win->w, win->h);
+    if (!win) return;
+    if (!win->chrome_drawn) {
+        wm_damage_window_full(win);
+        win->chrome_drawn = true;
+    } else {
+        wm_surface_damage(win, 0, 0, win->w, win->h);
+    }
 }
 
 static uint32_t test_w, test_h;
@@ -806,8 +836,9 @@ static inline void wm_close_window(int idx) {
 
 static int g_next_win_id = 1;
 
-static inline Window* wm_create_window(const char* title, int32_t x, int32_t y, int32_t w, int32_t h, bool closable, bool is_system = false, int type = WIN_TYPE_USER) {
+static inline Window* wm_create_window(const char* title, int32_t x, int32_t y, int32_t w, int32_t h, bool closable, bool is_system = false, int type = WIN_TYPE_USER, pid_t owner = 0) {
     if (g_window_count >= MAX_WINDOWS) return nullptr;
+    if (w < 32 || h < 32 || w > 3840 || h > 2160) return nullptr;
     
     Window* win = (Window*)kmalloc(sizeof(Window));
     if (!win) return nullptr;
@@ -823,10 +854,26 @@ static inline Window* wm_create_window(const char* title, int32_t x, int32_t y, 
     win->visible = true;
     win->is_system = is_system;
     win->type = type;
+    win->owner_pid = owner;
     
-    // Surface-backed windows: EVERY window owns a surface buffer covering its client area.
-    win->buffer = (uint32_t*)kmalloc((uint64_t)w * h * 4);
-    if (win->buffer) memset(win->buffer, 0, (uint64_t)w * h * 4);
+    uint64_t buf_bytes = (uint64_t)w * h * 4;
+    uint64_t pages = (buf_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    win->buffer_pages = pages;
+    
+    if (!is_system) {
+        // User windows: allocate contiguous physical pages so they can be mapped to user space
+        uint64_t phys = alloc_phys_pages(pages);
+        if (!phys) {
+            kfree(win);
+            return nullptr;
+        }
+        win->buffer_phys = phys;
+        win->buffer = (uint32_t*)(HHDM + phys);
+    } else {
+        win->buffer_phys = 0;
+        win->buffer = (uint32_t*)kmalloc(buf_bytes);
+        if (win->buffer) memset(win->buffer, 0, buf_bytes);
+    }
     win->buffer_pitch = w * 4;
     
     int idx = g_window_count;
@@ -834,7 +881,7 @@ static inline Window* wm_create_window(const char* title, int32_t x, int32_t y, 
     g_window_order[idx] = idx;
     g_window_count++;
     
-    g_needs_refresh = true;
+    wm_damage_window_full(win);
     return win;
 }
 
@@ -882,7 +929,15 @@ static inline void wm_destroy_window(int id) {
     if (idx == -1) return;
     
     Window* win = g_window_list[idx];
-    if (win->buffer) kfree(win->buffer);
+    if (win->buffer) {
+        if (!win->is_system && win->buffer_phys) {
+            for (uint64_t p = 0; p < win->buffer_pages; p++) {
+                free_phys_page(win->buffer_phys + p * PAGE_SIZE);
+            }
+        } else {
+            kfree(win->buffer);
+        }
+    }
     kfree(win);
     g_window_list[idx] = nullptr;
     
@@ -896,7 +951,23 @@ static inline void wm_destroy_window(int id) {
         for (int i = 0; i < g_window_count - 1; i++) if (g_window_order[i] > idx) g_window_order[i]--;
     }
     g_window_count--;
+    
+    if (fb) {
+        g_dirty_min_x = 0; g_dirty_max_x = fb->width - 1;
+        g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
+    }
     g_needs_refresh = true;
+}
+
+static inline void wm_destroy_task_windows(pid_t pid) {
+    if (pid == 0) return;
+    for (int i = 0; i < g_window_count; i++) {
+        Window* win = g_window_list[i];
+        if (win && !win->is_system && win->owner_pid == pid) {
+            wm_destroy_window(win->id);
+            i--;
+        }
+    }
 }
 
 // =============================================================================
