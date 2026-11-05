@@ -93,4 +93,40 @@ static Task* execve_memory(const uint8_t* elf_data) {
     return t;
 }
 
+// ── execve_path ───────────────────────────────────────────────────────────────
+// Load an ELF executable directly from a VFS path (e.g. "/bin/init.elf").
+static Task* execve_path(const char* path) {
+    if (!path) return nullptr;
+    file f;
+    if (vfs_open(path, 0, &f) != 0) {
+        print((char*)"[exec] failed to open: ");
+        print((char*)path);
+        return nullptr;
+    }
+
+    uint64_t sz = f.vn->size;
+    if (sz == 0 || sz > 32 * 1024 * 1024) {
+        vfs_close(&f);
+        return nullptr;
+    }
+
+    uint8_t* buf = (uint8_t*)kmalloc(sz);
+    if (!buf) {
+        vfs_close(&f);
+        return nullptr;
+    }
+
+    uint64_t read_bytes = vfs_read(&f, buf, sz);
+    vfs_close(&f);
+
+    if (read_bytes != sz) {
+        kfree(buf);
+        return nullptr;
+    }
+
+    Task* t = execve_memory(buf);
+    kfree(buf);
+    return t;
+}
+
 #endif // exec_h

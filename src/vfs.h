@@ -44,6 +44,9 @@ struct vfs_ops {
     
     // Create a new directory in a directory vnode.
     vnode* (*mkdir)(vnode* dir, const char* name);
+
+    // Read directory entry at index. Returns 1 if found, 0 on EOF, -1 on error.
+    int (*readdir)(vnode* dir, uint64_t index, char* name_out, uint64_t* size_out, VnodeType* type_out);
 };
 
 // VNODE: A node in the VFS tree (represents a file or directory inode)
@@ -222,6 +225,53 @@ static void vfs_close(file* f) {
         }
         f->vn = nullptr;
     }
+}
+
+static int vfs_mkdir(const char* path) {
+    char name[256];
+    vnode* parent = vfs_namei_parent(path, name);
+    if (!parent || !parent->ops || !parent->ops->mkdir) return -1;
+    vnode* vn = parent->ops->mkdir(parent, name);
+    return vn ? 0 : -1;
+}
+
+static int vfs_mkdir_p(const char* path) {
+    if (!vfs_root || !path || *path != '/') return -1;
+    vnode* current = vfs_root;
+    char comp[256];
+    const char* p = path + 1;
+    while (p) {
+        p = vfs_next_component(p, comp);
+        if (comp[0] == '\0') break;
+        if (current->type != VnodeType::DIRECTORY || !current->ops || !current->ops->lookup) return -1;
+        vnode* next = current->ops->lookup(current, comp);
+        if (!next) {
+            if (!current->ops->mkdir) return -1;
+            next = current->ops->mkdir(current, comp);
+            if (!next) return -1;
+        }
+        current = next;
+    }
+    return 0;
+}
+
+static void vfs_ensure_parent_dirs(const char* path) {
+    char parent_path[256];
+    int last_slash = -1;
+    for (int i = 0; path[i] && i < 255; i++) {
+        if (path[i] == '/') last_slash = i;
+    }
+    if (last_slash > 0) {
+        for (int i = 0; i < last_slash; i++) parent_path[i] = path[i];
+        parent_path[last_slash] = '\0';
+        vfs_mkdir_p(parent_path);
+    }
+}
+
+static int vfs_readdir(const char* path, uint64_t index, char* name_out, uint64_t* size_out, VnodeType* type_out) {
+    vnode* vn = vfs_namei(path);
+    if (!vn || vn->type != VnodeType::DIRECTORY || !vn->ops || !vn->ops->readdir) return -1;
+    return vn->ops->readdir(vn, index, name_out, size_out, type_out);
 }
 
 #endif // VFS_H

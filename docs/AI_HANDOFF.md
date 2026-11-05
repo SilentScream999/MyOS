@@ -35,6 +35,23 @@ Practical constraints that shape the work:
   * Preemptions and timer interrupts during a syscall now safely preserve and restore the task's private stack frame without clobbering other tasks.
   * Build verified: `make clean && make iso` → **0 errors, 12 warnings** (pre-existing volatile deprecations).
 
+* **Milestone 4 ✅ COMPLETE (Dynamic App Loading & Process Spawning):**
+  * **Ustar Archive Parser (`src/tar.h`):** Created full POSIX ustar parser. Unpacks `initrd.tar` directly into `ramfs` at boot time, populating directories and files automatically.
+  * **VFS Directory Hierarchy & Enumeration (`src/vfs.h`, `src/ramfs.h`):**
+    * Added `vfs_mkdir`, `vfs_mkdir_p`, `vfs_ensure_parent_dirs`, and directory enumeration `vfs_readdir` / `ramfs_readdir`.
+    * Implemented directory indexing traversal in RamFS children linked-list.
+  * **Dynamic Process Loading & Spawning (`src/exec.h`, `src/syscall.h`):**
+    * Implemented `execve_path(const char* path)`: opens and loads any static ELF from VFS into an isolated user address space and user stack.
+    * Kernel `kmain` boots `/bin/init.elf` via `execve_path("/bin/init.elf")` with module fallback.
+    * Added syscalls: `SYS_READDIR` (40) and `SYS_SPAWN` (59).
+  * **Test Program & Interactive Shell Commands (`user/counter.c`, `user/init.c`):**
+    * Created `user/counter.c`: prints PID from `SYS_GETPID`, counts 5 ticks with interleaved delays, and exits via `SYS_EXIT(0)`.
+    * Extended `user/init.c` shell with `ls [path]`, `run <path>`, and `help`.
+  * **Build System & Packaging (`Makefile`, `limine.conf`):**
+    * `Makefile` compiles `user/counter.c` -> `counter.elf`, creates `initrd_root/bin/` with `init.elf`, `counter.elf`, and `wallpaper.raw`, archives into `initrd.tar`, and bundles into ISO.
+    * Both `initrd.tar` and fallback modules loaded via `limine.conf`.
+    * Build verified with `wsl make clean && wsl make iso` → **0 errors**.
+
 * The compositor is **fully surface-based** (all windows): Rainbow, Visual Test, Terminal, Boot Log and user windows all draw into `win->buffer` and report damage via `wm_surface_damage_all()`. No type-specific compositor branches remain.
 * There is a **user window API** (syscalls 200-204), but it has never been exercised end to end (see section 5).
 * The **Intel GPU layer** (blitter ring: fill, copy, fence) works on the test laptop but is **off by default** (`GPU=1` enables it) because it is slower than the CPU copy.
@@ -82,7 +99,7 @@ These matter because the next big steps (apps, window API v2) run straight into 
 4. **`sys_win_create` trusts user values.** `w` and `h` are cast to `int32_t` and multiplied into a `kmalloc` size with no limits or overflow checks. The `flags` argument is never passed through (always 0), so user windows are never closable.
 5. **No input for windows.** There is no event syscall and no focus model. Keyboard input reaches programs only through the TTY (fd 0); mouse input is handled entirely inside the kernel compositor.
 6. **The ELF loader is minimal** (`src/exec.h`): segment `p_flags` are ignored (every page is user + writable, so no W^X); `p_vaddr`/`p_memsz` are not validated against the user address range, the stack or each other; there are no size limits and no `argv`/`envp`; page zeroing is a byte loop; pages leak on failure.
-7. **No spawn / wait / exec / readdir / stat syscalls.** `execve_memory()` takes a memory buffer and is called once, at boot, for Limine module 0 (`init.elf`). `SYS_EXIT` ignores its exit code. Task cleanup frees the fd table, kernel stack and `Task`; freeing of the process's user pages and page tables was not found.
+7. ✅ ~~**No spawn / wait / exec / readdir / stat syscalls.**~~ — **Done (Milestone 4).** Added `vfs_readdir`/`ramfs_readdir`, `vfs_mkdir_p`, `SYS_READDIR` (40), and `SYS_SPAWN` (59). Added `execve_path()` which dynamically loads static ELFs from the VFS. Apps can be spawned via `run <path>` or `sys_spawn()`.
 8. **Per-task state is thin:** `Task` has `pid`, `cr3`, a 16-entry `fd_table`, and entry/stack info, but no parent, exit status or owned windows.
 9. **Hard-coded UI:** `wm_init` creates Terminal, Visual Test, Rainbow and Boot Log unconditionally. The Start button prints "Start Menu coming soon..." into the terminal. Terminal cannot be closed. *(Compositor special-case branches were removed in Milestone 1 — all windows now use the unified surface blit path.)*
 10. **USB:** a failing device during the root-port scan can starve HID descriptor reads on other ports. Wish: detect which device is the boot drive.
@@ -92,7 +109,7 @@ These matter because the next big steps (apps, window API v2) run straight into 
 
 1. ✅ ~~**Convert Terminal and Boot Log to surface-backed windows**~~ — **Done (Milestone 1 / Stage A1).** Terminal and Boot Log are now full surface clients; compositor special-case branches deleted. Tested and verified on real hardware.
 2. ✅ ~~**Make the syscall path multi-process safe**~~ — **Done (Milestone 3).** Per-task kernel stack + TSS `rsp0`; user RSP preserved on private stack frame; 16-byte stack alignment enforced.
-3. **Spawn/exec and app discovery per `docs/APP_LOADING.md`**, then Window API v2 (owner, mapped surfaces, events, cleanup).
+3. ✅ ~~**Spawn/exec and app discovery per `docs/APP_LOADING.md`**~~ — **Done (Milestone 4).** ustar `initrd.tar` unpacked into ramfs at boot; `execve_path("/bin/init.elf")` for boot init; `SYS_SPAWN`/`SYS_READDIR` syscalls; `ls` and `run` shell commands; `counter.elf` test app. Next: Window API v2 (owner, mapped surfaces, events, cleanup).
 4. The roadmap's later stages: hardware cursor, page flipping, GPU memory, render engine.
 
 ## 7. Starting a work session

@@ -37,15 +37,17 @@ static uint64_t ramfs_write(vnode* vn, const void* buf, uint64_t len, uint64_t o
 static vnode* ramfs_lookup(vnode* dir, const char* name);
 static vnode* ramfs_create(vnode* dir, const char* name);
 static vnode* ramfs_mkdir(vnode* dir, const char* name);
+static int ramfs_readdir(vnode* dir, uint64_t index, char* name_out, uint64_t* size_out, VnodeType* type_out);
 
 static vfs_ops ramfs_ops = {
-    .read   = ramfs_read,
-    .write  = ramfs_write,
-    .open   = nullptr,
-    .close  = nullptr,
-    .lookup = ramfs_lookup,
-    .create = ramfs_create,
-    .mkdir  = ramfs_mkdir,
+    .read    = ramfs_read,
+    .write   = ramfs_write,
+    .open    = nullptr,
+    .close   = nullptr,
+    .lookup  = ramfs_lookup,
+    .create  = ramfs_create,
+    .mkdir   = ramfs_mkdir,
+    .readdir = ramfs_readdir,
 };
 
 // ── RAMFS IMPLEMENTATION ──────────────────────────────────────────────────
@@ -175,6 +177,28 @@ static vnode* ramfs_mkdir(vnode* dir, const char* name) {
     d_node->children = new_dir;
     
     return &new_dir->vn;
+}
+
+static int ramfs_readdir(vnode* dir, uint64_t index, char* name_out, uint64_t* size_out, VnodeType* type_out) {
+    if (dir->type != VnodeType::DIRECTORY) return -1;
+    ramfs_node* d_node = (ramfs_node*)dir->fs_data;
+    ramfs_node* child  = d_node->children;
+    uint64_t curr = 0;
+    while (child) {
+        if (curr == index) {
+            strcpy(name_out, child->name);
+            uint64_t sz = child->size;
+            if (strcmp(child->name, "bootlog.txt") == 0) {
+                sz = g_klog_pos;
+            }
+            if (size_out) *size_out = sz;
+            if (type_out) *type_out = child->type;
+            return 1;
+        }
+        curr++;
+        child = child->sibling;
+    }
+    return 0; // EOF
 }
 
 static uint64_t klog_vfs_read(vnode* vn, void* buf, uint64_t len, uint64_t offset) {

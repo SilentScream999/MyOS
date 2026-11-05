@@ -15,6 +15,7 @@
 #include "acpi.h"
 #include "syscall.h"
 #include "ramfs.h"
+#include "tar.h"
 #include "exec.h"
 #include "graphics.h"
 #include "wm.h"
@@ -701,21 +702,42 @@ extern "C" void kmain(void) {
 	ramfs_init();
 	ramfs_mount_klog();
 
-    // Optional wallpaper module: if a second Limine module is present,
-    // treat it as a raw BGRA wallpaper and also expose it as /wallpaper.raw.
-    if (module_req.response && module_req.response->module_count > 1) {
+    // Check for initrd tar archive in Limine modules and unpack into ramfs
+    if (module_req.response) {
+        for (uint64_t m = 0; m < module_req.response->module_count; m++) {
+            struct limine_file* mod = module_req.response->modules[m];
+            if (mod && mod->size >= 512) {
+                const char* magic = (const char*)mod->address + 257;
+                if (magic[0] == 'u' && magic[1] == 's' && magic[2] == 't' && magic[3] == 'a' && magic[4] == 'r') {
+                    tar_unpack((const uint8_t*)mod->address, mod->size);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Try loading wallpaper: from /wallpaper.raw in ramfs, or module 1 fallback
+    file wf;
+    if (vfs_open("/wallpaper.raw", 0, &wf) == 0) {
+        if (wf.vn && wf.vn->size > 0) {
+            uint64_t wsize = wf.vn->size;
+            uint8_t* wdata = (uint8_t*)kmalloc(wsize);
+            if (wdata) {
+                vfs_read(&wf, wdata, wsize);
+                wm_load_wallpaper_from_raw(wdata, wsize);
+                kfree(wdata);
+            }
+        }
+        vfs_close(&wf);
+    } else if (module_req.response && module_req.response->module_count > 1) {
         struct limine_file* wmod  = module_req.response->modules[1];
         uint64_t            wsize = wmod->size;
         const uint8_t*      wdata = (const uint8_t*)wmod->address;
-
-        // Mirror into ramfs so userspace can read it as /wallpaper.raw.
-        file wf;
-        if (vfs_open("/wallpaper.raw", 0, &wf) == 0) {
-            vfs_write(&wf, wdata, wsize);
-            vfs_close(&wf);
+        file wf2;
+        if (vfs_open("/wallpaper.raw", 0, &wf2) == 0) {
+            vfs_write(&wf2, wdata, wsize);
+            vfs_close(&wf2);
         }
-
-        // Feed raw pixels directly into the WM wallpaper buffer.
         wm_load_wallpaper_from_raw(wdata, wsize);
     }
 
@@ -936,9 +958,13 @@ extern "C" void kmain(void) {
 
 	print((char*)"[init] Decoupled terminal boot.");
 	static bool init_started = false;
-	if (!init_started && module_req.response && module_req.response->module_count > 0) {
-		struct limine_file *module = module_req.response->modules[0];
-		Task* init_task = execve_memory((const uint8_t*)module->address);
+	if (!init_started) {
+		Task* init_task = execve_path("/bin/init.elf");
+		if (!init_task && module_req.response && module_req.response->module_count > 0) {
+			// Fallback: load directly from Limine module 0
+			struct limine_file *module = module_req.response->modules[0];
+			init_task = execve_memory((const uint8_t*)module->address);
+		}
 		if (init_task) {
 			// Phase 9: register post-flip chrome hook
 			g_pre_flip_hook = nullptr; // Phase 18: handled by wm_compose_full
@@ -950,7 +976,7 @@ extern "C" void kmain(void) {
 			g_klog_bypass_framebuffer = true;
 			print((char*)"[wm] Shell task started inside WM frame.");
 		} else {
-			print((char*)"[init] Failed to load ELF module.");
+			print((char*)"[init] Failed to load shell task.");
 		}
 	}
 

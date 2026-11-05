@@ -32,6 +32,43 @@ static inline void sys_ttyraw(uint64_t raw) {
     __asm__ volatile ("syscall" : : "a"(17), "D"(raw) : "rcx", "r11", "memory");
 }
 
+static inline int64_t sys_readdir(const char* path, uint64_t index, char* name_out, uint64_t* size_out, uint64_t* type_out) {
+    int64_t ret;
+    // SysV AMD64: a4→r10, a5→r8 (rcx/r11 clobbered by syscall instruction).
+    // We use named register variables to unambiguously bind size_out→r10,
+    // type_out→r8 so the compiler cannot mis-assign them.
+    register uint64_t r10_val __asm__("r10") = (uint64_t)size_out;
+    register uint64_t r8_val  __asm__("r8")  = (uint64_t)type_out;
+    __asm__ volatile (
+        "syscall"
+        : "=a"(ret)
+        : "a"((uint64_t)40), "D"(path), "S"(index), "d"(name_out),
+          "r"(r10_val), "r"(r8_val)
+        : "rcx", "r11", "memory"
+    );
+    return ret;
+}
+
+static inline int64_t sys_spawn(const char* path) {
+    int64_t ret;
+    __asm__ volatile (
+        "syscall"
+        : "=a"(ret)
+        : "a"((uint64_t)59), "D"(path)
+        : "rcx", "r11", "memory"
+    );
+    return ret;
+}
+
+static inline void sys_sleep(uint64_t ms) {
+    __asm__ volatile (
+        "syscall"
+        :
+        : "a"((uint64_t)35), "D"(ms)
+        : "rcx", "r11", "memory"
+    );
+}
+
 static inline void sys_reboot() {
     __asm__ volatile ("syscall" : : "a"(169) : "rcx", "r11", "memory");
     for(;;) {}
@@ -56,6 +93,26 @@ static int streq(const char* a, const char* b, int len) {
 
 void print(const char* s) { sys_write(1, s, strlen(s)); }
 
+void print_dec(uint64_t val) {
+    if (val == 0) {
+        print("0");
+        return;
+    }
+    char buf[24];
+    int i = 0;
+    while (val > 0) {
+        buf[i++] = '0' + (val % 10);
+        val /= 10;
+    }
+    for (int j = 0; j < i / 2; j++) {
+        char tmp = buf[j];
+        buf[j] = buf[i - 1 - j];
+        buf[i - 1 - j] = tmp;
+    }
+    buf[i] = '\0';
+    print(buf);
+}
+
 #define MAX_HISTORY 10
 char history[MAX_HISTORY][128];
 int history_count = 0;
@@ -75,7 +132,7 @@ void add_history(const char* cmd) {
 
 // Known commands for green highlighting
 static const char* known_commands[] = {
-    "clear", "shutdown", "restart", "open bootlog", 0
+    "clear", "shutdown", "restart", "bsod", "open bootlog", "ls", "run", "help", 0
 };
 
 static int is_known_command(const char* buf, int len) {
@@ -94,27 +151,22 @@ static int is_known_command(const char* buf, int len) {
     int cmd_len = (space_idx == -1) ? len : space_idx;
     for (int i = 0; known_commands[i]; i++) {
         int klen = strlen(known_commands[i]);
-        // Don't match "open" against "open bootlog" here, it's handled above or by checking start
         if (cmd_len == klen && streq(buf, known_commands[i], klen)) return 1;
     }
-    
     return 0;
 }
 
 // Redraw the current input line in-place with color feedback
 static void redraw_line(const char* buf, int len) {
-    // Move to start of line, reprint prompt + buffer
-    // Use green if typing a valid command, default otherwise
     if (is_known_command(buf, len)) {
-        print("\r\x1b[32mshell> ");   // green
+        print("\r\x1b[32mwyzar> ");   // green
     } else {
-        print("\r\x1b[0mshell> ");    // default white
+        print("\r\x1b[0mwyzar> ");    // default white
     }
     sys_write(1, buf, len);
-    // Erase any leftover characters to the right (from a shorter previous entry)
+    // Erase any leftover characters to the right
     print("\x1b[K");
 }
-
 
 void _start() {
     print("\x1b[2J\x1b[H"); 
@@ -122,6 +174,7 @@ void _start() {
     print("Welcome to WyzarOS Interactive Terminal!\n");
     print("Shift + Up/Down: Hardware Scrollback\n");
     print("Up/Down: Command History\n");
+    print("Type 'help' for available commands\n");
     print("----------------------------------------\n");
 
     char buf[128];
@@ -129,7 +182,7 @@ void _start() {
 
     while(1) {
         sys_ttyraw(1);          // Enter raw/interactive mode BEFORE the prompt
-        print("\nwyzar> ");     // tty_raw_mode=1 → cursor appears here, nowhere during init
+        print("\nwyzar> ");     // tty_raw_mode=1 -> cursor appears here
         pos = 0;
         history_index = -1;
 
@@ -186,11 +239,73 @@ void _start() {
         if (pos == 0) continue;
         add_history(buf);
 
-        if (streq(buf, "clear", 5)) {
+        if (streq(buf, "help", 4) && (buf[4] == ' ' || buf[4] == '\0')) {
+            print("Available commands:\n");
+            print("  ls [path]       - List directory contents (default '/')\n");
+            print("  run <path>      - Spawn dynamic ELF executable from ramfs\n");
+            print("  open bootlog    - Display kernel boot log\n");
+            print("  clear           - Clear screen\n");
+            print("  bsod            - Trigger crash screen\n");
+            print("  restart         - Reboot system\n");
+            print("  shutdown        - Power off system\n");
+        } else if (streq(buf, "ls", 2) && (buf[2] == ' ' || buf[2] == '\0')) {
+            const char* path = "/";
+            if (buf[2] == ' ') {
+                int idx = 2;
+                while (buf[idx] == ' ') idx++;
+                if (buf[idx] != '\0') path = &buf[idx];
+            }
+            char name[128];
+            uint64_t sz = 0;
+            uint64_t type = 0;
+            uint64_t idx = 0;
+            int count = 0;
+            while (sys_readdir(path, idx, name, &sz, &type) > 0) {
+                if (type == 2) {
+                    print("\x1b[34m[DIR]  \x1b[0m");
+                    print(name);
+                    print("/\n");
+                } else {
+                    print("\x1b[32m[FILE] \x1b[0m");
+                    print(name);
+                    print(" (");
+                    print_dec(sz);
+                    print(" bytes)\n");
+                }
+                idx++;
+                count++;
+            }
+            if (count == 0) {
+                print("Directory is empty or does not exist: ");
+                print(path);
+                print("\n");
+            }
+        } else if (streq(buf, "run", 3) && buf[3] == ' ') {
+            int idx = 3;
+            while (buf[idx] == ' ') idx++;
+            if (buf[idx] != '\0') {
+                const char* prog = &buf[idx];
+                if (streq(prog, "/bin/init.elf", 13) || streq(prog, "init.elf", 8)) {
+                    print("Refused: Cannot spawn a second interactive init shell on the same TTY.\n");
+                    continue;
+                }
+                print("Spawning: "); print(prog); print("...\n");
+                int64_t pid = sys_spawn(prog);
+                if (pid > 0) {
+                    print("Successfully spawned process with PID ");
+                    print_dec(pid);
+                    print("\n");
+                } else {
+                    print("Failed to spawn process (error ");
+                    print_dec(-pid);
+                    print(")\n");
+                }
+            } else {
+                print("Usage: run <path>\n");
+            }
+        } else if (streq(buf, "clear", 5)) {
             print("\x1b[2J\x1b[H");
         } else if (streq(buf, "bsod", 4)) {
-            // Deliberately trigger an Invalid Opcode exception (#UD) from ring-3.
-            // The kernel's IDT handler will catch it and display the WyzarOS panic screen.
             print("Triggering BSOD...\n");
             __asm__ volatile ("ud2");
         } else if (streq(buf, "shutdown", 8)) {
