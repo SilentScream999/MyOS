@@ -134,7 +134,20 @@ static inline void fill_screen_fast(uint32_t argb) {
 
 static void draw_char(int x, int y, char c, uint32_t color) {
     if (x < 0 || y < 0) return;
-    if (!g_backbuffer) return;
+    if (!g_backbuffer) {
+        // Before wm_init there is no terminal surface. Render boot diagnostics
+        // directly into the Limine framebuffer so an early fault is visible.
+        if (!fb || !fb->address || fb->bpp != 32) return;
+        if ((uint64_t)x + 8 > fb->width || (uint64_t)y + 8 > fb->height) return;
+        const uint8_t* glyph = font8x8_basic[(uint8_t)c & 0x7F];
+        for (int row = 0; row < 8; row++) {
+            volatile uint32_t* pixels = (volatile uint32_t*)((uint8_t*)fb->address + (y + row) * fb->pitch);
+            for (int col = 0; col < 8; col++) {
+                if (glyph[row] & (1u << col)) pixels[x + col] = color;
+            }
+        }
+        return;
+    }
     
     uint32_t pitch32 = g_term_max_cols ? (g_term_max_cols * 8) : (fb ? fb->pitch / 4 : 800);
     uint32_t term_w_px = g_term_max_cols * 8;
@@ -166,7 +179,7 @@ static void print(char* buffer) {
 
     wm_log_append(buffer);
 
-    if (g_klog_bypass_framebuffer) return;
+    if (g_klog_bypass_framebuffer || !fb || !fb->address) return;
 
     if (max_print_lines == 0) {
         max_print_lines = fb->height / 10;
@@ -186,6 +199,39 @@ static void print(char* buffer) {
     }
     current_print_line ++;
     g_needs_refresh = true;
+}
+
+// Called by the terminal halt path with interrupts disabled. Write straight to
+// VRAM even if a terminal surface/compositor already exists. No heap or timer
+// is needed, and ordinary print() calls never reveal the log during startup.
+static void show_fatal_boot_log() {
+    if (g_fatal_screen_visible || !fb || !fb->address || fb->bpp != 32 ||
+        fb->width < 8 || fb->height < 30 || fb->pitch < fb->width * 4) return;
+    g_fatal_screen_visible = true;
+    uint8_t* saved_backbuffer = g_backbuffer;
+    g_backbuffer = nullptr;
+    fill_screen_fast(0xFF0A0F1E);
+    const char* title = "System halted. Recent kernel log:";
+    for (uint32_t x = 0; title[x]; x++)
+        draw_char(x * 8, 0, title[x], 0xFFFF8080);
+
+    uint64_t end = g_klog_pos;
+    if (end >= KLOG_BUFFER_SIZE) end = KLOG_BUFFER_SIZE - 1;
+    if (end && g_klog_buffer[end - 1] == '\n') end--;
+    uint64_t start = end;
+    uint32_t lines = 0, available = fb->height / 10 - 2;
+    while (start) {
+        if (g_klog_buffer[start - 1] == '\n' && ++lines >= available) break;
+        start--;
+    }
+    uint32_t x = 0, y = 20;
+    for (uint64_t i = start; i < end; i++) {
+        char c = g_klog_buffer[i];
+        if (c == '\n') { x = 0; y += 10; }
+        else { draw_char(x * 8, y, c, 0xFFFFFFFF); x++; }
+    }
+    g_backbuffer = saved_backbuffer;
+    __asm__ volatile("sfence" ::: "memory");
 }
 
 #endif

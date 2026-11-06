@@ -18,6 +18,7 @@
 extern char     g_klog_buffer[KLOG_BUFFER_SIZE];
 extern uint64_t g_klog_pos;
 extern bool     g_klog_bypass_framebuffer;
+extern bool     g_fatal_screen_visible;
 
 // Internal: append a single character to the kernel log.
 static inline void klog_putc(char c) {

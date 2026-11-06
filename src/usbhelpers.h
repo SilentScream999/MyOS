@@ -64,6 +64,7 @@ static void tsc_delay_ms(uint64_t ms) {
 	uint64_t start = _usb_rdtsc();
 	uint64_t end = start + (hz / 1000) * ms;
 	while (_usb_rdtsc() < end) {
+		boot_splash_tick();
 		__asm__ volatile ("pause");
 	}
 }

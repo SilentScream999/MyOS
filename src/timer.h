@@ -119,6 +119,7 @@ static void sleep_ms(uint64_t ms) {
     } else {
         uint64_t target = g_tick_count + ms;
         while (g_tick_count < target) {
+            boot_splash_tick();
             __asm__ volatile ("pause");
         }
     }

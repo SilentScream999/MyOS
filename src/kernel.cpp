@@ -20,6 +20,7 @@
 #include "graphics.h"
 #include "wm.h"
 #include "intel_gpu.h"
+#include "apic_timer.h"
 
 __attribute__((used, section(".limine_requests")))
 static volatile LIMINE_BASE_REVISION(4);
@@ -49,11 +50,9 @@ static volatile struct limine_stack_size_request stack_size_req = {
 	.stack_size = 4 * 1024 * 1024
 };
 
-__attribute__((used, section(".limine_requests")))
-static volatile struct limine_smp_request smp_req = {
-    .id = LIMINE_SMP_REQUEST,
-    .revision = 0
-};
+// The scheduler runs on the BSP only. Do not request Limine SMP startup merely
+// for a CPU count: it starts/parks APs and adds an unnecessary firmware/APIC
+// dependency before kmain. The HUD already obtains topology through CPUID.
 
 __attribute__((used, section(".limine_requests_start")))
 static volatile LIMINE_REQUESTS_START_MARKER;
@@ -79,7 +78,7 @@ static inline uint64_t rdtsc() {
 }
 
 // ── Boot splash (loading screen) ─────────────────────────────────────────────
-// For testing, this intentionally loops forever so you can observe animation.
+// Direct framebuffer helpers also serve the early loading ring and panic UI.
 static inline void vram_putpx(uint32_t x, uint32_t y, uint32_t argb) {
 	if (!fb || !fb->address) return;
 	if (x >= fb->width || y >= fb->height) return;
@@ -138,129 +137,7 @@ static inline void vram_draw_string_8x8(int32_t x, int32_t y, const char* s, uin
 	}
 }
 
-// 0..64 quarter-wave sine lookup (sin(0..pi/2)), scaled to Q15 (32767 = 1.0).
-// Generated once and hardcoded to avoid floating point / libm.
-static const int16_t k_sin_q15_qtr[65] = {
-	0, 804, 1608, 2410, 3212, 4011, 4808, 5602,
-	6393, 7180, 7962, 8740, 9512, 10279, 11039, 11793,
-	12539, 13279, 14010, 14732, 15446, 16151, 16846, 17530,
-	18204, 18868, 19519, 20159, 20787, 21403, 22005, 22594,
-	23170, 23732, 24279, 24812, 25330, 25833, 26319, 26790,
-	27245, 27683, 28105, 28510, 28898, 29269, 29622, 29957,
-	30275, 30574, 30855, 31118, 31362, 31588, 31794, 31982,
-	32151, 32301, 32431, 32543, 32635, 32708, 32761, 32767,
-	32767
-};
-
-static inline int16_t sin_q15_u8(uint8_t a) {
-	// Map a in [0,255] to sin(2pi * a/256) in Q15.
-	uint8_t q = (a >> 6) & 3;     // quadrant 0..3
-	uint8_t o = a & 63;           // offset within quadrant (0..63)
-	uint8_t idx = (q & 1) ? (uint8_t)(64 - o) : o;
-	int16_t v = k_sin_q15_qtr[idx];
-	return (q >= 2) ? (int16_t)-v : v;
-}
-
-static inline int16_t cos_q15_u8(uint8_t a) {
-	return sin_q15_u8((uint8_t)(a + 64)); // +pi/2
-}
-
-extern volatile bool g_desktop_ready;  // defined later in this TU
-
-static void boot_loading_screen_until_ready() {
-	if (!fb || !fb->address) return;
-
-	// Static background (Windows-like dark blue/black)
-	const uint32_t bg = 0xFF0A0F1E;
-
-	const int32_t cx = (int32_t)fb->width / 2;
-	const int32_t cy = (int32_t)fb->height / 2;
-	const int32_t radius = 24;
-	const int32_t dot_r = 3;
-
-	// Angle in "turn/256" units, but with fractional precision (Q16.16).
-	uint32_t ang_fp = 0;
-	uint8_t speed_phase = 0;
-
-	uint64_t target = rdtsc();
-	uint64_t step = (tsc_hz ? (tsc_hz / 60) : 50000000ULL);
-
-	while (!g_desktop_ready) {
-		// Clear frame
-		vram_fill(bg);
-
-		// Windows 11-ish spinner:
-		// - A short arc ("half circle") of dots
-		// - Smooth rotation
-		// - Speed varies: accelerates then decelerates (sinusoidal speed curve)
-		//
-		// Speed curve: omega = base + amp * (0.5 + 0.5*sin())
-		// (implemented in integer math, Q16.16 on angle)
-		{
-			int16_t s = sin_q15_u8(speed_phase);        // [-32767, 32767]
-			uint32_t ease = (uint32_t)(s + 32767);      // [0, 65534]
-			// base/amp in (turn/256) per frame, expressed in Q16.16
-			uint32_t omega_base = (2u << 16);           // ~2/256 turns per frame
-			uint32_t omega_amp  = (5u << 16);           // add up to ~5/256 turns per frame
-			uint32_t omega = omega_base + (uint32_t)((omega_amp * ease) / 65534u);
-			ang_fp += omega;
-			speed_phase = (uint8_t)(speed_phase + 3);   // controls accel/decel cadence
-		}
-
-		uint8_t ang_u8 = (uint8_t)(ang_fp >> 16);
-
-		// Dot arc: 8 dots spanning ~180 degrees (pi = 128 in u8-turns)
-		const uint32_t dot_count = 8;
-		const uint32_t arc_span = 128; // half circle
-
-		for (uint32_t i = 0; i < dot_count; i++) {
-			// Position along arc: head at i=0, tail at i=dot_count-1
-			uint32_t off = (dot_count <= 1) ? 0 : (i * arc_span) / (dot_count - 1);
-
-			// Per-dot "ease": give each dot a slightly different phase so it
-			// accelerates/decelerates a bit independently (Windows 11-ish feel).
-			//
-			// Keep wobble subtle and monotonic so dots never cross.
-			// wobble is scaled down near the head/tail to preserve the arc endpoints.
-			uint8_t dot_phase = (uint8_t)(speed_phase + (uint8_t)(i * 19u));
-			int16_t wob = sin_q15_u8(dot_phase); // [-32767, 32767]
-			uint32_t edge = (i <= (dot_count - 1u) / 2u) ? i : (dot_count - 1u - i);
-			// edge in [0..3] for dot_count=8 → scale factor in [0..255]
-			uint32_t edge_scale = (dot_count <= 1) ? 0u : (edge * 255u) / ((dot_count - 1u) / 2u);
-			// amplitude in angle-units (0..255 is full circle); keep small (~6 units).
-			int32_t wob_amp = (int32_t)(6 * (int32_t)edge_scale) / 255;
-			int32_t wob_u8 = (int32_t)((int32_t)wob * wob_amp / 32767);
-
-			uint8_t a = (uint8_t)(ang_u8 + (uint8_t)off + (uint8_t)wob_u8);
-
-			int16_t cs = cos_q15_u8(a);
-			int16_t sn = sin_q15_u8(a);
-			int32_t px = cx + (int32_t)((int64_t)cs * radius / 32767);
-			int32_t py = cy + (int32_t)((int64_t)sn * radius / 32767);
-
-			// Brightness falloff along the arc (visual head brightest).
-			// If the arc direction appears reversed, invert the gradient.
-			uint32_t j = (dot_count - 1u) - i;
-			uint32_t v = (j == 0) ? 255 :
-			             (j == 1) ? 210 :
-			             (j == 2) ? 170 :
-			             (j == 3) ? 135 :
-			             (j == 4) ? 110 :
-			             (j == 5) ? 95  :
-			             (j == 6) ? 82  : 70;
-			uint32_t col = 0xFF000000 | (v << 16) | (v << 8) | v;
-			vram_fill_circle(px, py, dot_r, col);
-		}
-
-		vram_fence();
-
-		// 60Hz-ish pacing using TSC (good enough for splash)
-		target += step;
-		while (rdtsc() < target) {
-			__asm__ volatile("pause");
-		}
-	}
-}
+#include "boot_splash.h"
 
 // ── Syscall globals ───────────────────────────────────────────────────────────
 alignas(16) static uint8_t g_boot_kstack[4096];
@@ -271,7 +148,9 @@ uint64_t g_user_rsp_scratch = 0;
 #include "klog.h"
 char     g_klog_buffer[KLOG_BUFFER_SIZE];
 uint64_t g_klog_pos = 0;
-bool     g_klog_bypass_framebuffer = false;
+// Keep normal startup quiet. Logs still populate /dev/klog and the WM viewer.
+bool     g_klog_bypass_framebuffer = true;
+bool     g_fatal_screen_visible = false;
 uint8_t* g_backbuffer = nullptr;
 uint8_t* g_master_backbuffer = nullptr;
 
@@ -315,19 +194,37 @@ volatile uint32_t g_mouse_btns_prev = 0;
 #include "ps2kb.h"
 
 // Phase 18: High-precision TSC calibration against PIT
-static void calibrate_tsc_pit() {
+static bool calibrate_tsc_pit() {
     print((char*)"Calibrating TSC...");
+    // Bound legacy timer detection so newer firmware can use the LAPIC path.
+    const uint64_t timeout = _usb_tsc_hz() * 2;
+    uint64_t deadline_start = rdtsc();
     
     // Wait for a PIT tick boundary (g_tick_count from timer.h)
     uint64_t start_tick = g_tick_count;
-    while (g_tick_count == start_tick);
+    while (g_tick_count == start_tick) {
+        boot_splash_tick();
+        if (rdtsc() - deadline_start > timeout) {
+            print((char*)"[timer] No PIT IRQ0; trying local APIC timer...");
+            return false;
+        }
+        __asm__ volatile("pause");
+    }
     
     // Start measurement
     uint64_t tsc1 = rdtsc();
     uint64_t m_start = g_tick_count;
     
     // Measuring for 100ms (100 ticks) for high precision
-    while (g_tick_count < m_start + 100);
+    deadline_start = rdtsc();
+    while (g_tick_count - m_start < 100) {
+        boot_splash_tick();
+        if (rdtsc() - deadline_start > timeout) {
+            print((char*)"[timer] PIT IRQ0 stopped; trying local APIC timer...");
+            return false;
+        }
+        __asm__ volatile("pause");
+    }
     uint64_t tsc2 = rdtsc();
     
     uint64_t delta = tsc2 - tsc1;
@@ -335,6 +232,40 @@ static void calibrate_tsc_pit() {
     
     char mstr[32];
     print((char*)" TSC Hz: "); to_str(tsc_hz, mstr); print(mstr);
+    return true;
+}
+
+static void init_boot_timer() {
+    init_irq();
+    init_timer(1000);
+    __asm__ volatile("sti" ::: "memory");
+    if (calibrate_tsc_pit()) {
+        print((char*)"[timer] PIT interrupts verified.");
+        return;
+    }
+    __asm__ volatile("cli" ::: "memory");
+    irq_unregister(0); // prevent double ticks if legacy IRQ0 arrives later
+    if (init_local_apic_timer(tsc_hz)) {
+        uint64_t first = g_tick_count;
+        uint64_t start = rdtsc();
+        __asm__ volatile("sti" ::: "memory");
+        while (g_tick_count - first < 10 && rdtsc() - start < tsc_hz) {
+            boot_splash_tick();
+            __asm__ volatile("pause");
+        }
+        if (g_tick_count - first >= 10) {
+            print((char*)"[timer] Local APIC interrupts verified. Boot continuing.");
+            return;
+        }
+        __asm__ volatile("cli" ::: "memory");
+        timer_apic_write(0x320, (1u << 16) | LOCAL_TIMER_VECTOR);
+        timer_apic_write(0x380, 0);
+        print((char*)"[timer] ERROR: Local APIC configured but interrupts did not arrive.");
+    } else {
+        print((char*)"[timer] ERROR: Could not calibrate a local APIC timer.");
+    }
+    print((char*)"[boot] ERROR: No working timer interrupt source. Halted.");
+    hcf();
 }
 
 // ── PAT / Write-Combining Setup ──────────────────────────────────────────────
@@ -495,9 +426,19 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
 }
 
 void compositor_thread_main() {
+    // Keep the ring on screen throughout the expensive initial composition.
+    // The normal dirty-rectangle presenter starts only after this full handoff.
+    if (!fb || !g_backbuffer || !g_master_backbuffer) {
+        print((char*)"[boot] ERROR: No buffers for the initial desktop frame.");
+        hcf();
+    }
+    wm_compose_dirty(0, fb->width - 1, 0, fb->height - 1, false, false);
+    if (!boot_splash_present_desktop(g_master_backbuffer)) hcf();
+    wm_overlay_update(g_mouse_x, g_mouse_y, g_mouse_buttons);
+    g_desktop_ready = true;
+
     uint64_t target_tsc = rdtsc(); // Start cadence from current time
     static uint64_t last_hud_tick     = 0;
-    static uint32_t boot_sync_frames = 30;
 
     while (true) {
         uint64_t frame_interval = (tsc_hz / 60);
@@ -527,7 +468,7 @@ void compositor_thread_main() {
             wm_dirty_add(hud_left, fb->width - 1, 0, 60);   // its own rect, not unioned with whatever else is dirty
         }
 
-        if (g_needs_refresh || boot_sync_frames > 0) {
+        if (g_needs_refresh) {
             g_needs_refresh  = false;
 
             // Drain and render any pending terminal output
@@ -561,13 +502,6 @@ void compositor_thread_main() {
 			}
 			damage_clear(&g_damage);
 			__asm__ volatile("sti");
-
-			if (boot_sync_frames > 0) {
-				fx1 = 0; fx2 = fb->width - 1;
-				fy1 = 0; fy2 = fb->height - 1;
-				frame_dmg.n = 0;               // a full-screen compose covers every listed rect
-				boot_sync_frames--;
-			}
 
 			// Compose each damaged region separately (HUD strip, animation, cursor ... are not
 			// merged into one giant box). The legacy box counts as one more rect when something wrote to it.
@@ -606,9 +540,6 @@ void compositor_thread_main() {
 			uint64_t t_end = rdtsc();
 			g_last_frame_ticks = t_end - t_start;
 
-			// signal the splash to exit after the first frame lands
-            if (!g_desktop_ready) g_desktop_ready = true;
-            
             term_dirty_reset();
         }
 
@@ -636,7 +567,6 @@ extern "C" void kmain(void) {
 	if (!fb_req.response || fb_req.response->framebuffer_count < 1) hcf();
 
 	fb = fb_req.response->framebuffers[0];
-	print_fb_pixel_format(); // confirm channel layout before trusting any hardcoded ARGB constant
 
     // --- SSE & SIMD Enablement (CR0, CR4) ---
     {
@@ -653,20 +583,16 @@ extern "C" void kmain(void) {
         __asm__ volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
     }
 
+	if (!fb->address || fb->bpp != 32 || fb->pitch < fb->width * 4) hcf();
+	boot_splash_begin();
+	print((char*)"[boot] Kernel entered. Limine handoff complete (BSP only).");
+	print_fb_pixel_format();
+
 	// ── NEW ──────────────────────────────────────
 	init_gdt();
 	syscall_init();
 	print((char*)"GDT loaded.");
 	init_idt();
-	init_irq();              // remap PIC, mask all IRQ lines
-	init_timer(1000);        // PIT at 1000 Hz → 1 ms tick
-
-
-	__asm__ volatile ("sti"); // enable hardware interrupts
-	calibrate_tsc_pit();
-	synaptics_init();
-	ps2kb_init();
-	print((char*)"Interrupts enabled. Timer running.");
 	// ── END NEW ──────────────────────────────────────
 
 	print((char*)"Stack size req response:");
@@ -704,7 +630,9 @@ extern "C" void kmain(void) {
 
 	print((char*)"Setting up memory management");
 	init_physical_allocator();
+	print((char*)"[boot] Mapping usable RAM regions...");
 	map_hhdm_usable(PRESENT | WRITABLE);
+	print((char*)"[boot] Usable RAM mapped.");
 	setup_pat();
 	
 	// Explicitly map the framebuffer in our new page tables if it's not already covered
@@ -721,6 +649,12 @@ extern "C" void kmain(void) {
 		}
 	}
 
+	// LAPIC/HPET fallback needs MMIO mappings, so start the timer after PMM/VMM.
+	init_boot_timer();
+	print((char*)"[boot] Initializing PS/2 input...");
+	synaptics_init();
+	ps2kb_init();
+	print((char*)"Interrupts enabled. Timer running.");
 	init_heap();
     
     // Allocate backbuffer for double buffering + huge scrollback history
@@ -795,71 +729,13 @@ extern "C" void kmain(void) {
 
 	boot_loading_screen_until_ready();
 
-    if (smp_req.response) {
-        char cstr[32];
-        print((char*)"[cpu] Detected cores: ");
-        to_str(smp_req.response->cpu_count, cstr);
-        print(cstr); print((char*)"\r\n");
+
+    print((char*)"[boot] Discovering PCI through ACPI (XSDT/RSDT)...");
+    volatile struct MCFGHeader *mcfg = (volatile struct MCFGHeader*)find_acpi_table("MCFG");
+    if (!mcfg || mcfg->header.length < sizeof(struct ACPISDTHeader) + 8) {
+        print((char*)"[boot] ERROR: No valid ACPI MCFG table.");
+        hcf();
     }
-
-	if (!rsdp_req.response) hcf();
-	uint64_t rsdp_va = (uint64_t)rsdp_req.response->address;
-	volatile uint8_t *ptr = (volatile uint8_t*)rsdp_va;
-
-	const char expected[8] = {'R','S','D',' ','P','T','R',' '};
-	bool valid_signature = true;
-	for (int i = 0; i < 8; i++) {
-		if (ptr[i] != expected[i]) { valid_signature = false; break; }
-	}
-	if (!valid_signature) {
-		print((char*)"Error: No valid signature for RSD ptr");
-		hcf();
-	}
-
-	uint32_t rsdt_pa_32 =
-		(uint32_t)ptr[0x10]         |
-		((uint32_t)ptr[0x11] <<  8) |
-		((uint32_t)ptr[0x12] << 16) |
-		((uint32_t)ptr[0x13] << 24);
-
-	uint64_t rsdt_va = HHDM + (uint64_t)rsdt_pa_32;
-	volatile uint8_t *ptr_rsdt = (volatile uint8_t *)rsdt_va;
-
-	const char expected_rsdt[4] = {'R','S','D','T'};
-	valid_signature = true;
-	for (int i = 0; i < 4; i++) {
-		if (ptr_rsdt[i] != expected_rsdt[i]) { valid_signature = false; break; }
-	}
-	if (!valid_signature) {
-		print((char*)"Error: No valid signature for rsdt");
-		hcf();
-	}
-
-	uint32_t rsdt_length =
-		(uint32_t)ptr_rsdt[4]         |
-		((uint32_t)ptr_rsdt[5] <<  8) |
-		((uint32_t)ptr_rsdt[6] << 16) |
-		((uint32_t)ptr_rsdt[7] << 24);
-	uint32_t entry_count = (rsdt_length - 36) / 4;
-
-	volatile uint8_t *ptr_mcfg = 0;
-	for (uint32_t i = 0; i < entry_count; i++) {
-		uint32_t offset   = 36 + i * 4;
-		uint32_t entry_pa =
-			(uint32_t)ptr_rsdt[offset]         |
-			((uint32_t)ptr_rsdt[offset+1] <<  8) |
-			((uint32_t)ptr_rsdt[offset+2] << 16) |
-			((uint32_t)ptr_rsdt[offset+3] << 24);
-		uint64_t entry_va   = HHDM + (uint64_t)entry_pa;
-		volatile uint8_t *e = (volatile uint8_t *)entry_va;
-		if (e[0]=='M' && e[1]=='C' && e[2]=='F' && e[3]=='G') {
-			ptr_mcfg = e;
-			break;
-		}
-	}
-	if (ptr_mcfg == 0) { print((char*)"Error: ptr_mcfg == 0"); hcf(); }
-
-	volatile struct MCFGHeader *mcfg = (volatile struct MCFGHeader *)ptr_mcfg;
 	uint32_t length  = mcfg->header.length;
 	uint32_t entries = (length - sizeof(struct ACPISDTHeader) - 8) / 16;
 
@@ -1036,7 +912,7 @@ extern "C" void kmain(void) {
 	//   repeat_period = 40  ms  (25 repeats / sec)
 	//
 	// We convert to TSC ticks so timing is correct regardless of loop speed.
-	// tsc_hz is already calibrated via calibrate_tsc_pit() earlier in kmain.
+	// tsc_hz is calibrated by the selected boot timer earlier in kmain.
 
 	// Print so you can verify CPUID gave a sensible value.
 	print((char*)"TSC freq (Hz):"); to_str(tsc_hz, str); print(str);
@@ -1553,6 +1429,7 @@ extern "C" void kmain(void) {
 extern "C" void kpanic(const char* name, ExceptionFrame* f) {
     // 1. Silence the system
     __asm__ volatile("cli");
+    g_fatal_screen_visible = true; // hcf must preserve this exception screen
 
     // 2. Graphical BSOD: WyzarOS "Deep Space" theme
     uint32_t wyzar_panic_bg = 0xFF141414; // Ultra dark/black

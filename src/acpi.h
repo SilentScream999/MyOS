@@ -95,25 +95,29 @@ static inline uint16_t inw_acpi(uint16_t port) {
     return ret;
 }
 
-// ── Find FADT ─────────────────────────────────────────────────────────────────
-// Shared by both shutdown and reset so we don't duplicate the RSDP walk.
-static struct FADT* find_fadt(void) {
+// Shared table lookup for boot-time PCI discovery, shutdown, and reset.
+// UEFI systems may supply only an XSDT (RsdtAddress == 0).
+static struct ACPISDTHeader* find_acpi_table(const char* signature) {
     if (!rsdp_req.response || rsdp_req.response->address == nullptr)
         return nullptr;
 
     struct RSDPDescriptor20* rsdp = (struct RSDPDescriptor20*)rsdp_req.response->address;
+    if (strncmp(rsdp->firstPart.Signature, "RSD PTR ", 8) != 0) return nullptr;
 
     uint8_t* table_pointers;
     int entries;
     int pointer_size;
 
-    if (rsdp->firstPart.Revision >= 2 && rsdp->XsdtAddress != 0) {
+    if (rsdp->firstPart.Revision >= 2 && rsdp->Length >= sizeof(RSDPDescriptor20) && rsdp->XsdtAddress != 0) {
         struct ACPISDTHeader* xsdt = (struct ACPISDTHeader*)(rsdp->XsdtAddress + HHDM);
+        if (strncmp(xsdt->signature, "XSDT", 4) != 0 || xsdt->length < sizeof(ACPISDTHeader)) return nullptr;
         entries = (xsdt->length - sizeof(struct ACPISDTHeader)) / 8;
         table_pointers = (uint8_t*)xsdt + sizeof(struct ACPISDTHeader);
         pointer_size = 8;
     } else {
+        if (!rsdp->firstPart.RsdtAddress) return nullptr;
         struct ACPISDTHeader* rsdt = (struct ACPISDTHeader*)((uint64_t)rsdp->firstPart.RsdtAddress + HHDM);
+        if (strncmp(rsdt->signature, "RSDT", 4) != 0 || rsdt->length < sizeof(ACPISDTHeader)) return nullptr;
         entries = (rsdt->length - sizeof(struct ACPISDTHeader)) / 4;
         table_pointers = (uint8_t*)rsdt + sizeof(struct ACPISDTHeader);
         pointer_size = 4;
@@ -121,14 +125,20 @@ static struct FADT* find_fadt(void) {
 
     for (int i = 0; i < entries; i++) {
         uint64_t addr = 0;
-        if (pointer_size == 8) addr = *(uint64_t*)(table_pointers + i * 8);
-        else                   addr = *(uint32_t*)(table_pointers + i * 4);
+        // XSDT entries start at byte 36, so they are not 8-byte aligned.
+        for (int byte = 0; byte < pointer_size; byte++)
+            addr |= (uint64_t)table_pointers[i * pointer_size + byte] << (byte * 8);
 
+        if (!addr) continue;
         struct ACPISDTHeader* header = (struct ACPISDTHeader*)(addr + HHDM);
-        if (strncmp(header->signature, "FACP", 4) == 0)
-            return (struct FADT*)header;
+        if (strncmp(header->signature, signature, 4) == 0 && header->length >= sizeof(ACPISDTHeader))
+            return header;
     }
     return nullptr;
+}
+
+static struct FADT* find_fadt(void) {
+    return (struct FADT*)find_acpi_table("FACP");
 }
 
 // ── hardware_reset ────────────────────────────────────────────────────────────

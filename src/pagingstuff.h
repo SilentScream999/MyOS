@@ -19,7 +19,7 @@
 //   • unmap_page() — clear a PTE and flush the TLB entry.
 //   • map_2m() / map_range_huge() — 2 MiB huge-page fast path for HHDM setup.
 //   • map_ecam_region() / map_mmio_region() — MMIO helpers (cache-disabled).
-//   • map_hhdm_usable() — identity-maps all physical RAM via the HHDM offset.
+//   • map_hhdm_usable() — maps usable RAM regions via the HHDM offset.
 //
 // User / kernel address space separation
 //   • USERSPACE_END   — top of the canonical user address range.
@@ -112,7 +112,8 @@ static PMMRegion pmm_regions[PMM_MAX_REGIONS];
 static int       pmm_region_count   = 0;
 static int       pmm_cur_region     = 0;
 
-// max_hhdm_size is used by map_hhdm_usable() to know how much RAM to map.
+// Highest address in the firmware map, for diagnostics only. Reserved/MMIO
+// ranges can be far above RAM and need not end on a page boundary.
 static uint64_t max_hhdm_size      = 0;
 static uint64_t total_usable_ram   = 0;
 
@@ -404,18 +405,31 @@ void map_2m(uint64_t va, uint64_t pa, uint64_t flags) {
 }
 
 void map_range_huge(uint64_t va, uint64_t pa, uint64_t len, uint64_t flags) {
-    while (len >= (1ULL << 21) && ((va | pa) & ((1ULL << 21) - 1)) == 0) {
-        map_2m(va, pa, flags);
-        va += (1ULL << 21); pa += (1ULL << 21); len -= (1ULL << 21);
-    }
+    // Callers supply page-aligned addresses; lengths may include a partial
+    // final page. Saturate the subtraction so that tail cannot wrap uint64_t.
     while (len) {
-        map_page(va, pa, flags);
-        va += PAGE_SIZE; pa += PAGE_SIZE; len -= PAGE_SIZE;
+        uint64_t step = PAGE_SIZE;
+        if (len >= (1ULL << 21) && ((va | pa) & ((1ULL << 21) - 1)) == 0) {
+            step = 1ULL << 21;
+            map_2m(va, pa, flags);
+        } else {
+            map_page(va, pa, flags);
+        }
+        if (len <= step) break;
+        va += step; pa += step; len -= step;
     }
 }
 
 static void map_hhdm_usable(uint64_t flags) {
-    map_range_huge(HHDM, 0, max_hhdm_size, flags);
+    // Keep Limine's mappings for ACPI, bootloader data, modules, and the
+    // framebuffer. Do not turn every reserved hole below the highest firmware
+    // address into ordinary write-back RAM. Drivers map their own MMIO as UC.
+    auto* memmap = memmap_req.response;
+    for (uint64_t i = 0; i < memmap->entry_count; i++) {
+        auto* entry = memmap->entries[i];
+        if (entry->type != LIMINE_MEMMAP_USABLE || !entry->length) continue;
+        map_range_huge(HHDM + entry->base, entry->base, entry->length, flags);
+    }
 }
 
 // ── User / kernel address space separation ────────────────────────────────────

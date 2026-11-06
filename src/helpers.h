@@ -5,7 +5,11 @@
 #include "string.h"
 #include "framebufferstuff.h"
 
+void boot_splash_tick(); // safe no-op until the early splash is active
+
 static inline void hcf() {
+	__asm__ __volatile__("cli" ::: "memory");
+	show_fatal_boot_log();
 	for (;;) { __asm__ __volatile__("hlt"); }
 }
 

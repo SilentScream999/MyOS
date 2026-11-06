@@ -1246,10 +1246,12 @@ static uint32_t g_overlay_backup[256];
 
 
 // Composes and flips ONE dirty rect. Returns true if it also ran the cursor/ghost-outline overlay.
+// With present=false, prepare the backbuffer only (boot's first desktop frame).
 // When several rects are composed in one frame the caller passes do_overlay=true only for the LAST one:
 // the overlay draws straight onto VRAM, so a later flip would overwrite what an earlier overlay drew.
 static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
-                                     uint32_t min_y, uint32_t max_y, bool do_overlay = true) {
+                                     uint32_t min_y, uint32_t max_y, bool do_overlay = true,
+                                     bool present = true) {
     if (!fb || !fb->address || !g_backbuffer || !g_master_backbuffer) return false;
     if (min_x >= fb->width)  min_x = 0;
     if (max_x >= fb->width)  max_x = fb->width - 1;
@@ -1714,6 +1716,10 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
     
     t2 = rdtsc_val();
     g_time_win_ticks = t2 - t1;
+
+    // Boot keeps the splash in VRAM until every part of the desktop is ready.
+    // No cursor, overlay, GPU hook, or framebuffer write may precede this gate.
+    if (!present) return false;
 
     // Stage 3: Blit dirty rectangle to VRAM
     if (min_x > max_x || min_y > max_y) {

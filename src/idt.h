@@ -88,6 +88,11 @@ struct ExceptionFrame {
 // Handlers must NOT send EOI — exception_dispatch() does that automatically.
 typedef void (*irq_handler_t)();
 static irq_handler_t g_irq_handlers[16] = {};
+// Local APIC interrupts bypass the PIC. Their handler acknowledges the LAPIC
+// before scheduling, since a context switch may delay its return indefinitely.
+static constexpr uint8_t LOCAL_TIMER_VECTOR = 64;
+static constexpr uint8_t LOCAL_SPURIOUS_VECTOR = 255;
+static irq_handler_t g_local_timer_handler = nullptr;
 
 // ── Minimal PIC EOI helper ────────────────────────────────────────────────────
 // Used only by exception_dispatch().  The full port I/O API (outb/inb) lives
@@ -177,10 +182,16 @@ static const char* const exception_names[32] = {
 // ROUTING:
 //   vectors  0-31 : CPU exceptions → kpanic (never returns)
 //   vectors 32-47 : hardware IRQs  → call g_irq_handlers[irq], send EOI, return
-//   vectors 48+   : unregistered   → kpanic (catches stray APIC/MSI vectors
-//                                    that arrive before we handle them)
+//   vector 64     : local APIC timer (handler sends LAPIC EOI before scheduling)
+//   vector 255    : local APIC spurious interrupt (no EOI)
+//   other 48+     : unregistered → kpanic
 extern "C" __attribute__((used))
 void exception_dispatch(ExceptionFrame* f) {
+    if (f->vector == LOCAL_SPURIOUS_VECTOR) return; // APIC spurious: no EOI
+    if (f->vector == LOCAL_TIMER_VECTOR && g_local_timer_handler) {
+        g_local_timer_handler();
+        return;
+    }
 
     // ── Hardware IRQ path (vectors 32-47, PIC IRQ lines 0-15) ─────────────────
     //
@@ -349,9 +360,10 @@ ISR_NO_ERR(45)   // IRQ 13 — x87 FPU / coprocessor
 ISR_NO_ERR(46)   // IRQ 14 — ATA primary
 ISR_NO_ERR(47)   // IRQ 15 — ATA secondary / spurious PIC2
 
-// Generic placeholder for unhandled vectors 48-255.
-// Will be replaced with APIC/MSI handlers in the APIC phase.
+// Generic placeholder for unhandled vectors, plus dedicated local APIC stubs.
 ISR_NO_ERR(48)
+ISR_NO_ERR(64)    // Local APIC timer
+ISR_NO_ERR(255)   // Local APIC spurious interrupt
 
 // ── init_idt ──────────────────────────────────────────────────────────────────
 static void init_idt() {
@@ -360,6 +372,8 @@ static void init_idt() {
     // Stray vectors produce a panic rather than a triple fault.
     for (int i = 0; i < 256; i++)
         idt_set_gate((uint8_t)i, (void*)isr_stub_48, 0, IDT_GATE_INTERRUPT);
+    idt_set_gate(LOCAL_TIMER_VECTOR, (void*)isr_stub_64, 0, IDT_GATE_INTERRUPT);
+    idt_set_gate(LOCAL_SPURIOUS_VECTOR, (void*)isr_stub_255, 0, IDT_GATE_INTERRUPT);
 
     // ── CPU exceptions 0-31 ───────────────────────────────────────────────────
     idt_set_gate(0,  (void*)isr_stub_0,  0, IDT_GATE_INTERRUPT);
@@ -426,4 +440,4 @@ static void init_idt() {
     print((char*)"IDT loaded -- exceptions armed, IRQ vectors 32-47 ready.");
 }
 
-#endif // idt_h 
+#endif // idt_h
