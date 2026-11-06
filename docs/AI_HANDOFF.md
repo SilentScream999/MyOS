@@ -1,7 +1,7 @@
 # Project handoff
 
 Current status, conventions, known issues and next steps, written so that anyone picking the project up cold (a new contributor, or an
-AI assistant given this file as context) can get productive without the history. *Last updated: 2026-11-04 (Milestone 1 / Stage A1 complete).*
+AI assistant given this file as context) can get productive without the history. *Last updated: 2026-11-06 (Start Menu complete, hardware-verified; next up: paint.elf).*
 Read this, then `docs/GPU_DESKTOP_ROADMAP.md` and `docs/APP_LOADING.md`.
 
 ## 1. The assignment
@@ -71,6 +71,8 @@ Practical constraints that shape the work:
       * Only when Boot Log has focus does Up/Down scroll log output.
       * When a user GUI window has focus, all arrow keys and modifiers are delivered as `WIN_EVENT_KEY_DOWN` to that window without affecting Terminal or Boot Log.
     * Removed temporary debug shortcuts; system is ready for clean desktop hotkeys.
+
+* **Start Menu ✅ COMPLETE:** The Start button now opens a popup menu listing `/bin/*.elf` (via `vfs_readdir`, skipping `init.elf`) and launches the selected app with one click (`execve_path` + `scheduler_add_task`). Kernel-side state lives in `src/wm.h` (`g_menu_open`, `wm_menu_*()`); the panel is drawn as compositor Stage 2.8 above all windows, styled to match the taskbar (dark navy glass, header strip, per-app rainbow-LUT icons, hover highlight like an active task button). Start click toggles it; item click launches and closes; any other click dismisses it. Hover repaints are driven by damage-rect marking on pointer move; the close/open damage rect is expanded 1px to cover the shadow ring (stale-ring bug fixed and confirmed on hardware). Build verified: `make clean && make iso` → **0 errors, 13 warnings** (all pre-existing). *Booted and confirmed working on the test laptop.*
   * **Cursor Offset & Client Coordinate Fix (`src/kernel.cpp`):**
     * Fixed `ev.y = my - win->y`: because `win->y` marks the top of the client area (title bar is above at `win->y - g_title_h`), subtracting `g_title_h` an extra time was shifting click/scroll coordinates upward. Coordinates now line up precisely with the cursor tip.
   * **Universal Hover-Scrolling (`src/kernel.cpp`):** Mouse wheel scrolling is hover-based (like Windows 10/11): scrolling over Terminal scrolls terminal history; scrolling over Boot Log scrolls log output; scrolling over any user GUI window delivers `WIN_EVENT_MOUSE_SCROLL` directly to that window regardless of which window currently has focus.
@@ -126,7 +128,7 @@ These matter because the next big steps (apps, window API v2) run straight into 
 6. **The ELF loader is minimal** (`src/exec.h`): segment `p_flags` are ignored (every page is user + writable, so no W^X); `p_vaddr`/`p_memsz` are not validated against the user address range, the stack or each other; there are no size limits and no `argv`/`envp`; page zeroing is a byte loop; pages leak on failure.
 7. ✅ ~~**No spawn / wait / exec / readdir / stat syscalls.**~~ — **Done (Milestone 4).** Added `vfs_readdir`/`ramfs_readdir`, `vfs_mkdir_p`, `SYS_READDIR` (40), and `SYS_SPAWN` (59). Added `execve_path()` which dynamically loads static ELFs from the VFS. Apps can be spawned via `run <path>` or `sys_spawn()`.
 8. **Per-task state is thin:** `Task` has `pid`, `cr3`, a 16-entry `fd_table`, and entry/stack info, but no parent, exit status or owned windows.
-9. **Hard-coded UI:** `wm_init` creates Terminal, Visual Test, Rainbow and Boot Log unconditionally. The Start button prints "Start Menu coming soon..." into the terminal. Terminal cannot be closed. *(Compositor special-case branches were removed in Milestone 1 — all windows now use the unified surface blit path.)*
+9. **Hard-coded UI:** `wm_init` creates Terminal, Visual Test, Rainbow and Boot Log unconditionally. The Start button opens the app menu (see Current state). Terminal cannot be closed. *(Compositor special-case branches were removed in Milestone 1 — all windows now use the unified surface blit path.)*
 10. **USB:** a failing device during the root-port scan can starve HID descriptor reads on other ports. Wish: detect which device is the boot drive.
 11. **Repository hygiene:** build outputs (`myos`, `myos.iso` at ~12 MB, `init.elf`, `*.o`, `iso_root/`) and three ~8 MB `.raw` images are tracked, and there is no `.gitignore`. Three UUID-named `.json` files are editor project settings containing local paths. `pythonshit/` is a scratch image script.
 
@@ -139,7 +141,7 @@ These matter because the next big steps (apps, window API v2) run straight into 
 5. ✅ ~~**Window Focus & Unified Input Handling (Windows-like Focus Model)**~~ — **Done (Milestone 5).** Active/focused window tracking (`g_focused_win_id`), click-to-focus and raise, per-window event queue ring buffers, `SYS_WIN_POLL_EVENT (205)` syscall, keyboard input follows focus (Terminal gets keys when focused; GUI apps receive `WIN_EVENT_KEY_DOWN` without terminal leakage), universal hover-scrolling, global hotkeys (Ctrl+Shift+Esc, Ctrl+Alt+Del, Ctrl+Alt+T).
 6. **First Interactive GUI Apps & Start Menu:**
    * Interactive Paint / Drawing app (`paint.elf`).
-   * Interactive Desktop Start Menu (lists `/bin/*.elf` and launches them).
+   * ✅ ~~Interactive Desktop Start Menu~~ — **Done.** Lists `/bin/*.elf`, launches on click; see Current state.
 7. **Filesystem on Boot Drive & `.wiz` Binary Support:**
    * USB Mass Storage (BOT) + FAT32 driver mounted at `/usb`.
    * Native `.wiz` executable loader co-existing with ELF (checks `"WIZ\x01"` magic, app icon/title metadata, segment loader).

@@ -118,7 +118,7 @@ There is **no** spawn/exec, wait, directory listing, stat or input-event syscall
 
 Details, with file pointers, are in [docs/AI_HANDOFF.md](docs/AI_HANDOFF.md). In short:
 
-* **Apps are hard-coded.** Terminal, Visual Test, Rainbow and Boot Log are created in `wm_init`; the Start button only prints "coming soon". Nothing can start a second user program.
+* **Apps are hard-coded.** Terminal, Visual Test, Rainbow and Boot Log are created in `wm_init`; the Start button opens a menu of `/bin/*.elf` apps and launches them on click.
 * **Not safe for more than one user process yet:** the syscall entry path uses one global saved-RSP slot and one shared kernel stack.
 * **The user window API probably cannot work from ring 3 as written** (it returns a kernel heap pointer; no ownership; no input events). It has not been exercised end to end.
 * **No per-pixel alpha** anywhere in the compositor.

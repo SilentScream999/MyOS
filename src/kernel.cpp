@@ -323,6 +323,9 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
     if (g_mouse_y < 0) g_mouse_y = 0;
     if (g_mouse_y >= (int32_t)fb->height) g_mouse_y = fb->height - 1;
 
+    // Start menu hover highlight follows the pointer
+    if (g_menu_open && (dx != 0 || dy != 0)) wm_menu_hover_dirty();
+
     // 2. Start drag / Raise / Close / Taskbar: hit-test Z-stack on fresh click
     if (mouse_press) {
         int32_t mx = g_mouse_x, my = g_mouse_y;
@@ -330,9 +333,11 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
         // Taskbar / Start button
         if (my >= (int32_t)fb->height - (int32_t)g_taskbar_h) {
             if (mx >= 6 && mx <= (int32_t)(6 + g_sb_w)) {
-                term_clear_screen();
-                term_write_string((char*)"[SYSTEM] Start Menu coming soon...\r\n");
+                // Start button toggles the menu
+                if (g_menu_open) wm_menu_close();
+                else            wm_menu_open();
             } else {
+                if (g_menu_open) wm_menu_close(); // any other taskbar click dismisses it
                 const int32_t WBTN_GAP = (int32_t)(4 * fb->height) / 1080;
                 int32_t cur_x = 6 + g_sb_w + (int32_t)(10 * fb->height) / 1080;
                 for (int i = 0; i < g_window_count; i++) {
@@ -346,6 +351,31 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
                 }
             }
         } else {
+            int menu_hit = wm_menu_hit_test(mx, my);
+            if (menu_hit >= 0) {
+                // Launch the selected app from /bin
+                char path[64];
+                strcpy(path, "/bin/");
+                int plen = 5;
+                const char* nm = g_menu_apps[menu_hit];
+                while (*nm && plen < 58) path[plen++] = *nm++;
+                path[plen++] = '.'; path[plen++] = 'e'; path[plen++] = 'l'; path[plen++] = 'f'; path[plen] = '\0';
+                Task* t = execve_path(path);
+                if (t) {
+                    scheduler_add_task(t);
+                    term_write_string((char*)"[SYSTEM] Started ");
+                    term_write_string((char*)nm);
+                    term_write_string((char*)"\r\n");
+                } else {
+                    term_write_string((char*)"[SYSTEM] Failed to start: /bin/");
+                    term_write_string((char*)nm);
+                    term_write_string((char*)".elf\r\n");
+                }
+                wm_menu_close();
+            } else if (g_menu_open) {
+                // Clicked header/padding or outside the panel: just dismiss it
+                wm_menu_close();
+            } else {
             int idx = wm_find_top_window(mx, my);
             if (idx != -1) {
                 wm_raise_window(idx);
@@ -374,6 +404,7 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
                 g_dirty_min_x = 0; g_dirty_max_x = fb->width - 1;
                 g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
                 g_needs_refresh = true;
+            }
             }
         }
     }

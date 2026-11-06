@@ -202,6 +202,105 @@ static uint32_t g_taskbar_h = 40; // Default, will be recalculated in wm_init
 static uint32_t g_sb_w = 92;
 static uint32_t g_wbtn_w = 124;
 
+// ── Start Menu (taskbar popup) ────────────────────────────────
+#define MENU_MAX_APPS 16
+static char  g_menu_apps[MENU_MAX_APPS][29]; // display names, ".elf" stripped
+static int   g_menu_app_count = 0;
+static bool  g_menu_open = false;
+
+// Panel geometry (scaled like the rest of the UI). The app list starts below the header.
+static inline void wm_menu_geom(int32_t* px, int32_t* py, int32_t* pw, int32_t* ph) {
+    uint32_t sn = fb->height, sd = 1080;
+    int32_t w     = (int32_t)((sn * 340) / sd); if (w < 250) w = 250;
+    int32_t hdr_h = (int32_t)((sn * 36)  / sd); if (hdr_h < 24) hdr_h = 24;
+    int32_t row_h = (int32_t)((sn * 38)  / sd); if (row_h < 26) row_h = 26;
+    int32_t pad   = (int32_t)((sn * 10)  / sd); if (pad < 6) pad = 6;
+
+    int rows = g_menu_app_count > 0 ? g_menu_app_count : 1;
+    int32_t h = hdr_h + rows * row_h + pad * 2;
+    int32_t max_h = (int32_t)((sn * 740) / sd);
+    if (h > max_h) h = max_h;
+
+    int32_t x = 6; // aligned with the Start button
+    int32_t y = (int32_t)fb->height - (int32_t)g_taskbar_h - h - (int32_t)((sn * 4) / sd);
+    if (y < 0) y = 0;
+    *px = x; *py = y; *pw = w; *ph = h;
+}
+
+// Item index under the cursor, or -1. in_panel reports whether the point is inside the panel.
+static inline int wm_menu_hit_test(int32_t mx, int32_t my, bool* in_panel = nullptr) {
+    if (!g_menu_open || !fb) { if (in_panel) *in_panel = false; return -1; }
+    int32_t px, py, pw, ph;
+    wm_menu_geom(&px, &py, &pw, &ph);
+    bool inside = (mx >= px && mx < px + pw && my >= py && my < py + ph);
+    if (in_panel) *in_panel = inside;
+    if (!inside) return -1;
+
+    uint32_t sn = fb->height, sd = 1080;
+    int32_t hdr_h = (int32_t)((sn * 36) / sd); if (hdr_h < 24) hdr_h = 24;
+    int32_t row_h = (int32_t)((sn * 38) / sd); if (row_h < 26) row_h = 26;
+    int32_t pad   = (int32_t)((sn * 10) / sd); if (pad < 6) pad = 6;
+
+    int32_t list_top = py + hdr_h + pad;
+    if (my < list_top || my >= list_top + g_menu_app_count * row_h) return -1;
+    int idx = (my - list_top) / row_h;
+    if (idx < 0 || idx >= g_menu_app_count) return -1;
+    return idx;
+}
+
+// Rebuild the app list from /bin/*.elf. init.elf is skipped — that's the shell itself.
+static inline void wm_menu_refresh() {
+    g_menu_app_count = 0;
+    char name[64];
+    uint64_t sz = 0;
+    VnodeType vt = VnodeType::FILE;
+    for (uint64_t i = 0; vfs_readdir("/bin", i, name, &sz, &vt) > 0 && g_menu_app_count < MENU_MAX_APPS; i++) {
+        if (vt != VnodeType::FILE) continue;
+        int n = strlen(name);
+        if (n <= 4 || strcmp(name + n - 4, ".elf") != 0) continue;
+        if (strcmp(name, "init.elf") == 0) continue;
+        char* d = g_menu_apps[g_menu_app_count];
+        int len = n - 4; if (len > 28) len = 28;
+        for (int k = 0; k < len; k++) d[k] = name[k];
+        d[len] = '\0';
+        g_menu_app_count++;
+    }
+}
+
+// Mark the whole panel dirty so the compositor repaints it.
+// Expanded by 1px: the shadow ring is drawn just OUTSIDE the panel rect,
+// and stale ring pixels are what lingered after closing the menu.
+static inline void wm_menu_dirty_rect() {
+    if (!fb) return;
+    int32_t px, py, pw, ph;
+    wm_menu_geom(&px, &py, &pw, &ph);
+    uint32_t x1 = (uint32_t)(px > 0 ? px - 1 : 0), y1 = (uint32_t)(py > 0 ? py - 1 : 0);
+    int32_t xe = px + pw; // shadow right edge, inclusive
+    int32_t ye = py + ph; // shadow bottom edge, inclusive
+    uint32_t x2 = (xe < (int32_t)fb->width)  ? (uint32_t)xe : fb->width - 1;
+    uint32_t y2 = (ye < (int32_t)fb->height) ? (uint32_t)ye : fb->height - 1;
+    wm_dirty_add(x1, x2, y1, y2);
+    g_needs_refresh = true;
+}
+
+static inline void wm_menu_open() {
+    wm_menu_refresh();
+    g_menu_open = true;
+    wm_menu_dirty_rect();
+}
+
+static inline void wm_menu_close() {
+    if (!g_menu_open) return;
+    g_menu_open = false;
+    wm_menu_dirty_rect(); // geometry unchanged: the list stays cached until next open
+}
+
+// Pointer moved over an open menu: repaint so hover highlights follow.
+static inline void wm_menu_hover_dirty() {
+    if (!g_menu_open) return;
+    wm_menu_dirty_rect();
+}
+
 // Optional precomputed wallpaper backing store (same size as framebuffer).
 // When present, the compositor samples wallpaper pixels from this buffer
 // instead of a flat teal fill for the desktop background.
@@ -1714,6 +1813,124 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         }
     }
     
+    // Stage 2.8: Start menu popup (topmost scene layer, below the cursor overlay)
+    if (g_menu_open && fb) {
+        int32_t px, py, pw, ph;
+        wm_menu_geom(&px, &py, &pw, &ph);
+
+        uint32_t sn = fb->height, sd = 1080;
+        int32_t hdr_h = (int32_t)((sn * 36) / sd); if (hdr_h < 24) hdr_h = 24;
+        int32_t row_h = (int32_t)((sn * 38) / sd); if (row_h < 26) row_h = 26;
+        int32_t pad   = (int32_t)((sn * 10) / sd); if (pad < 6) pad = 6;
+
+        // Hover index comes straight from the live cursor position — no state to keep in sync.
+        int hover = wm_menu_hit_test(g_mouse_x, g_mouse_y);
+
+        uint32_t char_h = (8 * g_font_scale_100) / 100;
+
+        // ── Shadow ring: 1px dark border around the whole panel (depth without alpha)
+        for (int32_t y = py - 1; y <= py + ph; y++) {
+            if (y < (int32_t)min_y || y > (int32_t)max_y) continue;
+            if (y < 0 || (uint32_t)y >= fb->height) continue;
+            uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
+            int32_t sx = px - 1 < 0 ? 0 : px - 1;
+            int32_t ex = px + pw + 1; if (ex > (int32_t)fb->width) ex = (int32_t)fb->width;
+            if (ex > sx) memset_32(drow + sx, 0xFF0A0E1A, (uint32_t)(ex - sx));
+        }
+
+        // ── Panel body: dark navy glass, same family as the taskbar
+        for (int32_t y = py; y < py + ph; y++) {
+            if (y < (int32_t)min_y || y > (int32_t)max_y) continue;
+            if (y < 0 || (uint32_t)y >= fb->height) continue;
+            uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
+
+            int32_t rel = y - py;
+            uint32_t bgc;
+            if (rel == 0) {
+                bgc = 0xFF6A76A8; // top shelf highlight, matches the taskbar's bright edge
+            } else if (rel < hdr_h) {
+                uint32_t t = (uint32_t)(rel - 1) * 255 / (hdr_h > 2 ? (uint32_t)(hdr_h - 2) : 1u);
+                int32_t rr = (int32_t)0x2E + ((int32_t)0x23 - (int32_t)0x2E) * (int32_t)t / 255;
+                int32_t gg = (int32_t)0x46 + ((int32_t)0x2F - (int32_t)0x46) * (int32_t)t / 255;
+                int32_t bb = (int32_t)0x70 + ((int32_t)0x52 - (int32_t)0x70) * (int32_t)t / 255;
+                bgc = 0xFF000000 | ((uint32_t)rr << 16) | ((uint32_t)gg << 8) | (uint32_t)bb;
+            } else if (rel == hdr_h) {
+                bgc = 0xFF0D1120; // separator line under the header
+            } else {
+                bgc = 0xFF161B2C; // body
+            }
+
+            int32_t sx = px < 0 ? 0 : px;
+            int32_t ex = px + pw; if (ex > (int32_t)fb->width) ex = (int32_t)fb->width;
+            if (ex > sx) memset_32(drow + sx, bgc, (uint32_t)(ex - sx));
+        }
+
+        // ── Header text: "START" left, app count right
+        {
+            int32_t hy = py + (hdr_h - (int32_t)char_h) / 2;
+            if (hy >= (int32_t)min_y && hy <= (int32_t)max_y) {
+                wm_draw_string((uint32_t)(px + pad), (uint32_t)hy, "START", 0xFFFFFFFF, g_font_scale_100);
+                char cnt[16];
+                to_str((uint64_t)g_menu_app_count, cnt);
+                uint32_t cl = strlen(cnt);
+                wm_draw_string((uint32_t)(px + pw - pad - (int32_t)(cl * char_h)), (uint32_t)hy, cnt, 0xFF9FB0D8, g_font_scale_100);
+            }
+        }
+
+        // ── App list: icon + name per row, hover highlight like an active taskbar button
+        int32_t list_top = py + hdr_h + pad;
+        for (int i = 0; i < g_menu_app_count; i++) {
+            int32_t ry = list_top + i * row_h;
+            if (ry >= py + ph - pad) break; // clipped by the height cap
+
+            bool hov = (i == hover);
+
+            if (hov) {
+                for (int32_t y = ry; y < ry + row_h; y++) {
+                    if (y < (int32_t)min_y || y > (int32_t)max_y) continue;
+                    if (y < 0 || (uint32_t)y >= fb->height) continue;
+                    uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
+                    uint32_t t = (uint32_t)(y - ry) * 255 / (row_h > 1 ? (uint32_t)(row_h - 1) : 1u);
+                    int32_t rr = (int32_t)0x3D + ((int32_t)0x28 - (int32_t)0x3D) * (int32_t)t / 255;
+                    int32_t gg = (int32_t)0x4D + ((int32_t)0x36 - (int32_t)0x4D) * (int32_t)t / 255;
+                    int32_t bb = (int32_t)0x80 + ((int32_t)0x6A - (int32_t)0x80) * (int32_t)t / 255;
+                    uint32_t c = 0xFF000000 | ((uint32_t)rr << 16) | ((uint32_t)gg << 8) | (uint32_t)bb;
+                    int32_t sx = px + pad < 0 ? 0 : px + pad;
+                    int32_t ex = px + pw - pad; if (ex > (int32_t)fb->width) ex = (int32_t)fb->width;
+                    if (ex > sx) memset_32(drow + sx, c, (uint32_t)(ex - sx));
+                }
+            }
+
+            // Icon: deterministic per-app color from the rainbow LUT
+            int hash = 0;
+            for (const char* q = g_menu_apps[i]; *q; q++) hash = hash * 31 + (int)*q;
+            uint32_t icon_c = g_rainbow_lut[(uint32_t)(hash & 0x7FFFFFFF) % 360];
+
+            int32_t isz = row_h - 10; if (isz < 14) isz = 14;
+            int32_t ix = px + pad, iy = ry + (row_h - isz) / 2;
+            for (int32_t y = iy; y < iy + isz; y++) {
+                if (y < (int32_t)min_y || y > (int32_t)max_y) continue;
+                if (y < 0 || (uint32_t)y >= fb->height) continue;
+                uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
+                int32_t sx = ix < 0 ? 0 : ix;
+                int32_t ex = ix + isz; if (ex > (int32_t)fb->width) ex = (int32_t)fb->width;
+                if (ex > sx) memset_32(drow + sx, icon_c, (uint32_t)(ex - sx));
+            }
+
+            uint32_t txt_clr = hov ? 0xFFFFFFFF : 0xFFE4E8F5;
+            int32_t ty = ry + (row_h - (int32_t)char_h) / 2;
+            if (ty >= (int32_t)min_y && ty <= (int32_t)max_y)
+                wm_draw_string((uint32_t)(ix + isz + 8), (uint32_t)ty, g_menu_apps[i], txt_clr, g_font_scale_100);
+        }
+
+        // Empty state
+        if (g_menu_app_count == 0 && list_top < py + ph - pad) {
+            int32_t ty = list_top + (row_h - (int32_t)char_h) / 2;
+            if (ty >= (int32_t)min_y && ty <= (int32_t)max_y)
+                wm_draw_string((uint32_t)(px + pad), (uint32_t)ty, "No apps in /bin", 0xFF8890A8, g_font_scale_100);
+        }
+    }
+
     t2 = rdtsc_val();
     g_time_win_ticks = t2 - t1;
 
