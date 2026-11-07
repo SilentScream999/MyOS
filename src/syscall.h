@@ -95,13 +95,19 @@ static inline uint64_t rdmsr(uint32_t msr) {
 #define SYS_WRITE   1u
 #define SYS_OPEN    2u
 #define SYS_CLOSE   3u
+#define SYS_STAT    4u
+#define SYS_UNLINK  87u
 #define SYS_SCROLL  16u
 #define SYS_TTYRAW  17u
+#define SYS_TTYECHO 18u
+#define SYS_TTYFLUSH_INPUT 19u
+#define SYS_TTYTAKE_LAUNCH 20u
 #define SYS_SLEEP   35u
 #define SYS_GETPID  39u
 #define SYS_READDIR 40u
 #define SYS_SPAWN   59u
 #define SYS_EXIT    60u
+#define SYS_WAITPID 61u
 #define SYS_SHUTDOWN 88u
 #define SYS_REBOOT   169u
 
@@ -179,6 +185,7 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf_va, uint64_t len) {
         char tmp[128];
         size_t to_read = len > 128 ? 128 : len;
         size_t read_bytes = tty_read(tmp, to_read);
+        if (!read_bytes && tty_shell_launch_ready()) return (uint64_t)-2;
         copy_string_to_user(buf_va, tmp, read_bytes);
         return read_bytes;
     }
@@ -224,10 +231,9 @@ static uint64_t sys_getpid() {
 
 // ── sys_exit ──────────────────────────────────────────────────────────────────
 
-[[noreturn]] static void sys_exit(uint64_t /*code*/) {
+[[noreturn]] static void sys_exit(uint64_t code) {
     if (g_current_task) {
-        wm_destroy_task_windows(g_current_task->pid);
-        task_exit();   // marks DEAD + schedule() — no return
+        task_exit(code);   // wakes a waiting parent, then schedules away
     }
     hcf();
 }
@@ -359,16 +365,31 @@ static uint64_t sys_readdir(uint64_t path_va, uint64_t index, uint64_t name_out_
 
 static Task* execve_path(const char* path);
 
+static uint64_t sys_unlink(uint64_t path_va) {
+    char path[256];
+    copy_string_from_user(path, path_va, sizeof(path));
+    return (uint64_t)vfs_unlink(path);
+}
+static uint64_t sys_stat(uint64_t path_va, uint64_t info_va) {
+    if (!info_va || info_va >= USERSPACE_END || sizeof(file_info) > USERSPACE_END - info_va) return (uint64_t)-1;
+    char path[256];
+    copy_string_from_user(path, path_va, sizeof(path));
+    file_info info;
+    int result = vfs_stat(path, &info);
+    if (result != 0) return (uint64_t)result;
+    const uint8_t* src = (const uint8_t*)&info;
+    uint8_t* dest = (uint8_t*)info_va;
+    for (uint64_t i = 0; i < sizeof(info); ++i) dest[i] = src[i];
+    return 0;
+}
+
 // ── sys_sleep ─────────────────────────────────────────────────────────────────
 // Block the calling task for `ms` milliseconds (rounded up to tick granularity).
 // At 1000 Hz each tick = 1 ms, so ms == ticks.  Blocks the task immediately
 // and forces a schedule(), yielding the CPU until wake_at_tick is reached.
 
 static uint64_t sys_sleep(uint64_t ms) {
-    if (!g_current_task || ms == 0) return 0;
-    g_current_task->state        = TaskState::BLOCKED;
-    g_current_task->wake_at_tick = g_tick_count + ms;
-    schedule(); // yield NOW — returns when this task is rescheduled
+    task_sleep_ms(ms);
     return 0;
 }
 
@@ -382,24 +403,61 @@ static uint64_t sys_spawn(uint64_t path_va) {
     }
     Task* t = execve_path(path);
     if (!t) return (uint64_t)-1;
+    t->parent_pid = g_current_task ? g_current_task->pid : 0;
+    if (t->parent_pid == g_terminal_shell_pid) g_terminal_foreground_pid = t->pid;
     scheduler_add_task(t);
     return (uint64_t)t->pid;
 }
 
+static uint64_t sys_take_launch(uint64_t dest, uint64_t capacity) {
+    if (!tty_shell_launch_ready() || !dest || dest >= USERSPACE_END || capacity > USERSPACE_END - dest) return (uint64_t)-1;
+    uint64_t length = strlen(tty_launch_path);
+    if (capacity <= length) return (uint64_t)-1;
+    for (uint64_t i = 0; i <= length; ++i) ((char*)dest)[i] = tty_launch_path[i];
+    tty_launch_pending = false;
+    tty_discard_input();
+    return length;
+}
+static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5);
 extern "C" __attribute__((used))
 uint64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+    Task* caller = g_current_task;
+    if (caller) {
+        caller->in_syscall = true;
+        if (caller->interrupt_requested) sys_exit(130);
+    }
+    uint64_t result = syscall_dispatch_body(nr, a1, a2, a3, a4, a5);
+    if (caller) {
+        if (caller->interrupt_requested) sys_exit(130);
+        caller->in_syscall = false;
+    }
+    return result;
+}
+static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     switch (nr) {
         case SYS_READ:   return sys_read(a1, a2, a3);
         case SYS_WRITE:  return sys_write(a1, a2, a3);
         case SYS_OPEN:   return sys_open(a1, a2);
         case SYS_CLOSE:  return sys_close(a1);
+        case SYS_STAT:   return sys_stat(a1, a2);
+        case SYS_UNLINK: return sys_unlink(a1);
         case SYS_SCROLL: return sys_scroll((int64_t)a1);
         case SYS_TTYRAW: return sys_ttyraw(a1);
+        case SYS_TTYECHO: return tty_set_echo(a1 != 0) ? 1 : 0;
+        case SYS_TTYFLUSH_INPUT: tty_discard_input(); return 0;
+        case SYS_TTYTAKE_LAUNCH: return sys_take_launch(a1, a2);
         case SYS_SLEEP:  return sys_sleep(a1);
         case SYS_GETPID: return sys_getpid();
         case SYS_READDIR: return sys_readdir(a1, a2, a3, a4, a5);
         case SYS_SPAWN:   return sys_spawn(a1);
         case SYS_EXIT:   sys_exit(a1);
+        case SYS_WAITPID: {
+            if (a1 > 0xffffffffULL || (a2 && (a2 >= USERSPACE_END || sizeof(uint64_t) > USERSPACE_END - a2))) return (uint64_t)-1;
+            uint64_t code = 0;
+            int64_t pid = task_wait_child((pid_t)a1, &code);
+            if (pid >= 0 && a2) *(uint64_t*)a2 = code;
+            return (uint64_t)pid;
+        }
         case SYS_SHUTDOWN: return sys_shutdown();
         case SYS_REBOOT:   hardware_reset(); return 0;
         

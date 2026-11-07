@@ -42,7 +42,7 @@ enum class TaskState : uint8_t {
     READY   = 0,   // on the run-queue, waiting for CPU time
     RUNNING = 1,   // currently executing
     BLOCKED = 2,   // waiting for an event; removed from consideration by schedule()
-    DEAD    = 3,   // exited; will be freed on next schedule() pass
+    DEAD    = 3,   // exited; retained until parent waits, or automatically reaped if detached
 };
 
 // ── PID type ───────────────────────────────────────────────────────────────────
@@ -101,6 +101,12 @@ struct Task {
 
     // ── Sleep / Block state ───────────────────────────────────────────────────
     uint64_t wake_at_tick;  // Tick count when this task should be unblocked; 0 = manual unblock
+    pid_t parent_pid;      // 0 = detached/kernel-launched, automatically reaped
+    pid_t wait_pid;        // child currently awaited; 0 = not waiting
+    uint64_t exit_code;
+    bool exit_collected;
+    bool in_syscall;
+    bool interrupt_requested;
 };
 
 // ── Global PID counter ─────────────────────────────────────────────────────────

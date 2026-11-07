@@ -80,11 +80,13 @@ enum PageFlags : uint64_t {
 // pcie
 
 
-uint64_t PCI_ECAM_VA_BASE = 0xFFFF'A000'0000'0000ULL;
-uint64_t PCI_ECAM_SEG_STRIDE = 0x10000000ULL;
+static constexpr uint64_t PCI_ECAM_VA_BASE = 0xFFFF'A000'0000'0000ULL;
+static constexpr uint64_t PCI_ECAM_SEG_STRIDE = 0x10000000ULL;
 
-uint64_t PCI_MMIO_VA_BASE = 0xFFFF'9000'0000'0000ULL;
-uint64_t USB_VA_BASE = (PCI_MMIO_VA_BASE + 0x0010'0000ULL);
+static constexpr uint64_t PCI_MMIO_VA_BASE = 0xFFFF'9000'0000'0000ULL;
+// No C++ global constructors run in this kernel. Constant initialization keeps
+// xHCI MMIO in the shared kernel half, including during ring-3 file syscalls.
+static constexpr uint64_t USB_VA_BASE = (PCI_MMIO_VA_BASE + 0x0010'0000ULL);
 
 
 // usb

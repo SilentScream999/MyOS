@@ -18,7 +18,15 @@ CFLAGS = $(OPT) -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
 # Developer use:  make clean && make GPU=1 iso
 GPU ?= 0
 
-CXXFLAGS = $(CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -mno-red-zone -DGPU_BRINGUP=$(GPU)
+# Taskbar clock (src/rtc.h). Windows keeps LOCAL time in the hardware clock, so 0 matches the Windows clock on
+# Windows-installed test machines. If the clock is off by whole hours, set minutes to ADD to the RTC value,
+# e.g. UTC-7:  make clean && make iso CLOCK_UTC_OFFSET_MIN=-420
+CLOCK_UTC_OFFSET_MIN ?= 0
+# 1 = show seconds in the tray (handy to see at a glance that the clock is ticking).
+CLOCK_SHOW_SECONDS ?= 0
+
+CXXFLAGS = $(CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -mno-red-zone -DGPU_BRINGUP=$(GPU) \
+           -DCLOCK_UTC_OFFSET_MIN=$(CLOCK_UTC_OFFSET_MIN) -DCLOCK_SHOW_SECONDS=$(CLOCK_SHOW_SECONDS)
 
 LDFLAGS=-nostdlib -z max-page-size=0x1000
 
@@ -70,7 +78,7 @@ initrd.tar: init.elf counter.elf win_test.elf
 	if [ -f wallpaper.raw ]; then cp wallpaper.raw initrd_root/; fi
 	tar -cf initrd.tar --format=ustar -C initrd_root .
 
-iso: all
+iso: all usb-image
 	rm -rf iso_root
 	mkdir -p iso_root/boot
 
@@ -92,19 +100,45 @@ iso: all
 	-$(LIMINE_BIN) bios-install wyzar.iso || limine/limine.exe bios-install wyzar.iso || true
 
 
+# Each ISO build refreshes USB boot files too; /disk data survives the update.
+PERSIST_DISK ?= wyzar-usb.img
+FRESH ?= 0
+ifeq ($(FRESH),1)
+USB_IMAGE_FLAGS = --fresh
+else
+USB_IMAGE_FLAGS = --update-boot
+endif
+
 run: iso
 	qemu-system-x86_64 \
 		-machine q35 \
 		-m 512M \
 		-bios OVMF.fd \
-		-cdrom wyzar.iso \
+		-drive if=none,id=bootcd,media=cdrom,readonly=on,file=wyzar.iso \
+		-device ide-cd,drive=bootcd,bootindex=1 \
+		-rtc base=localtime \
 		-no-reboot \
 		-no-shutdown \
 		-device qemu-xhci,id=xhci \
 		-device usb-mouse \
-		-device usb-kbd
+		-device usb-kbd \
+		-drive if=none,id=stick,format=raw,file=$(PERSIST_DISK) \
+		-device usb-storage,drive=stick,bootindex=2
 	
 
 
 clean:
 	rm -rf iso_root initrd_root $(OBJ) $(OBJ:.o=.d) user/init.o user/counter.o user/win_test.o wyzar wyzar.iso myos myos.iso init.elf counter.elf win_test.elf initrd.tar
+
+# Refresh an existing image's boot partition, preserving the data partition.
+usb-image: all
+	python3 tools/make_usb_image.py --output "$(PERSIST_DISK)" $(USB_IMAGE_FLAGS)
+
+# Boot directly from the USB image (uses its embedded kernel/initrd).
+run-usb: usb-image
+	qemu-system-x86_64 -machine q35 -m 512M -bios OVMF.fd \
+		-device qemu-xhci,id=xhci -device usb-kbd -device usb-mouse \
+		-drive if=none,id=stick,format=raw,file=$(PERSIST_DISK) \
+		-device usb-storage,drive=stick,bootindex=1 -rtc base=localtime
+
+.PHONY: usb-image run-usb

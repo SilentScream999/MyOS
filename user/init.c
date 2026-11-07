@@ -1,5 +1,6 @@
 typedef unsigned long uint64_t;
 typedef long          int64_t;
+#include "src/fileinfo.h"
 
 // Minimal syscall wrappers
 static inline uint64_t sys_read(uint64_t fd, char* buf, uint64_t len) {
@@ -23,6 +24,16 @@ static inline uint64_t sys_open(const char* path, uint64_t flags) {
 static inline void sys_close(uint64_t fd) {
     __asm__ volatile ("syscall" : : "a"(3), "D"(fd) : "rcx", "r11", "memory");
 }
+static inline int64_t sys_unlink(const char* path) {
+    int64_t result;
+    __asm__ volatile("syscall" : "=a"(result) : "a"(87UL), "D"(path) : "rcx", "r11", "memory");
+    return result;
+}
+static inline int64_t sys_stat(const char* path, file_info* info) {
+    int64_t result;
+    __asm__ volatile("syscall" : "=a"(result) : "a"(4UL), "D"(path), "S"(info) : "rcx", "r11", "memory");
+    return result;
+}
 
 static inline void sys_scroll(int64_t delta) {
     __asm__ volatile ("syscall" : : "a"(16), "D"(delta) : "rcx", "r11", "memory");
@@ -30,6 +41,19 @@ static inline void sys_scroll(int64_t delta) {
 
 static inline void sys_ttyraw(uint64_t raw) {
     __asm__ volatile ("syscall" : : "a"(17), "D"(raw) : "rcx", "r11", "memory");
+}
+static inline void sys_ttyecho(uint64_t enabled) {
+    uint64_t result;
+    __asm__ volatile("syscall" : "=a"(result) : "a"(18UL), "D"(enabled) : "rcx", "r11", "memory");
+}
+static inline void sys_ttyflush_input(void) {
+    uint64_t result;
+    __asm__ volatile("syscall" : "=a"(result) : "a"(19UL) : "rcx", "r11", "memory");
+}
+static inline int64_t sys_take_launch(char* path, uint64_t capacity) {
+    int64_t result;
+    __asm__ volatile("syscall" : "=a"(result) : "a"(20UL), "D"(path), "S"(capacity) : "rcx", "r11", "memory");
+    return result;
 }
 
 static inline int64_t sys_readdir(const char* path, uint64_t index, char* name_out, uint64_t* size_out, uint64_t* type_out) {
@@ -67,6 +91,11 @@ static inline void sys_sleep(uint64_t ms) {
         : "a"((uint64_t)35), "D"(ms)
         : "rcx", "r11", "memory"
     );
+}
+static inline int64_t sys_waitpid(uint64_t pid, uint64_t* code) {
+    int64_t result;
+    __asm__ volatile("syscall" : "=a"(result) : "a"(61UL), "D"(pid), "S"(code) : "rcx", "r11", "memory");
+    return result;
 }
 
 static inline void sys_reboot() {
@@ -113,6 +142,16 @@ void print_dec(uint64_t val) {
     print(buf);
 }
 
+static void print_two(uint64_t value) {
+    if (value < 10) print("0");
+    print_dec(value);
+}
+static void print_datetime(const file_datetime* t) {
+    if (!t->year) { print("unknown"); return; }
+    print_dec(t->year); print("-"); print_two(t->month); print("-"); print_two(t->day);
+    print(" "); print_two(t->hour); print(":"); print_two(t->minute); print(":"); print_two(t->second & ~1u);
+}
+
 #define MAX_HISTORY 10
 char history[MAX_HISTORY][128];
 int history_count = 0;
@@ -132,7 +171,7 @@ void add_history(const char* cmd) {
 
 // Known commands for green highlighting
 static const char* known_commands[] = {
-    "clear", "shutdown", "restart", "bsod", "open bootlog", "ls", "run", "help", 0
+    "clear", "shutdown", "restart", "bsod", "open bootlog", "ls", "run", "help", "write", "cat", "rm", "stat", 0
 };
 
 static int is_known_command(const char* buf, int len) {
@@ -181,6 +220,7 @@ void _start() {
     int pos = 0;
 
     while(1) {
+        sys_ttyecho(1);
         sys_ttyraw(1);          // Enter raw/interactive mode BEFORE the prompt
         print("\nwyzar> ");     // tty_raw_mode=1 -> cursor appears here
         pos = 0;
@@ -189,6 +229,15 @@ void _start() {
         while (1) {
             char c;
             uint64_t n = sys_read(0, &c, 1);
+
+            if (n == (uint64_t)-2) {
+                buf[0] = 'r'; buf[1] = 'u'; buf[2] = 'n'; buf[3] = ' ';
+                if (sys_take_launch(buf + 4, sizeof(buf) - 4) <= 0) continue;
+                pos = strlen(buf);
+                sys_ttyraw(0);
+                print("\r\x1b[2Kwyzar> "); print(buf); print("\n");
+                break;
+            }
 
             if (n == 0 || n == (uint64_t)-1) continue;
 
@@ -242,12 +291,55 @@ void _start() {
         if (streq(buf, "help", 4) && (buf[4] == ' ' || buf[4] == '\0')) {
             print("Available commands:\n");
             print("  ls [path]       - List directory contents (default '/')\n");
-            print("  run <path>      - Spawn dynamic ELF executable from ramfs\n");
+            print("  write <path> <text> - Create/write a file; /disk is persistent\n");
+            print("  cat <path>      - Read a file\n");
+            print("  rm <path>       - Delete a closed file on /disk\n");
+            print("  stat <path>     - Show size, creation and modification times\n");
+            print("  run <path>      - Run an ELF program; wait until it exits\n");
             print("  open bootlog    - Display kernel boot log\n");
             print("  clear           - Clear screen\n");
             print("  bsod            - Trigger crash screen\n");
             print("  restart         - Reboot system\n");
             print("  shutdown        - Power off system\n");
+        } else if (streq(buf, "rm", 2) && buf[2] == ' ') {
+            int idx = 3; while (buf[idx] == ' ') idx++;
+            if (sys_unlink(&buf[idx]) == 0) print("File deleted.\n");
+            else print("Cannot delete: check path, open handles, read-only attribute and storage. Only short-name files are supported.\n");
+        } else if (streq(buf, "stat", 4) && buf[4] == ' ') {
+            int idx = 5; while (buf[idx] == ' ') idx++;
+            file_info info;
+            if (sys_stat(&buf[idx], &info) != 0) { print("Cannot stat file.\n"); continue; }
+            print("Size: "); print_dec(info.size); print(" bytes\n");
+            print("Created:  "); print_datetime(&info.created); print("\n");
+            print("Modified: "); print_datetime(&info.modified); print("\n");
+            print("Times shown to 2-second precision; quick writes may have equal times.\n");
+        } else if (streq(buf, "write", 5) && buf[5] == ' ') {
+            int idx = 6;
+            while (buf[idx] == ' ') idx++;
+            char* path = &buf[idx];
+            while (buf[idx] && buf[idx] != ' ') idx++;
+            if (!buf[idx]) { print("Usage: write <path> <text>\n"); continue; }
+            buf[idx++] = 0;
+            while (buf[idx] == ' ') idx++;
+            uint64_t fd = sys_open(path, 0x41); // O_WRONLY | O_CREAT
+            if (fd == (uint64_t)-1) {
+                print("Cannot open file. Check that the parent directory exists and storage is online.\n");
+                print("For /disk, check 'ls /disk' and the boot log for WYZARDATA mounted. Names must fit 8.3.\n");
+                continue;
+            }
+            uint64_t len = strlen(&buf[idx]);
+            uint64_t written = sys_write(fd, &buf[idx], len);
+            sys_close(fd);
+            if (written == len) print("Write complete. Existing files keep any trailing bytes.\n");
+            else print("Write failed or incomplete.\n");
+        } else if (streq(buf, "cat", 3) && buf[3] == ' ') {
+            int idx = 4;
+            while (buf[idx] == ' ') idx++;
+            uint64_t fd = sys_open(&buf[idx], 0);
+            if (fd == (uint64_t)-1) { print("Cannot open file.\n"); continue; }
+            char data[512]; uint64_t bytes;
+            while ((bytes = sys_read(fd, data, sizeof(data))) > 0 && bytes <= sizeof(data)) sys_write(1, data, bytes);
+            sys_close(fd); print("\n");
         } else if (streq(buf, "ls", 2) && (buf[2] == ' ' || buf[2] == '\0')) {
             const char* path = "/";
             if (buf[2] == ' ') {
@@ -290,16 +382,28 @@ void _start() {
                     continue;
                 }
                 print("Spawning: "); print(prog); print("...\n");
+                sys_ttyecho(0); // child may run as soon as spawn returns
                 int64_t pid = sys_spawn(prog);
                 if (pid > 0) {
                     print("Successfully spawned process with PID ");
                     print_dec(pid);
                     print("\n");
+                    uint64_t exit_code = 0;
+                    if (sys_waitpid(pid, &exit_code) < 0) {
+                        print("Failed to wait for program.\n");
+                    } else if (exit_code == 130) {
+                        print("^C\n");
+                    } else if (exit_code != 0) {
+                        print("Program exited with code "); print_dec(exit_code); print("\n");
+                    }
                 } else {
                     print("Failed to spawn process (error ");
                     print_dec(-pid);
                     print(")\n");
                 }
+                sys_ttyraw(0);
+                sys_ttyflush_input(); // discard keys the finished program never consumed
+                sys_ttyecho(1);
             } else {
                 print("Usage: run <path>\n");
             }

@@ -1,11 +1,11 @@
 # WyzarOS Window Management API
 
-*Last updated: 2026-11-02.* This documents what the kernel **does today**, including its problems, so nothing gets built on wrong assumptions.
-The planned redesign (owner, mapped surfaces, events) is in `docs/APP_LOADING.md` section 3.6.
+*Last updated: 2026-11-07.* Mapped user surfaces, owner tracking, input events and exit cleanup are implemented. The remaining limitations below still apply.
 
-> **Status warning:** this API has probably **never run end to end from ring 3.** `SYS_WIN_GET_BUFFER` returns a kernel heap pointer, which a
-> user process should fault on (see "Known problems"). `user/win_test.c` is not built by the Makefile and nothing can launch it.
-> The built-in Rainbow and Visual Test windows use the same surfaces from inside the kernel, and that path does work.
+The built `win_test.elf` exercises this API from ring 3. Terminal and Start-menu
+launches share a foreground session; Ctrl+C cancels the program even with its GUI
+focused, closes its windows and restores terminal focus/prompt. These paths were
+verified in QEMU. See [the handoff](../docs/AI_HANDOFF.md) for verification scope.
 
 ## Calling convention
 
@@ -15,11 +15,12 @@ The planned redesign (owner, mapped surfaces, events) is in `docs/APP_LOADING.md
 
 | # | Name | Arguments | Returns | Notes |
 |---|---|---|---|---|
-| 200 | `SYS_WIN_CREATE` | `title` (user string, max 63 chars), `x`, `y`, `w`, `h` | window id, or `0` on failure | Allocates a `Window` and a `w*h*4` byte surface. A 6th `flags` value (bit 0 = closable) exists internally but the dispatcher always passes `0`, so user windows are never closable. |
+| 200 | `SYS_WIN_CREATE` | `title` (max 63 chars), `x`, `y`, `w`, `h` | window id, or `0` on failure | Creates a closable user window, records owner PID and maps contiguous surface pages into the process. Dimensions are bounded to 32..3840 by 32..2160. |
 | 201 | `SYS_WIN_SYNC` | `id` | `0` | Marks the **whole** surface damaged and requests a refresh. Always returns 0, even for an unknown id. |
 | 202 | `SYS_WIN_DESTROY` | `id` | `0` | Removes the window from the z-stack and frees it. |
-| 203 | `SYS_WIN_GET_BUFFER` | `id` | surface pointer, or `0` | Returns the kernel's pointer to the surface. **See known problems.** |
+| 203 | `SYS_WIN_GET_BUFFER` | `id` | surface pointer, or `0` | User windows return their mapped user address (`USER_WIN_BASE + id * USER_WIN_STRIDE`). Window-ID authorization remains incomplete. |
 | 204 | `SYS_WIN_DAMAGE` | `id`, `x`, `y`, `w`, `h` | `0`, or `-1` for an unknown id or out-of-range values | Reports a partial update (surface-relative pixels). Cheaper than `SYNC` for small changes. The compositor tracks up to 8 rects per frame. |
+| 205 | `SYS_WIN_POLL_EVENT` | `id`, `WinEvent*` | `1` for an event, otherwise `0` | Pops a nonblocking input event from the window's 64-slot queue. |
 
 ## Surface format
 
@@ -30,27 +31,24 @@ are composited opaque. Alpha will be defined (premultiplied or straight) in road
 
 1. `WIN_CREATE`: the kernel allocates the window and a zero-filled surface, appends it to the window list and schedules a redraw.
 2. Draw into the surface, then call `WIN_SYNC` (everything) or `WIN_DAMAGE` (a rect). The compositor runs at about 60 Hz and copies damaged areas.
-3. `WIN_DESTROY` removes the window. **Nothing destroys a process's windows when the process exits.**
+3. `WIN_DESTROY` removes the window. Normal exit and Ctrl+C cancellation automatically destroy all windows owned by the task. Closing a window alone does not terminate an app's event loop; apps must handle that lifecycle themselves.
 
-System windows (Terminal, Boot Log) are created with `is_system = true` and a type. Terminal and Boot Log have **no surface** today (special-cased drawing);
-Visual Test and Rainbow are system windows that *do* use surfaces.
+Terminal, Boot Log, Visual Test and Rainbow are system windows with surfaces. All
+windows use the generic compositor surface path.
 
 ## Known problems
 
-* **Kernel pointer handed to user space.** `win->buffer` is a `kmalloc` address in the higher-half direct map, which is not mapped user-accessible. A ring-3 write to it should page-fault.
-* **No ownership.** Any process can get a buffer for, sync, or destroy **any** window id.
-* **No cleanup on exit.** A crashed or exited process leaves its windows behind.
-* **Unvalidated sizes.** `w` and `h` go into `kmalloc(w*h*4)` after being cast to `int32_t`, with no limit or overflow check.
-* **No input.** There is no syscall to receive mouse or keyboard events for a window; the compositor handles the mouse internally and the keyboard goes to the TTY only.
+* **Incomplete authorization.** Owner PID is recorded for cleanup, but window syscalls do not consistently reject another task's window ID. System-window buffer lookup can still expose a kernel address. Treat the API as trusted-prototype code.
+* **User-pointer and mapping cleanup need hardening.** Event output pointers are not fully validated, and destroyed surfaces' user mappings need explicit revocation before treating this as secure isolation.
 * **No present/ack protocol.** A client can write into the surface while the compositor is reading it (no double-buffering).
 * **`SYNC` returns success for nonexistent windows.**
 
-## Intended usage (do not rely on it yet)
+## Basic usage
 
 ```c
 // Wrappers as in user/win_test.c: arguments in rdi, rsi, rdx, r10, r8.
 uint64_t win = sys_win_create("My App", 100, 100, 400, 300, 0);
-uint32_t* px = (uint32_t*)sys_win_get_buffer(win);      // NOT valid from ring 3 yet (see above)
+uint32_t* px = (uint32_t*)sys_win_get_buffer(win);      // mapped surface for this user window
 for (int i = 0; i < 400 * 300; i++) px[i] = 0xFF0000FF; // opaque blue
 sys_win_sync(win);                                       // or sys_win_damage(win, x, y, w, h)
 ```

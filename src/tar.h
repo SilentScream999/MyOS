@@ -90,7 +90,7 @@ static inline void tar_unpack(const uint8_t* archive, uint64_t archive_size) {
                 // Regular file
                 vfs_ensure_parent_dirs(full_path);
                 file f;
-                if (vfs_open(full_path, 0, &f) == 0) {
+                if (vfs_open(full_path, 0x41, &f) == 0) {
                     if (file_size > 0 && offset + 512 + file_size <= archive_size) {
                         vfs_write(&f, data, file_size);
                     }

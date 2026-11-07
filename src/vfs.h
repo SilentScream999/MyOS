@@ -11,6 +11,7 @@
 
 #include <stdint.h>
 #include "helpers.h"
+#include "fileinfo.h"
 
 struct vnode;
 struct file;
@@ -47,6 +48,8 @@ struct vfs_ops {
 
     // Read directory entry at index. Returns 1 if found, 0 on EOF, -1 on error.
     int (*readdir)(vnode* dir, uint64_t index, char* name_out, uint64_t* size_out, VnodeType* type_out);
+    int (*unlink)(vnode* dir, const char* name);
+    int (*stat)(vnode* vn, file_info* info);
 };
 
 // VNODE: A node in the VFS tree (represents a file or directory inode)
@@ -67,6 +70,11 @@ struct file {
 
 // GLOBAL VFS STATE
 static vnode* vfs_root = nullptr;
+static vnode* vfs_disk_mountpoint = nullptr;
+static vnode* vfs_disk_root = nullptr;
+static vnode* vfs_follow_mount(vnode* vn) {
+    return vn && vn == vfs_disk_mountpoint ? vfs_disk_root : vn;
+}
 
 // ── VFS GLOBAL API ────────────────────────────────────────────────────────
 
@@ -85,6 +93,7 @@ static const char* vfs_next_component(const char* path, char* comp) {
     
     int i = 0;
     while (*path != '/' && *path != '\0') {
+        if (i == 255) { comp[0] = 1; comp[1] = 0; return nullptr; }
         comp[i++] = *path++;
     }
     comp[i] = '\0';
@@ -93,7 +102,7 @@ static const char* vfs_next_component(const char* path, char* comp) {
 
 // Resolve a path to a vnode
 static vnode* vfs_namei(const char* path) {
-    if (!vfs_root) return nullptr;
+    if (!vfs_root || !path) return nullptr;
     
     vnode* current = vfs_root;
     char comp[256];
@@ -108,6 +117,7 @@ static vnode* vfs_namei(const char* path) {
     
     while (true) {
         const char* next_p = vfs_next_component(p, comp);
+        if (!next_p && comp[0]) return nullptr;
         if (comp[0] == '\0') break; // end of path
         
         if (current->type != VnodeType::DIRECTORY || !current->ops->lookup) {
@@ -117,7 +127,7 @@ static vnode* vfs_namei(const char* path) {
         vnode* next = current->ops->lookup(current, comp);
         if (!next) return nullptr; // Not found
         
-        current = next;
+        current = vfs_follow_mount(next);
         p = next_p;
     }
     
@@ -127,7 +137,7 @@ static vnode* vfs_namei(const char* path) {
 // Find the parent directory of a path, and return the final name component
 // e.g., "/mnt/foo/bar.txt" -> returns vnode for "/mnt/foo" and sets name="bar.txt"
 static vnode* vfs_namei_parent(const char* path, char* name) {
-    if (!vfs_root) return nullptr;
+    if (!vfs_root || !path) return nullptr;
     
     vnode* current = vfs_root;
     char comp[256];
@@ -138,6 +148,7 @@ static vnode* vfs_namei_parent(const char* path, char* name) {
     else return nullptr; // Only absolute paths for now
     
     p = vfs_next_component(p, comp);
+    if (!p && comp[0]) return nullptr;
     if (comp[0] == '\0') {
         name[0] = '\0';
         return vfs_root; // Path is just "/"
@@ -145,6 +156,7 @@ static vnode* vfs_namei_parent(const char* path, char* name) {
     
     while (true) {
         const char* next_p = vfs_next_component(p, next_comp);
+        if (!next_p && next_comp[0]) return nullptr;
         if (next_comp[0] == '\0') {
             // comp is the final component!
             strcpy(name, comp);
@@ -154,7 +166,7 @@ static vnode* vfs_namei_parent(const char* path, char* name) {
         // comp is a directory to traverse
         if (current->type != VnodeType::DIRECTORY || !current->ops->lookup) return nullptr;
         
-        current = current->ops->lookup(current, comp);
+        current = vfs_follow_mount(current->ops->lookup(current, comp));
         if (!current) return nullptr;
         
         strcpy(comp, next_comp);
@@ -171,12 +183,11 @@ static vnode* vfs_namei_parent(const char* path, char* name) {
 static int vfs_open(const char* path, int flags, file* f) {
     vnode* vn = vfs_namei(path);
     if (!vn) {
-        // File doesn't exist, try to create it (if flags imply O_CREAT)
-        // For simplicity now, we'll try to create it automatically if it doesn't exist.
-        // In a real OS, we'd check O_CREAT flag.
+        if (!(flags & 0x40)) return -1; // O_CREAT; reads never create files.
+        // File doesn't exist and O_CREAT was requested.
         char name[256];
         vnode* parent = vfs_namei_parent(path, name);
-        if (parent && parent->ops->create) {
+        if (parent && name[0] && parent->type == VnodeType::DIRECTORY && parent->ops->create) {
             vn = parent->ops->create(parent, name);
             if (!vn) return -1;
         } else {
@@ -198,6 +209,7 @@ static int vfs_open(const char* path, int flags, file* f) {
 
 static uint64_t vfs_read(file* f, void* buf, uint64_t len) {
     if (!f || !f->vn || !f->vn->ops->read) return 0;
+    if ((f->mode & 3) == 1) return 0;
     uint64_t read_bytes = f->vn->ops->read(f->vn, buf, len, f->offset);
     f->offset += read_bytes;
     return read_bytes;
@@ -205,6 +217,7 @@ static uint64_t vfs_read(file* f, void* buf, uint64_t len) {
 
 static uint64_t vfs_write(file* f, const void* buf, uint64_t len) {
     if (!f || !f->vn || !f->vn->ops->write) return 0;
+    if ((f->mode & 3) == 0) return 0;
     uint64_t written = f->vn->ops->write(f->vn, buf, len, f->offset);
     f->offset += written;
     
@@ -242,6 +255,7 @@ static int vfs_mkdir_p(const char* path) {
     const char* p = path + 1;
     while (p) {
         p = vfs_next_component(p, comp);
+        if (!p && comp[0]) return -1;
         if (comp[0] == '\0') break;
         if (current->type != VnodeType::DIRECTORY || !current->ops || !current->ops->lookup) return -1;
         vnode* next = current->ops->lookup(current, comp);
@@ -250,7 +264,7 @@ static int vfs_mkdir_p(const char* path) {
             next = current->ops->mkdir(current, comp);
             if (!next) return -1;
         }
-        current = next;
+        current = vfs_follow_mount(next);
     }
     return 0;
 }
@@ -272,6 +286,22 @@ static int vfs_readdir(const char* path, uint64_t index, char* name_out, uint64_
     vnode* vn = vfs_namei(path);
     if (!vn || vn->type != VnodeType::DIRECTORY || !vn->ops || !vn->ops->readdir) return -1;
     return vn->ops->readdir(vn, index, name_out, size_out, type_out);
+}
+
+static int vfs_unlink(const char* path) {
+    char name[256];
+    vnode* parent = vfs_namei_parent(path, name);
+    if (!parent || !name[0] || !parent->ops || !parent->ops->unlink) return -1;
+    return parent->ops->unlink(parent, name);
+}
+static int vfs_stat(const char* path, file_info* info) {
+    if (!info) return -1;
+    vnode* vn = vfs_namei(path);
+    if (!vn) return -1;
+    memset(info, 0, sizeof(*info));
+    info->size = vn->size;
+    info->type = vn->type == VnodeType::FILE ? 1 : vn->type == VnodeType::DIRECTORY ? 2 : 3;
+    return vn->ops->stat ? vn->ops->stat(vn, info) : 0;
 }
 
 #endif // VFS_H

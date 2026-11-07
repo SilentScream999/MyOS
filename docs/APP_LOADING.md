@@ -1,6 +1,27 @@
 # How apps should be loaded (and how Windows does it)
 
-*Last updated: 2026-11-02.* Goal: stop hard-coding apps into the kernel. Apps become **files plus metadata**, discovered and started at runtime.
+*Last updated: 2026-11-07.* Goal: apps become **files plus metadata**, discovered and started at runtime. Near-term disk-backed app and settings work is in [NEXT_STEPS.md](NEXT_STEPS.md).
+
+**Implementation update (2026-11-07):** the historical state below predates the
+current VFS app loader and shell. `run <path>` now launches and waits for a child
+with syscall 61 (`WAITPID`), restoring the prompt on exit. Parent/child identity,
+retained exit status, waiter wakeup and orphan cleanup live in task/scheduler code.
+See [AI_HANDOFF.md](AI_HANDOFF.md) for current implementation status. Start-menu
+launches now pass a pending path to the shell and use the same foreground flow;
+full terminal job control and app manifests remain future work.
+Foreground input defaults to echo off. `TTYECHO(enabled)` (syscall 18) changes echo
+for the single shared terminal and returns its previous state; `TTYFLUSH_INPUT`
+(19) discards unread input. The shell restores its modes after the child exits.
+Ctrl+C requests foreground cancellation with status 130. Owned windows and file
+descriptors are closed, the parent wakes, and terminal focus returns. Cancellation
+defers through in-progress syscalls to avoid abandoning kernel operations. This
+currently targets one task, not an entire child-process group. A Start-menu request
+wakes the registered shell's stdin with -2; syscall 20 consumes the pending path.
+Busy foreground sessions reject additional menu launches.
+The `/bin` tree is still RAMFS-backed. A persistent `/disk/bin` directory mounted
+at `/bin` can reuse current app discovery and `execve_path`, but needs initial app
+seeding, RAMFS fallback when storage is absent, and an explicit bundled-app update
+policy. This echo change does not change where executables are stored.
 Windows facts below were checked against the sources listed at the end; anything not sourced is marked.
 
 ## 1. How Windows starts an app like Calculator
@@ -37,12 +58,12 @@ is just "load this image into a new address space and run it"; the GUI API ties 
 | Layer | Today |
 |---|---|
 | App registry | **None.** Terminal, Visual Test, Rainbow and Boot Log are created unconditionally in `wm_init` (`src/wm.h`). |
-| Shell/launcher | The taskbar lists open windows. The Start button prints "Start Menu coming soon..." into the terminal. |
-| Process creation | `execve_memory(const uint8_t* elf)` loads an ELF from a memory buffer and returns a `Task*`. It is called **once**, at boot, for Limine module 0 (`init.elf`, the shell). **No spawn/exec syscall.** |
-| Storage | VFS and ramfs exist and contain `/bootlog.txt` and `/wallpaper.raw`. No programs, and no `readdir`/`stat`. |
+| Shell/launcher | Start menu discovers `/bin/*.elf` and passes launches to the shell's foreground execution path. Ctrl+C cancels the foreground app and restores the prompt/focus. |
+| Process creation | `execve_path` loads a static ELF from VFS. `SYS_SPAWN` (59), exact-child `WAITPID` (61), exit status and orphan cleanup are implemented. |
+| Storage | RAMFS/initrd system files plus writable FAT16 at `/disk`; readdir/stat/unlink exist. `/bin` is still RAMFS-backed; persistent `/disk/bin` is planned. |
 | Runtime linking | Not needed yet: programs are static ELFs linked at `0x400000`, using raw `syscall` wrappers (see `user/init.c`). |
-| GUI API | Syscalls 200-204 exist, but see the issues in `docs/AI_HANDOFF.md` section 5 (kernel pointer returned, no owner, no events). |
-| Per-process state | `Task`: pid, cr3, 16-entry fd table. No parent, exit status or owned windows. |
+| GUI API | Syscalls 200-205 provide mapped user surfaces, damage and input events; windows record owners and are cleaned up at exit/cancellation. Authorization checks need hardening. |
+| Per-process state | PID/parent PID, CR3, private kernel stack, descriptors, wait/exit state and safe-boundary cancellation tracking. |
 
 The kernel should not know what Calculator is. Two nuances:
 

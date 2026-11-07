@@ -10,6 +10,7 @@
 #include "structures.h"
 #include "pagingstuff.h"
 #include "helpers.h"
+#include "block.h"
 #include "usbhelpers.h"
 
 /* ── Ring / Event Ring sizes ──────────────────────────────── */
@@ -56,7 +57,9 @@ static uint64_t _usb_tsc_hz(void) {
 
 // Accurate millisecond delay — call from anywhere in usbhelpers.h
 static void tsc_delay_ms(uint64_t ms) {
-    if (g_scheduler_ready) {
+    uint64_t irq_flags;
+    __asm__ volatile("pushfq; popq %0" : "=r"(irq_flags));
+    if (g_scheduler_ready && (irq_flags & (1u << 9))) {
         task_sleep_ms(ms);
         return;
     }
@@ -101,7 +104,7 @@ static void ring_push_cmd(struct Ring *r, uint32_t ctrl, uint64_t param, uint32_
 }
 
 /* ── get_usb_response ─────────────────────────────────────── */
-static USB_Response get_usb_response(XHCIController* hc, int timeout_ms = 250) {
+static USB_Response get_usb_response_raw(XHCIController* hc, int timeout_ms = 250) {
     uint64_t end = _usb_rdtsc() + (_usb_tsc_hz() / 1000) * (uint64_t)timeout_ms;
 
     for (;;) {
@@ -131,6 +134,33 @@ static USB_Response get_usb_response(XHCIController* hc, int timeout_ms = 250) {
 
         __asm__ volatile ("pause");
     }
+}
+
+// Synchronous disk I/O shares the event ring with HID and hotplug. Keep copies
+// of unrelated events until the regular polling loop can dispatch them.
+struct usb_deferred_events {
+    TRB events[256];
+    uint16_t head, count;
+    TRB delivered;
+};
+static usb_deferred_events usb_pending[MAX_CONTROLLERS] = {};
+static usb_deferred_events* usb_pending_for(XHCIController* hc) { return &usb_pending[hc - xhci_hc]; }
+static bool usb_defer(XHCIController* hc, const USB_Response& r) {
+    usb_deferred_events* q = usb_pending_for(hc);
+    if (q->count == 256) { hc->needsResetting = true; return false; }
+    TRB* e = &q->events[(q->head + q->count++) % 256];
+    e->parameter = r.event->parameter; e->status = r.event->status; e->control = r.ctrl;
+    return true;
+}
+static USB_Response get_usb_response(XHCIController* hc, int timeout_ms = 250) {
+    usb_deferred_events* q = usb_pending_for(hc);
+    if (!q->count) return get_usb_response_raw(hc, timeout_ms);
+    TRB* e = &q->events[q->head];
+    q->delivered.parameter = e->parameter; q->delivered.status = e->status; q->delivered.control = e->control;
+    q->head = (q->head + 1) % 256; --q->count;
+    USB_Response r;
+    r.gotresponse = true; r.event = &q->delivered; r.ctrl = q->delivered.control; r.type = (r.ctrl >> 10) & 63;
+    return r;
 }
 
 /* ── do_control_transfer ──────────────────────────────────── */
@@ -183,6 +213,8 @@ static USB_Response do_control_transfer(USBDevice &dev,
 	resp.gotresponse = false;
 	return resp;
 }
+
+#include "usb_storage.h"
 
 /* ── Descriptor helpers ───────────────────────────────────── */
 static bool get_device_descriptor(USBDevice &dev, volatile uint8_t* outbuf, uint16_t len) {
@@ -390,6 +422,11 @@ static void enumerate_device_after_address(
 
 	int  idx      = 0;
 	int  conf_len = (int)((uint16_t)config_buf[2] | ((uint16_t)config_buf[3] << 8));
+	if (conf_len < 9 || conf_len > 512) return;
+	bool mass_interface = false;
+	bool mass_found = false;
+	uint8_t mass_in = 0, mass_out = 0;
+	uint16_t mass_in_mps = 0, mass_out_mps = 0;
 	
 	dev->interface_count = 0;
 	bool current_iface_is_hid = false;
@@ -399,9 +436,12 @@ static void enumerate_device_after_address(
 	while (idx + 2 < conf_len) {
 		uint8_t blen  = config_buf[idx];
 		uint8_t btype = config_buf[idx + 1];
-		if (blen == 0) break;
+		if (blen < 2 || idx + blen > conf_len) return;
 		
 		if (btype == 4 && idx + 9 <= conf_len) { // Interface Descriptor
+			mass_interface = !mass_found && config_buf[idx + 3] == 0 &&
+			    config_buf[idx + 5] == 8 && config_buf[idx + 6] == 6 && config_buf[idx + 7] == 0x50;
+			if (mass_interface) { mass_found = true; mass_in = mass_out = 0; }
 			current_iface_is_hid = (config_buf[idx + 5] == 0x03);
 			current_iface_num = config_buf[idx + 2];
 			current_iface_protocol = config_buf[idx + 7];
@@ -411,6 +451,10 @@ static void enumerate_device_after_address(
 			uint8_t addr = config_buf[idx + 2];
 			uint8_t attr = config_buf[idx + 3];
 			uint16_t mps = (uint16_t)config_buf[idx + 4] | ((uint16_t)config_buf[idx + 5] << 8);
+			if (mass_interface && (attr & 3) == 2 && (addr & 15) && mps <= 1024) {
+				if (addr & 0x80) { mass_in = addr & 15; mass_in_mps = mps; }
+				else { mass_out = addr & 15; mass_out_mps = mps; }
+			}
 			
 			if (current_iface_is_hid && (addr & 0x80u) && (attr & 0x03u) == 0x03) { // Interrupt IN
 				if (dev->interface_count < 4) {
@@ -438,7 +482,7 @@ static void enumerate_device_after_address(
 
 	dev->is_hub = found_hub;
 
-	if (dev->interface_count == 0 && !found_hub) {
+	if (dev->interface_count == 0 && !found_hub && !(mass_in && mass_out)) {
 		print((char*)"Device has no HID interfaces nor hub; disabling slot.");
 
 		// Issue Disable Slot so the xHC stops all activity on this slot and
@@ -480,6 +524,12 @@ static void enumerate_device_after_address(
 		} else {
 			print((char*)"SET_CONFIGURATION ok");
 		}
+	}
+
+	if (mass_in && mass_out) {
+		if (!usb_storage_configure(dev, mass_in, mass_in_mps, mass_out, mass_out_mps))
+			print((char*)"[storage] Unsupported or unavailable USB disk.");
+		return;
 	}
 
 	/* ════════════════════════════════════════════════════════════
@@ -1134,6 +1184,7 @@ static void enumerate_hub_children(
 
 /* ── setupUSB ─────────────────────────────────────────────── */
 static void setupUSB(XHCIController* hc) {
+	usb_storage_reset_controller(hc);
 	uint64_t usb_virt_base = hc->virt_base;
 	uint8_t usb_start = 0, usb_bus = hc->bus, usb_dev = hc->dev, usb_fn = hc->fn;
 	
@@ -1526,7 +1577,7 @@ static void setupUSB(XHCIController* hc) {
 		// in the Addressed state. The xHCI will keep polling EP0, generating
 		// stray NAK/timeout Transfer Events that flood the event ring and starve
 		// real HID devices of their events. Disable the slot now.
-		if (!newdev->is_hub && newdev->interface_count == 0) {
+		if (!newdev->is_hub && newdev->interface_count == 0 && !usb_storage_is_device(newdev)) {
 			print((char*)"Cleaning up non-functional device on root port");
 
 			// CRITICAL: Physically disable the port first. The xHC may still be

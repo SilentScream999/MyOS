@@ -10,17 +10,28 @@
 
 #include "irq.h"    // PIC remapping + irq_register
 #include "timer.h"  // PIT driver + g_tick_count
+#include "rtc.h"    // CMOS RTC wall clock (taskbar clock)
 #include "heap.h"
 #include "tty.h"
 #include "acpi.h"
 #include "syscall.h"
 #include "ramfs.h"
+#include "fat16.h"
 #include "tar.h"
 #include "exec.h"
 #include "graphics.h"
 #include "wm.h"
 #include "intel_gpu.h"
 #include "apic_timer.h"
+
+static void process_exit_ui(pid_t pid) {
+    bool foreground = pid == g_terminal_foreground_pid;
+    wm_destroy_task_windows(pid);
+    if (foreground && g_win_terminal) {
+        for (int i = 0; i < g_window_count; ++i)
+            if (g_window_list[i] == g_win_terminal) { wm_raise_window(i); break; }
+    }
+}
 
 __attribute__((used, section(".limine_requests")))
 static volatile LIMINE_BASE_REVISION(4);
@@ -360,17 +371,10 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
                 const char* nm = g_menu_apps[menu_hit];
                 while (*nm && plen < 58) path[plen++] = *nm++;
                 path[plen++] = '.'; path[plen++] = 'e'; path[plen++] = 'l'; path[plen++] = 'f'; path[plen] = '\0';
-                Task* t = execve_path(path);
-                if (t) {
-                    scheduler_add_task(t);
-                    term_write_string((char*)"[SYSTEM] Started ");
-                    term_write_string((char*)nm);
-                    term_write_string((char*)"\r\n");
-                } else {
-                    term_write_string((char*)"[SYSTEM] Failed to start: /bin/");
-                    term_write_string((char*)nm);
-                    term_write_string((char*)".elf\r\n");
-                }
+                if (tty_queue_launch(path)) {
+                    for (int i = 0; i < g_window_count; ++i)
+                        if (g_window_list[i] == g_win_terminal) { wm_raise_window(i); break; }
+                } else print((char*)"[launcher] Terminal busy; finish or interrupt its foreground program first.");
                 wm_menu_close();
             } else if (g_menu_open) {
                 // Clicked header/padding or outside the panel: just dismiss it
@@ -463,6 +467,26 @@ void compositor_thread_main() {
         print((char*)"[boot] ERROR: No buffers for the initial desktop frame.");
         hcf();
     }
+    // Read the RTC before the first frame so the taskbar clock never shows a placeholder.
+    // The result is also written to the boot log, which is the quickest way to check the clock on hardware.
+    {
+        static char clk_line[48];
+        if (rtc_poll()) {
+            char tb[16], db[16];
+            rtc_format_date(g_clock, db);
+            rtc_format_time(g_clock, tb, true);
+            char* p = clk_line;
+            const char* s = "[clock] RTC OK: ";
+            while (*s) *p++ = *s++;
+            s = db; while (*s) *p++ = *s++;
+            *p++ = ' ';
+            s = tb; while (*s) *p++ = *s++;
+            *p = 0;
+            print(clk_line);
+        } else {
+            print((char*)"[clock] RTC read failed (no RTC, or invalid values). Tray shows --:--.");
+        }
+    }
     wm_compose_dirty(0, fb->width - 1, 0, fb->height - 1, false, false);
     if (!boot_splash_present_desktop(g_master_backbuffer)) hcf();
     wm_overlay_update(g_mouse_x, g_mouse_y, g_mouse_buttons);
@@ -470,6 +494,7 @@ void compositor_thread_main() {
 
     uint64_t target_tsc = rdtsc(); // Start cadence from current time
     static uint64_t last_hud_tick     = 0;
+    static uint64_t last_clock_tick   = 0;
 
     while (true) {
         uint64_t frame_interval = (tsc_hz / 60);
@@ -497,6 +522,13 @@ void compositor_thread_main() {
             uint32_t hud_px   = (uint32_t)HUD_MSG_CAP * 8 + 32;
             uint32_t hud_left = fb->width > hud_px ? fb->width - hud_px : 0;
             wm_dirty_add(hud_left, fb->width - 1, 0, 60);   // its own rect, not unioned with whatever else is dirty
+        }
+
+        // Taskbar clock: poll the RTC 4x per second (cheap: a handful of port reads) so a minute change shows
+        // within ~250 ms. The tray is repainted only when the displayed text actually changed.
+        if (now_refresh - last_clock_tick > tsc_hz / 4) {
+            last_clock_tick = now_refresh;
+            if (rtc_poll()) wm_clock_damage();
         }
 
         if (g_needs_refresh) {
@@ -742,7 +774,7 @@ extern "C" void kmain(void) {
         uint64_t            wsize = wmod->size;
         const uint8_t*      wdata = (const uint8_t*)wmod->address;
         file wf2;
-        if (vfs_open("/wallpaper.raw", 0, &wf2) == 0) {
+        if (vfs_open("/wallpaper.raw", 0x41, &wf2) == 0) {
             vfs_write(&wf2, wdata, wsize);
             vfs_close(&wf2);
         }
@@ -752,6 +784,7 @@ extern "C" void kmain(void) {
 	scheduler_init();
     // Initializing graphical UI components
     wm_init();     // Initialize window manager and UI scaling first
+    g_task_exit_hook = process_exit_ui;
     wm_log_init(); // Then initialize the log buffer with the correct scaled dimensions
     
     // Spawn compositor thread extremely early so it guarantees 60fps
@@ -848,6 +881,9 @@ extern "C" void kmain(void) {
 	// re-enumerate all ports, reinitialise per-keyboard state, re-queue TRBs,
 	// and re-enter the main loop.
 	restart:
+	// Serialize controller resets against synchronous filesystem I/O. Existing
+	// mounted disks are offlined by setupUSB; never rebind an open vnode.
+	__asm__ volatile("cli" ::: "memory");
     for (int c = 0; c < xhci_count; c++) {
         if (xhci_hc[c].portfailed) {
             for (int _p = 0; _p < 4096; _p++) xhci_hc[c].portfailed[_p] = 0;
@@ -864,6 +900,24 @@ extern "C" void kmain(void) {
             }
         }
     }
+
+	// Mount only the designated data partition, once per boot. No formatting.
+	if (!vfs_disk_root) {
+		for (int d = 0; d < usb_disk_count; ++d) {
+			if (!usb_disks[d].disk.online) continue;
+			fat16_volume* volume = fat16_probe(&usb_disks[d].disk);
+			if (!volume) continue;
+			vfs_mkdir("/disk");
+			vnode* point = vfs_namei("/disk");
+			if (point && point->type == VnodeType::DIRECTORY) {
+				vfs_disk_mountpoint = point;
+				vfs_disk_root = &volume->root.vn;
+				print((char*)"[storage] WYZARDATA mounted at /disk.");
+				break;
+			}
+		}
+	}
+	__asm__ volatile("sti" ::: "memory");
 
 	// ── Queue hub status-change TRBs BEFORE the keyboard_count == 0 check ───
 	//
@@ -916,6 +970,7 @@ extern "C" void kmain(void) {
 			init_task = execve_memory((const uint8_t*)module->address);
 		}
 		if (init_task) {
+			g_terminal_shell_pid = init_task->pid;
 			// Phase 9: register post-flip chrome hook
 			g_pre_flip_hook = nullptr; // Phase 18: handled by wm_compose_full
 			g_post_flip_hook = nullptr;

@@ -12,6 +12,33 @@
 static char tty_line_buf[TTY_BUF_SIZE];
 static uint32_t tty_line_len = 0;
 static bool tty_raw_mode = false;
+static bool tty_echo_enabled = true;
+static char tty_launch_path[124];
+static bool tty_launch_pending = false;
+
+static bool tty_queue_launch(const char* path) {
+    uint64_t flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    size_t len = 0;
+    while (path && path[len] && len < sizeof(tty_launch_path)) ++len;
+    bool accepted = g_terminal_shell_pid && !g_terminal_foreground_pid && !tty_launch_pending &&
+                    path && path[0] == '/' && len && len < sizeof(tty_launch_path);
+    if (accepted) {
+        for (size_t i = 0; i <= len; ++i) tty_launch_path[i] = path[i];
+        tty_launch_pending = true;
+    }
+    __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
+    return accepted;
+}
+static bool tty_shell_launch_ready() {
+    return tty_launch_pending && g_current_task && g_current_task->pid == g_terminal_shell_pid;
+}
+
+static bool tty_set_echo(bool enabled) {
+    bool previous = tty_echo_enabled;
+    tty_echo_enabled = enabled;
+    return previous;
+}
 
 static void tty_set_raw(bool raw) {
     tty_raw_mode = raw;
@@ -21,6 +48,14 @@ static void tty_set_raw(bool raw) {
 static char tty_out_buf[TTY_BUF_SIZE];
 static volatile uint32_t tty_out_head = 0;
 static volatile uint32_t tty_out_tail = 0;
+
+static void tty_discard_input() {
+    uint64_t flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    tty_line_len = 0;
+    tty_out_tail = tty_out_head;
+    __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
+}
 
 static void tty_flush_line() {
     for (uint32_t i = 0; i < tty_line_len; i++) {
@@ -48,10 +83,10 @@ static void tty_input(char c) {
     if (c == '\b') {
         if (tty_line_len > 0) {
             tty_line_len--;
-            term_putchar('\b');
+            if (tty_echo_enabled) term_putchar('\b');
         }
     } else {
-        if (c >= 32 || c == '\n' || c == '\r' || c == '\t') {
+        if (tty_echo_enabled && (c >= 32 || c == '\n' || c == '\r' || c == '\t')) {
             term_putchar(c);
         }
         if (tty_line_len < TTY_BUF_SIZE - 2) {
@@ -60,13 +95,14 @@ static void tty_input(char c) {
             if (c == '\n') tty_flush_line();
         }
     }
-    term_flip();
+    if (tty_echo_enabled) term_flip();
 }
 
 // In kernel reads. Blocks until at least 1 character is available.
 static size_t tty_read(char* buf, size_t count) {
     size_t read = 0;
     while (read < count) {
+        if ((g_current_task && g_current_task->interrupt_requested) || tty_shell_launch_ready()) break;
         if (tty_out_head != tty_out_tail) {
             char c = tty_out_buf[tty_out_tail];
             tty_out_tail = (tty_out_tail + 1) % TTY_BUF_SIZE;

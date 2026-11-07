@@ -34,6 +34,11 @@ static Task* execve_memory(const uint8_t* elf_data) {
         return nullptr;
     }
     
+    // The scheduler restores each task's recorded CR3. It must not preempt
+    // this temporary address-space switch while segments are being populated.
+    uint64_t mapping_flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(mapping_flags) :: "memory");
+
     // Create a new Address Space (PML4) isolating this process.
     uint64_t new_cr3 = create_user_page_table();
     
@@ -84,6 +89,7 @@ static Task* execve_memory(const uint8_t* elf_data) {
     
     // Restore the kernel's original address space
     switch_to_cr3(old_cr3);
+    if (mapping_flags & (1u << 9)) __asm__ volatile("sti" ::: "memory");
     
     // ── Create the PCB ────────────────────────────────────────────────────────
     Task* t = task_create_user(exec_trampoline, new_cr3, 4); // 4 pages for kernel stack

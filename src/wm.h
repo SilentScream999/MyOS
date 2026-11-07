@@ -669,6 +669,26 @@ static inline void wm_draw_string(uint32_t x, uint32_t y, const char* s, uint32_
     }
 }
 
+// ─── Taskbar clock (tray) ────────────────────────────────────────────────────
+// The time comes from rtc.h (g_clock, refreshed by the compositor thread). Drawing only reads that cache.
+// Tray width follows the font scale; the widest line is "10:59:59 PM" (11 chars) or the date "2026-11-06" (10).
+static inline int32_t wm_tray_w() {
+    int32_t cw    = (int32_t)((8 * g_font_scale_100) / 100);
+    int32_t chars = CLOCK_SHOW_SECONDS ? 11 : 10;
+    return chars * cw + 16;
+}
+
+// Mark the tray (plus the 2px separator left of it) dirty so the compositor repaints the clock.
+static inline void wm_clock_damage() {
+    if (!fb) return;
+    int32_t x1 = (int32_t)fb->width - wm_tray_w() - 6 - 8;
+    if (x1 < 0) x1 = 0;
+    int32_t y1 = (int32_t)fb->height - (int32_t)g_taskbar_h;
+    if (y1 < 0) y1 = 0;
+    wm_dirty_add((uint32_t)x1, fb->width - 1, (uint32_t)y1, fb->height - 1);
+    g_needs_refresh = true;
+}
+
 static inline void wm_draw_window_chrome(int32_t x, int32_t y, int32_t w, int32_t h, const char* title, bool closable, int32_t min_y, int32_t max_y, bool focused = false) {
     if (!g_master_backbuffer) return;
     // Title bar background: active blue accent if focused, muted dark grey if inactive
@@ -1072,6 +1092,10 @@ extern void term_write_string(char* s);
 static inline void wm_dispatch_key(char c, uint32_t scancode, bool is_down, uint32_t mods) {
     g_kbd_modifiers = mods;
     if (!is_down) return;
+    if ((mods & WIN_MOD_CTRL) && (c == 'c' || c == 'C' || c == 3)) {
+        task_request_interrupt(g_terminal_foreground_pid);
+        return; // consume the chord, including repeats after the process exits
+    }
 
     // Focus-based routing
     Window* focused = wm_find_window(g_focused_win_id);
@@ -1569,19 +1593,36 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                     sb_y + (int32_t)(sb_h - char_h) / 2,
                     start_lbl, 0xFFFFFFFF, g_font_scale_100);
         
-        // (tray and separator code omitted for brevity in chunk but should stay same)
-        // [wait, I need to make sure I don't delete them. I'll include them in the chunk.]
-
         // ── System tray (right side, drawn before task buttons so we know its x) 
-        const int32_t TRAY_W = 80;
+        const int32_t TRAY_W = wm_tray_w();
         int32_t tray_x = (int32_t)fb->width - TRAY_W - 6;
         int32_t tray_y = sb_y, tray_h = sb_h;
 
         draw_btn(tray_x, tray_y, TRAY_W, tray_h,
                 0xFF252a42, 0xFF1a1f35,
                 0xFF303560, false);
-        wm_draw_string(tray_x + 6, tray_y + (tray_h - 8) / 2,
-                    "12:00 PM", 0xFFBBBBDD);
+
+        // Clock: time on top, date below (like the Windows taskbar). Only reads the cached g_clock.
+        {
+            char tbuf[16], dbuf[16];
+            int tl, dl = 0;
+            if (g_clock_valid) {
+                tl = rtc_format_time(g_clock, tbuf, CLOCK_SHOW_SECONDS != 0);
+                dl = rtc_format_date(g_clock, dbuf);
+            } else {
+                tbuf[0] = '-'; tbuf[1] = '-'; tbuf[2] = ':'; tbuf[3] = '-'; tbuf[4] = '-'; tbuf[5] = 0;
+                tl = 5;
+            }
+            int32_t cw = (int32_t)char_w, ch = (int32_t)char_h;
+            bool two_lines = dl > 0 && tray_h >= 2 * ch + 4;
+            int32_t ty0 = two_lines ? tray_y + (tray_h - (2 * ch + 2)) / 2
+                                    : tray_y + (tray_h - ch) / 2;
+            wm_draw_string((uint32_t)(tray_x + (TRAY_W - tl * cw) / 2), (uint32_t)ty0,
+                           tbuf, 0xFFE6E8FF, g_font_scale_100);
+            if (two_lines)
+                wm_draw_string((uint32_t)(tray_x + (TRAY_W - dl * cw) / 2), (uint32_t)(ty0 + ch + 2),
+                               dbuf, 0xFF9FA6CC, g_font_scale_100);
+        }
 
         // Separator between task area and tray
         for (int32_t y = sb_y + 4; y < sb_y + sb_h - 4; y++) {

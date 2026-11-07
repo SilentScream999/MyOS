@@ -58,6 +58,30 @@ Task*    g_task_list       = nullptr;   // head of circular run-queue
 bool     g_scheduler_ready = false;
 static uint64_t g_kernel_cr3      = 0;         // master kernel PML4 physical address
 static uint32_t g_tick_counter    = 0;         // added back for time-slice tracking
+static pid_t g_terminal_shell_pid = 0;
+static pid_t g_terminal_foreground_pid = 0;
+static void (*g_task_exit_hook)(pid_t) = nullptr;
+
+// Mark only user processes for interruption. Do not free resources from a key
+// IRQ or abandon a suspended kernel operation; cancellation happens at a safe
+// syscall boundary or when the task is suspended in user mode.
+static bool task_request_interrupt(pid_t pid) {
+    uint64_t flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    bool found = false;
+    Task* t = g_task_list;
+    if (t && pid && pid != g_terminal_shell_pid) do {
+        if (t->pid == pid && t->user_entry && t->state != TaskState::DEAD) {
+            t->interrupt_requested = true;
+            if (t->state == TaskState::BLOCKED) { t->wake_at_tick = 0; t->state = TaskState::READY; }
+            found = true; break;
+        }
+        t = t->next;
+    } while (t != g_task_list);
+    __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
+    return found;
+}
+static void task_complete(Task* exiting, uint64_t code);
 
 // CPU idle cycle tracker (accumulates TSC cycles spent in hlt each window)
 extern volatile uint64_t g_idle_tsc_accum;
@@ -157,7 +181,8 @@ static void scheduler_reap_dead() {
 
     while (cur != g_task_list) {
         Task* nxt = cur->next;
-        if (cur->state == TaskState::DEAD) {
+        if (cur != g_current_task && cur->state == TaskState::DEAD &&
+            (cur->parent_pid == 0 || cur->exit_collected)) {
             prev->next = nxt;
             task_free(cur);
         } else {
@@ -169,6 +194,7 @@ static void scheduler_reap_dead() {
     // Check the head node itself (never remove if it is the current task).
     if (g_task_list != g_current_task &&
         g_task_list->state == TaskState::DEAD &&
+        (g_task_list->parent_pid == 0 || g_task_list->exit_collected) &&
         g_task_list->next  != g_task_list) {
         Task* old_head = g_task_list;
         prev->next  = old_head->next;
@@ -185,6 +211,14 @@ static void schedule() {
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
 
     scheduler_reap_dead();
+
+    Task* pending = g_task_list;
+    do {
+        if (pending != g_current_task && pending->state != TaskState::DEAD &&
+            pending->interrupt_requested && !pending->in_syscall)
+            task_complete(pending, 130);
+        pending = pending->next;
+    } while (pending != g_task_list);
 
     // Check for any tasks that need to be unblocked
     Task* scan = g_task_list;
@@ -277,30 +311,102 @@ static void yield() {
 // Yields the CPU immediately.
 
 static void task_sleep_ms(uint64_t ms) {
-    if (!g_current_task) return;
-    g_current_task->wake_at_tick = g_tick_count + ms;
-    g_current_task->state = TaskState::BLOCKED;
-    while (g_current_task->state == TaskState::BLOCKED) {
+    if (!g_current_task || !ms) return;
+    uint64_t flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    Task* self = g_current_task;
+    self->wake_at_tick = g_tick_count + ms;
+    self->state = TaskState::BLOCKED;
+    while (self->state == TaskState::BLOCKED) {
         schedule();
-        if (g_current_task->state == TaskState::BLOCKED) {
+        if (self->state == TaskState::BLOCKED) {
             uint64_t t0;
             __asm__ volatile("rdtsc; shl $32, %%rdx; or %%rdx, %%rax" : "=a"(t0) :: "rdx");
-            __asm__ volatile("hlt");
+            __asm__ volatile("sti; hlt; cli" ::: "memory");
             uint64_t t1;
             __asm__ volatile("rdtsc; shl $32, %%rdx; or %%rdx, %%rax" : "=a"(t1) :: "rdx");
             __sync_fetch_and_add(&g_idle_tsc_accum, t1 - t0);
         }
     }
+    __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
 }
 
-// ── task_exit ─────────────────────────────────────────────────────────────────
-// Mark the calling task DEAD and switch away.  Does not return.
-// Memory is freed by scheduler_reap_dead() on the next schedule() call.
+// Wait for one child, retaining completed children until status is collected.
 
-[[noreturn]] static void task_exit() {
-    if (g_current_task) g_current_task->state = TaskState::DEAD;
-    schedule();
-    hcf();   // unreachable
+static int64_t task_wait_child(pid_t pid, uint64_t* exit_code) {
+    if (!g_current_task || !pid || pid == g_current_task->pid) return -1;
+    uint64_t flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    Task* parent = g_current_task;
+    for (;;) {
+        if (parent->interrupt_requested) {
+            parent->wait_pid = 0;
+            __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
+            return -1;
+        }
+        Task* child = nullptr;
+        Task* scan = g_task_list;
+        if (scan) do {
+            if (scan->pid == pid && scan->parent_pid == parent->pid && !scan->exit_collected) { child = scan; break; }
+            scan = scan->next;
+        } while (scan != g_task_list);
+        if (!child) {
+            __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
+            return -1;
+        }
+        if (child->state == TaskState::DEAD) {
+            if (exit_code) *exit_code = child->exit_code;
+            child->exit_collected = true;
+            parent->wait_pid = 0;
+            __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
+            return pid;
+        }
+        // Interrupts remain disabled between testing exit and blocking, so an
+        // exit cannot race the waiter into sleeping after its wakeup was sent.
+        parent->wait_pid = pid;
+        parent->wake_at_tick = 0;
+        parent->state = TaskState::BLOCKED;
+        schedule();
+        if (parent->state == TaskState::BLOCKED)
+            __asm__ volatile("sti; hlt; cli" ::: "memory");
+    }
+}
+
+static void task_complete(Task* exiting, uint64_t code) {
+    if (exiting && exiting->state != TaskState::DEAD) {
+        if (g_task_exit_hook) g_task_exit_hook(exiting->pid);
+        if (g_terminal_foreground_pid == exiting->pid) g_terminal_foreground_pid = 0;
+        exiting->exit_code = code;
+        // Release descriptors now, even if the parent has not waited yet.
+        for (int fd = 0; fd < MAX_FDS; ++fd) if (exiting->fd_table[fd]) {
+            vfs_close(exiting->fd_table[fd]);
+            kfree(exiting->fd_table[fd]);
+            exiting->fd_table[fd] = nullptr;
+        }
+        Task* scan = g_task_list;
+        if (scan) do {
+            if (scan->parent_pid == exiting->pid) scan->parent_pid = 0;
+            if (scan->pid == exiting->parent_pid && scan->wait_pid == exiting->pid && scan->state == TaskState::BLOCKED) {
+                scan->wait_pid = 0;
+                scan->state = TaskState::READY;
+            }
+            scan = scan->next;
+        } while (scan != g_task_list);
+        exiting->state = TaskState::DEAD;
+    }
+}
+
+[[noreturn]] static void task_exit(uint64_t code = 0) {
+    __asm__ volatile("cli" ::: "memory");
+    task_complete(g_current_task, code);
+    // The parent may still be asleep (exit-before-wait), and the compositor
+    // and input task can both be sleeping too. With no READY task, schedule()
+    // returns. Keep this dead task's stack alive and idle until a timer wakes
+    // another task instead of halting the whole OS.
+    for (;;) {
+        schedule();
+        __asm__ volatile("sti; hlt; cli" ::: "memory");
+    }
 }
 
 // ── scheduler_tick ────────────────────────────────────────────────────────────

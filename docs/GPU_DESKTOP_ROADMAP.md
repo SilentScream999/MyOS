@@ -1,7 +1,10 @@
 # Roadmap: toward a Windows-like, GPU-composited desktop
 
-*Last updated: 2026-11-02.* Based on a read of the code and a check of the technical claims against public sources (section 6).
+*Last updated: 2026-11-07.* GPU/display technical claims retain the original sources (section 6); implementation status below reflects the current surface compositor.
 See `docs/AI_HANDOFF.md` for constraints and conventions.
+Clock, disk-backed desktop assets, persistent apps and installation priorities are
+tracked in [NEXT_STEPS.md](NEXT_STEPS.md); wallpaper should be cached in RAM after
+a VFS load, never fetched from disk during composition.
 
 ## 1. What the target is
 
@@ -21,7 +24,7 @@ blending, scaling and effects; it does not pay off for the plain copies we do to
 | Capability | Status |
 |---|---|
 | Windows as surfaces + damage reporting | **Done** for Rainbow, Visual Test and user windows (`SYS_WIN_CREATE/SYNC/DAMAGE/DESTROY/GET_BUFFER`). Damage list of up to 8 rects (`src/damage.h`). |
-| Terminal and Boot Log as surfaces | **Not done.** Special-cased branches in the compositor with their own geometry and hit-testing. |
+| Terminal and Boot Log as surfaces | **Done (A1).** All windows use the generic surface blit path; the compositor's old special-case branches are removed. |
 | Per-pixel alpha | **None.** Everything is opaque; the "glass" taskbar is a hand-built gradient. |
 | Chrome and shadows as layers | **No.** Chrome is drawn by CPU code straight into one master backbuffer, back to front. No retained layers. |
 | Surface pixel format | ARGB8888 by convention (`APIDocs/WindowAPI.md`); the compositor ignores the alpha byte. |
@@ -49,7 +52,7 @@ Observed symptoms: horizontal tearing during animation and window drag, cursor f
 Each stage is independently shippable and testable, ordered by dependency and risk. Don't start a stage before the previous one boots cleanly on the laptop.
 
 ### Stage A: CPU compositor model (no hardware risk)
-* **A1.** Convert Terminal and Boot Log to surface-backed windows using the internal API, as Rainbow and Visual Test already are. Delete the special cases. *Acceptance:* identical look; one code path for all windows; HUD `W:` not worse.
+* **A1. Complete:** Terminal and Boot Log are surface-backed; the special-case compositor branches have been deleted. Earlier desktop behavior was verified on the test laptop; see the handoff for current build-specific verification.
 * **A2.** Define the pixel format (premultiplied vs straight alpha; decide and document) and a per-window "opaque" flag. Opaque windows keep the fast copy; others use an SSE2 blend. Keep the blend in a pure header and check it against a scalar reference.
 * **A3.** Retained layers: window decoration cached or composed separately; shadow as a pre-rendered nine-slice. Taskbar glass via real alpha instead of a baked gradient.
 * **A4.** (optional) Client double-buffering: swap front/back on `WIN_SYNC` so a client never shows a half-drawn frame.
@@ -89,7 +92,10 @@ User-mode clients submit work through the kernel with validation, with per-proce
 
 ## 6. Sources and confidence
 
-"Verified" means the statement was found in the cited source. Nothing here has been tested on our hardware.
+"Verified" in this source table means the statement was found in the cited
+source, not that the proposed display/render work has been hardware-tested.
+The existing blitter and earlier surface compositor have separate runtime
+verification recorded in the handoff.
 
 | Claim | Status | Source |
 |---|---|---|
