@@ -8,7 +8,7 @@
 #include "damage.h"
 
 extern "C" {
-    #include "../limine.h"
+    #include "limine.h"
 }
 
 extern struct limine_framebuffer *fb;

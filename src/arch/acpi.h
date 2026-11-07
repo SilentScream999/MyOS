@@ -8,7 +8,7 @@
 #include "tty.h"
 
 extern "C" {
-    #include "../limine.h"
+    #include "limine.h"
 }
 
 // Ensure the linker can find requests defined in kernel.cpp

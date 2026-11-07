@@ -1,91 +1,95 @@
-src/kernel.o: src/kernel.cpp src/helpers.h src/structures.h src/string.h \
-  src/framebufferstuff.h src/font8x8_basic.h src/klog.h src/damage.h \
-  src/../limine.h src/pagingstuff.h src/usbhelpers.h src/scheduler.h \
-  src/task.h src/heap.h src/vfs.h src/fileinfo.h src/gdt.h src/block.h \
-  src/usb_storage.h src/idt.h src/irq.h src/timer.h src/rtc.h src/tty.h \
-  src/terminal.h src/acpi.h src/syscall.h src/wm.h src/graphics.h \
-  src/mouse.h src/surface.h src/ramfs.h src/fat16.h src/tar.h src/exec.h \
-  src/elf.h src/intel_gpu.h src/gpu_cmds.h src/apic_timer.h \
-  src/boot_splash.h src/synaptics.h src/ps2kb.h
+src/kernel.o: src/kernel.cpp src/core/helpers.h src/core/structures.h \
+  src/core/string.h src/gui/framebufferstuff.h src/gui/font8x8_basic.h \
+  src/core/klog.h src/gui/damage.h limine.h src/arch/pagingstuff.h \
+  src/drivers/usbhelpers.h src/core/scheduler.h src/core/task.h \
+  src/core/heap.h src/fs/vfs.h src/fs/fileinfo.h src/arch/gdt.h \
+  src/drivers/block.h src/drivers/usb_storage.h src/arch/idt.h \
+  src/arch/irq.h src/arch/timer.h src/arch/rtc.h src/core/tty.h \
+  src/core/terminal.h src/arch/acpi.h src/core/syscall.h src/gui/wm.h \
+  src/gui/graphics.h src/drivers/mouse.h src/gui/surface.h \
+  src/fs/ramfs.h src/fs/fat16.h src/fs/tar.h src/core/exec.h \
+  src/core/elf.h src/drivers/intel_gpu.h src/drivers/gpu_cmds.h \
+  src/arch/apic_timer.h src/gui/boot_splash.h src/drivers/synaptics.h \
+  src/drivers/ps2kb.h
 
-src/helpers.h:
+src/core/helpers.h:
 
-src/structures.h:
+src/core/structures.h:
 
-src/string.h:
+src/core/string.h:
 
-src/framebufferstuff.h:
+src/gui/framebufferstuff.h:
 
-src/font8x8_basic.h:
+src/gui/font8x8_basic.h:
 
-src/klog.h:
+src/core/klog.h:
 
-src/damage.h:
+src/gui/damage.h:
 
-src/../limine.h:
+limine.h:
 
-src/pagingstuff.h:
+src/arch/pagingstuff.h:
 
-src/usbhelpers.h:
+src/drivers/usbhelpers.h:
 
-src/scheduler.h:
+src/core/scheduler.h:
 
-src/task.h:
+src/core/task.h:
 
-src/heap.h:
+src/core/heap.h:
 
-src/vfs.h:
+src/fs/vfs.h:
 
-src/fileinfo.h:
+src/fs/fileinfo.h:
 
-src/gdt.h:
+src/arch/gdt.h:
 
-src/block.h:
+src/drivers/block.h:
 
-src/usb_storage.h:
+src/drivers/usb_storage.h:
 
-src/idt.h:
+src/arch/idt.h:
 
-src/irq.h:
+src/arch/irq.h:
 
-src/timer.h:
+src/arch/timer.h:
 
-src/rtc.h:
+src/arch/rtc.h:
 
-src/tty.h:
+src/core/tty.h:
 
-src/terminal.h:
+src/core/terminal.h:
 
-src/acpi.h:
+src/arch/acpi.h:
 
-src/syscall.h:
+src/core/syscall.h:
 
-src/wm.h:
+src/gui/wm.h:
 
-src/graphics.h:
+src/gui/graphics.h:
 
-src/mouse.h:
+src/drivers/mouse.h:
 
-src/surface.h:
+src/gui/surface.h:
 
-src/ramfs.h:
+src/fs/ramfs.h:
 
-src/fat16.h:
+src/fs/fat16.h:
 
-src/tar.h:
+src/fs/tar.h:
 
-src/exec.h:
+src/core/exec.h:
 
-src/elf.h:
+src/core/elf.h:
 
-src/intel_gpu.h:
+src/drivers/intel_gpu.h:
 
-src/gpu_cmds.h:
+src/drivers/gpu_cmds.h:
 
-src/apic_timer.h:
+src/arch/apic_timer.h:
 
-src/boot_splash.h:
+src/gui/boot_splash.h:
 
-src/synaptics.h:
+src/drivers/synaptics.h:
 
-src/ps2kb.h:
+src/drivers/ps2kb.h:

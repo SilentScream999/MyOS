@@ -1,6 +1,6 @@
 typedef unsigned long uint64_t;
 typedef long          int64_t;
-#include "src/fileinfo.h"
+#include "src/fs/fileinfo.h"
 
 // Minimal syscall wrappers
 static inline uint64_t sys_read(uint64_t fd, char* buf, uint64_t len) {

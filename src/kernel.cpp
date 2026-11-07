@@ -1,28 +1,28 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#include "helpers.h"
-#include "pagingstuff.h"
-#include "usbhelpers.h"
+#include "core/helpers.h"
+#include "arch/pagingstuff.h"
+#include "drivers/usbhelpers.h"
 
-#include "gdt.h"
-#include "idt.h"
+#include "arch/gdt.h"
+#include "arch/idt.h"
 
-#include "irq.h"    // PIC remapping + irq_register
-#include "timer.h"  // PIT driver + g_tick_count
-#include "rtc.h"    // CMOS RTC wall clock (taskbar clock)
-#include "heap.h"
-#include "tty.h"
-#include "acpi.h"
-#include "syscall.h"
-#include "ramfs.h"
-#include "fat16.h"
-#include "tar.h"
-#include "exec.h"
-#include "graphics.h"
-#include "wm.h"
-#include "intel_gpu.h"
-#include "apic_timer.h"
+#include "arch/irq.h"    // PIC remapping + irq_register
+#include "arch/timer.h"  // PIT driver + g_tick_count
+#include "arch/rtc.h"    // CMOS RTC wall clock (taskbar clock)
+#include "core/heap.h"
+#include "core/tty.h"
+#include "arch/acpi.h"
+#include "core/syscall.h"
+#include "fs/ramfs.h"
+#include "fs/fat16.h"
+#include "fs/tar.h"
+#include "core/exec.h"
+#include "gui/graphics.h"
+#include "gui/wm.h"
+#include "drivers/intel_gpu.h"
+#include "arch/apic_timer.h"
 
 static void process_exit_ui(pid_t pid) {
     bool foreground = pid == g_terminal_foreground_pid;
@@ -148,7 +148,7 @@ static inline void vram_draw_string_8x8(int32_t x, int32_t y, const char* s, uin
 	}
 }
 
-#include "boot_splash.h"
+#include "gui/boot_splash.h"
 
 // ── Syscall globals ───────────────────────────────────────────────────────────
 alignas(16) static uint8_t g_boot_kstack[4096];
@@ -156,7 +156,7 @@ uint64_t g_current_kstack_top = (uint64_t)(g_boot_kstack + sizeof(g_boot_kstack)
 uint64_t g_user_rsp_scratch = 0;
 
 // ── klog globals ──────────────────────────────────────────────────────────────
-#include "klog.h"
+#include "core/klog.h"
 char     g_klog_buffer[KLOG_BUFFER_SIZE];
 uint64_t g_klog_pos = 0;
 // Keep normal startup quiet. Logs still populate /dev/klog and the WM viewer.
@@ -200,9 +200,9 @@ volatile bool g_needs_refresh = true;
 volatile bool g_desktop_ready = false;
 volatile uint32_t g_mouse_btns_prev = 0;
 
-#include "mouse.h"
-#include "synaptics.h"
-#include "ps2kb.h"
+#include "drivers/mouse.h"
+#include "drivers/synaptics.h"
+#include "drivers/ps2kb.h"
 
 // Phase 18: High-precision TSC calibration against PIT
 static bool calibrate_tsc_pit() {

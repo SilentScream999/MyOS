@@ -71,9 +71,9 @@ options, hence the `make clean`.
 * **Userspace:** static ELF64 loading from VFS, isolated user address spaces, shell, counter and window demo. Init normally loads from `/bin/init.elf` in RAMFS; Limine modules provide a fallback.
 * **Filesystem:** VFS plus RAMFS/initrd system files, and a persistent FAT16 USB data volume at `/disk` when using the new USB image. See [persistent storage](docs/PERSISTENT_STORAGE.md) for scope and testing.
 * **Terminal:** TTY with line discipline, framebuffer terminal emulator (ANSI subset), shell with history, scrollback and live command highlighting.
-* **Input:** xHCI USB (Intel port-routing support plus an AMD quirk workaround, hubs, connect detection), USB HID keyboard and mouse, PS/2 keyboard, Synaptics touchpad over PS/2 (see `src/SynapticsGuide.md`).
+* **Input:** xHCI USB (Intel port-routing support plus an AMD quirk workaround, hubs, connect detection), USB HID keyboard and mouse, PS/2 keyboard, Synaptics touchpad over PS/2 (see `src/drivers/SynapticsGuide.md`).
 * **Platform:** ACPI (shutdown/reboot), PCI ECAM mapping and enumeration.
-* **Taskbar clock:** real time and date from the CMOS RTC (`src/rtc.h`), repainted when the minute changes. Windows keeps local time in the RTC, so it matches the Windows clock by default; see the `CLOCK_*` build options in the Makefile.
+* **Taskbar clock:** real time and date from the CMOS RTC (`src/arch/rtc.h`), repainted when the minute changes. Windows keeps local time in the RTC, so it matches the Windows clock by default; see the `CLOCK_*` build options in the Makefile.
 * **Desktop:** window manager with z-order, drag (ghost outline), close buttons, taskbar, HUD, wallpaper, mouse cursor.
 * **Compositor:** surface-backed windows, a damage-rect list, and the rainbow animation as a surface client (see below).
 * **Intel GPU (Gen9):** PCI discovery, MMIO + GGTT mapping, forcewake/reset, blitter (BCS) ring with fill/copy and a fence. The self-test and benchmark have run on our laptop, but the path is **off by default** (slower than the CPU copy).
@@ -82,8 +82,8 @@ options, hence the `make clean`.
 
 The compositor thread (`compositor_thread_main` in `src/kernel.cpp`) runs at roughly 60 Hz on a TSC cadence. Each frame:
 
-1. Clients update their **surfaces** and report **damage** (`wm_surface_damage*`). The Rainbow and Visual Test windows are surface clients, as are user windows. Up to 8 separate dirty rects are tracked (`src/damage.h`); some writers still use one global box.
-2. For each damaged rect, `wm_compose_dirty()` (`src/wm.h`) builds the scene in the master backbuffer: Stage 1 wallpaper from RAM, Stage 2 all windows through the generic surface blit path, then taskbar, RAM/CPU readouts and the Start-menu overlay.
+1. Clients update their **surfaces** and report **damage** (`wm_surface_damage*`). The Rainbow and Visual Test windows are surface clients, as are user windows. Up to 8 separate dirty rects are tracked (`src/gui/damage.h`); some writers still use one global box.
+2. For each damaged rect, `wm_compose_dirty()` (`src/gui/wm.h`) builds the scene in the master backbuffer: Stage 1 wallpaper from RAM, Stage 2 all windows through the generic surface blit path, then taskbar, RAM/CPU readouts and the Start-menu overlay.
 3. Stage 3 copies the rect to VRAM with the CPU (SSE non-temporal stores). An optional GPU-blitter hook exists but is only enabled if the boot benchmark shows it is faster.
 4. The cursor and drag-outline overlay is drawn **directly onto VRAM, once, after the last flip** of the frame.
 
@@ -121,18 +121,18 @@ Window authorization and ELF/user-pointer validation still need hardening. This 
 | Path | What it is |
 |---|---|
 | `src/kernel.cpp` | `kmain`, boot sequence, compositor thread, input glue, starts `init.elf` |
-| `src/wm.h` | window manager and CPU compositor, HUD, taskbar, wallpaper |
-| `src/framebufferstuff.h`, `src/damage.h`, `src/surface.h` | dirty tracking; damage rect list and surface helpers (pure, no kernel dependencies) |
-| `src/graphics.h`, `src/font8x8_basic.h` | render-target abstraction, bitmap font |
-| `src/terminal.h`, `src/tty.h`, `src/klog.h` | terminal emulator, TTY line discipline, kernel log |
-| `src/syscall.h`, `src/exec.h`, `src/elf.h` | syscall entry/dispatch, ELF loader |
-| `src/task.h`, `src/scheduler.h` | PCB, scheduler |
-| `src/pagingstuff.h`, `src/heap.h`, `src/structures.h`, `src/helpers.h`, `src/string.h` | memory management and utilities |
-| `src/gdt.h`, `src/idt.h`, `src/irq.h`, `src/timer.h`, `src/acpi.h` | CPU tables, interrupts, timers, ACPI |
-| `src/rtc.h` | CMOS real-time clock for the taskbar clock; pure decode/format logic plus thin port I/O |
-| `src/usbhelpers.h`, `src/mouse.h`, `src/ps2kb.h`, `src/synaptics.h` | xHCI/USB HID, mouse state and cursor, PS/2 keyboard, touchpad |
-| `src/vfs.h`, `src/ramfs.h`, `src/fat16.h`, `src/block.h`, `src/usb_storage.h` | VFS, RAMFS, FAT16 and USB block storage |
-| `src/intel_gpu.h`, `src/gpu_cmds.h` | Intel Gen9 kernel glue; command/ring encoding (pure, no kernel dependencies) |
+| `src/gui/wm.h` | window manager and CPU compositor, HUD, taskbar, wallpaper |
+| `src/gui/framebufferstuff.h`, `src/gui/damage.h`, `src/gui/surface.h`, `src/gui/boot_splash.h` | dirty tracking; damage rect list and surface helpers (pure, no kernel dependencies) |
+| `src/gui/graphics.h`, `src/gui/font8x8_basic.h` | render-target abstraction, bitmap font |
+| `src/core/terminal.h`, `src/core/tty.h`, `src/core/klog.h` | terminal emulator, TTY line discipline, kernel log |
+| `src/core/syscall.h`, `src/core/exec.h`, `src/core/elf.h` | syscall entry/dispatch, ELF loader |
+| `src/core/task.h`, `src/core/scheduler.h` | PCB, scheduler |
+| `src/arch/pagingstuff.h`, `src/core/heap.h`, `src/core/structures.h`, `src/core/helpers.h`, `src/core/string.h` | memory management and utilities |
+| `src/arch/gdt.h`, `src/arch/idt.h`, `src/arch/irq.h`, `src/arch/timer.h`, `src/arch/apic_timer.h`, `src/arch/acpi.h` | CPU tables, interrupts, timers, ACPI |
+| `src/arch/rtc.h` | CMOS real-time clock for the taskbar clock; pure decode/format logic plus thin port I/O |
+| `src/drivers/usbhelpers.h`, `src/drivers/mouse.h`, `src/drivers/ps2kb.h`, `src/drivers/synaptics.h` | xHCI/USB HID, mouse state and cursor, PS/2 keyboard, touchpad |
+| `src/fs/vfs.h`, `src/fs/ramfs.h`, `src/fs/fat16.h`, `src/drivers/block.h`, `src/drivers/usb_storage.h` | VFS, RAMFS, FAT16 and USB block storage |
+| `src/drivers/intel_gpu.h`, `src/drivers/gpu_cmds.h` | Intel Gen9 kernel glue; command/ring encoding (pure, no kernel dependencies) |
 | `user/init.c`, `user/counter.c` | shell and console process demo, bundled in the initrd |
 | `user/win_test.c` | mapped-surface/input demo, launched through the shell or Start menu |
 | `tools/make_usb_image.py` | required USB image creation/refresh/FRESH-mode script |

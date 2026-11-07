@@ -38,7 +38,7 @@
 #include <stdint.h>
 
 extern "C" {
-    #include "../limine.h"
+    #include "limine.h"
 }
 
 // ── Limine requests ───────────────────────────────────────────────────────────

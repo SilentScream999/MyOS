@@ -11,14 +11,15 @@ OPT ?= -O0
 CFLAGS = $(OPT) -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
          -mno-red-zone -mcmodel=kernel -target x86_64-elf \
          -fno-builtin -fno-builtin-memset -fno-builtin-memcpy -fno-builtin-memmove \
-         -fno-unwind-tables -fno-asynchronous-unwind-tables
+         -fno-unwind-tables -fno-asynchronous-unwind-tables \
+         -I. -Isrc -Isrc/arch -Isrc/core -Isrc/drivers -Isrc/fs -Isrc/gui
 
 # Intel GPU bring-up + self-test + benchmark at boot. OFF by default: on the Gen9 test laptop the CPU
 # copy (~0.3 ms) beats the GPU copy (~3 ms), and the self-test briefly draws test patterns on screen.
 # Developer use:  make clean && make GPU=1 iso
 GPU ?= 0
 
-# Taskbar clock (src/rtc.h). Windows keeps LOCAL time in the hardware clock, so 0 matches the Windows clock on
+# Taskbar clock (src/arch/rtc.h). Windows keeps LOCAL time in the hardware clock, so 0 matches the Windows clock on
 # Windows-installed test machines. If the clock is off by whole hours, set minutes to ADD to the RTC value,
 # e.g. UTC-7:  make clean && make iso CLOCK_UTC_OFFSET_MIN=-420
 CLOCK_UTC_OFFSET_MIN ?= 0
