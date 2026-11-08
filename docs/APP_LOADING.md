@@ -18,11 +18,10 @@ defers through in-progress syscalls to avoid abandoning kernel operations. This
 currently targets one task, not an entire child-process group. A Start-menu request
 wakes the registered shell's stdin with -2; syscall 20 consumes the pending path.
 Busy foreground sessions reject additional menu launches.
-The `/bin` tree is still RAMFS-backed. A persistent `/disk/bin` directory mounted
-at `/bin` can reuse current app discovery and `execve_path`, but needs initial app
-seeding, RAMFS fallback when storage is absent, and an explicit bundled-app update
-policy. This echo change does not change where executables are stored.
-Windows facts below were checked against the sources listed at the end; anything not sourced is marked.
+The `/bin` tree now lives on the disk-backed `/` filesystem. Normal image updates
+refresh bundled programs while preserving user-added executables and settings.
+The initrd provides a RAM recovery shell when the system volume is unavailable.
+See [PERSISTENT_STORAGE.md](PERSISTENT_STORAGE.md).
 
 ## 1. How Windows starts an app like Calculator
 
@@ -60,7 +59,7 @@ is just "load this image into a new address space and run it"; the GUI API ties 
 | App registry | **None.** Terminal, Visual Test, Rainbow and Boot Log are created unconditionally in `wm_init` (`src/wm.h`). |
 | Shell/launcher | Start menu discovers `/bin/*.elf` and passes launches to the shell's foreground execution path. Ctrl+C cancels the foreground app and restores the prompt/focus. |
 | Process creation | `execve_path` loads a static ELF from VFS. `SYS_SPAWN` (59), exact-child `WAITPID` (61), exit status and orphan cleanup are implemented. |
-| Storage | RAMFS/initrd system files plus writable FAT16 at `/disk`; readdir/stat/unlink exist. `/bin` is still RAMFS-backed; persistent `/disk/bin` is planned. |
+| Storage | Disk-backed FAT16 root with persistent `/bin`; RAM initrd recovery. Readdir/stat/unlink exist. |
 | Runtime linking | Not needed yet: programs are static ELFs linked at `0x400000`, using raw `syscall` wrappers (see `user/init.c`). |
 | GUI API | Syscalls 200-205 provide mapped user surfaces, damage and input events; windows record owners and are cleaned up at exit/cancellation. Authorization checks need hardening. |
 | Per-process state | PID/parent PID, CR3, private kernel stack, descriptors, wait/exit state and safe-boundary cancellation tracking. |
@@ -74,10 +73,14 @@ The kernel should not know what Calculator is. Two nuances:
 
 Keep it small: static ELF programs, no dynamic linking, and a tiny shared C library for syscall and window helpers (WyzarOS's "user32/kernel32").
 
-### 3.1 Packaging: one `initrd` module
-Instead of one Limine module per program, build **one archive** (a plain `tar`/ustar file) holding `/bin`, `/apps` and assets, and pass it as a single
-module. At boot, unpack it into ramfs. Adding an app means adding files to the archive; `limine.conf` never changes again. (`init.elf` and
-`wallpaper.raw` can move into it.) A ustar reader is about a hundred lines.
+### 3.1 Packaging: disk system plus recovery initrd
+The host image builder installs bundled executables into disk `/bin` and seeds
+missing configuration/assets. Normal refresh updates OS-owned programs while
+preserving user-added applications, settings and wallpaper. A small ustar initrd
+contains recovery programs; it is unpacked into RAM before root selection. Normal
+boot starts the disk shell, while missing/invalid storage uses RAM recovery.
+Wallpaper is read once from the mounted system disk and retained in compositor
+RAM; it is not an initrd asset or standalone Limine module.
 
 ### 3.2 Registration: an app manifest
 Each app gets a directory `/apps/<id>/` containing `app.manifest` (simple `key=value` lines, so no JSON parser is needed) and its executable:

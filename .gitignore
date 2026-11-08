@@ -1,5 +1,6 @@
 .storage-test/
-wyzar-usb.img
+wyzar-usb.img*
+*.tmp
 __pycache__/
 /core
 core.*

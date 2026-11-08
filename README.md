@@ -4,7 +4,7 @@ A hobby 64-bit x86 operating system: C++ kernel, C userspace, booted by [Limine]
 It has a framebuffer desktop (window manager, CPU compositor, taskbar, mouse cursor), USB (xHCI) and PS/2 input,
 preemptive multitasking, an ELF loader and a ring-3 shell.
 
-*Last updated: 2026-11-07.* Start with **[docs/AI_HANDOFF.md](docs/AI_HANDOFF.md)** for current status and **[docs/NEXT_STEPS.md](docs/NEXT_STEPS.md)** for runtime timezones, disk-backed apps/settings and wallpaper loading.
+*Last updated: 2026-11-07.* Start with **[docs/AI_HANDOFF.md](docs/AI_HANDOFF.md)** for current status and **[docs/NEXT_STEPS.md](docs/NEXT_STEPS.md)** for runtime timezones and remaining storage work.
 
 The long-term goal is a **Windows-like, GPU-composited desktop**. Where we are on that road, and what comes next, is in
 [docs/GPU_DESKTOP_ROADMAP.md](docs/GPU_DESKTOP_ROADMAP.md). How programs should be started (instead of being hard-coded) is in
@@ -15,14 +15,15 @@ The long-term goal is a **Windows-like, GPU-composited desktop**. Where we are o
 ## Quick start
 
 **Persistent USB storage:** build with `make usb-image` and boot the resulting
-UEFI USB image. `/disk` is a writable FAT16 data volume; the ISO remains a live
-RAMFS boot. See [docs/PERSISTENT_STORAGE.md](docs/PERSISTENT_STORAGE.md) for image
+UEFI USB image. The FAT16 system volume mounts at `/`, with persistent apps, settings and
+wallpaper. The initrd provides RAM recovery when no valid system volume is found. See [docs/PERSISTENT_STORAGE.md](docs/PERSISTENT_STORAGE.md) for image
 writing, persistence checks, limitations, and the path toward an installer.
-`make iso` also refreshes the USB image's boot files while preserving `/disk` data.
-In the shell, use `rm /disk/FILE.TXT` to delete a closed file and
-`stat /disk/FILE.TXT` to display creation and modification times.
+Use `make run-usb` for QEMU disk boot tests; the ISO is useful for recovery or
+QEMU boot with an attached system disk. `make iso` also refreshes the USB image's boot files and bundled programs while preserving user files/settings.
+In the shell, use `rm /home/FILE.TXT` to delete a closed file and
+`stat /home/FILE.TXT` to display creation and modification times.
 For a clean image on each test, use `make clean && make run FRESH=1`.
-The flag resets saved `/disk` files; ordinary builds preserve them.
+The flag resets saved files; ordinary builds preserve them.
 `run /bin/counter.elf` runs in the foreground: the shell waits for exit and then
 prints a fresh prompt automatically. Keep `tools/make_usb_image.py` for image
 builds; the `tests/` directory contains optional development checks.
@@ -68,13 +69,13 @@ options, hence the `make clean`.
 * **Memory:** Limine memory map, physical frame allocator, 4-level paging, higher-half direct map, growable kernel heap (`kmalloc`/`kfree`), per-process address spaces.
 * **Tasks:** PCB, context switch, round-robin **single-core** preemptive scheduler. Other cores are detected but never started.
 * **Syscalls:** `syscall`/`sysret` entry and a small dispatcher (table below).
-* **Userspace:** static ELF64 loading from VFS, isolated user address spaces, shell, counter and window demo. Init normally loads from `/bin/init.elf` in RAMFS; Limine modules provide a fallback.
-* **Filesystem:** VFS plus RAMFS/initrd system files, and a persistent FAT16 USB data volume at `/disk` when using the new USB image. See [persistent storage](docs/PERSISTENT_STORAGE.md) for scope and testing.
+* **Userspace:** static ELF64 loading from VFS, isolated user address spaces, shell, counter and window demo. Init normally loads from disk `/bin/init.elf`; initrd/Limine modules provide recovery.
+* **Filesystem:** VFS with a persistent FAT16 root on USB, RAM runtime mounts and initrd recovery. See [persistent storage](docs/PERSISTENT_STORAGE.md) for scope and testing.
 * **Terminal:** TTY with line discipline, framebuffer terminal emulator (ANSI subset), shell with history, scrollback and live command highlighting.
 * **Input:** xHCI USB (Intel port-routing support plus an AMD quirk workaround, hubs, connect detection), USB HID keyboard and mouse, PS/2 keyboard, Synaptics touchpad over PS/2 (see `src/drivers/SynapticsGuide.md`).
 * **Platform:** ACPI (shutdown/reboot), PCI ECAM mapping and enumeration.
 * **Taskbar clock:** real time and date from the CMOS RTC (`src/arch/rtc.h`), repainted when the minute changes. Windows keeps local time in the RTC, so it matches the Windows clock by default; see the `CLOCK_*` build options in the Makefile.
-* **Desktop:** window manager with z-order, drag (ghost outline), close buttons, taskbar, HUD, wallpaper, mouse cursor.
+* **Desktop:** window manager with z-order, drag (ghost outline), close buttons, taskbar, HUD, wallpaper, mouse cursor. Titles, menus and taskbar use antialiased Selawik; shell text stays monospace. See [font assets and regeneration](assets/fonts/selawik/README.md).
 * **Compositor:** surface-backed windows, a damage-rect list, and the rainbow animation as a surface client (see below).
 * **Intel GPU (Gen9):** PCI discovery, MMIO + GGTT mapping, forcewake/reset, blitter (BCS) ring with fill/copy and a fence. The self-test and benchmark have run on our laptop, but the path is **off by default** (slower than the CPU copy).
 
@@ -147,7 +148,7 @@ Details, with file pointers, are in [docs/AI_HANDOFF.md](docs/AI_HANDOFF.md). In
 
 * **Apps are hard-coded.** Terminal, Visual Test, Rainbow and Boot Log are created in `wm_init`; the Start button opens a menu of `/bin/*.elf` apps and launches them on click.
 * **Prototype process isolation:** per-task kernel stacks and mapped user surfaces work; ELF validation, window-ID authorization and complete address-space reclamation remain incomplete.
-* **Storage and time settings:** `/bin` is still RAMFS-backed; only `/disk` persists. Clock offsets are compile-time, with no named timezone/DST settings. See the near-term plan.
+* **Storage and time settings:** The system root, `/bin`, settings and wallpaper persist; `/tmp` and `/run` use RAM. Clock offsets are compile-time, with no named timezone/DST settings. See the near-term plan.
 * **No per-pixel alpha** anywhere in the compositor.
 * **Tearing and cursor flicker are unresolved.** The cause has not been established; see the roadmap.
 * **USB:** a failing device (for example a boot drive that fails descriptor reads) plugged in during the root-port scan can starve HID descriptor reads on other ports. Plug it in once the system has settled. Related wish: detect which USB device is the boot drive.
@@ -159,7 +160,7 @@ Details, with file pointers, are in [docs/AI_HANDOFF.md](docs/AI_HANDOFF.md). In
 Ordered by dependency. Each step should be bootable and testable on its own.
 
 1. Verify the combined clock/storage/foreground-app changes on hardware.
-2. Add runtime timezone settings, persistent `/bin` and desktop settings, and disk-to-RAM wallpaper loading. See [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md).
+2. Add runtime timezone settings and finish storage operations after disk-root/wallpaper hardware verification. See [docs/NEXT_STEPS.md](docs/NEXT_STEPS.md).
 3. Expand file operations, disk usage reporting, asynchronous I/O, internal-drive support and installation; continue app manifests and API hardening.
 4. **CPU compositor features:** alpha, shadows, retained layers.
 5. **Display control:** hardware cursor plane, then page flipping at vblank.

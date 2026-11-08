@@ -1,223 +1,234 @@
-# Persistent USB storage
+# Persistent system storage
 
-The USB stick can now contain both the bootable OS and a writable FAT16 data
-partition. The initial system tree still comes from the initrd into RAMFS;
-files under `/disk` go through the xHCI mass-storage driver to the stick.
-This is the first persistent-storage milestone, not an internal-disk installer.
-For upcoming runtime timezones, persistent `/bin`, disk usage and wallpaper
-loading, see [NEXT_STEPS.md](NEXT_STEPS.md). `/bin` and wallpaper are still loaded
-from the initrd into RAMFS today; the recommended wallpaper target is a file read
-once from disk after mount, retained in RAM for composition, with a boot fallback.
+Updated 2026-11-07. The USB image contains an EFI boot partition and a writable
+FAT16 system partition. The system partition mounts at `/`; applications do not
+use a `/disk` prefix. This is a USB system root, not an internal-drive installer.
 
 ## Build and boot
 
 From WSL in the repository:
 
 ```sh
-make usb-image
+make usb-image       # refresh boot files AND bundled disk programs; preserve user files
+make run-usb         # build and boot the disk image directly in QEMU
+make iso             # build recovery/live ISO and refresh the USB image
+make run             # boot ISO in QEMU, with the USB system image attached
 ```
 
-This creates `wyzar-usb.img` (193 MiB), using only the existing compiler toolchain
-and Python 3. If it already exists, it rebuilds the boot partition from the current
-kernel, shell and initrd, preserving the entire `/disk` data partition byte for byte.
-`make clean` leaves USB images alone. Close QEMU before rebuilding: image updates
-take an exclusive lock and refuse an image in use. A validated update is published
-atomically so a failed build leaves the previous complete image.
+Use `wyzar-usb.img` for physical USB testing. Write the whole image with your usual
+imaging program. Reflashing the whole image replaces the physical stick's saved
+files, even though refreshing the host image preserves its saved files. An
+in-place updater for a running/physical installation is not implemented.
 
-For a completely fresh image with an empty data volume (apart from README.TXT),
-choose a new filename:
+`PERSIST_DISK=another.img` selects a different host image. `make clean` leaves disk
+images alone. Close QEMU before updating its image; the updater locks the image
+and atomically publishes a completed replacement. It never opens physical drives.
+A failed update leaves the original image intact. The updater accepts only this
+project's recognized image layout and validates the system FAT before editing it.
+
+`FRESH=1` intentionally resets all saved files, settings, applications and wallpaper:
 
 ```sh
-make all
-python3 tools/make_usb_image.py --output wyzar-new.img
+make usb-image FRESH=1
 ```
 
-For repeated testing, reset the usual image with a build flag:
-
-```sh
-make clean && make run FRESH=1
-```
-
-`FRESH=1` deliberately erases all saved `/disk` files in `PERSIST_DISK` and builds
-a clean data volume containing README.TXT. It works with `make iso`,
-`make usb-image`, and `make run-usb` too. With no flag, saved files are preserved.
-For example, the longer workflow is
-`make clean && make iso FRESH=1 && make run`. Close QEMU before either kind of
-rebuild. The script's corresponding option is `--fresh`.
-
-Use your image-writing program to write the **whole `.img` file** to a USB stick,
-then boot its UEFI entry. Writing the image replaces the stick's partition table
-and contents; back up existing files first. The ISO remains a separate live-boot
-option and does not itself gain persistent storage when flashed unchanged.
-
-The image has an MBR and two partitions:
+## Layout and root selection
 
 | Partition | Size | Purpose |
 |---|---|---|
-| `WYZARBOOT` | 128 MiB | EFI system partition, Limine, kernel and boot modules |
-| `WYZARDATA` | 64 MiB | Writable FAT16 volume mounted at `/disk` |
+| WYZARBOOT | 128 MiB | EFI boot, Limine, kernel, small recovery initrd and init module |
+| WYZARDATA | 64 MiB | FAT16 persistent system root `/` |
 
-The kernel only probes MBR partition types `0x06`/`0x0e` with a valid FAT16 BPB
-and the exact BPB volume label `WYZARDATA`. It never formats devices and does
-not mount the EFI boot partition for writes. Currently the first matching volume
-is selected; connect only one designated data volume. Selection by Limine's boot
-disk identity is a future improvement. A CD/ISO boot can also use a separate
-prepared USB data volume with this layout.
+The existing partition layout/labels remain compatible with older images.
+Normal refresh migrates an older data volume without formatting it. A file formerly
+seen as `/disk/hello.txt` is now `/hello.txt`; its bytes are preserved.
 
-For normal development in QEMU, supply `OVMF.fd`, then:
+| Path | Backing and purpose |
+|---|---|
+| `/bin` | Disk programs; shell/Start menu discover programs here |
+| `/etc` | Disk settings and system-root signature |
+| `/home` | Persistent documents and personal assets |
+| `/share` | Persistent bundled assets |
+| `/tmp`, `/run` | RAM mounts, cleared at boot |
+| `/bootlog.txt`, `/run/boot.log` | Live RAM kernel log views; stat/listing size follows current log length |
+| `/dev`, `/mnt` | Reserved directories for future devices/additional mounts |
 
-```sh
-make run
-```
+The kernel initially unpacks recovery programs into RAMFS. After USB enumeration,
+exactly one matching WYZARDATA disk must be available. `/etc/root.cfg` must begin
+with `WYZARROOT1` plus a newline, and `/bin/init.elf` must exist. Runtime/log mounts
+must attach successfully before disk root is accepted. The shell then starts from
+disk. Missing, invalid or ambiguous storage selects RAM recovery; failure to load
+the disk shell also selects the full recovery tree. Recovery has a procedural
+wallpaper and nonpersistent files. The boot log identifies the selected mode.
 
-This boots the freshly built ISO and attaches `wyzar-usb.img` as a USB storage
-device. Every `make iso` also invokes `make usb-image`, refreshing its boot files
-while retaining saved data. Therefore `make clean && make iso && make run` produces
-an up-to-date ISO and USB image, with saved files retained between builds.
-`PERSIST_DISK=some-other.img` selects another image.
-The ISO itself is still read-only; the attached USB image holds persistent data.
+Selection happens once before userspace starts. Storage unplug/controller failure
+offlines the mounted filesystem until reboot; failed saves are never silently
+redirected to RAM. Selection by stable boot-disk identity remains future work.
+The general mount table supports up to 16 mounts; path traversal handles `.` and
+`..` across mount boundaries, and mounted files cannot be unlinked through VFS.
 
-To test booting directly from the USB image instead:
+## Updates and ownership
 
-```sh
-make run-usb
-```
+Normal image refresh replaces these OS-owned paths from the current build:
 
-`run-usb` refreshes the boot partition before starting QEMU too. Running `make all`
-alone builds kernel/userspace but does not refresh images; use `make iso` or
-`make usb-image` to package them. The update script accepts only this project's
-recognized image size, partition layout and labels, and never opens physical disks.
-Refreshing a host image preserves the host image's data; reflashing the whole
-image onto a physical USB stick still replaces that stick's saved files.
+- `/bin/init.elf`
+- `/bin/counter.elf`
+- `/bin/win_test.elf`
+- `/etc/root.cfg`
+- `/share/fonts/selawik.txt` (bundled font license)
 
-## Try persistence
+Other applications, documents, configuration and existing wallpapers remain.
+Missing default directories/settings/wallpaper are seeded. A full directory/disk,
+conflicting system path or malformed FAT causes the update to fail, leaving the
+original image intact. Use a different executable name for a user replacement of
+a bundled application; bundled names are owned by the OS updater.
 
-In the OS terminal:
+## Wallpaper
+
+`/etc/desktop.cfg` contains a single absolute file path, defaulting to:
 
 ```text
-ls /disk
-write /disk/hello.txt hello-from-wyzar
-cat /disk/hello.txt
-stat /disk/hello.txt
-restart
-cat /disk/hello.txt
-rm /disk/hello.txt
+/share/wall.raw
 ```
 
-Filenames are case-insensitive DOS 8.3 names (for example `HELLO.TXT`). The shell's
-`write` starts at offset zero, creates missing files, and **does not truncate** an
-existing file: shorter replacements leave trailing bytes. Each write flushes data,
-FAT changes, and the directory entry before returning success. No separate sync
-command is needed. Successful flushes depend on the device honoring SCSI
-SYNCHRONIZE CACHE.
+The initial asset is copied from the repository's `wallpaper.raw` during image
+creation/migration only when `/share/wall.raw` is absent. Later builds preserve an
+existing disk wallpaper. To restore the repository asset, remove the disk default
+before refreshing the image, or intentionally create a fresh image.
 
-`rm <path>` deletes a closed, writable, short-name file on `/disk` and frees its
-cluster chain. It refuses directories, read-only files, open files, long-name
-aliases, and corrupt/cyclic chains. Deletion persists across reboots. `stat <path>`
-shows size, creation time and modification time. Creation time stays fixed during
-edits; modification time advances on successful data writes. Times are civil local
-times from the same RTC/offset as the desktop clock. New creation and modification
-times both use two-second resolution; `stat` displays both at that precision,
-including older imported files whose creation time contains an odd second. A
-write within the creation interval may correctly have the same displayed time.
-This avoids the previous odd-second creation/even-second modification mismatch.
-Missing/invalid RTC timestamps
-display as `unknown`; older files are not assigned invented creation times.
-RAMFS and the FAT16 root directory have no recorded timestamps yet.
+Settings changes apply on reboot. Use 8.3-compatible disk names, such as
+`/home/blue.raw`. WRAW is a 16-byte little-endian header (`WRAW`, uint32 width,
+uint32 height, uint32 format=0), followed by BGRA8888 pixels. Legacy headerless
+BGRA is accepted only at exactly the current framebuffer dimensions.
 
-## Implementation and current limits
+Boot keeps the animated splash visible through storage discovery and the first
+wallpaper attempt. After the system root mounts, the selected file is read once
+(maximum 64 MiB, 15-second read budget checked between chunks), checked for a complete read and
+validated/scaled into a separate RAM buffer. Only successful decoding replaces
+the current wallpaper. Missing/corrupt/unreadable/timed-out assets keep the procedural
+fallback. The compositor presents its first complete desktop only after this attempt
+finishes, so successful boots do not expose a temporary blue desktop.
+The compositor reads RAM on every frame; it never reads the disk. The recovery
+initrd and Limine module list contain no duplicate wallpaper assets.
 
-* `src/block.h`: transport-neutral one-sector read/write/flush interface. Future
-  AHCI/NVMe drivers can implement this same interface.
-* `src/usb_storage.h`: xHCI bulk endpoints, USB Bulk-Only Transport CBW/data/CSW,
-  SCSI readiness/sense, capacity, READ(10), WRITE(10), and SYNCHRONIZE CACHE.
-  Transfer completions must match their TRB pointer, endpoint and slot. Unrelated
-  HID and port events are copied into a bounded queue for normal dispatch.
-* `src/fat16.h`: BPB and partition bounds validation, mirrored FAT updates, short
-  names, cached vnodes, file I/O, creation, deletion, directory creation, timestamps
-  and enumeration. Deleted vnode objects remain invalidated if their slot is reused.
-* `src/vfs.h`: `/disk` mount traversal. Missing files require `O_CREAT` (`0x40`);
-  `O_RDONLY=0`, `O_WRONLY=1`, and `O_RDWR=2` are enforced. Initrd extraction uses
-  `O_WRONLY | O_CREAT` explicitly. Oversized path components are rejected.
-* `tools/make_usb_image.py`: standard-library-only image builder. Boot files use
-  VFAT long entries where Limine filenames require them; writable files use 8.3.
+Reads use 64 KiB filesystem chunks to permit preemption between synchronous
+operations. FAT16 follows FAT links to combine physically contiguous clusters
+into requests of up to 128 sectors, handling unaligned heads/tails separately.
+Fragmented links stop a run. The USB driver issues READ(10) commands for up to
+128 sectors (64 KiB). Its DMA buffer is a physically contiguous, 64 KiB-aligned
+subrange of a retained 128 KiB allocation, so a transfer cannot cross xHCI's
+64 KiB buffer boundary. Other block backends can omit the optional
+multi-sector callback and retain one-sector reads. Bounds are checked at the block,
+partition and READ(10) boundaries. Writes remain one sector per command.
 
-Only transparent SCSI over USB BOT, LUN 0, 512-byte logical sectors and READ(10)
-addressing are supported. UAS, GPT, FAT12/32, exFAT and internal SATA/NVMe drives
-are not supported. Stalls, transport errors and timeouts offline the disk until
-reboot; BOT reset recovery is deferred. Devices that reject cache flushes cannot
-complete successful writes. Hardware compatibility remains to be tested.
+Sequential cluster hints and a FAT-sector cache avoid repeated metadata I/O;
+FAT writes invalidate cached metadata. Large assets can still slow boot; this is
+not an asynchronous I/O implementation. Wallpaper attempt duration is logged in
+milliseconds for hardware diagnosis, split into disk read and decode/scale.
+USB discovery, disk readiness/capacity, initial desktop composition and total
+kernel-to-desktop time are also logged. The latter excludes firmware/bootloader
+time. Physical-device performance still needs verification.
 
-FAT16 supports read/write/create/unlink/stat/mkdir/readdir through the VFS.
-Syscalls 4 (stat) and 87 (unlink) expose metadata and deletion; the metadata layout
-is shared in `src/fileinfo.h`. No rename, directory deletion, truncate, seek syscall,
-long-name lookup, sparse files or directory growth yet. The root directory has 512 entries; subdirectories
-created by this implementation have one cluster (126 usable slots with this
-image). The shell currently has no mkdir command; the VFS operation is present.
-`run /disk/APP.ELF` can use the existing loader for files placed there, but Start
-Menu discovery still uses `/bin` in RAMFS.
+Root ports are powered together and given one shared 100 ms settling window per
+controller. Previously every empty port added its own 100 ms wait. Per-device
+port-reset and descriptor/readiness handling are retained.
 
-I/O and controller resets are serialized by disabling interrupts on this
-single-core kernel. I/O uses bounded busy waits; large operations can pause the
-desktop. An asynchronous request queue and sleeping locks are needed before
-larger workloads or SMP. A controller reset, unplug or transport failure leaves
-existing mounted vnodes offline; reconnecting requires a reboot to regain `/disk`.
-Up to eight storage device instances are retained per boot so old handles cannot
-accidentally address a replacement device.
+## Intermittent cold-start failures
 
-FAT16 is not journaled. Flush ordering limits exposure, but power loss during a
-write can still leave partial overwrites, leaked clusters or inconsistent metadata.
-This first backend is intended for development data with backups.
+The SCSI readiness probe now allows up to five seconds of polling for recognized
+transient readiness responses, instead of four quick attempts. Ready devices
+continue immediately. READ CAPACITY has a two-second retry budget and reads a
+one-second retry budget, checked between complete commands. A 32-attempt cap also
+bounds persistent reset attention. Individual USB transfer timeouts can extend
+elapsed time beyond those between-command budgets.
+
+Retries use REQUEST SENSE and accept current reset attention or recognized
+becoming-ready/operation-in-progress conditions. Media-change attention is
+accepted during initialization only; media-change on a read offlines the mounted
+disk until reboot. Permanent errors, malformed/deferred sense and transport
+failures are not blindly retried. Writes and flushes are never replayed. This is
+not USB BOT reset/stall recovery and does not fix failures before device discovery.
+
+If wallpaper or disk startup fails, the messages remain in the RAM kernel log
+after the desktop appears. Run `open bootlog` or `cat /bootlog.txt`; photograph
+or record the storage/sense/USB lines before rebooting. The log distinguishes
+readiness/capacity failure, no readable system partition, failed root validation,
+USB transport errors and short wallpaper reads. Physical cold-start behavior must
+still be retested; the original failed attempt's log was not captured.
+
+## Shell and current limits
+
+```text
+ls /
+ls /bin
+write /home/hello.txt hello-from-wyzar
+cat /home/hello.txt
+stat /home/hello.txt
+rm /home/hello.txt
+open bootlog
+```
+
+The shell's `write` creates a file or overwrites from offset zero without truncating.
+For a shorter replacement setting, remove the old file first, then write the new
+one. For example: `rm /etc/desktop.cfg`, then
+`write /etc/desktop.cfg /home/blue.raw`. Runtime wallpaper reload is not implemented.
+
+Disk filenames are case-insensitive DOS 8.3 names. FAT16 currently supports
+read/write/create/unlink/stat/mkdir/readdir. No seek/truncate/rename/rmdir syscall,
+shell mkdir command, long-name lookup, sparse files or directory growth exists.
+Root has 512 entries; newly created subdirectories have 126 usable slots.
+`rm` refuses directories, read-only/open files, long-name aliases and corrupt chains.
+Writes flush data, FAT metadata and directory changes; successful completion
+requires the USB device to honor SCSI SYNCHRONIZE CACHE.
+
+FAT times use RTC/local civil time at two-second precision, without timezone
+metadata. Creation time survives edits. Filesystem/USB I/O still disables
+interrupts during each synchronous operation; asynchronous requests, sleeping
+locks and BOT recovery remain future work. FAT16 has no journal, so power loss can
+leave partial writes, leaked clusters or inconsistent metadata.
+
+Only USB BOT/SCSI LUN 0, 512-byte sectors, READ(10), MBR and FAT16 are supported.
+No UAS/GPT/FAT32/exFAT/internal SATA/NVMe support exists.
+USB 2.0-class hub enumeration retains registered storage devices and supports
+nested route contexts; SuperSpeed hub descriptors/enumeration remain a separate
+compatibility gap. Test physical hardware
+before relying on the new root/asset path. The next filesystem should be chosen
+before the installer/everyday-storage milestone; see [NEXT_STEPS.md](NEXT_STEPS.md).
 
 ## Verification
 
-Host tests use the actual VFS and FAT16 implementation with a memory block device:
+Development checks live in the locally ignored `tests/` directory:
 
 ```sh
-mkdir -p .storage-test
-python3 tools/make_usb_image.py --output .storage-test/usb.img
-clang++ -std=c++20 -fsanitize=address,undefined tests/storage_test.cpp -o .storage-test/storage-test
-ASAN_OPTIONS=detect_leaks=0 .storage-test/storage-test .storage-test/usb.img
+clang++ -std=c++20 -fsanitize=address,undefined tests/scsi_retry_test.cpp -o .storage-test/scsi-retry-test
+.storage-test/scsi-retry-test
+python3 tests/system_volume_test.py
+python3 tests/image_update_test.py
+# Live-log callback/mounted metadata checks:
+clang++ -std=c++20 -fsanitize=address,undefined -iquote src/core tests/live_log_test.cpp -o .storage-test/live-log-test
+ASAN_OPTIONS=detect_leaks=0 .storage-test/live-log-test
+clang++ -std=c++20 -fsanitize=address,undefined -iquote src/core -iquote src/drivers -iquote src/fs tests/storage_test.cpp -o .storage-test/storage-test
+ASAN_OPTIONS=detect_leaks=0 .storage-test/storage-test .storage-test/root.img
+clang++ -std=c++20 -fsanitize=address,undefined tests/wallpaper_test.cpp -o .storage-test/wallpaper-test
+.storage-test/wallpaper-test
+python3 tests/qemu_storage_smoke.py --image .storage-test/root.img --features
+python3 tests/qemu_root_variants.py
+python3 tests/qemu_hub_storage_test.py
 ```
 
-Tests cover multi-cluster I/O, unaligned overwrites, fresh mounts, directories,
-name/partition/BPB validation, full disks, failed writes, failed cache flushes,
-timestamp persistence, open/read-only deletion protection, cluster reclamation,
-cyclic-chain rejection and directory-slot reuse.
-VNode caches live for the mounted volume's lifetime; no unmount/free operation
-exists yet, so leak detection is disabled for this host harness.
-
-`python3 tests/qemu_storage_smoke.py` uses a disposable `.storage-test/usb.img`
-containing the current build and `/usr/share/OVMF/OVMF_CODE.fd`. It boots through
-USB, issues a shell write through the USB keyboard, terminates QEMU, verifies the
-file directly in the image, cold-boots the same image, and issues a shell read.
-Framebuffer captures and kernel logs are kept in `.storage-test/`.
-Pass `--iso --image .storage-test/iso-usb.img` to test the `make run` configuration
-using a separately generated disposable image while booting the current ISO.
-Add `--features` for three boots that also test creation/modification timestamps,
-file deletion, slot reuse, and a boot-image refresh between boots. Run
-`python3 tests/image_update_test.py` for atomic image-update/data-preservation,
-layout validation, exclusive creation, lock and simulated publication-failure tests.
-
-Verified on 2026-11-07: kernel/userspace build (13 existing warnings), host tests
-under ASan/UBSan, atomic image-update tests, and the three-cold-boot QEMU feature
-test (timestamps, deletion, slot reuse, persistent files across a boot refresh).
-`fsck.fat -n` reported no errors in the resulting data partition. Initial USB tests also exposed and
-verified fixes for USB's runtime-initialized MMIO base and preemption during the
-ELF loader's temporary CR3 switch. Physical-stick behavior is still unverified.
-
-## Next milestones toward installation
-
-1. Verify the boot stick on physical xHCI hardware, including storage and HID
-   coexistence, flush behavior, disk-full behavior and unplug handling.
-2. Add asynchronous block requests, BOT recovery and filesystem error reporting.
-3. Add an internal-drive transport (NVMe or AHCI, based on target hardware).
-4. Add general partition discovery, mount selection and a richer filesystem API.
-5. Build an installer that shows the destination disk, prepares EFI/system/data
-   partitions, copies Limine and OS files, and preserves a recovery USB path.
-6. Move persistent applications/configuration into a disk-backed system layout,
-   and add boot-partition upgrades that preserve user data.
-
-Protocol reference: [USB-IF Bulk-Only Transport 1.0](https://www.usb.org/sites/default/files/usbmassbulk_10.pdf).
-Timestamp reference: [Microsoft file times and FAT precision](https://learn.microsoft.com/en-us/windows/win32/sysinfo/file-times).
-Controller reference: [Intel xHCI specification](https://www.intel.com.br/content/dam/www/public/us/en/documents/technical-specifications/extensible-host-controler-interface-usb-xhci.pdf).
+Prepare the disposable image using `python3 tools/make_usb_image.py --output
+.storage-test/root.img` after `make all`; QEMU variants also require `make iso`.
+Host checks cover migration, upgrades, preservation, reclamation, full-volume and
+corruption rejection, plus VFS/FAT operations and wallpaper bounds/decoding.
+Read checks cover batching, fallback backends, overflow/bounds, unaligned and
+fragmented files, failed reads and FAT cache behavior. Live log checks verify
+growth and matching stat/read/directory sizes, including mounted placeholders.
+The QEMU `qemu_boot_log_test.py` check additionally runs a userspace probe built
+from `tests/log_metadata_probe.c` (place it at `.storage-test/log-probe.elf`)
+and `tests/read_hash_probe.c` (place it at `.storage-test/read-hash-probe.elf`). It
+compares the complete wallpaper hash after 64 KiB reads, and verifies the splash/desktop handoff and log stat/read/readdir agreement.
+QEMU checks cover cold boots, persistence across image updates, disk-selected
+wallpaper pixels, corrupt/missing assets and RAM recovery without a valid disk.
+Hub checks boot the actual USB image through one/two emulated hubs, compare the
+full wallpaper hash and retain writes across cold reboots. Hardware verification
+is still required.

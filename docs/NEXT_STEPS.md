@@ -35,7 +35,7 @@ Next:
    Windows. Changing a display zone must not silently rewrite the hardware clock
    or apply an offset twice.
 2. Persist settings, initially in an 8.3-compatible path such as
-   `/disk/config/clock.cfg`. Start with runtime fixed-offset selection, then add
+   `/etc/clock.cfg`. Start with runtime fixed-offset selection, then add
    named zones and their DST rules. A zone identifier is not just a fixed offset.
 3. Introduce a clock service/time syscall with an explicit UTC basis and local
    conversion for the tray and filesystem. Keep monotonic uptime/scheduling
@@ -49,72 +49,59 @@ Acceptance: changing a persisted setting updates the tray without recompiling;
 reboot retains it; UTC/local RTC modes work; offset/date rollover cases are tested;
 new file times follow the documented policy without changing creation time on edits.
 
-## 3. Persistent applications and disk usage
+## 3. Disk-backed root and remaining storage work
 
-Today only `/disk` is persistent. `/bin`, `/wallpaper.raw` and the initial root
-tree are unpacked from `initrd.tar` into RAMFS. The shell and Start menu use
-`/bin/*.elf`; adding files to `/disk` does not yet add menu apps.
+Implemented: the WYZARDATA volume becomes `/` before userspace starts. `/bin`,
+`/etc`, `/home`, and `/share` persist; `/tmp` and `/run` are RAM-backed mounts.
+The initrd contains recovery applications, not the normal system tree or wallpaper.
+`/bootlog.txt` and `/run/boot.log` expose the live RAM log.
 
-Use a persistent `/disk/bin` directory mounted at `/bin`. Extend the current
-single mount-point mechanism to support directory mounts before changing app
-paths. Seed bundled ELF programs on first use, and keep a RAMFS recovery shell
-when storage is absent or offline. Retain `/bootlog.txt` as a live RAM-backed view.
+Normal image refresh replaces bundled `/bin/init.elf`, `/bin/counter.elf`, and
+`/bin/win_test.elf`, preserving added apps, documents, settings and existing
+wallpaper. The host updater migrates old data volumes without reformatting them;
+old `/disk/hello.txt` becomes `/hello.txt`. `FRESH=1` still resets all saved files.
+Missing/invalid/ambiguous volumes select RAM recovery. Root selection happens once;
+unplugging storage never silently redirects saves into RAM.
 
-Define updates explicitly: refresh bundled system programs from the build while
-preserving user-added executables and settings. Merely mounting an old persistent
-`/bin` over the current initrd can boot an outdated shell after an OS upgrade.
-Normal image refresh currently preserves the entire data partition unchanged;
-updating files inside it requires additional filesystem-aware tooling. `FRESH=1`
-remains the intentional reset operation, including future persistent apps/settings.
+Next: test on hardware, add capacity/free-space reporting, shell mkdir, truncate,
+seek, rename and directory removal. Replace interrupt-disabled synchronous I/O
+with asynchronous block requests and sleeping locks. Generalize root selection to
+stable boot-volume identity; currently exactly one WYZARDATA-labelled disk is
+required, with `/etc/root.cfg` and `/bin/init.elf` checked before selection.
 
-Add disk capacity/free-space reporting, directory creation in the shell, truncation,
-rename and directory removal as separate filesystem milestones. For larger disk
-loads, replace interrupt-disabled synchronous I/O with an asynchronous block queue
-and safe sleeping locks. Then add internal-drive support and an installer; the
-USB block interface is the transport abstraction to reuse.
+Upgrade beyond FAT16 after this root/recovery foundation and core file operations
+are stable, before the installer/everyday-storage milestone. Ext2 is a candidate,
+not a committed choice; journaling/crash-recovery requirements need a decision.
+Keep the EFI boot partition independent of the system filesystem. Then add
+internal-drive support and an installer using the same block/VFS abstractions.
 
-Acceptance: a copied app survives reboot and appears in the menu; updating the OS
-refreshes bundled programs without deleting added apps; missing disk still permits
-recovery; image refresh and factory reset have distinct, tested outcomes.
+## 4. Disk wallpaper
 
-## 4. Wallpaper: disk file to RAM once, after storage mounts
+Implemented: `/etc/desktop.cfg` contains one absolute asset path, defaulting to
+`/share/wall.raw`. Both settings and the asset persist across builds. Normal image
+updates install the bundled wallpaper only when the default asset is absent.
 
-Recommended target: a disk-backed setting selects an asset such as
-`/disk/desktop/wall.raw`. These names fit the current FAT16 8.3 restriction;
-`wallpaper.raw` does not. Retain WRAW/BGRA support for now rather than requiring
-new image decoders as part of this storage change.
+Boot keeps the animated splash visible. After root selection, the asset is read
+once, validated and scaled into a private RAM buffer, then swapped into the
+compositor. Missing, short, corrupt or unreadable assets preserve the fallback.
+The first desktop appears after loading succeeds or a fallback is selected.
+The compositor does no disk I/O. WRAW/BGRA remains the supported format; the initrd
+and standalone Limine wallpaper module copies have been removed.
 
-Read and validate the asset once, convert/scale it into the compositor's RAM
-wallpaper buffer, release the temporary file buffer, then redraw. Repaint from
-that RAM buffer every frame. Do not read the USB disk inside the compose loop.
-Reload only when the wallpaper setting/asset explicitly changes. Load into a
-temporary buffer and swap only after complete successful validation; on a missing,
-short, corrupt or unreadable file keep the existing/procedural background.
-
-Boot the initial desktop with a procedural or small bundled fallback. After USB
-enumeration and `/disk` mount, apply the user's wallpaper. Currently `wm_init`
-and the compositor start before USB storage is discovered, so a disk wallpaper
-cannot simply be opened at the existing early wallpaper-load call. Large reads
-can still stall the current synchronous driver; moving the call to a worker alone
-does not fix the driver's interrupt-disabled I/O. Treat responsive background
-loading as dependent on the block-I/O work above.
-
-Today wallpaper is bundled in the initrd and also passed as a standalone Limine
-module, causing duplicate boot data. Keep this working path until disk loading and
-fallback are implemented and tested. Then remove the duplicate standalone module;
-Limine should load boot essentials, while desktop assets come through the VFS.
-When retaining module fallbacks, identify modules by path/type, not array position:
-the present configuration lists initrd, init.elf, then wallpaper, while the old
-wallpaper fallback assumes module index 1. That index actually names init.elf.
-
-Acceptance: wallpaper changes survive reboot; boot succeeds with the data disk or
-asset missing; corrupt images cannot replace a valid background; the compositor
-does no disk I/O per frame; duplicate boot wallpaper copies are removed only after
-the replacement path is verified.
+Reads are bounded (15-second budget checked between chunks) and chunked so
+preemption can occur between reads. Aligned FAT reads now use multi-sector I/O,
+USB READ(10) batches up to 128 sectors with aligned DMA, FAT coalesces contiguous
+cluster runs, and FAT metadata sectors are cached. USB ports share one 100 ms
+settling window per controller instead of waiting separately on each empty port.
+Boot phase timings identify discovery, readiness, read, decode and composition costs.
+The USB backend remains synchronous. Runtime wallpaper selection/reload UI and fully
+responsive asynchronous loading remain future work. Settings changes apply on
+reboot. See [PERSISTENT_STORAGE.md](PERSISTENT_STORAGE.md) for file locations and
+current editing limitations.
 
 ## 5. Continue app and desktop work
 
-Add Paint as a normal ELF application, persist its documents under `/disk`, and
+Add Paint as a normal ELF application, persist its documents under `/home`, and
 keep application discovery driven by files. Follow the existing GPU roadmap for
 alpha, retained layers, hardware cursor and page flipping. Keep GPU bring-up
 opt-in. Tighten window-ID ownership checks, user-pointer/ELF validation and user

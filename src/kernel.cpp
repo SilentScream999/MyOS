@@ -198,6 +198,8 @@ volatile uint64_t g_idle_tsc_accum = 0;
 volatile uint64_t g_tick_count = 0;
 volatile bool g_needs_refresh = true;
 volatile bool g_desktop_ready = false;
+static volatile bool g_boot_assets_ready = false;
+static uint64_t g_boot_started_tsc = 0;
 volatile uint32_t g_mouse_btns_prev = 0;
 
 #include "drivers/mouse.h"
@@ -365,13 +367,7 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
             int menu_hit = wm_menu_hit_test(mx, my);
             if (menu_hit >= 0) {
                 // Launch the selected app from /bin
-                char path[64];
-                strcpy(path, "/bin/");
-                int plen = 5;
-                const char* nm = g_menu_apps[menu_hit];
-                while (*nm && plen < 58) path[plen++] = *nm++;
-                path[plen++] = '.'; path[plen++] = 'e'; path[plen++] = 'l'; path[plen++] = 'f'; path[plen] = '\0';
-                if (tty_queue_launch(path)) {
+                if (tty_queue_launch(g_menu_paths[menu_hit])) {
                     for (int i = 0; i < g_window_count; ++i)
                         if (g_window_list[i] == g_win_terminal) { wm_raise_window(i); break; }
                 } else print((char*)"[launcher] Terminal busy; finish or interrupt its foreground program first.");
@@ -461,6 +457,12 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
 }
 
 void compositor_thread_main() {
+    // Storage/root selection and the first wallpaper attempt precede the first
+    // desktop frame. Keep animating the splash while boot makes that progress.
+    while (!g_boot_assets_ready) {
+        boot_splash_tick();
+        task_sleep_ms(16);
+    }
     // Keep the ring on screen throughout the expensive initial composition.
     // The normal dirty-rectangle presenter starts only after this full handoff.
     if (!fb || !g_backbuffer || !g_master_backbuffer) {
@@ -487,8 +489,14 @@ void compositor_thread_main() {
             print((char*)"[clock] RTC read failed (no RTC, or invalid values). Tray shows --:--.");
         }
     }
+    uint64_t first_frame_started = rdtsc();
     wm_compose_dirty(0, fb->width - 1, 0, fb->height - 1, false, false);
     if (!boot_splash_present_desktop(g_master_backbuffer)) hcf();
+    char boot_elapsed[32];
+    to_str((rdtsc() - first_frame_started) / (_usb_tsc_hz() / 1000), boot_elapsed);
+    print((char*)"[boot] First desktop compose/present milliseconds:"); print(boot_elapsed);
+    to_str((rdtsc() - g_boot_started_tsc) / (_usb_tsc_hz() / 1000), boot_elapsed);
+    print((char*)"[boot] Kernel-to-desktop milliseconds:"); print(boot_elapsed);
     wm_overlay_update(g_mouse_x, g_mouse_y, g_mouse_buttons);
     g_desktop_ready = true;
 
@@ -626,6 +634,7 @@ void compositor_thread_main() {
 }
 
 extern "C" void kmain(void) {
+    g_boot_started_tsc = rdtsc();
 	if (!LIMINE_BASE_REVISION_SUPPORTED) hcf();
 	if (!fb_req.response || fb_req.response->framebuffer_count < 1) hcf();
 
@@ -741,6 +750,19 @@ extern "C" void kmain(void) {
 
 	ramfs_init();
 	ramfs_mount_klog();
+    vnode* recovery_root = vfs_root;
+    vnode* live_log = vfs_namei("/bootlog.txt");
+    vfs_mkdir("/tmp");
+    vfs_mkdir("/run");
+    vnode* runtime_tmp = vfs_namei("/tmp");
+    vnode* runtime_run = vfs_namei("/run");
+    file runtime_log{};
+    if (vfs_open("/run/boot.log", 0x41, &runtime_log) == 0) {
+        runtime_log.vn->ops = &klog_vfs_ops;
+        vfs_close(&runtime_log);
+    }
+    static bool storage_selected = false;
+    static bool disk_root_active = false;
 
     // Check for initrd tar archive in Limine modules and unpack into ramfs
     if (module_req.response) {
@@ -756,30 +778,6 @@ extern "C" void kmain(void) {
         }
     }
 
-    // Try loading wallpaper: from /wallpaper.raw in ramfs, or module 1 fallback
-    file wf;
-    if (vfs_open("/wallpaper.raw", 0, &wf) == 0) {
-        if (wf.vn && wf.vn->size > 0) {
-            uint64_t wsize = wf.vn->size;
-            uint8_t* wdata = (uint8_t*)kmalloc(wsize);
-            if (wdata) {
-                vfs_read(&wf, wdata, wsize);
-                wm_load_wallpaper_from_raw(wdata, wsize);
-                kfree(wdata);
-            }
-        }
-        vfs_close(&wf);
-    } else if (module_req.response && module_req.response->module_count > 1) {
-        struct limine_file* wmod  = module_req.response->modules[1];
-        uint64_t            wsize = wmod->size;
-        const uint8_t*      wdata = (const uint8_t*)wmod->address;
-        file wf2;
-        if (vfs_open("/wallpaper.raw", 0x41, &wf2) == 0) {
-            vfs_write(&wf2, wdata, wsize);
-            vfs_close(&wf2);
-        }
-        wm_load_wallpaper_from_raw(wdata, wsize);
-    }
 
 	scheduler_init();
     // Initializing graphical UI components
@@ -791,7 +789,6 @@ extern "C" void kmain(void) {
     // screen refreshes regardless of whether USB enumeration blocks.
     scheduler_add_task(task_create(compositor_thread_main));
 
-	boot_loading_screen_until_ready();
 
 
     print((char*)"[boot] Discovering PCI through ACPI (XSDT/RSDT)...");
@@ -881,6 +878,7 @@ extern "C" void kmain(void) {
 	// re-enumerate all ports, reinitialise per-keyboard state, re-queue TRBs,
 	// and re-enter the main loop.
 	restart:
+	uint64_t usb_scan_started = _usb_rdtsc();
 	// Serialize controller resets against synchronous filesystem I/O. Existing
 	// mounted disks are offlined by setupUSB; never rebind an open vnode.
 	__asm__ volatile("cli" ::: "memory");
@@ -901,23 +899,58 @@ extern "C" void kmain(void) {
         }
     }
 
-	// Mount only the designated data partition, once per boot. No formatting.
-	if (!vfs_disk_root) {
-		for (int d = 0; d < usb_disk_count; ++d) {
-			if (!usb_disks[d].disk.online) continue;
-			fat16_volume* volume = fat16_probe(&usb_disks[d].disk);
-			if (!volume) continue;
-			vfs_mkdir("/disk");
-			vnode* point = vfs_namei("/disk");
-			if (point && point->type == VnodeType::DIRECTORY) {
-				vfs_disk_mountpoint = point;
-				vfs_disk_root = &volume->root.vn;
-				print((char*)"[storage] WYZARDATA mounted at /disk.");
-				break;
-			}
-		}
-	}
+    to_str((_usb_rdtsc() - usb_scan_started) / (_usb_tsc_hz() / 1000), str);
+    print((char*)"[boot] USB discovery milliseconds:"); print(str);
+
+    // Select once before launching userspace; never switch roots after unplug/replug.
+    if (!storage_selected) {
+        storage_selected = true;
+        fat16_volume* candidate = nullptr;
+        unsigned candidates = 0;
+        for (int d = 0; d < usb_disk_count; ++d) {
+            if (!usb_disks[d].disk.online) continue;
+            fat16_volume* volume = fat16_probe(&usb_disks[d].disk);
+            if (!volume) continue;
+            ++candidates;
+            candidate = volume;
+        }
+        if (!candidates) print((char*)"[storage] No readable WYZARDATA system partition found.");
+        else if (candidates > 1) print((char*)"[storage] Multiple system volumes found; refusing ambiguous root selection.");
+        if (candidates == 1) {
+            vfs_mount_root(&candidate->root.vn);
+            file marker{};
+            char signature[12] = {};
+            bool valid = vfs_open("/etc/root.cfg", 0, &marker) == 0;
+            if (valid) {
+                valid = vfs_read(&marker, signature, 11) == 11 &&
+                        strncmp(signature, "WYZARROOT1\n", 11) == 0;
+                vfs_close(&marker);
+            }
+            vnode* shell = vfs_namei("/bin/init.elf");
+            valid = valid && shell && shell->type == VnodeType::FILE && shell->size > 0;
+            vnode* tmp_point = vfs_namei("/tmp");
+            vnode* run_point = vfs_namei("/run");
+            vnode* log_point = vfs_namei("/bootlog.txt");
+            if (valid && vfs_mount(tmp_point, runtime_tmp) == 0 &&
+                vfs_mount(run_point, runtime_run) == 0 && vfs_mount(log_point, live_log) == 0 &&
+                vfs_mount(vfs_namei("/run/boot.log"), live_log) == 0) {
+                disk_root_active = true;
+                print((char*)"[storage] WYZARDATA mounted as root /.");
+            } else {
+                print((char*)"[storage] System signature, init file or runtime mounts unavailable.");
+                vfs_mount_root(recovery_root);
+            }
+        }
+        if (!disk_root_active) print((char*)"[storage] No unique valid system volume; RAM recovery mode.");
+    }
 	__asm__ volatile("sti" ::: "memory");
+    static bool wallpaper_loaded = false;
+    if (!wallpaper_loaded) {
+        wallpaper_loaded = true;
+        if (disk_root_active) wm_load_disk_wallpaper();
+        g_boot_assets_ready = true;
+        boot_loading_screen_until_ready();
+    }
 
 	// ── Queue hub status-change TRBs BEFORE the keyboard_count == 0 check ───
 	//
@@ -964,11 +997,26 @@ extern "C" void kmain(void) {
 	static bool init_started = false;
 	if (!init_started) {
 		Task* init_task = execve_path("/bin/init.elf");
-		if (!init_task && module_req.response && module_req.response->module_count > 0) {
-			// Fallback: load directly from Limine module 0
-			struct limine_file *module = module_req.response->modules[0];
-			init_task = execve_memory((const uint8_t*)module->address);
-		}
+        if (!init_task && disk_root_active) {
+            // Failed disk shell: enter the complete RAM recovery environment.
+            vfs_mount_root(recovery_root);
+            disk_root_active = false;
+            print((char*)"[storage] Disk init failed; RAM recovery mode.");
+            init_task = execve_path("/bin/init.elf");
+        }
+        if (!init_task && module_req.response) {
+            for (uint64_t m = 0; m < module_req.response->module_count; ++m) {
+                struct limine_file* mod = module_req.response->modules[m];
+                const char* path = mod ? mod->path : nullptr;
+                if (!path) continue;
+                const char* base = path;
+                for (const char* p = path; *p; ++p) if (*p == '/') base = p + 1;
+                if (strcmp(base, "init.elf") == 0 && mod->size >= sizeof(Elf64_Ehdr)) {
+                    init_task = execve_memory((const uint8_t*)mod->address);
+                    break;
+                }
+            }
+        }
 		if (init_task) {
 			g_terminal_shell_pid = init_task->pid;
 			// Phase 9: register post-flip chrome hook
@@ -1567,7 +1615,36 @@ extern "C" void kpanic(const char* name, ExceptionFrame* f) {
         vram_draw_string_8x8(x, y, "[ NO EXCEPTION FRAME ]", 0xFFFFAAAA);
     }
 
-    y += 40;
+    // Retain the last boot messages on the fault screen: a hardware-only USB
+    // failure must remain diagnosable after the desktop replaces the splash.
+    y += 20;
+    uint32_t lines = fb && fb->height > (uint32_t)y + 60 ? (fb->height - y - 60) / 12 : 0;
+    if (lines > 8) lines = 8;
+    if (lines && fb->width > (uint32_t)x + 8) {
+        uint64_t end = g_klog_pos, start = end;
+        if (start && g_klog_buffer[start - 1] == '\n') --start;
+        uint32_t found = 1;
+        while (start && found <= lines) {
+            --start;
+            if (g_klog_buffer[start] == '\n' && ++found > lines) { ++start; break; }
+        }
+        vram_draw_string_8x8(x, y, "RECENT KERNEL LOG:", 0xFFBBBBBB);
+        y += 14;
+        uint32_t columns = (fb->width - x) / 8;
+        if (columns > 127) columns = 127;
+        while (start < end && lines--) {
+            char line[128]; uint32_t used = 0;
+            while (start < end && g_klog_buffer[start] != '\n') {
+                if (used < columns) line[used++] = g_klog_buffer[start];
+                ++start;
+            }
+            if (start < end) ++start;
+            line[used] = 0;
+            vram_draw_string_8x8(x, y, line, 0xFFCCCCCC);
+            y += 12;
+        }
+    }
+    y += 20;
     vram_draw_string_8x8(x, y, "SYSTEM HALTED. PLEASE RESTART MANUALLY.", 0xFFFF5555);
 
     vram_fence();

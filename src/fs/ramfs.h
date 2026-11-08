@@ -188,8 +188,10 @@ static int ramfs_readdir(vnode* dir, uint64_t index, char* name_out, uint64_t* s
         if (curr == index) {
             strcpy(name_out, child->name);
             uint64_t sz = child->size;
-            if (strcmp(child->name, "bootlog.txt") == 0) {
-                sz = g_klog_pos;
+            if (child->vn.ops->stat) {
+                file_info info;
+                if (vfs_stat_node(&child->vn, &info) != 0) return -1;
+                sz = info.size;
             }
             if (size_out) *size_out = sz;
             if (type_out) *type_out = child->type;
@@ -208,6 +210,10 @@ static uint64_t klog_vfs_read(vnode* vn, void* buf, uint64_t len, uint64_t offse
     memcpy(buf, g_klog_buffer + offset, to_read);
     return to_read;
 }
+static int klog_vfs_stat(vnode*, file_info* info) {
+    info->size = g_klog_pos;
+    return 0;
+}
 
 static vfs_ops klog_vfs_ops = {
     .read   = klog_vfs_read,
@@ -217,6 +223,7 @@ static vfs_ops klog_vfs_ops = {
     .lookup = nullptr,
     .create = nullptr,
     .mkdir  = nullptr,
+    .stat   = klog_vfs_stat,
 };
 
 static void ramfs_mount_klog() {

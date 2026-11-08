@@ -968,9 +968,8 @@ static void enumerate_hub_children(
 		hub_clear_port_feature(*hub, p, 20);
 
 		// USB 2.0 §7.1.7.5: 10ms TRSTRCY recovery after reset before first
-		// transaction. The old spin_delay(5000000) was wildly over-budget
-		// (potentially seconds); 2ms is sufficient on modern hardware.
-		tsc_delay_ms(2);
+		// transaction. Hub-attached storage must receive the full recovery time.
+		tsc_delay_ms(10);
 
 		// Read final port status
 		uint8_t status4[4]; for (int i = 0; i < 4; i++) status4[i] = 0;
@@ -1002,6 +1001,19 @@ static void enumerate_hub_children(
 		else if (port_status & (1u << 10)) speed = 3;   // High Speed (xHCI code 3)
 		else                               speed = 1;   // Full Speed (xHCI code 1)
 		print((char*)"Hub child speed:"); to_str(speed, str); print(str);
+
+		// Preserve the whole hub chain and the upstream root port. Replacing
+		// the route with just p works for one hub but misroutes nested children.
+		volatile uint32_t* parent_slot = (volatile uint32_t*)hub->device_ctx;
+		uint32_t route_string = parent_slot[0] & 0xfffffu;
+		uint32_t route_shift = 0;
+		while (route_shift < 20 && ((route_string >> route_shift) & 15u)) route_shift += 4;
+		if (route_shift == 20) {
+			print((char*)"[USB] Hub route depth exceeded; skipping child.");
+			continue;
+		}
+		route_string |= (uint32_t)(p > 15 ? 15 : p) << route_shift;
+		uint32_t root_port_context = parent_slot[1] & 0x00ff0000u;
 
 		// Enable Slot
 		print((char*)"Enabling slot for hub child");
@@ -1040,16 +1052,18 @@ static void enumerate_hub_children(
 		volatile uint32_t* slot_ctx = (volatile uint32_t*)((uint64_t)ictx + ctx_stride);
 		volatile uint32_t* ep0_ctx  = (volatile uint32_t*)((uint64_t)ictx + ctx_stride * 2);
 
-		uint32_t route_string = (uint32_t)(p & 0xFu);
-
 		slot_ctx[0] = ((speed & 0xFu) << 20) | (1u << 27) | route_string;
-		slot_ctx[1] = ((uint32_t)(hub->port_num & 0xFFu) << 16);
+		slot_ctx[1] = root_port_context;
 		slot_ctx[2] = 0;
 		slot_ctx[3] = 0;
 
 		if (hub->speed == 3 && speed < 3) {
 			slot_ctx[2] = (hub->slot_id & 0xFFu)
 			            | ((uint32_t)(p & 0xFFu) << 8);
+		} else if (speed < 3) {
+			// A slower intermediate hub keeps the transaction translator of
+			// its upstream high-speed hub, including that ancestor's port.
+			slot_ctx[2] = parent_slot[2] & 0xffffu;
 		}
 
 		uint16_t ep0_mps = (speed >= 4) ? 512u : (speed == 3 ? 64u : 8u);
@@ -1137,7 +1151,7 @@ static void enumerate_hub_children(
 		}
 
 		// Cleanup logic for failed hub children (Stop EP0, Disable Slot, Drain)
-		if (!child->is_hub && child->interface_count == 0) {
+		if (!child->is_hub && child->interface_count == 0 && !usb_storage_is_device(child)) {
 			print((char*)"Cleaning up non-functional hub child");
 
 			// CRITICAL: Physically disable the hub port to kill the link.
@@ -1386,6 +1400,14 @@ static void setupUSB(XHCIController* hc) {
 
 	print((char*)"Scanning root ports...");
 
+	// Power all ports before waiting. Every port gets the same 100 ms link
+	// settling allowance; empty ports must not each add another 100 ms to boot.
+	for (uint32_t i = 0; i < max_ports; ++i) {
+		volatile uint32_t* portsc = (volatile uint32_t*)((uintptr_t)hc->ops + 0x400 + i * 0x10);
+		if (needs_ppc) *portsc = (*portsc & ~0x00FE0002u) | PORTSC_PP;
+	}
+	tsc_delay_ms(100);
+
 	auto port_reset = [&](volatile uint32_t* portsc) -> bool {
 		// Assert PR. Zero the W1C change bits (17–22) so a read-modify-write
 		// doesn't accidentally clear them — writing 1 to a W1C bit clears it.
@@ -1422,23 +1444,8 @@ static void setupUSB(XHCIController* hc) {
 
 		volatile uint32_t* portsc = (volatile uint32_t*)((uintptr_t)hc->ops + 0x400 + i * 0x10);
 
-		if (needs_ppc) {
-			*portsc |= PORTSC_PP;
-		}
-
-		// The controller just underwent a full hardware reset. Devices that were 
-		// physically plugged in lose their link state and need time to re-assert 
-		// D+/D- pull-ups. We poll up to 100ms; most devices assert within 10ms.
-		bool connected = false;
-		for (int attempt = 0; attempt < 100; attempt++) {
-			tsc_delay_ms(1);
-			if (*portsc & PORTSC_CCS) {
-				connected = true;
-				break;
-			}
-		}
-
-		if (!connected) continue;
+		// All ports have already had at least 100 ms since power was applied.
+		if (!(*portsc & PORTSC_CCS)) continue;
 
 		print((char*)"Device on root port:"); to_str(i + 1, str); print(str);
 

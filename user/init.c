@@ -291,9 +291,9 @@ void _start() {
         if (streq(buf, "help", 4) && (buf[4] == ' ' || buf[4] == '\0')) {
             print("Available commands:\n");
             print("  ls [path]       - List directory contents (default '/')\n");
-            print("  write <path> <text> - Create/write a file; /disk is persistent\n");
+            print("  write <path> <text> - Create/write a file; disk root is persistent\n");
             print("  cat <path>      - Read a file\n");
-            print("  rm <path>       - Delete a closed file on /disk\n");
+            print("  rm <path>       - Delete a closed file\n");
             print("  stat <path>     - Show size, creation and modification times\n");
             print("  run <path>      - Run an ELF program; wait until it exits\n");
             print("  open bootlog    - Display kernel boot log\n");
@@ -324,7 +324,7 @@ void _start() {
             uint64_t fd = sys_open(path, 0x41); // O_WRONLY | O_CREAT
             if (fd == (uint64_t)-1) {
                 print("Cannot open file. Check that the parent directory exists and storage is online.\n");
-                print("For /disk, check 'ls /disk' and the boot log for WYZARDATA mounted. Names must fit 8.3.\n");
+                print("Check the boot log for disk root or RAM recovery mode. Disk names must fit 8.3.\n");
                 continue;
             }
             uint64_t len = strlen(&buf[idx]);

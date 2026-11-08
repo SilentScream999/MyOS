@@ -10,10 +10,10 @@ from pathlib import Path
 import struct
 import datetime
 import os
-import shutil
 import tempfile
 import stat
 from contextlib import contextmanager
+from system_volume import install_system
 
 SECTOR = 512
 START = 2048
@@ -187,7 +187,7 @@ def validate_existing(source):
             raise ValueError('Extra partitions present; refusing boot update')
 
 
-def write_image(output, boot, data, mbr, update_boot=False, fresh=False):
+def write_image(output, boot, data, mbr, update_boot=False, fresh=False, system_root=None):
     # Atomic replacement: a failed refresh leaves the previous complete image.
     # Lock the old image against QEMU's sector writes throughout the copy.
     exists = output.exists() or output.is_symlink()
@@ -210,7 +210,8 @@ def write_image(output, boot, data, mbr, update_boot=False, fresh=False):
                         dest.write(source.read(START * SECTOR))
                         dest.write(boot.data)
                         source.seek((START + BOOT_SECTORS) * SECTOR)
-                        shutil.copyfileobj(source, dest)
+                        saved = source.read(DATA_SECTORS * SECTOR)
+                        dest.write(install_system(saved, system_root) if system_root else saved)
                     dest.flush()
                     os.fsync(dest.fileno())
                     # Keep lock held until the complete replacement is ready.
@@ -241,8 +242,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=Path('wyzar-usb.img'))
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument('--update-boot', action='store_true', help='Refresh an existing image atomically, preserving the complete data partition; create it if missing')
-    mode.add_argument('--fresh', action='store_true', help='Replace the complete image with a fresh one, ERASING saved /disk files (refuses images in use)')
+    mode.add_argument('--update-boot', action='store_true', help='Refresh an existing image atomically, refreshing bundled system apps and preserving user files/settings; create it if missing')
+    mode.add_argument('--fresh', action='store_true', help='Replace the complete image with a fresh one, ERASING saved files (refuses images in use)')
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     files = {
@@ -252,23 +253,22 @@ def main():
         'boot/initrd.tar': 'initrd.tar',
         'boot/init.elf': 'init.elf',
     }
-    if (root / 'wallpaper.raw').exists():
-        files['boot/wallpaper.raw'] = 'wallpaper.raw'
     boot = Fat16Image(BOOT_SECTORS, 'WYZARBOOT', START)
     for target, source in files.items():
         boot.add(target, (root / source).read_bytes())
     data_start = START + BOOT_SECTORS
     data = Fat16Image(DATA_SECTORS, 'WYZARDATA', data_start)
-    data.add('README.TXT', b'WyzarOS persistent data volume. Mounted at /disk.\r\n')
+    data.add('README.TXT', b'WyzarOS persistent system volume. Mounted at /.\r\n')
+    data.data = install_system(data.data, root)
     mbr = bytearray(SECTOR)
     for i, (kind, start, count) in enumerate(((0xef, START, BOOT_SECTORS), (0x0e, data_start, DATA_SECTORS))):
         struct.pack_into('<B3sB3sII', mbr, 446 + i * 16, 0, b'\xfe\xff\xff', kind, b'\xfe\xff\xff', start, count)
     mbr[510:512] = b'\x55\xaa'
     existed = args.output.exists()
-    write_image(args.output, boot, data, mbr, args.update_boot, args.fresh)
+    write_image(args.output, boot, data, mbr, args.update_boot, args.fresh, system_root=root)
     preserved = existed and not args.fresh
     print(f'{"Updated boot files in" if preserved else "Created fresh image"} {args.output}; ' +
-          ('existing /disk data preserved' if preserved else 'UEFI boot + clean 64 MiB FAT16 data volume'))
+          ('bundled apps refreshed; user files/settings/wallpaper preserved' if preserved else 'UEFI boot + 64 MiB FAT16 system root'))
 
 
 if __name__ == '__main__':

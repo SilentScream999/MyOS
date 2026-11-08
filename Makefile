@@ -70,13 +70,14 @@ user/win_test.o: user/win_test.c
 win_test.elf: user/win_test.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
-initrd.tar: init.elf counter.elf win_test.elf
+initrd.tar: init.elf counter.elf win_test.elf assets/fonts/selawik/LICENSE.txt
 	rm -rf initrd_root
 	mkdir -p initrd_root/bin
 	cp init.elf initrd_root/bin/
 	cp counter.elf initrd_root/bin/
 	cp win_test.elf initrd_root/bin/
-	if [ -f wallpaper.raw ]; then cp wallpaper.raw initrd_root/; fi
+	mkdir -p initrd_root/share/fonts
+	cp assets/fonts/selawik/LICENSE.txt initrd_root/share/fonts/selawik.txt
 	tar -cf initrd.tar --format=ustar -C initrd_root .
 
 iso: all usb-image
@@ -86,8 +87,6 @@ iso: all usb-image
 	cp wyzar iso_root/boot/
 	cp init.elf iso_root/boot/
 	cp initrd.tar iso_root/boot/
-	# Optional (ignored if missing): raw BGRA wallpaper module
-	cp wallpaper.raw iso_root/boot/ || true
 	cp limine.conf iso_root/               # <-- config must be named limine.conf
 	cp limine/limine-bios.sys iso_root/boot/
 	cp limine/limine-bios-cd.bin limine/limine-uefi-cd.bin iso_root/
@@ -101,7 +100,7 @@ iso: all usb-image
 	-$(LIMINE_BIN) bios-install wyzar.iso || limine/limine.exe bios-install wyzar.iso || true
 
 
-# Each ISO build refreshes USB boot files too; /disk data survives the update.
+# Each ISO build refreshes USB boot/system files; user data and settings survive.
 PERSIST_DISK ?= wyzar-usb.img
 FRESH ?= 0
 ifeq ($(FRESH),1)
@@ -131,7 +130,7 @@ run: iso
 clean:
 	rm -rf iso_root initrd_root $(OBJ) $(OBJ:.o=.d) user/init.o user/counter.o user/win_test.o wyzar wyzar.iso myos myos.iso init.elf counter.elf win_test.elf initrd.tar
 
-# Refresh an existing image's boot partition, preserving the data partition.
+# Refresh boot files and bundled system apps, preserving user files/settings.
 usb-image: all
 	python3 tools/make_usb_image.py --output "$(PERSIST_DISK)" $(USB_IMAGE_FLAGS)
 
@@ -143,3 +142,9 @@ run-usb: usb-image
 		-device usb-storage,drive=stick,bootindex=1 -rtc base=localtime
 
 .PHONY: usb-image run-usb
+
+# Generated atlas is checked in; this target alone requires system libfreetype6.
+font-atlas:
+	python3 tools/bake_ui_font.py
+
+.PHONY: font-atlas

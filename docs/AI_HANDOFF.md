@@ -4,8 +4,10 @@ Current status, conventions, known issues and next steps, written so that anyone
 AI assistant given this file as context) can get productive without the history. *Last updated: 2026-11-07 (RTC clock, persistent USB storage, foreground/menu execution and Ctrl+C integrated).*
 Read this, then `docs/GPU_DESKTOP_ROADMAP.md` and `docs/APP_LOADING.md`.
 The shared near-term plan is [NEXT_STEPS.md](NEXT_STEPS.md): hardware verification,
-runtime timezones, persistent `/bin` and settings, disk-to-RAM wallpaper loading,
-then expanded disk usage and installation. Those changes are planned, not done.
+runtime timezones, expanded disk operations and installation. Disk-backed root,
+persistent apps/settings and disk-to-RAM wallpaper loading are now implemented.
+See [PERSISTENT_STORAGE.md](PERSISTENT_STORAGE.md) for the current boot/storage
+contract; older `/disk` descriptions below describe the previous milestone.
 
 ## 1. The assignment
 
@@ -20,6 +22,122 @@ Practical constraints that shape the work:
 * Keep risky experiments out of safe changes so the safe part can be committed on its own.
 
 ## 2. Current state
+
+* **Hub-attached storage (2026-11-07):** reproduced a disk reaching SCSI ready
+  and then being disabled by hub-child cleanup, which recognized only hubs/HID.
+  The cleanup predicate now preserves registered storage devices, matching the
+  direct-root-port path. Child slot contexts append the full parent route string,
+  inherit the actual upstream root-port field, and propagate upstream TT data
+  through slower intermediate hubs. Hub reset recovery now honors the documented
+  10 ms interval. `tests/qemu_hub_storage_test.py` boots the USB image through
+  one/two emulated USB 2.0-class hubs, checks wallpaper loading and its full byte
+  hash, and verifies writes after a cold reboot. This does not establish support
+  for SuperSpeed hub descriptors/enumeration; the physical hub type is pending
+  user clarification. Normal `wyzar-usb.img` was in use, so the updated alternative
+  image is `wyzar-usb-close.img`; future normal builds include these source fixes.
+
+* **Desktop typography (2026-11-07):** window titles, Start/menu/task buttons and
+  the tray clock now use antialiased Selawik, Microsoft's open-source Segoe UI
+  replacement (chosen for the requested Windows 7–10 look). Source TTF and OFL
+  license are in `assets/fonts/selawik/`. `make font-atlas` regenerates checked-in
+  grayscale atlases using Python stdlib + system FreeType; ordinary builds need
+  no font runtime or extra packages. `ui_font.h` handles proportional advances,
+  alpha blending and clipping, and UI layout measures actual string widths with
+  ellipses for long captions. Shell, boot-log contents, HUD and panic text keep
+  the existing bitmap font. Font data is embedded in the kernel; no startup disk
+  font load occurs. Current glyph coverage is printable ASCII with `?` fallback,
+  not Unicode shaping or a runtime TTF system. Original license is included at
+  `/share/fonts/selawik.txt` on disk and in the recovery initrd. Host rendering
+  tests and mouse-driven disk/recovery launches passed; QEMU previews were
+  visually checked at 1024x768 and 1920x1080 in `.storage-test/ui-font-menu-*.png`.
+
+* **Boot storage performance (2026-11-07):** user identified startup/wallpaper
+  as the slow path. USB reads now use up to 64 KiB, with a genuinely contiguous
+  64 KiB-aligned DMA subrange retained inside a 128 KiB physical allocation.
+  FAT16 follows FAT links to coalesce contiguous cluster runs up to 128 sectors,
+  stopping at fragmentation. Wallpaper reads request 64 KiB chunks. Root ports
+  are powered together and given one shared 100 ms settling allowance per
+  controller, replacing a separate 100 ms wait per empty port; reset/descriptor
+  and SCSI readiness handling remain. Boot log reports USB discovery, readiness,
+  disk read, decode/scale, first composition and kernel-to-desktop milliseconds.
+  Host tests cover large contiguous and fragmented reads. The QEMU boot/log test
+  also hashes the entire wallpaper through a userspace 64 KiB reader and compares
+  it with the original volume data. This remains synchronous USB BOT/FAT16;
+  asynchronous request queues, sleeping locks and a new filesystem are separate
+  milestones. Physical performance of this upgrade still needs user verification.
+
+* **Intermittent physical USB cold start (2026-11-07):** user reported a disk
+  read/wallpaper failure that disappeared after physically reinserting the stick
+  and rebooting; no failed-attempt log was captured. Exact cause remains unknown.
+  Readiness now has a five-second polling budget for recognized transient SCSI
+  sense, instead of four quick attempts. Capacity probes and reads have bounded
+  sense-aware retries; transport failures and writes are not replayed. A runtime
+  media-change response offlines the old mounted disk. More boot diagnostics
+  identify readiness, capacity, root-validation, USB and wallpaper-read failures.
+  Logs remain readable using `open bootlog` after desktop startup. Shared retry
+  logic in `src/drivers/scsi_retry.h` has deterministic injected-response tests
+  covering delayed readiness, deadlines, reset attention and fatal conditions.
+  This is not BOT reset recovery or a confirmed fix for pre-enumeration failures;
+  physical retesting is still needed. Both the normal `wyzar-usb.img` and the
+  separate `wyzar-usb-close.img` were refreshed. Three QEMU ISO-plus-USB cold boots
+  passed, including persistence across an image refresh.
+
+* **Application window close requests (2026-11-07):** title-bar close on a user
+  window now sets a separate pending `WIN_EVENT_CLOSE` (7), delivered before input
+  events and protected from queue overflow. It leaves the surface/window alive
+  for the application to respond (exit, close one window, or confirm a save).
+  `win_test` exits normally on this event, so terminal/menu foreground waits
+  finish and the prompt returns without Ctrl+C. Built-in system windows retain
+  their existing hide behavior. See `APIDocs/WindowAPI.md`. The real mouse-driven
+  QEMU menu check exercises closing from both launch routes in disk and recovery
+  boots. A separate `wyzar-usb-close.img` was built because the normal image was
+  locked by a running process; future normal builds include these source changes.
+
+* **Start-menu disk discovery (2026-11-07):** FAT16 enumerates uppercase `.ELF`
+  filenames. The menu now compares suffixes and `init.elf` case-insensitively,
+  preserves exact launch paths separately from truncated display labels, and uses
+  a full-sized readdir name buffer. Both disk and RAM recovery menus are checked
+  with real QEMU mouse launches. Remaining boot delay includes synchronous USB
+  discovery and I/O; asynchronous work and phase timing remain future work.
+
+* **Hardware page-fault investigation (2026-11-07):** real hardware reported
+  a brief frozen splash, a fallback desktop and exception #14, error code 0.
+  The original executable is saved locally as
+  `.storage-test/hardware-fault-before.elf` for address decoding. The reported
+  RIP `0xFFFFFFFF8000DB32` decodes to the main-loop xHCI PORTSC read at the old
+  kernel.cpp:1473; CR2 was `0xFFFF900000100480` (USB register mapping).
+  A definite heap defect was reproduced with separated allocation extents:
+  `heap_grow` assumed separately allocated PMM pages were contiguous, and growth,
+  free and realloc merged nonadjacent blocks. It now uses `alloc_phys_pages`,
+  checks physical adjacency at every merge, and disables BSP preemption while
+  modifying the heap. `tests/heap_regions_test.cpp` covers separated extents,
+  wallpaper-sized buffers, realloc preservation and untouched gap sentinels.
+  The user subsequently confirmed this image boots successfully on real hardware.
+  USB completion waits now animate the splash and report transfer status/timeouts;
+  panic screens include the latest kernel log lines for follow-up diagnosis.
+
+* **Batched reads, boot handoff and live-log metadata (2026-11-07):** the block
+  interface has an optional multi-sector read callback, falling back to single
+  sectors for other backends. USB READ(10) uses up to eight sectors per command,
+  within its existing page-sized DMA buffer; writes remain single-sector. FAT16
+  batches within clusters and caches FAT sectors with write invalidation. The
+  compositor waits for root selection and the first bounded wallpaper attempt
+  before replacing the splash; the load duration is logged. Both log paths have
+  dynamic stat metadata; VFS listings report mounted-node metadata rather than
+  the empty disk placeholder, and recovery `/run/boot.log` is also live.
+
+* **Disk root and wallpaper (2026-11-07):** a unique WYZARDATA volume with
+  `/etc/root.cfg` signature and `/bin/init.elf` becomes `/` before shell launch.
+  General vnode mounts attach RAM `/tmp`, `/run`, and live log files. Disk failure
+  after selection leaves the mounted filesystem offline; it never redirects saves
+  to RAM. No disk/invalid root selects the complete initrd recovery environment.
+  Wallpaper loads once from the path in `/etc/desktop.cfg` (default
+  `/share/wall.raw`), validates into a new RAM buffer, then swaps safely. No
+  wallpaper is bundled in the initrd or a Limine module. Host image updates now
+  refresh only bundled system programs and seed missing defaults while preserving
+  user data, settings, wallpaper and added apps. FAT chain hints avoid quadratic
+  disk reads for large assets. Hardware verification remains required.
+
 
 * **Foreground shell execution (2026-11-07):** `run <path>` now waits for its
   spawned child through syscall 61, `WAITPID(pid, uint64_t* exit_code)` (nullable

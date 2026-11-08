@@ -7,7 +7,7 @@
 // DESIGN — two-level allocator:
 //
 //   Level 1 — Physical page pool (backing store)
-//     Calls alloc_phys_page() / free_phys_page() from pagingstuff.h.
+//     Uses alloc_phys_pages() for contiguous extents from pagingstuff.h.
 //     Pages are reachable via the HHDM linear mapping set up before init_heap()
 //     is called.  The heap does NOT maintain its own page freelist — that is
 //     the PMM's responsibility.
@@ -21,14 +21,15 @@
 //     krealloc()  — in-place grow if the next block is free and large enough,
 //                   otherwise alloc + copy + free.
 //
-// THREAD SAFETY: none yet — add a spinlock here when SMP arrives.
+// THREAD SAFETY: disable preemption/interrupts on the current single-core kernel.
+// SMP will require a sleeping lock or spinlock in addition to this guard.
 //
 // USAGE:
 //   Call init_heap() once, after init_physical_allocator() and after
 //   map_hhdm_usable() (HHDM must be valid).  Then kmalloc / kfree freely.
 //
 // DEPENDENCIES:
-//   pagingstuff.h  — alloc_phys_page(), free_phys_page(), HHDM, PAGE_SIZE
+//   pagingstuff.h  — alloc_phys_pages(), HHDM, PAGE_SIZE
 //   helpers.h      — print(), hcf()
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -36,6 +37,14 @@
 #include <stddef.h>
 #include "pagingstuff.h"
 #include "helpers.h"
+
+struct heap_guard {
+#ifndef HEAP_HOST_TEST
+    uint64_t flags;
+    heap_guard() { __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory"); }
+    ~heap_guard() { if (flags & (1u << 9)) __asm__ volatile("sti" ::: "memory"); }
+#endif
+};
 
 // ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -69,6 +78,10 @@ struct HeapBlock {
 
 static_assert(sizeof(HeapBlock) == 48, "HeapBlock header must be exactly 48 bytes for 16-byte alignment");
 
+static bool heap_adjacent(const HeapBlock* left, const HeapBlock* right) {
+    return (uint64_t)left + left->size == (uint64_t)right;
+}
+
 #define HEAP_MAGIC  0xDEADBEEFCAFEBABEULL
 
 // ── Module globals ─────────────────────────────────────────────────────────────
@@ -94,22 +107,15 @@ static inline void heap_check(HeapBlock* b, const char* ctx) {
 
 // ── heap_grow ──────────────────────────────────────────────────────────────────
 // Extend the heap arena by `pages` physical pages.
-// Allocates pages one at a time from the PMM.  They are always contiguous in
-// virtual address space because the entire physical RAM is linearly mapped via
-// HHDM — the first page's virtual address is all we need for the block header.
-// Coalesces the new block with g_heap_tail if that block is free.
+// HHDM preserves physical gaps; individual PMM pages cannot form an arena.
+// Reserve a genuinely contiguous extent and merge only physically adjacent blocks.
 
 static void heap_grow(uint32_t pages) {
+    heap_guard guard;
     uint64_t bytes = (uint64_t)pages * PAGE_SIZE;
 
-    // Allocate the first page; its HHDM address is where we put the header.
-    uint64_t first_phys = alloc_phys_page();
+    uint64_t first_phys = alloc_phys_pages(pages);
     uint8_t* start      = (uint8_t*)(HHDM + first_phys);
-
-    // Allocate remaining pages.  They are higher physical addresses and
-    // therefore higher HHDM virtual addresses — the block header covers all
-    // of them as a single contiguous virtual range.
-    for (uint32_t p = 1; p < pages; p++) alloc_phys_page();
 
     HeapBlock* nb = (HeapBlock*)start;
     nb->size  = bytes;
@@ -122,7 +128,7 @@ static void heap_grow(uint32_t pages) {
         heap_check(g_heap_tail, "heap_grow coalesce");
         g_heap_tail->next = nb;
 
-        if (g_heap_tail->free) {
+        if (g_heap_tail->free && heap_adjacent(g_heap_tail, nb)) {
             // Absorb the new block into the existing free tail.
             g_heap_tail->size += bytes;
             g_heap_tail->next  = nullptr;
@@ -147,6 +153,7 @@ static void init_heap() {
 // Returns nullptr if size == 0.  The returned pointer is HEAP_ALIGN aligned.
 
 static void* kmalloc(uint64_t size) {
+    heap_guard guard;
     if (size == 0) return nullptr;
 
     uint64_t payload = heap_align_up(size, HEAP_ALIGN);
@@ -197,6 +204,7 @@ static void* kmalloc(uint64_t size) {
 // Passing nullptr is a no-op (matches standard free() behaviour).
 
 static void kfree(void* ptr) {
+    heap_guard guard;
     if (!ptr) return;
 
     HeapBlock* b = (HeapBlock*)((uint8_t*)ptr - sizeof(HeapBlock));
@@ -213,7 +221,7 @@ static void kfree(void* ptr) {
     // Coalesce with next neighbour.
     if (b->next) {
         heap_check(b->next, "kfree coalesce-next");
-        if (b->next->free) {
+        if (b->next->free && heap_adjacent(b, b->next)) {
             HeapBlock* n = b->next;
             b->size += n->size;
             b->next  = n->next;
@@ -229,7 +237,7 @@ static void kfree(void* ptr) {
     // Coalesce with prev neighbour.
     if (b->prev) {
         heap_check(b->prev, "kfree coalesce-prev");
-        if (b->prev->free) {
+        if (b->prev->free && heap_adjacent(b->prev, b)) {
             HeapBlock* p = b->prev;
             p->size += b->size;
             p->next  = b->next;
@@ -250,6 +258,7 @@ static void kfree(void* ptr) {
 //   krealloc(ptr,    size)  == resize in place if possible, else alloc+copy+free
 
 static void* krealloc(void* ptr, uint64_t new_size) {
+    heap_guard guard;
     if (!ptr)      return kmalloc(new_size);
     if (!new_size) { kfree(ptr); return nullptr; }
 
@@ -264,7 +273,7 @@ static void* krealloc(void* ptr, uint64_t new_size) {
     if (b->size >= need) return ptr;
 
     // In-place grow: absorb a free next neighbour if it is large enough.
-    if (b->next && b->next->free && (b->size + b->next->size) >= need) {
+    if (b->next && b->next->free && heap_adjacent(b, b->next) && (b->size + b->next->size) >= need) {
         heap_check(b->next, "krealloc in-place");
         HeapBlock* n = b->next;
         b->size     += n->size;

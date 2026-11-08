@@ -18,6 +18,8 @@ struct fat16_node {
     uint16_t entry_offset, cluster;
     bool root, deleted, long_name;
     uint32_t open_count;
+    uint32_t chain_index, chain_generation;
+    uint16_t chain_cluster;
 };
 struct fat16_volume {
     block_device* disk;
@@ -25,6 +27,10 @@ struct fat16_volume {
     uint16_t fat_sectors, root_entries;
     uint8_t spc, fats;
     bool failed;
+    uint32_t chain_generation;
+    uint32_t fat_cache_lba;
+    bool fat_cache_valid;
+    uint8_t fat_cache[512];
     fat16_node* nodes;
     fat16_node root;
 };
@@ -72,6 +78,10 @@ static void fat_decode_datetime(uint16_t date, uint16_t time, uint8_t fraction, 
 static bool fat_read_sector(fat16_volume* v, uint32_t lba, void* buf) {
     return !v->failed && lba >= v->start && (uint64_t)lba - v->start < v->sectors && block_read(v->disk, lba, buf);
 }
+static bool fat_read_sectors(fat16_volume* v, uint32_t lba, uint32_t count, void* buf) {
+    return !v->failed && lba >= v->start && (uint64_t)lba - v->start < v->sectors &&
+           count <= v->sectors - (lba - v->start) && block_read_sectors(v->disk, lba, count, buf);
+}
 static bool fat_write_sector(fat16_volume* v, uint32_t lba, const void* buf) {
     if (v->failed || lba < v->start || (uint64_t)lba - v->start >= v->sectors) return false;
     if (block_write(v->disk, lba, buf)) return true;
@@ -92,20 +102,28 @@ static uint32_t fat_cluster_sector(fat16_volume* v, uint16_t c) {
     return v->data_start + (uint32_t)(c - 2) * v->spc;
 }
 static bool fat_get(fat16_volume* v, uint16_t c, uint16_t* next) {
-    uint8_t sector[512];
-    if (!fat_cluster_valid(v, c) || !fat_read_sector(v, v->fat_start + c / 256, sector)) return false;
-    *next = fat_u16(sector + (c % 256) * 2);
+    if (!fat_cluster_valid(v, c) || v->failed || !v->disk->online) return false;
+    uint32_t lba = v->fat_start + c / 256;
+    if (!v->fat_cache_valid || v->fat_cache_lba != lba) {
+        v->fat_cache_valid = false;
+        if (!fat_read_sector(v, lba, v->fat_cache)) return false;
+        v->fat_cache_lba = lba;
+        v->fat_cache_valid = true;
+    }
+    *next = fat_u16(v->fat_cache + (c % 256) * 2);
     return true;
 }
 static bool fat_set(fat16_volume* v, uint16_t c, uint16_t next) {
     uint8_t sector[512];
     if (!fat_cluster_valid(v, c)) return false;
+    v->fat_cache_valid = false;
     for (uint8_t i = 0; i < v->fats; ++i) {
         uint32_t lba = v->fat_start + i * v->fat_sectors + c / 256;
         if (!fat_read_sector(v, lba, sector)) return false;
         fat_p16(sector + (c % 256) * 2, next);
         if (!fat_write_sector(v, lba, sector)) return false;
     }
+    ++v->chain_generation;
     return true;
 }
 static uint16_t fat_allocate(fat16_volume* v) {
@@ -129,7 +147,14 @@ static bool fat_chain_at(fat16_node* n, uint32_t index, bool grow, uint16_t* res
     if (!n->cluster && grow) n->cluster = fat_allocate(v);
     uint16_t c = n->cluster;
     if (!fat_cluster_valid(v, c)) return false;
-    for (uint32_t i = 0; i < index; ++i) {
+    uint32_t start = 0;
+    // Sequential reads must not restart at the first cluster for every sector.
+    // A FAT mutation invalidates all hints, including hints on other vnodes.
+    if (n->chain_cluster && n->chain_generation == v->chain_generation && n->chain_index <= index) {
+        c = n->chain_cluster;
+        start = n->chain_index;
+    }
+    for (uint32_t i = start; i < index; ++i) {
         uint16_t next;
         if (!fat_get(v, c, &next)) return false;
         if (next >= 0xfff8 && grow) {
@@ -139,6 +164,9 @@ static bool fat_chain_at(fat16_node* n, uint32_t index, bool grow, uint16_t* res
         if (!fat_cluster_valid(v, next)) return false;
         c = next;
     }
+    n->chain_cluster = c;
+    n->chain_index = index;
+    n->chain_generation = v->chain_generation;
     *result = c;
     return true;
 }
@@ -217,6 +245,7 @@ static fat16_node* fat_node(fat16_volume* v, uint32_t lba, uint16_t off, const u
     n->volume = v; n->root = false; n->entry_sector = lba; n->entry_offset = off;
     n->cluster = fat_u16(e + 26);
     n->deleted = false; n->long_name = long_name; n->open_count = 0;
+    n->chain_cluster = 0; n->chain_index = n->chain_generation = 0;
     n->vn.type = (e[11] & 0x10) ? VnodeType::DIRECTORY : VnodeType::FILE;
     n->vn.ops = &fat16_ops; n->vn.fs_data = n; n->vn.size = fat_u32(e + 28);
     n->next = v->nodes; v->nodes = n;
@@ -259,7 +288,30 @@ static uint64_t fat16_read(vnode* vn, void* out, uint64_t len, uint64_t offset) 
         uint64_t pos = offset + done;
         uint16_t c;
         if (!fat_chain_at(n, pos / (512 * n->volume->spc), false, &c)) break;
-        if (!fat_read_sector(n->volume, fat_cluster_sector(n->volume, c) + (pos / 512) % n->volume->spc, buf)) break;
+        uint32_t sector = (pos / 512) % n->volume->spc;
+        uint32_t lba = fat_cluster_sector(n->volume, c) + sector;
+        if (pos % 512 == 0 && len - done >= 512) {
+            uint64_t limit = (len - done) / 512;
+            if (limit > 128) limit = 128; // bounded 64 KiB requests
+            uint64_t sectors = n->volume->spc - sector;
+            if (sectors > limit) sectors = limit;
+            uint32_t index = pos / (512 * n->volume->spc);
+            uint16_t last = c;
+            // Extend only after following a FAT link to the adjacent physical
+            // cluster. Adjacent file offsets need not be contiguous on disk.
+            while (sectors < limit) {
+                uint16_t next;
+                if (!fat_chain_at(n, ++index, false, &next) || next != last + 1) break;
+                uint64_t take = limit - sectors;
+                if (take > n->volume->spc) take = n->volume->spc;
+                sectors += take;
+                last = next;
+            }
+            if (!fat_read_sectors(n->volume, lba, sectors, (uint8_t*)out + done)) break;
+            done += sectors * 512;
+            continue;
+        }
+        if (!fat_read_sector(n->volume, lba, buf)) break;
         uint64_t take = 512 - pos % 512;
         if (take > len - done) take = len - done;
         memcpy((uint8_t*)out + done, buf + pos % 512, take);
@@ -442,8 +494,11 @@ static fat16_volume* fat16_probe(block_device* disk) {
         v->fat_start = start + reserved; v->fat_sectors = fatsecs; v->root_entries = roots;
         v->root_start = v->fat_start + fats * fatsecs; v->data_start = start + metadata;
         v->clusters = clusters; v->failed = false; v->nodes = nullptr;
+        v->chain_generation = 0;
+        v->fat_cache_valid = false; v->fat_cache_lba = 0;
         v->root.volume = v; v->root.root = true; v->root.cluster = 0; v->root.next = nullptr;
         v->root.deleted = false; v->root.long_name = false; v->root.open_count = 0;
+        v->root.chain_cluster = 0; v->root.chain_index = v->root.chain_generation = 0;
         v->root.vn.type = VnodeType::DIRECTORY; v->root.vn.ops = &fat16_ops;
         v->root.vn.fs_data = &v->root; v->root.vn.size = 0;
         return v;

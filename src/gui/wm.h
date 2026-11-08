@@ -11,6 +11,7 @@
 #include "surface.h"
 
 #include "font8x8_basic.h"
+#include "ui_font.h"
 
 // ── RDTSC Helper ─────────────────────────────────────────────────────────────
 static inline uint64_t rdtsc_val() {
@@ -66,6 +67,7 @@ static char* hud_put_ms1(char* sp, uint64_t ticks) {
 #define WIN_EVENT_MOUSE_SCROLL 4u
 #define WIN_EVENT_KEY_DOWN     5u
 #define WIN_EVENT_KEY_UP       6u
+#define WIN_EVENT_CLOSE        7u
 
 struct WinEvent {
     uint32_t type;    // WIN_EVENT_*
@@ -92,6 +94,7 @@ struct Window {
     bool closable;
     bool chrome_drawn;
     bool is_system; // If true, handled specially (e.g. Terminal, Rain)
+    bool close_pending; // separate from the bounded input queue: cannot be dropped
     int type;      // For system windows
     bool ghost_dragging;
     int32_t ghost_x, ghost_y;
@@ -133,6 +136,12 @@ static inline bool wm_win_push_event(Window* win, const WinEvent& ev) {
 
 static inline bool wm_win_pop_event(Window* win, WinEvent* out_ev) {
     if (!win || !out_ev) return false;
+    if (win->close_pending) {
+        win->close_pending = false;
+        *out_ev = {};
+        out_ev->type = WIN_EVENT_CLOSE;
+        return true;
+    }
     if (win->event_head == win->event_tail) return false;
     *out_ev = win->event_queue[win->event_tail];
     win->event_tail = (win->event_tail + 1) % WIN_EVENT_QUEUE_SIZE;
@@ -205,6 +214,7 @@ static uint32_t g_wbtn_w = 124;
 // ── Start Menu (taskbar popup) ────────────────────────────────
 #define MENU_MAX_APPS 16
 static char  g_menu_apps[MENU_MAX_APPS][29]; // display names, ".elf" stripped
+static char  g_menu_paths[MENU_MAX_APPS][124]; // exact paths, within the TTY launch limit
 static int   g_menu_app_count = 0;
 static bool  g_menu_open = false;
 
@@ -249,16 +259,28 @@ static inline int wm_menu_hit_test(int32_t mx, int32_t my, bool* in_panel = null
 }
 
 // Rebuild the app list from /bin/*.elf. init.elf is skipped — that's the shell itself.
+static bool wm_menu_name_equal(const char* a, const char* b) {
+    while (*a && *b) {
+        char x = *a++, y = *b++;
+        if (x >= 'A' && x <= 'Z') x += 'a' - 'A';
+        if (y >= 'A' && y <= 'Z') y += 'a' - 'A';
+        if (x != y) return false;
+    }
+    return *a == *b;
+}
+
 static inline void wm_menu_refresh() {
     g_menu_app_count = 0;
-    char name[64];
+    char name[256];
     uint64_t sz = 0;
     VnodeType vt = VnodeType::FILE;
     for (uint64_t i = 0; vfs_readdir("/bin", i, name, &sz, &vt) > 0 && g_menu_app_count < MENU_MAX_APPS; i++) {
         if (vt != VnodeType::FILE) continue;
         int n = strlen(name);
-        if (n <= 4 || strcmp(name + n - 4, ".elf") != 0) continue;
-        if (strcmp(name, "init.elf") == 0) continue;
+        if (n <= 4 || n + 5 >= (int)sizeof(g_menu_paths[0]) || !wm_menu_name_equal(name + n - 4, ".elf")) continue;
+        if (wm_menu_name_equal(name, "init.elf")) continue;
+        strcpy(g_menu_paths[g_menu_app_count], "/bin/");
+        strcpy(g_menu_paths[g_menu_app_count] + 5, name);
         char* d = g_menu_apps[g_menu_app_count];
         int len = n - 4; if (len > 28) len = 28;
         for (int k = 0; k < len; k++) d[k] = name[k];
@@ -387,65 +409,96 @@ static inline void wm_init_wallpaper() {
     }
 }
 
-// Load wallpaper pixels from a raw BGRA buffer (width * height * 4 bytes),
-// typically provided by a Limine module or a ramfs-backed file.
-static inline void wm_load_wallpaper_from_raw(const uint8_t* data, uint64_t size_bytes) {
-    if (!fb || !data) return;
-    const uint32_t dst_w = fb->width;
-    const uint32_t dst_h = fb->height;
-    if (!dst_w || !dst_h) return;
+#include "wallpaper.h"
 
-    const uint64_t expected = (uint64_t)dst_w * (uint64_t)dst_h * 4ULL;
-
-    if (!g_wallpaper) {
-        g_wallpaper = (uint32_t*)kmalloc(expected);
-        if (!g_wallpaper) return;
+// Decode into a private buffer; publish only a complete validated wallpaper.
+static bool wm_load_wallpaper_from_raw(const uint8_t* data, uint64_t size) {
+    if (!fb || !fb->width || !fb->height || fb->width > 16384 || fb->height > 16384) return false;
+    uint32_t* replacement = (uint32_t*)kmalloc((uint64_t)fb->width * fb->height * 4);
+    if (!replacement) return false;
+    if (!wallpaper_decode(data, size, fb->width, fb->height, replacement)) {
+        kfree(replacement);
+        return false;
     }
+    // Single-core: exclude compositor preemption while replacing/freeing its source.
+    uint64_t flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    uint32_t* previous = g_wallpaper;
+    g_wallpaper = replacement;
+    kfree(previous);
+    wm_dirty_add(0, fb->width - 1, 0, fb->height - 1);
+    g_needs_refresh = true;
+    if (flags & (1u << 9)) __asm__ volatile("sti" ::: "memory");
+    return true;
+}
 
-    // Format A (legacy): raw pixel bytes only, must exactly match framebuffer size.
-    if (size_bytes == expected) {
-        memcpy(g_wallpaper, data, expected);
-        return;
+static bool wm_load_wallpaper_file(const char* path) {
+    file f{};
+    if (vfs_open(path, 0, &f) != 0) {
+        print((char*)"[wallpaper] Cannot open configured asset:");
+        print((char*)path);
+        return false;
     }
-
-    // Format B (preferred): simple header + pixel bytes, allows scaling to current mode.
-    //
-    // Layout (little-endian):
-    //   0x00: char magic[4] = "WRAW"
-    //   0x04: uint32 src_w
-    //   0x08: uint32 src_h
-    //   0x0C: uint32 format (0 = BGRA8888)
-    //   0x10: uint8  pixels[src_w * src_h * 4]
-    //
-    if (size_bytes >= 16 &&
-        data[0] == 'W' && data[1] == 'R' && data[2] == 'A' && data[3] == 'W') {
-        const uint32_t src_w = *(const uint32_t*)(data + 4);
-        const uint32_t src_h = *(const uint32_t*)(data + 8);
-        const uint32_t fmt   = *(const uint32_t*)(data + 12);
-        if (fmt != 0) return;
-        if (!src_w || !src_h) return;
-
-        const uint64_t src_bytes = (uint64_t)src_w * (uint64_t)src_h * 4ULL;
-        if (size_bytes < 16ULL + src_bytes) return;
-
-        const uint8_t* src = data + 16;
-
-        // Nearest-neighbor scale into ARGB words (src is BGRA bytes).
-        for (uint32_t y = 0; y < dst_h; y++) {
-            const uint32_t sy = (uint32_t)(((uint64_t)y * (uint64_t)src_h) / (uint64_t)dst_h);
-            const uint8_t* src_row = src + (uint64_t)sy * (uint64_t)src_w * 4ULL;
-            uint32_t* dst_row = g_wallpaper + (uint64_t)y * (uint64_t)dst_w;
-            for (uint32_t x = 0; x < dst_w; x++) {
-                const uint32_t sx = (uint32_t)(((uint64_t)x * (uint64_t)src_w) / (uint64_t)dst_w);
-                const uint8_t* p = src_row + (uint64_t)sx * 4ULL; // BGRA
-                // Pack to 0xAARRGGBB (little-endian-compatible with the rest of the WM).
-                dst_row[x] = 0xFF000000u | ((uint32_t)p[2] << 16) | ((uint32_t)p[1] << 8) | (uint32_t)p[0];
-            }
+    uint64_t size = f.vn->size;
+    // Bound allocations even when disk metadata is corrupt.
+    uint8_t* data = size && size <= 64 * 1024 * 1024 ? (uint8_t*)kmalloc(size) : nullptr;
+    uint64_t loaded = 0;
+    uint64_t started = rdtsc_val();
+    uint64_t budget = _usb_tsc_hz() * 15;
+    while (data && loaded < size) {
+        if (rdtsc_val() - started >= budget) {
+            print((char*)"[wallpaper] Disk read timed out; keeping fallback.");
+            break;
         }
-        return;
+        uint64_t chunk = size - loaded;
+        if (chunk > 65536) chunk = 65536;
+        uint64_t count = vfs_read(&f, data + loaded, chunk);
+        if (count != chunk) {
+            print((char*)"[wallpaper] Short/failed disk read; loaded bytes:");
+            char amount[32]; to_str(loaded + count, amount); print(amount);
+            break;
+        }
+        loaded += count;
+        boot_splash_tick();
     }
+    char elapsed[32];
+    to_str((rdtsc_val() - started) / (_usb_tsc_hz() / 1000), elapsed);
+    print((char*)"[wallpaper] Disk-read milliseconds:"); print(elapsed);
+    uint64_t decode_started = rdtsc_val();
+    bool ok = data && loaded == size && wm_load_wallpaper_from_raw(data, size);
+    to_str((rdtsc_val() - decode_started) / (_usb_tsc_hz() / 1000), elapsed);
+    print((char*)"[wallpaper] Decode/scale milliseconds:"); print(elapsed);
+    vfs_close(&f);
+    if (data) kfree(data);
+    return ok;
+}
 
-    // Anything else: ignore (prevents the "wrap/tile" corruption when sizes differ).
+// desktop.cfg is one absolute asset path, optionally followed by CR/LF.
+static void wm_load_disk_wallpaper() {
+    char path[256];
+    strcpy(path, "/share/wall.raw");
+    file config{};
+    if (vfs_open("/etc/desktop.cfg", 0, &config) == 0) {
+        char setting[256];
+        uint64_t size = config.vn->size;
+        if (size > 0 && size < sizeof(setting) && vfs_read(&config, setting, size) == size) {
+            setting[size] = 0;
+            while (size && (setting[size - 1] == '\n' || setting[size - 1] == '\r')) setting[--size] = 0;
+            bool valid = size && setting[0] == '/';
+            for (uint64_t i = 0; i < size; ++i) if ((uint8_t)setting[i] < 32) valid = false;
+            if (valid) strcpy(path, setting);
+        }
+        vfs_close(&config);
+    }
+    print((char*)"[wallpaper] Loading disk asset...");
+    uint64_t started = rdtsc_val();
+    print((char*)(wm_load_wallpaper_file(path) ?
+        "[wallpaper] Loaded disk asset into RAM." :
+        "[wallpaper] Missing, unreadable or invalid asset; keeping fallback."));
+    char elapsed[32];
+    to_str((rdtsc_val() - started) / (_usb_tsc_hz() / 1000), elapsed);
+    print((char*)"[wallpaper] Load attempt milliseconds:");
+    print(elapsed);
 }
 
 // ── WIN_LOG: independent scrollable text window ──────────────────────────────
@@ -615,7 +668,7 @@ static void wm_log_scroll(int delta) {
 }
 
 
-static inline void wm_draw_char(uint32_t x, uint32_t y, char c, uint32_t color, uint32_t scale_100 = 100) {
+static inline void wm_draw_mono_char(uint32_t x, uint32_t y, char c, uint32_t color, uint32_t scale_100 = 100) {
     if (!g_master_backbuffer || (uint32_t)c > 127) return;
     uint8_t* glyph = (uint8_t*)font8x8_basic[(uint8_t)c];
     
@@ -662,20 +715,58 @@ static inline void wm_draw_char(uint32_t x, uint32_t y, char c, uint32_t color, 
     }
 }
 
-static inline void wm_draw_string(uint32_t x, uint32_t y, const char* s, uint32_t color, uint32_t scale_100 = 100) {
+static inline void wm_draw_mono_string(uint32_t x, uint32_t y, const char* s, uint32_t color, uint32_t scale_100 = 100) {
     uint32_t char_w = (8 * scale_100) / 100;
     for (int i = 0; s[i]; i++) {
-        wm_draw_char(x + i * char_w, y, s[i], color, scale_100);
+        wm_draw_mono_char(x + i * char_w, y, s[i], color, scale_100);
     }
 }
+
+// Selawik UI typography. Shell, boot log and diagnostics keep the bitmap font.
+static int32_t g_ui_clip_left = 0, g_ui_clip_top = 0, g_ui_clip_right = 0, g_ui_clip_bottom = 0;
+static const UiFont* wm_ui_font(uint32_t scale_100 = 100) {
+    uint32_t base = !fb || fb->height < 600 ? 12 : fb->height < 900 ? 14 : 16;
+    return ui_font_for_pixels((base * scale_100 + 50) / 100);
+}
+static uint32_t wm_text_height(uint32_t scale_100 = 100) { return wm_ui_font(scale_100)->height; }
+static int32_t wm_text_width(const char* text, uint32_t scale_100 = 100) {
+    return ui_text_width(wm_ui_font(scale_100), text);
+}
+static void wm_draw_string(int32_t x, int32_t y, const char* text, uint32_t color,
+                           uint32_t scale_100 = 100, int32_t max_width = -1) {
+    if (!fb || !g_master_backbuffer || !text || max_width == 0) return;
+    int32_t right = g_ui_clip_right;
+    if (max_width > 0 && x + max_width < right) right = x + max_width;
+    char shortened[128];
+    if (max_width > 0 && wm_text_width(text, scale_100) > max_width) {
+        int32_t width = 0, dots = wm_text_width("...", scale_100);
+        unsigned n = 0;
+        while (text[n] && n < sizeof(shortened) - 4) {
+            unsigned advance = ui_font_glyph(wm_ui_font(scale_100), (uint8_t)text[n])->advance;
+            if (width + (int32_t)advance + dots > max_width) break;
+            width += advance; shortened[n] = text[n]; ++n;
+        }
+        if (dots <= max_width) { shortened[n++] = '.'; shortened[n++] = '.'; shortened[n++] = '.'; }
+        shortened[n] = 0;
+        text = shortened;
+    }
+    ui_text_draw((uint32_t*)g_master_backbuffer, fb->width, fb->height, fb->pitch / 4,
+                 wm_ui_font(scale_100), x, y, text, color, g_ui_clip_left, g_ui_clip_top, right, g_ui_clip_bottom);
+}
+static void wm_draw_char(int32_t x, int32_t y, char c, uint32_t color, uint32_t scale_100 = 100) {
+    char text[2]; text[0] = c; text[1] = 0;
+    wm_draw_string(x, y, text, color, scale_100);
+}
+static uint32_t wm_clock_scale() { return g_font_scale_100 * 85 / 100; }
 
 // ─── Taskbar clock (tray) ────────────────────────────────────────────────────
 // The time comes from rtc.h (g_clock, refreshed by the compositor thread). Drawing only reads that cache.
 // Tray width follows the font scale; the widest line is "10:59:59 PM" (11 chars) or the date "2026-11-06" (10).
 static inline int32_t wm_tray_w() {
-    int32_t cw    = (int32_t)((8 * g_font_scale_100) / 100);
-    int32_t chars = CLOCK_SHOW_SECONDS ? 11 : 10;
-    return chars * cw + 16;
+    uint32_t scale = wm_clock_scale();
+    int32_t time_width = wm_text_width(CLOCK_SHOW_SECONDS ? "88:88:88 PM" : "88:88 PM", scale);
+    int32_t date_width = wm_text_width("8888-88-88", scale);
+    return (time_width > date_width ? time_width : date_width) + 20;
 }
 
 // Mark the tray (plus the 2px separator left of it) dirty so the compositor repaints the clock.
@@ -706,11 +797,11 @@ static inline void wm_draw_window_chrome(int32_t x, int32_t y, int32_t w, int32_
         }
     }
     // Title text (Vertically centered)
-    uint32_t char_h = (8 * g_font_scale_100) / 100;
+    uint32_t char_h = wm_text_height(g_font_scale_100);
     int32_t text_y = y + (int32_t)(g_title_h - char_h) / 2;
     uint32_t text_clr = focused ? 0xFFFFFFFF : 0xFF9094A0;
     if (text_y + (int32_t)char_h >= min_y && text_y <= max_y)
-        wm_draw_string(x + 10, (uint32_t)text_y, title, text_clr, g_font_scale_100);
+        wm_draw_string(x + 10, text_y, title, text_clr, g_font_scale_100, w > (int32_t)g_title_h + 24 ? w - g_title_h - 24 : 0);
     
     // Close button (Scaled with title bar)
     int32_t btn_pad = (int32_t)(4 * g_title_h) / 42;
@@ -730,9 +821,9 @@ static inline void wm_draw_window_chrome(int32_t x, int32_t y, int32_t w, int32_
         if (e_x > s_x) memset_32(row + s_x, btn_clr, e_x - s_x);
     }
     // Centered 'X' in button
-    int32_t x_off = (int32_t)(btn_w - char_h) / 2;
-    int32_t y_off = (int32_t)(btn_h - char_h) / 2;
-    if (btn_y + y_off >= min_y && btn_y + y_off + (int32_t)char_h <= max_y)
+    int32_t x_off = (btn_w - wm_text_width("X", g_font_scale_100)) / 2;
+    int32_t y_off = (btn_h - (int32_t)char_h) / 2;
+    if (btn_y + y_off <= max_y && btn_y + y_off + (int32_t)char_h >= min_y)
         wm_draw_char(btn_x + x_off, btn_y + y_off, 'X', 0xFFFFFFFF, g_font_scale_100);
 }
 
@@ -1010,6 +1101,12 @@ static inline void wm_close_window(int idx) {
     if (idx < 0 || idx >= g_window_count) return;
     Window* win = g_window_list[idx];
     if (win->is_system && win->type == WIN_TYPE_TERM) return; // Terminal is immortal
+    if (!win->is_system) {
+        // Applications decide whether to exit, close one of several windows,
+        // or ask the user to save. Keep the surface alive until they respond.
+        win->close_pending = true;
+        return;
+    }
     win->visible = false;
     if (g_focused_win_id == win->id) {
         g_focused_win_id = -1;
@@ -1382,6 +1479,11 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
     if (max_y >= fb->height) max_y = fb->height - 1;
     if (min_y > max_y || min_x > max_x) return false;
 
+    // Chrome/taskbar currently repaint whole horizontal spans on damaged rows.
+    // Restore text across those same spans, clipping vertically to avoid blending
+    // antialiasing twice onto rows whose backgrounds were not recomposed.
+    g_ui_clip_left = 0; g_ui_clip_top = min_y;
+    g_ui_clip_right = fb->width; g_ui_clip_bottom = max_y + 1;
     WinRect rects[MAX_WINDOWS];
     for (int i = 0; i < g_window_count; i++) {
         if (g_window_list[i]) wm_get_win_rect(g_window_list[i], &rects[i]);
@@ -1586,10 +1688,8 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
 
         // "# START" label, centered
         const char* start_lbl   = "# START";
-        const int32_t start_len = 7;
-        uint32_t char_h = (8 * g_font_scale_100) / 100;
-        uint32_t char_w = (8 * g_font_scale_100) / 100;
-        wm_draw_string(sb_x + (int32_t)(g_sb_w - start_len * char_w) / 2,
+        uint32_t char_h = wm_text_height(g_font_scale_100);
+        wm_draw_string(sb_x + ((int32_t)g_sb_w - wm_text_width(start_lbl, g_font_scale_100)) / 2,
                     sb_y + (int32_t)(sb_h - char_h) / 2,
                     start_lbl, 0xFFFFFFFF, g_font_scale_100);
         
@@ -1613,15 +1713,16 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                 tbuf[0] = '-'; tbuf[1] = '-'; tbuf[2] = ':'; tbuf[3] = '-'; tbuf[4] = '-'; tbuf[5] = 0;
                 tl = 5;
             }
-            int32_t cw = (int32_t)char_w, ch = (int32_t)char_h;
-            bool two_lines = dl > 0 && tray_h >= 2 * ch + 4;
+            uint32_t clock_scale = wm_clock_scale();
+            int32_t ch = wm_text_height(clock_scale);
+            bool two_lines = dl > 0 && tray_h >= 2 * ch + 2;
             int32_t ty0 = two_lines ? tray_y + (tray_h - (2 * ch + 2)) / 2
                                     : tray_y + (tray_h - ch) / 2;
-            wm_draw_string((uint32_t)(tray_x + (TRAY_W - tl * cw) / 2), (uint32_t)ty0,
-                           tbuf, 0xFFE6E8FF, g_font_scale_100);
+            wm_draw_string((uint32_t)(tray_x + (TRAY_W - wm_text_width(tbuf, clock_scale)) / 2), (uint32_t)ty0,
+                           tbuf, 0xFFE6E8FF, clock_scale);
             if (two_lines)
-                wm_draw_string((uint32_t)(tray_x + (TRAY_W - dl * cw) / 2), (uint32_t)(ty0 + ch + 2),
-                               dbuf, 0xFF9FA6CC, g_font_scale_100);
+                wm_draw_string((uint32_t)(tray_x + (TRAY_W - wm_text_width(dbuf, clock_scale)) / 2), (uint32_t)(ty0 + ch + 2),
+                               dbuf, 0xFF9FA6CC, clock_scale);
         }
 
         // Separator between task area and tray
@@ -1667,7 +1768,7 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
             wm_draw_string(cur_x + 8, sb_y + (int32_t)(sb_h - char_h) / 2,
                         win->title,
                         active ? 0xFFEEEEFF : 0xFF8888AA,
-                        g_font_scale_100);
+                        g_font_scale_100, g_wbtn_w - 16);
 
             cur_x += g_wbtn_w + WBTN_GAP;
         }
@@ -1709,7 +1810,7 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                 if (bx + bw > fb->width) bw = fb->width - bx;
                 memset_32(drow + bx, 0xCC1A1F35, bw); // Dark navy glass
             }
-            wm_draw_string(rx, ry, ram_msg, 0xFFEEEEFF);
+            wm_draw_mono_string(rx, ry, ram_msg, 0xFFEEEEFF);
         }
     }
 
@@ -1850,7 +1951,7 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
             // Color: green when low usage, yellow when moderate, red when high
             uint32_t cpu_color = g_cpu_usage_pct < 50 ? 0xFF88FF88 :
                                  g_cpu_usage_pct < 80 ? 0xFFFFDD44 : 0xFFFF6644;
-            wm_draw_string(rx, ry, cpu_msg, cpu_color);
+            wm_draw_mono_string(rx, ry, cpu_msg, cpu_color);
         }
     }
     
@@ -1867,7 +1968,7 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         // Hover index comes straight from the live cursor position — no state to keep in sync.
         int hover = wm_menu_hit_test(g_mouse_x, g_mouse_y);
 
-        uint32_t char_h = (8 * g_font_scale_100) / 100;
+        uint32_t char_h = wm_text_height(g_font_scale_100);
 
         // ── Shadow ring: 1px dark border around the whole panel (depth without alpha)
         for (int32_t y = py - 1; y <= py + ph; y++) {
@@ -1909,12 +2010,11 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         // ── Header text: "START" left, app count right
         {
             int32_t hy = py + (hdr_h - (int32_t)char_h) / 2;
-            if (hy >= (int32_t)min_y && hy <= (int32_t)max_y) {
+            if (hy + (int32_t)char_h >= (int32_t)min_y && hy <= (int32_t)max_y) {
                 wm_draw_string((uint32_t)(px + pad), (uint32_t)hy, "START", 0xFFFFFFFF, g_font_scale_100);
                 char cnt[16];
                 to_str((uint64_t)g_menu_app_count, cnt);
-                uint32_t cl = strlen(cnt);
-                wm_draw_string((uint32_t)(px + pw - pad - (int32_t)(cl * char_h)), (uint32_t)hy, cnt, 0xFF9FB0D8, g_font_scale_100);
+                wm_draw_string((uint32_t)(px + pw - pad - wm_text_width(cnt, g_font_scale_100)), (uint32_t)hy, cnt, 0xFF9FB0D8, g_font_scale_100);
             }
         }
 
@@ -1960,14 +2060,14 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
 
             uint32_t txt_clr = hov ? 0xFFFFFFFF : 0xFFE4E8F5;
             int32_t ty = ry + (row_h - (int32_t)char_h) / 2;
-            if (ty >= (int32_t)min_y && ty <= (int32_t)max_y)
-                wm_draw_string((uint32_t)(ix + isz + 8), (uint32_t)ty, g_menu_apps[i], txt_clr, g_font_scale_100);
+            if (ty + (int32_t)char_h >= (int32_t)min_y && ty <= (int32_t)max_y)
+                wm_draw_string((uint32_t)(ix + isz + 8), (uint32_t)ty, g_menu_apps[i], txt_clr, g_font_scale_100, px + pw - pad - (ix + isz + 8));
         }
 
         // Empty state
         if (g_menu_app_count == 0 && list_top < py + ph - pad) {
             int32_t ty = list_top + (row_h - (int32_t)char_h) / 2;
-            if (ty >= (int32_t)min_y && ty <= (int32_t)max_y)
+            if (ty + (int32_t)char_h >= (int32_t)min_y && ty <= (int32_t)max_y)
                 wm_draw_string((uint32_t)(px + pad), (uint32_t)ty, "No apps in /bin", 0xFF8890A8, g_font_scale_100);
         }
     }

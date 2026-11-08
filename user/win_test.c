@@ -12,6 +12,7 @@ typedef long           int64_t;
 #define WIN_EVENT_MOUSE_SCROLL 4u
 #define WIN_EVENT_KEY_DOWN     5u
 #define WIN_EVENT_KEY_UP       6u
+#define WIN_EVENT_CLOSE        7u
 
 typedef struct {
     uint32_t type;
@@ -120,7 +121,10 @@ void _start() {
         // Poll and process pending events
         WinEvent ev;
         while (sys_win_poll_event(win, &ev)) {
-            if (ev.type == WIN_EVENT_MOUSE_DOWN) {
+            if (ev.type == WIN_EVENT_CLOSE) {
+                // Normal process exit destroys owned windows and wakes the shell.
+                sys_exit(0);
+            } else if (ev.type == WIN_EVENT_MOUSE_DOWN) {
                 // Click paints a stamp at cursor
                 for (int dy = -8; dy <= 8; dy++) {
                     int py = ev.y + dy;
