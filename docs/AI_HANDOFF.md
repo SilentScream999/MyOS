@@ -507,7 +507,7 @@ scope above; QEMU success must not be reported as physical-hardware verification
 3. **Keep logic separate from hardware access.** New logic (blending, damage handling, command/state encoding) goes in small headers with no kernel dependencies, like `damage.h`, `surface.h` and `gpu_cmds.h`, so it can be reviewed and checked off-target. Keep the hardware glue thin.
 4. **Hardware-touching code must fail safe:** validate what it reads, fall back to the CPU path, and never loop forever on hardware state.
 5. **Write down what you could not verify.** Mark hypotheses as hypotheses (the roadmap's claims log shows the style).
-6. **Executable Formats:** Standard static ELF (`.elf`) remains the permanent base format for compatibility with clang/GCC/lld toolchains. A future native `.wiz` binary format (magic `"WIZ\x01"`, app title, icon, segments) will co-exist alongside ELF in `src/exec.h` as an optional lightweight container, never replacing ELF.
+6. **Executable Formats:** `.wiz` and `.elf` now both name static x86-64 ELF executables using the WyzarOS ABI. `make <app>.wiz` copies the ELF build; shell launch and Start-menu discovery support both (including uppercase FAT16 names). Boot keeps `/bin/init.elf`. A future metadata container (magic `"WIZ\x01"`, app title, icon, segments) remains optional and is not the current `.wiz` format.
 
 ## 4. Rules and gotchas
 
@@ -552,7 +552,7 @@ completed milestones below are retained as history; storage is now FAT16 at
    * ✅ ~~Interactive Desktop Start Menu~~ — **Done.** Lists `/bin/*.elf`, launches on click; see Current state.
 7. **Filesystem on Boot Drive & `.wiz` Binary Support:**
    * ✅ USB Mass Storage (BOT/SCSI) + FAT16 mounted at `/disk`, with create/read/write/delete/stat. Persistent `/bin`, runtime timezones and disk-loaded wallpaper are next; FAT32 is not implemented.
-   * Native `.wiz` executable loader co-existing with ELF (checks `"WIZ\x01"` magic, app icon/title metadata, segment loader).
+   * `.wiz` app naming alongside `.elf` is implemented using ELF contents. A separate `"WIZ\x01"` container with embedded app icon/title metadata remains future work.
 8. The roadmap's later stages: hardware cursor, page flipping, GPU memory, render engine.
 
 ## 7. Starting a work session

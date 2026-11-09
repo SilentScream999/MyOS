@@ -1,5 +1,14 @@
 # How apps should be loaded (and how Windows does it)
 
+**App extensions (2026-11-09):** `.wiz` and `.elf` are interchangeable names for
+static x86-64 ELF programs built for WyzarOS. The loader identifies ELF contents,
+not the extension. `make counter.wiz` copies the ELF build without conversion.
+The Start menu discovers both extensions in `/bin`, case-insensitively, and
+excludes `init.elf` and `init.wiz`. The shell accepts either through `run <path>`;
+both use the same spawn, wait, input and window lifecycle. Boot still uses the
+fixed `/bin/init.elf` recovery/system-shell path. A separate metadata container
+with a `WIZ` header is future work, not required by today's `.wiz` files.
+
 *Last updated: 2026-11-07.* Goal: apps become **files plus metadata**, discovered and started at runtime. Near-term disk-backed app and settings work is in [NEXT_STEPS.md](NEXT_STEPS.md).
 
 **Implementation update (2026-11-07):** the historical state below predates the

@@ -58,6 +58,7 @@
 #include "helpers.h"
 #include "scheduler.h"
 #include "vfs.h"
+#include "app.h"
 #include "tty.h"
 #include "acpi.h"
 #include "wm.h"
@@ -481,7 +482,7 @@ static uint64_t sys_spawn(uint64_t path_va) {
     char path[256];
     if (!get_user_path(path_va, path, sizeof(path))) return (uint64_t)-1;
     // Guard: prevent spawning a duplicate interactive init shell
-    if (strcmp(path, "/bin/init.elf") == 0 || strcmp(path, "init.elf") == 0) {
+    if (app_path_is_shell(path)) {
         print((char*)"[spawn] Refused: cannot spawn duplicate init shell\n");
         return (uint64_t)-1;
     }

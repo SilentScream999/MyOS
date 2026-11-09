@@ -1,6 +1,7 @@
 typedef unsigned long uint64_t;
 typedef long          int64_t;
 #include "src/fs/fileinfo.h"
+#include "src/core/app.h"
 
 // Minimal syscall wrappers
 static inline uint64_t sys_read(uint64_t fd, char* buf, uint64_t len) {
@@ -364,7 +365,7 @@ void _start() {
             print("  cat <path>      - Read a file\n");
             print("  rm <path>       - Delete a closed file\n");
             print("  stat <path>     - Show size, creation and modification times\n");
-            print("  run <path>      - Run an ELF program; wait until it exits\n");
+            print("  run <path>      - Run a .wiz or .elf app; wait until it exits\n");
             print("  open bootlog    - Display kernel boot log\n");
             print("  clear           - Clear screen\n");
             print("  bsod            - Trigger crash screen\n");
@@ -502,7 +503,7 @@ void _start() {
             while (buf[idx] == ' ') idx++;
             if (buf[idx] != '\0') {
                 const char* prog = &buf[idx];
-                if (streq(prog, "/bin/init.elf", 13) || streq(prog, "init.elf", 8)) {
+                if (app_path_is_shell(prog)) {
                     print("Refused: Cannot spawn a second interactive init shell on the same TTY.\n");
                     continue;
                 }

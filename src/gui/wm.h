@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "app.h"
 #include "graphics.h"
 #include "framebufferstuff.h"
 #include "heap.h"
@@ -213,7 +214,7 @@ static uint32_t g_wbtn_w = 124;
 
 // ── Start Menu (taskbar popup) ────────────────────────────────
 #define MENU_MAX_APPS 16
-static char  g_menu_apps[MENU_MAX_APPS][29]; // display names, ".elf" stripped
+static char  g_menu_apps[MENU_MAX_APPS][29]; // display names, app extension stripped
 static char  g_menu_paths[MENU_MAX_APPS][124]; // exact paths, within the TTY launch limit
 static int   g_menu_app_count = 0;
 static bool  g_menu_open = false;
@@ -258,16 +259,7 @@ static inline int wm_menu_hit_test(int32_t mx, int32_t my, bool* in_panel = null
     return idx;
 }
 
-// Rebuild the app list from /bin/*.elf. init.elf is skipped — that's the shell itself.
-static bool wm_menu_name_equal(const char* a, const char* b) {
-    while (*a && *b) {
-        char x = *a++, y = *b++;
-        if (x >= 'A' && x <= 'Z') x += 'a' - 'A';
-        if (y >= 'A' && y <= 'Z') y += 'a' - 'A';
-        if (x != y) return false;
-    }
-    return *a == *b;
-}
+// Rebuild the app list from /bin/*.elf and /bin/*.wiz, excluding the shell.
 
 static inline void wm_menu_refresh() {
     g_menu_app_count = 0;
@@ -277,8 +269,8 @@ static inline void wm_menu_refresh() {
     for (uint64_t i = 0; vfs_readdir("/bin", i, name, &sz, &vt) > 0 && g_menu_app_count < MENU_MAX_APPS; i++) {
         if (vt != VnodeType::FILE) continue;
         int n = strlen(name);
-        if (n <= 4 || n + 5 >= (int)sizeof(g_menu_paths[0]) || !wm_menu_name_equal(name + n - 4, ".elf")) continue;
-        if (wm_menu_name_equal(name, "init.elf")) continue;
+        if (n + 5 >= (int)sizeof(g_menu_paths[0]) || !app_name_supported(name)) continue;
+        if (app_name_is_shell(name)) continue;
         strcpy(g_menu_paths[g_menu_app_count], "/bin/");
         strcpy(g_menu_paths[g_menu_app_count] + 5, name);
         char* d = g_menu_apps[g_menu_app_count];

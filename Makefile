@@ -52,11 +52,16 @@ USER_CFLAGS = -O0 -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
               -mno-red-zone -target x86_64-elf -fno-builtin \
               -fno-unwind-tables -fno-asynchronous-unwind-tables
 
-user/init.o: user/init.c
+user/init.o: user/init.c src/core/app.h src/fs/fileinfo.h
 	$(CC) $(USER_CFLAGS) -I. -c $< -o $@
 
 init.elf: user/init.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
+
+# Wyzar app names use the same static ELF contents and ABI.
+# Example: make counter.wiz (keep counter.elf available too).
+%.wiz: %.elf
+	cp $< $@
 
 user/counter.o: user/counter.c
 	$(CC) $(USER_CFLAGS) -I. -c $< -o $@

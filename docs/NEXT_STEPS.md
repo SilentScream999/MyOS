@@ -1,6 +1,6 @@
 # Near-term platform work
 
-Updated 2026-11-07. These are planned changes, not features already implemented.
+Updated 2026-11-09. Implemented foundations and planned follow-up work are marked below.
 Current behavior and verification are in [AI_HANDOFF.md](AI_HANDOFF.md) and
 [PERSISTENT_STORAGE.md](PERSISTENT_STORAGE.md).
 
@@ -106,8 +106,27 @@ current editing limitations.
 
 ## 5. Continue app and desktop work
 
-Add Paint as a normal ELF application, persist its documents under `/home`, and
+Add Paint as a normal `.wiz` or `.elf` application, persist its documents under `/home`, and
 keep application discovery driven by files. Follow the existing GPU roadmap for
 alpha, retained layers, hardware cursor and page flipping. Keep GPU bring-up
 opt-in. Tighten window-ID ownership checks, user-pointer/ELF validation and user
 mapping cleanup before treating the application API as a security boundary.
+
+### Future `.wiz` app metadata
+
+Implemented: `.wiz` and `.elf` currently contain the same static x86-64 ELF
+binary and use the same WyzarOS ABI, loader and process lifecycle. Only the
+filename extension differs. Both are discovered in `/bin` and launch through
+the shell or Start menu; renaming between them requires no conversion.
+
+Possible additions later:
+
+- Embedded app icons for the Start menu and desktop.
+- A display name independent of the filename, plus an app description.
+- Version and publisher metadata for app information and updates.
+- An optional versioned `.wiz` container/header holding metadata and the
+  executable payload, with a packaging tool to create it from an ELF build.
+
+Keep existing ELF-based `.wiz` files and ordinary `.elf` programs working if a
+new container is introduced. These metadata/container features are planned
+possibilities, not part of current `.wiz` support. See [APP_LOADING.md](APP_LOADING.md).

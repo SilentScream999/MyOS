@@ -29,6 +29,12 @@ The flag resets saved files; ordinary builds preserve them.
 `run /bin/counter.elf` runs in the foreground: the shell waits for exit and then
 prints a fresh prompt automatically. Keep `tools/make_usb_image.py` for image
 builds; the `tests/` directory contains optional development checks.
+Apps can use either `.wiz` or `.elf`: both contain static x86-64 ELF binaries
+for the WyzarOS syscall ABI. `make counter.wiz` creates a `.wiz` copy of the
+existing ELF build. Install apps in `/bin` for Start-menu discovery, or launch
+them from any directory with `run <path>`. Both extensions work with relative
+and absolute paths; renaming a WyzarOS `.elf` to `.wiz` needs no conversion.
+This does not make Windows executables or ordinary Linux programs compatible.
 Foreground programs start with keyboard echo off; interactive programs can enable
 it with syscall 18 (`TTYECHO`). Unread input is discarded before the prompt returns.
 Press Ctrl+C to terminate the foreground program, including `win_test` when its

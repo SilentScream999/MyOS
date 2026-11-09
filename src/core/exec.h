@@ -100,7 +100,8 @@ static Task* execve_memory(const uint8_t* elf_data) {
 }
 
 // ── execve_path ───────────────────────────────────────────────────────────────
-// Load an ELF executable directly from a VFS path (e.g. "/bin/init.elf").
+// Load a .wiz or .elf app from VFS. Both use ELF contents; the filename
+// extension does not select a different loader or change the syscall ABI.
 static Task* execve_path(const char* path) {
     if (!path) return nullptr;
     file f;
@@ -111,7 +112,7 @@ static Task* execve_path(const char* path) {
     }
 
     uint64_t sz = f.vn->size;
-    if (sz == 0 || sz > 32 * 1024 * 1024) {
+    if (sz < sizeof(Elf64_Ehdr) || sz > 32 * 1024 * 1024) {
         vfs_close(&f);
         return nullptr;
     }
