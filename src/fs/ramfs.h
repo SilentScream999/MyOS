@@ -38,6 +38,9 @@ static vnode* ramfs_lookup(vnode* dir, const char* name);
 static vnode* ramfs_create(vnode* dir, const char* name);
 static vnode* ramfs_mkdir(vnode* dir, const char* name);
 static int ramfs_readdir(vnode* dir, uint64_t index, char* name_out, uint64_t* size_out, VnodeType* type_out);
+static int ramfs_unlink(vnode* dir, const char* name);
+static int ramfs_rmdir(vnode* dir, const char* name);
+static int ramfs_statfs(vnode* vn, fs_info* out);
 
 static vfs_ops ramfs_ops = {
     .read    = ramfs_read,
@@ -48,6 +51,10 @@ static vfs_ops ramfs_ops = {
     .create  = ramfs_create,
     .mkdir   = ramfs_mkdir,
     .readdir = ramfs_readdir,
+    .unlink  = ramfs_unlink,
+    .stat    = nullptr,
+    .rmdir   = ramfs_rmdir,
+    .statfs  = ramfs_statfs,
 };
 
 // ── RAMFS IMPLEMENTATION ──────────────────────────────────────────────────
@@ -201,6 +208,58 @@ static int ramfs_readdir(vnode* dir, uint64_t index, char* name_out, uint64_t* s
         child = child->sibling;
     }
     return 0; // EOF
+}
+
+static int ramfs_unlink(vnode* dir, const char* name) {
+    if (dir->type != VnodeType::DIRECTORY) return -1;
+    ramfs_node* d_node = (ramfs_node*)dir->fs_data;
+    ramfs_node* prev = nullptr;
+    ramfs_node* curr = d_node->children;
+    while (curr) {
+        if (strcmp(curr->name, name) == 0) {
+            if (curr->type != VnodeType::FILE) return -1;
+            if (prev) prev->sibling = curr->sibling;
+            else d_node->children = curr->sibling;
+            if (curr->data) kfree(curr->data);
+            kfree(curr);
+            return 0;
+        }
+        prev = curr;
+        curr = curr->sibling;
+    }
+    return -1;
+}
+
+static int ramfs_rmdir(vnode* dir, const char* name) {
+    if (dir->type != VnodeType::DIRECTORY) return -1;
+    ramfs_node* d_node = (ramfs_node*)dir->fs_data;
+    ramfs_node* prev = nullptr;
+    ramfs_node* curr = d_node->children;
+    while (curr) {
+        if (strcmp(curr->name, name) == 0) {
+            if (curr->type != VnodeType::DIRECTORY) return -1;
+            if (curr->children != nullptr) return -1; // Directory is not empty
+            if (prev) prev->sibling = curr->sibling;
+            else d_node->children = curr->sibling;
+            kfree(curr);
+            return 0;
+        }
+        prev = curr;
+        curr = curr->sibling;
+    }
+    return -1;
+}
+
+static int ramfs_statfs(vnode*, fs_info* out) {
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+    out->block_size = 4096;
+    out->total_blocks = 16384; // 64 MiB RAM disk representation
+    out->free_blocks  = 16384;
+    out->total_bytes  = (uint64_t)out->total_blocks * out->block_size;
+    out->free_bytes   = (uint64_t)out->free_blocks * out->block_size;
+    strcpy(out->fs_type, "RAMFS");
+    return 0;
 }
 
 static uint64_t klog_vfs_read(vnode* vn, void* buf, uint64_t len, uint64_t offset) {

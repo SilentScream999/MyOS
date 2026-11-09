@@ -20,8 +20,10 @@ wallpaper. The initrd provides RAM recovery when no valid system volume is found
 writing, persistence checks, limitations, and the path toward an installer.
 Use `make run-usb` for QEMU disk boot tests; the ISO is useful for recovery or
 QEMU boot with an attached system disk. `make iso` also refreshes the USB image's boot files and bundled programs while preserving user files/settings.
-In the shell, use `rm /home/FILE.TXT` to delete a closed file and
-`stat /home/FILE.TXT` to display creation and modification times.
+In the shell, use `cd <path>` and `pwd` to navigate directories, `mkdir <path>` and
+`rmdir <path>` to manage folders, `df` to check disk usage, `rm /home/FILE.TXT` to
+delete a closed file, and `stat /home/FILE.TXT` to display creation and modification times.
+Relative paths, `.`, and `..` are supported across all file commands.
 For a clean image on each test, use `make clean && make run FRESH=1`.
 The flag resets saved files; ordinary builds preserve them.
 `run /bin/counter.elf` runs in the foreground: the shell waits for exit and then
@@ -99,9 +101,13 @@ Convention: `rax` = number, arguments in `rdi, rsi, rdx, r10, r8`, result in `ra
 | # | Name | Notes |
 |---|---|---|
 | 0 / 1 / 2 / 3 | `READ` / `WRITE` / `OPEN` / `CLOSE` | fd 0/1 are the TTY; files go through the VFS |
+| 8 | `LSEEK` | file seek offset (SEEK_SET, SEEK_CUR, SEEK_END) |
 | 16 / 17 | `SCROLL` / `TTYRAW` | terminal scrollback, raw input mode |
 | 18 / 19 / 20 | `TTYECHO` / `TTYFLUSH_INPUT` / `TTYTAKE_LAUNCH` | echo controls, discard pending input, shell consumes a Start-menu launch |
 | 4 / 87 | `STAT` / `UNLINK` | file metadata/timestamps and short-name FAT16 file deletion |
+| 79 / 80 | `GETCWD` / `CHDIR` | get and change task current working directory (CWD) |
+| 83 / 84 | `MKDIR` / `RMDIR` | create and delete directories (rmdir requires empty directory) |
+| 137 | `STATFS` | filesystem capacity, used, and free space reporting |
 | 35 / 40 | `SLEEP` / `READDIR` | timed blocking and directory enumeration |
 | 39 / 60 | `GETPID` / `EXIT` | PID and retained exit status; descriptors/windows are cleaned up |
 | 59 / 61 | `SPAWN` / `WAITPID` | VFS ELF launch and wait for one exact child PID |

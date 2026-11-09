@@ -221,6 +221,8 @@ static vnode* fat16_mkdir(vnode*, const char*);
 static int fat16_readdir(vnode*, uint64_t, char*, uint64_t*, VnodeType*);
 static int fat16_unlink(vnode*, const char*);
 static int fat16_stat(vnode*, file_info*);
+static int fat16_rmdir(vnode*, const char*);
+static int fat16_statfs(vnode*, fs_info*);
 static int fat16_open(vnode* vn, file*) {
     storage_guard guard;
     fat16_node* n = (fat16_node*)vn->fs_data;
@@ -235,7 +237,7 @@ static void fat16_close(vnode* vn) {
 static vfs_ops fat16_ops = {
     .read = fat16_read, .write = fat16_write, .open = fat16_open, .close = fat16_close,
     .lookup = fat16_lookup, .create = fat16_create, .mkdir = fat16_mkdir, .readdir = fat16_readdir,
-    .unlink = fat16_unlink, .stat = fat16_stat,
+    .unlink = fat16_unlink, .stat = fat16_stat, .rmdir = fat16_rmdir, .statfs = fat16_statfs,
 };
 static fat16_node* fat_node(fat16_volume* v, uint32_t lba, uint16_t off, const uint8_t* e, bool long_name = false) {
     for (fat16_node* n = v->nodes; n; n = n->next)
@@ -466,6 +468,74 @@ static int fat16_unlink(vnode* dir, const char* name) {
         c = next >= 0xfff8 ? 0 : next;
     }
     return fat_flush(v) ? 0 : -1;
+}
+static int fat16_rmdir(vnode* dir, const char* name) {
+    storage_guard guard;
+    vnode* vn = fat16_lookup(dir, name);
+    if (!vn || vn->type != VnodeType::DIRECTORY) return -1;
+    fat16_node* n = (fat16_node*)vn->fs_data;
+    fat16_volume* v = n->volume;
+    if (n->root || n->deleted || n->open_count || n->long_name) return -1;
+
+    // Check if directory is empty (only '.' and '..' or deleted entries allowed)
+    uint8_t buf[512];
+    uint32_t cached = 0xffffffff;
+    for (uint32_t i = 0; i < v->clusters * v->spc * 16; ++i) {
+        uint32_t lba; uint16_t off;
+        if (!fat_slot(n, i, &lba, &off)) break;
+        if (lba != cached && !fat_read_sector(v, lba, buf)) return -1;
+        cached = lba;
+        const uint8_t* e = buf + off;
+        if (!e[0]) break;
+        if (e[0] == 0xe5) continue;
+        if (e[0] == '.') {
+            if (e[1] == ' ' || (e[1] == '.' && e[2] == ' ')) continue;
+        }
+        return -1; // Directory not empty
+    }
+
+    if (!fat_read_sector(v, n->entry_sector, buf) || (buf[n->entry_offset + 11] & 1)) return -1;
+
+    buf[n->entry_offset] = 0xe5;
+    if (!fat_write_sector(v, n->entry_sector, buf) || !fat_flush(v)) return -1;
+    n->deleted = true;
+
+    uint16_t c = n->cluster;
+    while (c) {
+        uint16_t next;
+        if (!fat_get(v, c, &next) || !fat_set(v, c, 0)) { v->failed = true; return -1; }
+        c = next >= 0xfff8 ? 0 : next;
+    }
+    return fat_flush(v) ? 0 : -1;
+}
+static int fat16_statfs(vnode* vn, fs_info* out) {
+    storage_guard guard;
+    if (!vn || !out) return -1;
+    fat16_node* n = (fat16_node*)vn->fs_data;
+    fat16_volume* v = n->volume;
+    if (v->failed || !v->disk->online) return -1;
+
+    uint8_t sec[512];
+    uint32_t free_clusters = 0;
+    for (uint32_t s = 0; s < v->fat_sectors; ++s) {
+        if (!fat_read_sector(v, v->fat_start + s, sec)) break;
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = s * 256 + i;
+            if (c < 2) continue;
+            if (c >= v->clusters + 2) break;
+            uint16_t val = fat_u16(sec + i * 2);
+            if (val == 0) free_clusters++;
+        }
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->block_size = (uint32_t)v->spc * 512;
+    out->total_blocks = v->clusters;
+    out->free_blocks = free_clusters;
+    out->total_bytes = (uint64_t)v->clusters * out->block_size;
+    out->free_bytes = (uint64_t)free_clusters * out->block_size;
+    strcpy(out->fs_type, "FAT16");
+    return 0;
 }
 static fat16_volume* fat16_probe(block_device* disk) {
     storage_guard guard;

@@ -63,8 +63,13 @@ old `/disk/hello.txt` becomes `/hello.txt`. `FRESH=1` still resets all saved fil
 Missing/invalid/ambiguous volumes select RAM recovery. Root selection happens once;
 unplugging storage never silently redirects saves into RAM.
 
-Next: test on hardware, add capacity/free-space reporting, shell mkdir, truncate,
-seek, rename and directory removal. Replace interrupt-disabled synchronous I/O
+Implemented: capacity/free-space reporting (`df` / `SYS_STATFS`), shell `mkdir`
+(`SYS_MKDIR`), directory removal (`rmdir` / `SYS_RMDIR` requiring empty directories),
+file seeking (`SYS_LSEEK`), per-task CWD tracking (`SYS_GETCWD` / `SYS_CHDIR`),
+relative path resolution (`.`, `..`, and subdirectories across all filesystem syscalls),
+and shell `cd` / `pwd` with a dynamic `wyzar:<cwd>>` prompt.
+
+Next: test on hardware, shell truncate and rename. Replace interrupt-disabled synchronous I/O
 with asynchronous block requests and sleeping locks. Generalize root selection to
 stable boot-volume identity; currently exactly one WYZARDATA-labelled disk is
 required, with `/etc/root.cfg` and `/bin/init.elf` checked before selection.

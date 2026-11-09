@@ -96,7 +96,7 @@ static inline uint64_t rdmsr(uint32_t msr) {
 #define SYS_OPEN    2u
 #define SYS_CLOSE   3u
 #define SYS_STAT    4u
-#define SYS_UNLINK  87u
+#define SYS_LSEEK   8u
 #define SYS_SCROLL  16u
 #define SYS_TTYRAW  17u
 #define SYS_TTYECHO 18u
@@ -108,7 +108,13 @@ static inline uint64_t rdmsr(uint32_t msr) {
 #define SYS_SPAWN   59u
 #define SYS_EXIT    60u
 #define SYS_WAITPID 61u
+#define SYS_GETCWD  79u
+#define SYS_CHDIR   80u
+#define SYS_MKDIR   83u
+#define SYS_RMDIR   84u
+#define SYS_UNLINK  87u
 #define SYS_SHUTDOWN 88u
+#define SYS_STATFS  137u
 #define SYS_REBOOT   169u
 
 #define SYS_WIN_CREATE    200u
@@ -138,13 +144,21 @@ static void copy_string_to_user(uint64_t dest_va, const char* src, uint64_t len)
     }
 }
 
+static bool get_user_path(uint64_t path_va, char* out_path, uint64_t max_len) {
+    if (!path_va || !out_path) return false;
+    char raw[256];
+    copy_string_from_user(raw, path_va, sizeof(raw));
+    const char* cwd = g_current_task ? g_current_task->cwd : "/";
+    return vfs_resolve_path(cwd, raw, out_path, max_len);
+}
+
 // ── sys_open ──────────────────────────────────────────────────────────────────
 
 static uint64_t sys_open(uint64_t path_va, uint64_t flags) {
     if (!g_current_task) return (uint64_t)-1;
     
     char path[256];
-    copy_string_from_user(path, path_va, sizeof(path));
+    if (!get_user_path(path_va, path, sizeof(path))) return (uint64_t)-1;
     
     file* f = (file*)kmalloc(sizeof(file));
     if (!f) return (uint64_t)-1;
@@ -157,6 +171,25 @@ static uint64_t sys_open(uint64_t path_va, uint64_t flags) {
     }
     kfree(f);
     return (uint64_t)-1;
+}
+
+static int64_t sys_lseek(uint64_t fd, int64_t offset, uint64_t whence) {
+    if (!g_current_task || fd >= MAX_FDS) return -1;
+    file* f = g_current_task->fd_table[fd];
+    if (!f || !f->vn) return -1;
+    int64_t new_offset = 0;
+    if (whence == 0) { // SEEK_SET
+        new_offset = offset;
+    } else if (whence == 1) { // SEEK_CUR
+        new_offset = (int64_t)f->offset + offset;
+    } else if (whence == 2) { // SEEK_END
+        new_offset = (int64_t)f->vn->size + offset;
+    } else {
+        return -1;
+    }
+    if (new_offset < 0) return -1;
+    f->offset = (uint64_t)new_offset;
+    return new_offset;
 }
 
 // ── sys_close ─────────────────────────────────────────────────────────────────
@@ -344,7 +377,7 @@ static uint64_t sys_win_poll_event(uint64_t win_id, uint64_t ev_va) {
 
 static uint64_t sys_readdir(uint64_t path_va, uint64_t index, uint64_t name_out_va, uint64_t size_out_va, uint64_t type_out_va) {
     char path[256];
-    copy_string_from_user(path, path_va, sizeof(path));
+    if (!get_user_path(path_va, path, sizeof(path))) return (uint64_t)-1;
     char name[256];
     uint64_t sz = 0;
     VnodeType type = VnodeType::FILE;
@@ -367,18 +400,69 @@ static Task* execve_path(const char* path);
 
 static uint64_t sys_unlink(uint64_t path_va) {
     char path[256];
-    copy_string_from_user(path, path_va, sizeof(path));
+    if (!get_user_path(path_va, path, sizeof(path))) return (uint64_t)-1;
     return (uint64_t)vfs_unlink(path);
 }
 static uint64_t sys_stat(uint64_t path_va, uint64_t info_va) {
     if (!info_va || info_va >= USERSPACE_END || sizeof(file_info) > USERSPACE_END - info_va) return (uint64_t)-1;
     char path[256];
-    copy_string_from_user(path, path_va, sizeof(path));
+    if (!get_user_path(path_va, path, sizeof(path))) return (uint64_t)-1;
     file_info info;
     int result = vfs_stat(path, &info);
     if (result != 0) return (uint64_t)result;
     const uint8_t* src = (const uint8_t*)&info;
     uint8_t* dest = (uint8_t*)info_va;
+    for (uint64_t i = 0; i < sizeof(info); ++i) dest[i] = src[i];
+    return 0;
+}
+
+static uint64_t sys_chdir(uint64_t path_va) {
+    if (!g_current_task) return (uint64_t)-1;
+    char path[256];
+    if (!get_user_path(path_va, path, sizeof(path))) return (uint64_t)-1;
+    vnode* vn = vfs_namei(path);
+    if (!vn || vn->type != VnodeType::DIRECTORY) return (uint64_t)-1;
+    strcpy(g_current_task->cwd, path);
+    return 0;
+}
+
+static uint64_t sys_getcwd(uint64_t buf_va, uint64_t size) {
+    if (!g_current_task || !buf_va || !size || buf_va >= USERSPACE_END) return 0;
+    const char* cwd = g_current_task->cwd[0] ? g_current_task->cwd : "/";
+    uint64_t len = strlen(cwd) + 1;
+    if (size < len || len > USERSPACE_END - buf_va) return 0;
+    copy_string_to_user(buf_va, cwd, len);
+    return buf_va;
+}
+
+static uint64_t sys_mkdir(uint64_t path_va, uint64_t mode) {
+    (void)mode;
+    char path[256];
+    if (!get_user_path(path_va, path, sizeof(path))) return (uint64_t)-1;
+    return (uint64_t)vfs_mkdir(path);
+}
+
+static uint64_t sys_rmdir(uint64_t path_va) {
+    char path[256];
+    if (!get_user_path(path_va, path, sizeof(path))) return (uint64_t)-1;
+    if (strcmp(path, "/") == 0) return (uint64_t)-1;
+    if (g_current_task && strcmp(path, g_current_task->cwd) == 0) return (uint64_t)-1;
+    return (uint64_t)vfs_rmdir(path);
+}
+
+static uint64_t sys_statfs(uint64_t path_va, uint64_t buf_va) {
+    if (!buf_va || buf_va >= USERSPACE_END || sizeof(fs_info) > USERSPACE_END - buf_va) return (uint64_t)-1;
+    char path[256];
+    if (path_va) {
+        if (!get_user_path(path_va, path, sizeof(path))) return (uint64_t)-1;
+    } else {
+        strcpy(path, "/");
+    }
+    fs_info info;
+    int res = vfs_statfs(path, &info);
+    if (res != 0) return (uint64_t)res;
+    const uint8_t* src = (const uint8_t*)&info;
+    uint8_t* dest = (uint8_t*)buf_va;
     for (uint64_t i = 0; i < sizeof(info); ++i) dest[i] = src[i];
     return 0;
 }
@@ -395,7 +479,7 @@ static uint64_t sys_sleep(uint64_t ms) {
 
 static uint64_t sys_spawn(uint64_t path_va) {
     char path[256];
-    copy_string_from_user(path, path_va, sizeof(path));
+    if (!get_user_path(path_va, path, sizeof(path))) return (uint64_t)-1;
     // Guard: prevent spawning a duplicate interactive init shell
     if (strcmp(path, "/bin/init.elf") == 0 || strcmp(path, "init.elf") == 0) {
         print((char*)"[spawn] Refused: cannot spawn duplicate init shell\n");
@@ -404,6 +488,9 @@ static uint64_t sys_spawn(uint64_t path_va) {
     Task* t = execve_path(path);
     if (!t) return (uint64_t)-1;
     t->parent_pid = g_current_task ? g_current_task->pid : 0;
+    if (g_current_task) {
+        strcpy(t->cwd, g_current_task->cwd);
+    }
     if (t->parent_pid == g_terminal_shell_pid) g_terminal_foreground_pid = t->pid;
     scheduler_add_task(t);
     return (uint64_t)t->pid;
@@ -440,6 +527,7 @@ static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uin
         case SYS_OPEN:   return sys_open(a1, a2);
         case SYS_CLOSE:  return sys_close(a1);
         case SYS_STAT:   return sys_stat(a1, a2);
+        case SYS_LSEEK:  return (uint64_t)sys_lseek(a1, (int64_t)a2, a3);
         case SYS_UNLINK: return sys_unlink(a1);
         case SYS_SCROLL: return sys_scroll((int64_t)a1);
         case SYS_TTYRAW: return sys_ttyraw(a1);
@@ -458,6 +546,11 @@ static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uin
             if (pid >= 0 && a2) *(uint64_t*)a2 = code;
             return (uint64_t)pid;
         }
+        case SYS_GETCWD: return sys_getcwd(a1, a2);
+        case SYS_CHDIR:  return sys_chdir(a1);
+        case SYS_MKDIR:  return sys_mkdir(a1, a2);
+        case SYS_RMDIR:  return sys_rmdir(a1);
+        case SYS_STATFS: return sys_statfs(a1, a2);
         case SYS_SHUTDOWN: return sys_shutdown();
         case SYS_REBOOT:   hardware_reset(); return 0;
         

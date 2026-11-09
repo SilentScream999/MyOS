@@ -24,6 +24,11 @@ static inline uint64_t sys_open(const char* path, uint64_t flags) {
 static inline void sys_close(uint64_t fd) {
     __asm__ volatile ("syscall" : : "a"(3), "D"(fd) : "rcx", "r11", "memory");
 }
+static inline int64_t sys_lseek(uint64_t fd, int64_t offset, uint64_t whence) {
+    int64_t result;
+    __asm__ volatile("syscall" : "=a"(result) : "a"(8UL), "D"(fd), "S"(offset), "d"(whence) : "rcx", "r11", "memory");
+    return result;
+}
 static inline int64_t sys_unlink(const char* path) {
     int64_t result;
     __asm__ volatile("syscall" : "=a"(result) : "a"(87UL), "D"(path) : "rcx", "r11", "memory");
@@ -32,6 +37,31 @@ static inline int64_t sys_unlink(const char* path) {
 static inline int64_t sys_stat(const char* path, file_info* info) {
     int64_t result;
     __asm__ volatile("syscall" : "=a"(result) : "a"(4UL), "D"(path), "S"(info) : "rcx", "r11", "memory");
+    return result;
+}
+static inline int64_t sys_getcwd(char* buf, uint64_t size) {
+    int64_t result;
+    __asm__ volatile("syscall" : "=a"(result) : "a"(79UL), "D"(buf), "S"(size) : "rcx", "r11", "memory");
+    return result;
+}
+static inline int64_t sys_chdir(const char* path) {
+    int64_t result;
+    __asm__ volatile("syscall" : "=a"(result) : "a"(80UL), "D"(path) : "rcx", "r11", "memory");
+    return result;
+}
+static inline int64_t sys_mkdir(const char* path, uint64_t mode) {
+    int64_t result;
+    __asm__ volatile("syscall" : "=a"(result) : "a"(83UL), "D"(path), "S"(mode) : "rcx", "r11", "memory");
+    return result;
+}
+static inline int64_t sys_rmdir(const char* path) {
+    int64_t result;
+    __asm__ volatile("syscall" : "=a"(result) : "a"(84UL), "D"(path) : "rcx", "r11", "memory");
+    return result;
+}
+static inline int64_t sys_statfs(const char* path, fs_info* info) {
+    int64_t result;
+    __asm__ volatile("syscall" : "=a"(result) : "a"(137UL), "D"(path), "S"(info) : "rcx", "r11", "memory");
     return result;
 }
 
@@ -171,8 +201,37 @@ void add_history(const char* cmd) {
 
 // Known commands for green highlighting
 static const char* known_commands[] = {
-    "clear", "shutdown", "restart", "bsod", "open bootlog", "ls", "run", "help", "write", "cat", "rm", "stat", 0
+    "clear", "shutdown", "restart", "bsod", "open bootlog", "ls", "run", "help",
+    "write", "cat", "rm", "stat", "cd", "pwd", "mkdir", "rmdir", "df", 0
 };
+
+static char current_dir[256] = "/";
+
+static void update_cwd() {
+    if (!sys_getcwd(current_dir, sizeof(current_dir))) {
+        current_dir[0] = '/';
+        current_dir[1] = '\0';
+    }
+}
+
+static void print_size_mb(uint64_t bytes) {
+    if (bytes >= 1024 * 1024 * 1024) {
+        uint64_t gb = bytes / (1024 * 1024 * 1024);
+        print_dec(gb);
+        print("G");
+    } else if (bytes >= 1024 * 1024) {
+        uint64_t mb = bytes / (1024 * 1024);
+        print_dec(mb);
+        print("M");
+    } else if (bytes >= 1024) {
+        uint64_t kb = bytes / 1024;
+        print_dec(kb);
+        print("K");
+    } else {
+        print_dec(bytes);
+        print("B");
+    }
+}
 
 static int is_known_command(const char* buf, int len) {
     if (len == 0) return 0;
@@ -198,10 +257,12 @@ static int is_known_command(const char* buf, int len) {
 // Redraw the current input line in-place with color feedback
 static void redraw_line(const char* buf, int len) {
     if (is_known_command(buf, len)) {
-        print("\r\x1b[32mwyzar> ");   // green
+        print("\r\x1b[32mwyzar:");   // green
     } else {
-        print("\r\x1b[0mwyzar> ");    // default white
+        print("\r\x1b[0mwyzar:");    // default white
     }
+    print(current_dir);
+    print("> \x1b[0m");
     sys_write(1, buf, len);
     // Erase any leftover characters to the right
     print("\x1b[K");
@@ -220,9 +281,12 @@ void _start() {
     int pos = 0;
 
     while(1) {
+        update_cwd();
         sys_ttyecho(1);
         sys_ttyraw(1);          // Enter raw/interactive mode BEFORE the prompt
-        print("\nwyzar> ");     // tty_raw_mode=1 -> cursor appears here
+        print("\nwyzar:");
+        print(current_dir);
+        print("> ");     // tty_raw_mode=1 -> cursor appears here
         pos = 0;
         history_index = -1;
 
@@ -235,7 +299,7 @@ void _start() {
                 if (sys_take_launch(buf + 4, sizeof(buf) - 4) <= 0) continue;
                 pos = strlen(buf);
                 sys_ttyraw(0);
-                print("\r\x1b[2Kwyzar> "); print(buf); print("\n");
+                print("\r\x1b[2Kwyzar:"); print(current_dir); print("> "); print(buf); print("\n");
                 break;
             }
 
@@ -290,7 +354,12 @@ void _start() {
 
         if (streq(buf, "help", 4) && (buf[4] == ' ' || buf[4] == '\0')) {
             print("Available commands:\n");
-            print("  ls [path]       - List directory contents (default '/')\n");
+            print("  cd [path]       - Change directory (default '/')\n");
+            print("  pwd             - Print current working directory\n");
+            print("  ls [path]       - List directory contents (default '.')\n");
+            print("  mkdir <path>    - Create a new directory\n");
+            print("  rmdir <path>    - Remove an empty directory\n");
+            print("  df              - Show filesystem disk space usage\n");
             print("  write <path> <text> - Create/write a file; disk root is persistent\n");
             print("  cat <path>      - Read a file\n");
             print("  rm <path>       - Delete a closed file\n");
@@ -301,6 +370,62 @@ void _start() {
             print("  bsod            - Trigger crash screen\n");
             print("  restart         - Reboot system\n");
             print("  shutdown        - Power off system\n");
+        } else if (streq(buf, "cd", 2) && (buf[2] == ' ' || buf[2] == '\0')) {
+            const char* target = "/";
+            if (buf[2] == ' ') {
+                int idx = 2;
+                while (buf[idx] == ' ') idx++;
+                if (buf[idx] != '\0' && !streq(&buf[idx], "~", 1)) target = &buf[idx];
+            }
+            if (sys_chdir(target) == 0) {
+                update_cwd();
+            } else {
+                print("cd: no such directory: "); print(target); print("\n");
+            }
+        } else if (streq(buf, "pwd", 3) && (buf[3] == ' ' || buf[3] == '\0')) {
+            update_cwd();
+            print(current_dir); print("\n");
+        } else if (streq(buf, "mkdir", 5) && buf[5] == ' ') {
+            int idx = 5;
+            while (buf[idx] == ' ') idx++;
+            if (buf[idx] == '\0') {
+                print("Usage: mkdir <path>\n");
+            } else if (sys_mkdir(&buf[idx], 0755) == 0) {
+                print("Directory created.\n");
+            } else {
+                print("Cannot create directory. Check path, storage, or duplicate name.\n");
+            }
+        } else if (streq(buf, "rmdir", 5) && buf[5] == ' ') {
+            int idx = 5;
+            while (buf[idx] == ' ') idx++;
+            if (buf[idx] == '\0') {
+                print("Usage: rmdir <path>\n");
+            } else if (sys_rmdir(&buf[idx]) == 0) {
+                print("Directory removed.\n");
+            } else {
+                print("Cannot remove directory. Ensure directory exists and is empty.\n");
+            }
+        } else if (streq(buf, "df", 2) && (buf[2] == ' ' || buf[2] == '\0')) {
+            fs_info st;
+            if (sys_statfs("/", &st) == 0) {
+                print("Filesystem     Type    Size    Used    Free   Use% Mounted on\n");
+                print("/dev/root      ");
+                print(st.fs_type);
+                int pad = 8 - strlen(st.fs_type);
+                while (pad-- > 0) print(" ");
+                print_size_mb(st.total_bytes);
+                print("    ");
+                uint64_t used = st.total_bytes >= st.free_bytes ? st.total_bytes - st.free_bytes : 0;
+                print_size_mb(used);
+                print("    ");
+                print_size_mb(st.free_bytes);
+                print("   ");
+                uint64_t pct = st.total_bytes ? (used * 100) / st.total_bytes : 0;
+                print_dec(pct);
+                print("%   /\n");
+            } else {
+                print("df: failed to get filesystem statistics\n");
+            }
         } else if (streq(buf, "rm", 2) && buf[2] == ' ') {
             int idx = 3; while (buf[idx] == ' ') idx++;
             if (sys_unlink(&buf[idx]) == 0) print("File deleted.\n");
@@ -341,7 +466,7 @@ void _start() {
             while ((bytes = sys_read(fd, data, sizeof(data))) > 0 && bytes <= sizeof(data)) sys_write(1, data, bytes);
             sys_close(fd); print("\n");
         } else if (streq(buf, "ls", 2) && (buf[2] == ' ' || buf[2] == '\0')) {
-            const char* path = "/";
+            const char* path = ".";
             if (buf[2] == ' ') {
                 int idx = 2;
                 while (buf[idx] == ' ') idx++;

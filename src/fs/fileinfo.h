@@ -13,4 +13,13 @@ typedef struct file_info {
     file_datetime created;
     file_datetime modified;
 } file_info;
+
+typedef struct fs_info {
+    uint64_t total_bytes;
+    uint64_t free_bytes;
+    uint32_t block_size;
+    uint32_t total_blocks;
+    uint32_t free_blocks;
+    char     fs_type[16];
+} fs_info;
 #endif

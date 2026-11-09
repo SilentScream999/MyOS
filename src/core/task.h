@@ -69,6 +69,8 @@ struct Task {
     bool      yielded;     // true if task voluntarily called yield()
     uint8_t   _pad[2];
 
+    char      cwd[256];    // Current working directory (always canonical absolute)
+
     // ── Saved CPU context ─────────────────────────────────────────────────────
     // After a context switch OUT, the stack contains (from high to low):
     //   [return address / entry point]
@@ -126,6 +128,8 @@ static Task* task_alloc() {
 
     t->pid   = g_next_pid++;
     t->state = TaskState::READY;
+    t->cwd[0] = '/';
+    t->cwd[1] = '\0';
     for (int i = 0; i < MAX_FDS; i++) {
         t->fd_table[i] = nullptr;
     }

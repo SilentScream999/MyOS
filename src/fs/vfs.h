@@ -10,7 +10,9 @@
 // ──────────────────────────────────────────────────────────────────────────────
 
 #include <stdint.h>
+#ifndef STORAGE_HOST_TEST
 #include "helpers.h"
+#endif
 #include "fileinfo.h"
 
 struct vnode;
@@ -50,6 +52,8 @@ struct vfs_ops {
     int (*readdir)(vnode* dir, uint64_t index, char* name_out, uint64_t* size_out, VnodeType* type_out);
     int (*unlink)(vnode* dir, const char* name);
     int (*stat)(vnode* vn, file_info* info);
+    int (*rmdir)(vnode* dir, const char* name);
+    int (*statfs)(vnode* vn, fs_info* out);
 };
 
 // VNODE: A node in the VFS tree (represents a file or directory inode)
@@ -112,10 +116,85 @@ static const char* vfs_next_component(const char* path, char* comp) {
     return path;
 }
 
+static bool vfs_resolve_path(const char* cwd, const char* in_path, char* out_path, uint64_t max_len) {
+    if (!out_path || max_len < 2) return false;
+    const char* c = (cwd && cwd[0] == '/') ? cwd : "/";
+    if (!in_path || in_path[0] == '\0') {
+        uint64_t clen = strlen(c);
+        if (clen >= max_len) return false;
+        strcpy(out_path, c);
+        return true;
+    }
+
+    char temp[512];
+    uint64_t tlen = 0;
+
+    if (in_path[0] != '/') {
+        while (*c && tlen + 1 < sizeof(temp)) {
+            temp[tlen++] = *c++;
+        }
+        if (tlen > 0 && temp[tlen - 1] != '/' && tlen + 1 < sizeof(temp)) {
+            temp[tlen++] = '/';
+        }
+    }
+    const char* p = in_path;
+    while (*p && tlen + 1 < sizeof(temp)) {
+        temp[tlen++] = *p++;
+    }
+    temp[tlen] = '\0';
+
+    out_path[0] = '/';
+    out_path[1] = '\0';
+    uint64_t out_len = 1;
+
+    const char* src = temp;
+    while (*src) {
+        while (*src == '/') src++;
+        if (!*src) break;
+
+        char comp[256];
+        uint64_t clen = 0;
+        while (*src && *src != '/' && clen + 1 < sizeof(comp)) {
+            comp[clen++] = *src++;
+        }
+        comp[clen] = '\0';
+
+        if (strcmp(comp, ".") == 0) {
+            continue;
+        } else if (strcmp(comp, "..") == 0) {
+            if (out_len > 1) {
+                while (out_len > 1 && out_path[out_len - 1] != '/') {
+                    out_len--;
+                }
+                if (out_len > 1) {
+                    out_len--;
+                }
+                out_path[out_len] = '\0';
+            }
+        } else {
+            if (out_len > 1) {
+                if (out_len + 1 >= max_len) return false;
+                out_path[out_len++] = '/';
+            }
+            for (uint64_t i = 0; i < clen; i++) {
+                if (out_len + 1 >= max_len) return false;
+                out_path[out_len++] = comp[i];
+            }
+            out_path[out_len] = '\0';
+        }
+    }
+    return true;
+}
+
 // Walk with a namespace parent stack: '..' crosses a mount back to its parent.
 // Filesystem-specific '..' entries must never escape or bypass a VFS mount.
 static vnode* vfs_walk(const char* path, char* final_name = nullptr, bool create_dirs = false) {
-    if (!vfs_root || !path || *path != '/') return nullptr;
+    if (!vfs_root || !path) return nullptr;
+    char resolved[256];
+    if (*path != '/') {
+        if (!vfs_resolve_path("/", path, resolved, sizeof(resolved))) return nullptr;
+        path = resolved;
+    }
     vnode* parents[128];
     unsigned depth = 0;
     vnode* current = vfs_root;
@@ -281,6 +360,23 @@ static int vfs_unlink(const char* path) {
 }
 static int vfs_stat(const char* path, file_info* info) {
     return vfs_stat_node(vfs_namei(path), info);
+}
+
+static int vfs_rmdir(const char* path) {
+    char name[256];
+    vnode* parent = vfs_namei_parent(path, name);
+    if (!parent || !name[0] || !parent->ops || !parent->ops->rmdir) return -1;
+    vnode* covered = parent->ops->lookup ? parent->ops->lookup(parent, name) : nullptr;
+    if (covered && vfs_follow_mount(covered) != covered) return -1;
+    return parent->ops->rmdir(parent, name);
+}
+
+static int vfs_statfs(const char* path, fs_info* out) {
+    if (!out) return -1;
+    vnode* vn = (path && path[0]) ? vfs_namei(path) : vfs_root;
+    if (!vn && vfs_root) vn = vfs_root;
+    if (!vn || !vn->ops || !vn->ops->statfs) return -1;
+    return vn->ops->statfs(vn, out);
 }
 
 #endif // VFS_H
