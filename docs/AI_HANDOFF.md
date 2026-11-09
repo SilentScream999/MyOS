@@ -1,7 +1,7 @@
 # Project handoff
 
 Current status, conventions, known issues and next steps, written so that anyone picking the project up cold (a new contributor, or an
-AI assistant given this file as context) can get productive without the history. *Last updated: 2026-11-07 (RTC clock, persistent USB storage, foreground/menu execution and Ctrl+C integrated).*
+AI assistant given this file as context) can get productive without the history. *Last updated: 2026-11-08 (persistent storage, UI typography, reset-storm fixes and port-local root USB hotplug).*
 Read this, then `docs/GPU_DESKTOP_ROADMAP.md` and `docs/APP_LOADING.md`.
 The shared near-term plan is [NEXT_STEPS.md](NEXT_STEPS.md): hardware verification,
 runtime timezones, expanded disk operations and installation. Disk-backed root,
@@ -23,6 +23,194 @@ Practical constraints that shape the work:
 
 ## 2. Current state
 
+* **Asynchronous background hub monitoring (2026-11-08):** replaced busy-waiting
+  runtime GET_STATUS/CLEAR_FEATURE with `usb_hub_async.h`. One persistent request
+  and DMA page per hub, handled through the normal event dispatcher; no completion
+  polling loop or interrupt-disabled wait. Input retains its 8 ms cadence and
+  sleeps normally between passes. Matching includes controller/slot/DCI/exact TRB;
+  copied results avoid borrowed event lifetimes. Change acknowledgments complete
+  before rearming the interrupt pipe; notifications during a scan remain pending.
+  Timeout (250 ms), transfer error or short status read disables only the affected
+  hub monitor until reconnection, preserving its children/disks and DMA buffers.
+  Reusing a timed-out/stalled EP0 without recovery is deliberately avoided.
+  Cold/hotplug enumeration remains bounded and synchronous. The production state
+  machine passes sanitizer tests and one/two-hub hotplug with the nested notification
+  pipe disabled; idle request budgets remain low. A missing-completion QEMU fixture
+  verifies timer/mouse progress during the wait, a persisted disk write below the
+  affected hub, and a healthy upstream monitor. Existing enumeration command/control
+  fault tests, held-button drag, G502 HERO and combo-pointer tests also pass.
+  ISO/USB images rebuilt. User confirms physical CPU usage returned to 5% and
+  plugging in a new device feels instant. The upcoming commit should cover the
+  full pending USB/HID batch, including the earlier fixes that were never pushed.
+
+* **Root scan cadence restored (2026-11-08):** user confirms hub polling reduction
+  brought reported CPU usage from 17% to 7%, but the subsequent 50 ms root-port
+  scan experiment made no measurable difference. Restored root scans to the input
+  task's 8 ms cadence and removed the experimental deadline/counter. The efficient
+  rotating hub audit remains. User observes CPU usage grows with more hubs;
+  at that stage hub audits issued synchronous EP0 transactions whose loops spun
+  with interrupts disabled. These added per-hub active CPU time, unlike root MMIO
+  reads. This explains a plausible scaling mechanism; remaining physical CPU cost
+  has not been profiled. Further reduction should address asynchronous control
+  completion/validated notification reliability, rather than just slowing root
+  scans or discarding the fallback needed for USB-C accessory replacement.
+
+* **Hub polling CPU regression (2026-11-08):** physical combo pointer and USB-C
+  accessory replacement now work; user reports idle CPU increased from 5% to 17%.
+  Previous fallback read hub status and every downstream port four times a second.
+  `usb_hub_poll_policy.h` now services interrupt-indicated ports immediately and
+  audits one rotating port every 250 ms, with hub status once per sweep. Eight-port
+  idle budget drops from 36 to 4.5 GET_STATUS requests/second. Active debounce stays
+  at 50 ms. Background request errors now follow the asynchronous monitor failure
+  policy above. Deadlines start at request completion, avoiding back-to-back scans when
+  USB is slow. Missing-notification detection can take one full port sweep plus
+  debounce; normal notification-driven hotplug remains immediate. Policy tests
+  cover traffic budgets/debounce/retries, and QEMU tests measure actual idle
+  traffic and check hotplug with interrupt rearming disabled. QEMU measured 10
+  GET_STATUS requests in three seconds with one hub and 24 with two hubs (previous
+  full-scan budgets: 108 and 216). Physical CPU usage
+  needs retesting; request reduction is not a measured CPU percentage.
+
+* **Combo pointer regression and downstream hotplug (2026-11-08):** user reports
+  the older wireless keyboard/trackpad combo only moves vertically after the
+  G502 changes, although its keyboard works; replacing an accessory through the
+  USB-C hub produces no log/new device, while USB-A works. `hid_pointer_setup.h`
+  now uses report descriptors/report protocol for all relative pointer interfaces,
+  including numbered 8-bit mouse reports on combo receivers. Keyboard boot input
+  remains separate; non-pointer auxiliary reports are ignored. The G502 wrapper
+  shares the same setup, retaining device recognition. A fixture reproduces the
+  combo's ID/buttons/X/Y shift and checks both axes, alongside G502 tests.
+  Hub accessory changes now use `usb_hub_reconcile`, selecting only that child
+  branch by recorded `parent_hub` links. Only that branch's slots/input lists are
+  replaced, preserving siblings and their mounted disks. Hub change flags are
+  latched before acknowledgment so rapid swaps are not lost. Rotating port audits
+  every 250 ms provide a fallback when the interrupt pipe misses notifications; active
+  debounce polls every 50 ms. Normal and coalesced swaps through one/two emulated
+  hubs retain the sibling boot disk and mouse. The nested test also disables
+  interrupt rearming to exercise fallback detection. User confirms the physical
+  combo/USB-C fixes work. Native SuperSpeed downstream hub enumeration is still not
+  implemented; USB 2 companion handling benefits from these fixes.
+
+* **USB-C hub freeze containment (2026-11-08):** user reports USB-C connecting
+  an empty hub or the same hub with attached devices freezes the OS. Confirmed
+  defects: four hub-child command waits had no timeout under disabled interrupts;
+  failed status reads were retried up to 25/100 times per port; controller
+  halt/reset/ready/run waits and restart retries were unbounded. Legacy handoff
+  also followed relative Next offsets as absolute offsets and wrote FFFFFFFF to
+  USBLEGCTLSTS, re-enabling firmware SMI sources. `xhci_legacy.h` now bounds the
+  capability walk, uses relative offsets and disables SMI enables while clearing
+  the documented event bits. `usb_probe_budget.h` gives nested hub/HID probes a
+  shared 3-second deadline and controller-register waits 1 second. BOT's existing
+  bounded cold-media allowance is excluded from that budget. Command waits are
+  bounded and checked before response dereferences; failed port status ends that
+  polling attempt. A failed hub is removed with a separate one-second best-effort
+  slot cleanup so its timed-out control pipe is not left running. Failed controller initialization is parked instead of retried
+  forever. Main/startup event draining is bounded, preventing a port-event storm
+  from monopolizing dispatch. SuperSpeed downstream hub enumeration is explicitly
+  rejected before USB 2 descriptor/status requests; the separate USB 2 companion
+  path remains available. This contains failure, not full SuperSpeed hub support.
+  Host sanitizer checks cover shared deadlines, media allowance, stuck/missing
+  registers, relative capability chains and SMI masks. A QEMU fixture deliberately
+  hides command/control completions while hotplugging a hub, then checks recovery
+  of scheduler ticks, the original mouse, keyboard and mounted-disk writes.
+  User confirmed the USB-C freeze is fixed. The remaining accessory-replacement
+  issue is handled by the newer local hotplug work above, pending physical retest.
+
+* **Logitech G502 HERO input (2026-11-08):** user confirms front-panel instant
+  swaps now work. Requested G502 HERO support because pressing mouse buttons
+  broke vertical movement and made window drags repeatedly release/re-grab.
+  Confirmed causes: the composite-device heuristic skipped byte 0 when a boot
+  mouse's button mask was 1 or 2; every non-keyboard HID interface was also
+  treated as a mouse, including the HERO's keyboard/consumer/HID++ interface.
+  `src/drivers/logitech_g502.h` identifies wired HERO `046d:c08b`, retrieves each
+  interface's advertised HID report descriptor, selects report protocol on its
+  pointer interface, and ignores non-pointer traffic. The bounded parser in
+  `hid_mouse_report.h` handles report IDs, button usages 1–8, signed relative
+  axes up to 32 bits (saturated to GUI int16), vertical wheel, padding, global
+  push/pop, collections and packet-length validation. Unknown/truncated reports
+  do not release buttons. Actual xHCI residual length bounds input decoding.
+  Boot mice no longer use button values as a Report ID hint. SET_PROTOCOL and
+  SET_IDLE use the actual interface number rather than the interface-array index.
+  ASan/UBSan tests cover all 256 button masks, 1000 held-drag frames, split/numbered
+  reports, truncation, descriptor bounds and G502 control/setup error handling.
+  QEMU checks ordinary mouse axes/dragging and instant replacement with a disk.
+  Physical G502 verification remains required. This is pointer input support;
+  DPI/RGB/HID++ configuration, horizontal scroll and auxiliary keyboard/macro
+  reports are not implemented, and onboard settings are left unchanged.
+
+* **Front mouse/boot-drive interaction (2026-11-08):** user reports the other
+  front connector's mouse barely moves, then the mouse itself flashes "no
+  signal"; unplugging the boot drive immediately fixes it. No new USB log
+  messages appear. User confirmed this is a wireless mouse with USB receiver.
+  User subsequently confirmed a wired mouse works and moving the wireless mouse
+  close to the receiver restores its signal. This supports USB 3 / 2.4 GHz radio
+  interference as a separate issue. Test with the drive attached and receiver on a USB
+  extension away from the drive/front-panel connectors. Intel reference:
+  https://www.usb.org/sites/default/files/327216.pdf . No additional driver patch
+  was retained for this report. Separately noticed during inspection: responses
+  hold pointers into recycled USB event storage, and the existing HID error
+  logging is nested inside success handling; these merit focused future work,
+  but are not established causes of the mouse's radio-link loss.
+
+* **Root-port hotplug (2026-11-08):** after the reset-loop fix, user confirms
+  `ls`/disk access works on B850 but attaching a keyboard at the front panel
+  (two USB-A connectors and one USB-C) is not detected. Root enumeration is now
+  shared by startup and runtime in `src/drivers/usb_root_ports.h`. A stable
+  150 ms connection change attaches/removes only the affected root port, without
+  resetting xHCI, offlining disks on other ports, or replacing their HID queues.
+  Devices behind a hub inherit the real upstream root port for subtree removal.
+  Command waits match the current command TRB and preserve unrelated events.
+  Each configured HID interface is armed once, composite devices register once
+  per input type, and stale completions are checked against the active ring.
+  Root reset waits up to 500 ms for PR clear and PED set; if readiness arrives
+  later, a separate unbound-port watch attempts enumeration locally once. Failed
+  enumeration does not globally reset the controller. HID periodic endpoints
+  now use descriptor intervals and Max ESIT Payload. Input/disk tests cover five
+  same-controller keyboard cycles and an emulated missed reset completion.
+  Nested-hub disk cold boots and multi-controller isolation also pass. The
+  actual B850 front panel still needs retesting. Downstream hub-child topology
+  changes are now handled locally as described above; disk reconnect does not rebind old
+  mounts. Removed DMA/device allocations remain retained for late-event safety.
+  **Replacement follow-up:** user reports no new logs and a replacement mouse
+  not lighting after unplugging another front device. A confirmed detector gap
+  cleared CSC before checking final CCS, missing connected/disconnected/connected
+  sequences between samples. PSC dispatch and software polling now both latch
+  CSC evidence before acknowledgment. A previously connected port with latched
+  change and stable connected status is locally detached/re-enumerated after
+  150 ms, even if the sampler never observed it empty. The new diagnostic is
+  `[usb] Root device replacement; port:`. Unit checks and QEMU rapid mouse swaps
+  cover this sequence; a separate delayed replacement leaves the port empty for
+  five seconds. User confirmed instant swaps now work on the B850 front panel.
+
+* **Front-panel/root-port reset storms (2026-11-08):** user reports B850 front
+  ports repeatedly restarting xHCI, losing disk and eventually HID; rear ports
+  work. Confirmed code defects: every PSC event (including reset/link changes)
+  triggered a full controller reset; software CCS detection had no debounce and
+  covered only 32 ports; restarting one controller requeued already-armed HID/hub
+  endpoints on other controllers. PSC now acknowledges PORTSC change flags using
+  neutral writes (no PED/PR/WPR/LWS echo). Per-port CCS sampling covers every
+  root port, requiring 150 ms of stable connection change. Only new input pipes
+  are armed, and startup draining only touches reset controllers. EP0 descriptor decoding also now
+  correctly translates SuperSpeed's exponent 9 into 512 bytes, validates USB 2
+  sizes, and root resets allow 10 ms recovery. The B850 user confirmed the next
+  build restored stable disk access. Root hotplug is now port-local as described
+  above, including downstream child recovery. Local checks:
+  `tests/xhci_port_state_test.cpp` (ASan/UBSan), hub cold boots
+  and `tests/qemu_controller_hotplug_test.py` for cross-controller isolation.
+  **Follow-up:** first physical test still looped at 449–503 ms. User's photo
+  shows stable-root-change port 18 with PORTSC `0x603`, then reset timeouts on
+  root ports 17/18 and eventually an unavailable disk. Counting PED in the
+  connection signature was incorrect: late reset enablement can trigger the
+  next reset indefinitely. The watch now ignores PED completely; late enable
+  and disabled-state transitions are regression-tested. Independently, hub status notifications now read/
+  clear latched hub/port changes before rearming, debounce actual connection
+  changes, use complete port bitmaps and correct xHCI interrupt intervals, and
+  isolate interrupt-pipe errors rather than resetting the whole controller.
+  Synchronous control requests match slot/DCI/TRB and preserve unrelated events;
+  startup event draining happens before arming the hub pipe. The notification
+  regression exercises transient hub bounces with surviving disk writes and
+  lasting hub insert/removal. SuperSpeed hub descriptors remain unsupported.
+
 * **Hub-attached storage (2026-11-07):** reproduced a disk reaching SCSI ready
   and then being disabled by hub-child cleanup, which recognized only hubs/HID.
   The cleanup predicate now preserves registered storage devices, matching the
@@ -32,9 +220,9 @@ Practical constraints that shape the work:
   10 ms interval. `tests/qemu_hub_storage_test.py` boots the USB image through
   one/two emulated USB 2.0-class hubs, checks wallpaper loading and its full byte
   hash, and verifies writes after a cold reboot. This does not establish support
-  for SuperSpeed hub descriptors/enumeration; the physical hub type is pending
-  user clarification. Normal `wyzar-usb.img` was in use, so the updated alternative
-  image is `wyzar-usb-close.img`; future normal builds include these source fixes.
+  for SuperSpeed hub descriptors/enumeration. User confirmed the physical hub is
+  USB 3.x and the fix worked; it may be using the USB 2 companion path. Normal
+  `wyzar-usb.img` and `wyzar.iso` were rebuilt on 2026-11-08 with these fixes.
 
 * **Desktop typography (2026-11-07):** window titles, Start/menu/task buttons and
   the tray clock now use antialiased Selawik, Microsoft's open-source Segoe UI

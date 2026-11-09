@@ -138,6 +138,7 @@ struct XHCIController {
 
     volatile bool*      portfailed;
     bool                needsResetting;
+    bool                unavailable;
     
     struct Ring         cr;
     uint32_t            global_port_index;
@@ -145,9 +146,6 @@ struct XHCIController {
     // Hardware base addressing tracking
     uint64_t            virt_base;
     uint8_t             bus, dev, fn;
-
-    // Software hotplug tracking
-    uint32_t            last_ccs;
 };
 
 struct InputControlCtx {
@@ -164,6 +162,7 @@ struct USBSetupPacket {
 	uint16_t wLength;
 } __attribute__((packed));
 
+struct HIDMouseLayout;
 struct HIDInterface {
 	uint8_t  ep_num;
 	uint16_t mps;
@@ -171,13 +170,21 @@ struct HIDInterface {
 	uint8_t  type;     // 1=kbd, 2=mouse
 	uint8_t  protocol; // 1=boot kbd, 2=boot mouse, 0=none/report
 	uint8_t  iface_num;
+	uint8_t  interval;
+	uint16_t report_descriptor_length;
+	HIDMouseLayout* mouse_layout;
+	uint8_t held_buttons;
+	bool boot_capable;
+	bool configured;
+	bool armed;
 };
 
 struct USBDevice {
 	uint8_t slot_id;
 	uint8_t port_num;     // port number on *parent* hub/root (1-based)
-	uint8_t root_port_num;   // 1-based root port this device is on; 0 if behind a hub
+	uint8_t root_port_num;   // 1-based upstream root port, also inherited by hub children
 	uint32_t speed;
+	uint16_t vendor_id, product_id;
 	struct Ring* ep0_ring;
 	struct Ring* hub_ring;
 	
@@ -190,6 +197,7 @@ struct USBDevice {
 	uint64_t ep0_ring_phys;
 	uint64_t dev_ctx_phys;
 	struct XHCIController* hc;
+	USBDevice* parent_hub;
 };
 
 struct USB_Response {

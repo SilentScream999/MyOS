@@ -879,6 +879,7 @@ extern "C" void kmain(void) {
 	// and re-enter the main loop.
 	restart:
 	uint64_t usb_scan_started = _usb_rdtsc();
+	bool usb_restarted[MAX_CONTROLLERS] = {};
 	// Serialize controller resets against synchronous filesystem I/O. Existing
 	// mounted disks are offlined by setupUSB; never rebind an open vnode.
 	__asm__ volatile("cli" ::: "memory");
@@ -888,16 +889,16 @@ extern "C" void kmain(void) {
         }
     }
     
-	bool any_reset = true;
-	while (any_reset) {
-        any_reset = false;
         for (int c = 0; c < xhci_count; c++) {
-            if (xhci_hc[c].needsResetting) {
+            if (xhci_hc[c].needsResetting && !xhci_hc[c].unavailable) {
+                usb_restarted[c] = true;
                 setupUSB(&xhci_hc[c]);
-                if (xhci_hc[c].needsResetting) any_reset = true;
+                if (xhci_hc[c].needsResetting) {
+                    print((char*)"[usb] Controller initialization failed; continuing with other controllers.");
+                    xhci_hc[c].unavailable = true;
+                }
             }
         }
-    }
 
     to_str((_usb_rdtsc() - usb_scan_started) / (_usb_tsc_hz() / 1000), str);
     print((char*)"[boot] USB discovery milliseconds:"); print(str);
@@ -952,6 +953,18 @@ extern "C" void kmain(void) {
         boot_loading_screen_until_ready();
     }
 
+	// Discard enumeration leftovers before arming ANY new input/status pipe.
+	// Unchanged controllers keep both their event queues and armed transfers.
+	for (int c = 0; c < xhci_count; ++c) {
+		if (!usb_restarted[c]) continue;
+		USB_Response stale;
+		if (xhci_hc[c].unavailable) continue;
+		for (uint32_t drained = 0; drained < ER_RING_SIZE * 2; ++drained) {
+			stale = get_usb_response(&xhci_hc[c], 1);
+			if (!stale.gotresponse) break;
+		}
+	}
+
 	// ── Queue hub status-change TRBs BEFORE the keyboard_count == 0 check ───
 	//
 	// CRITICAL ORDER: hub TRBs must be queued here, before the empty-keyboard
@@ -971,24 +984,9 @@ extern "C" void kmain(void) {
 	//   - No hub at all → hub_count == 0, loop body never runs, no cost.
 	for (int h = 0; h < hub_count; h++) {
 		USBDevice* hd = hubs[h];
+		if (hub_watch[h].armed || !hub_watch[h].ready || hub_watch[h].pipe_failed) continue;
 
-		volatile uint8_t* buf = (volatile uint8_t*)alloc_table();
-		for (int j = 0; j < 4096; j++) buf[j] = 0;
-		uint64_t buf_phys = (uint64_t)buf - HHDM;
-
-		volatile TRB* trb = &hd->hub_ring->trb[hd->hub_ring->enq];
-		trb->parameter = buf_phys;
-		trb->status    = 1;   // 1 byte status-change bitmap (covers up to 7 ports)
-		trb->control   = (1u << 10) | (1u << 5) | (hd->hub_ring->pcs & 1u);
-
-		if (++hd->hub_ring->enq == LINK_INDEX) {
-			hd->hub_ring->trb[LINK_INDEX].control =
-				(TRB_TYPE_LINK << 10) | (1u << 1) | (hd->hub_ring->pcs & 1u);
-			hd->hub_ring->enq = 0;
-			hd->hub_ring->pcs ^= 1;
-		}
-
-		hd->hc->doorbell32[hd->slot_id] = hub_dcis[h];
+		hub_queue_status(h);
 		print((char*)"Queued status-change TRB for hub slot:");
 		to_str(hd->slot_id, str); print(str);
 	}
@@ -1075,25 +1073,11 @@ extern "C" void kmain(void) {
 
 	print((char*)"About to enter main loop");
 
-	// ── Drain stale events accumulated during enumeration ────────────────────
-	// Non-keyboard devices (e.g. a USB boot drive) may have left pending
-	// Transfer Events in the ring from their EP0 descriptor reads, or from
-	// being left in a confused state after UEFI used them.  Consume and discard
-	// everything now so the main loop starts with a clean event ring.
-	// We do this BEFORE queueing keyboard TRBs so we can't accidentally
-	// discard a real event.
-	{
-        for (int c = 0; c < xhci_count; c++) {
-		    USB_Response stale;
-		    do { stale = get_usb_response(&xhci_hc[c], 1); } while (stale.gotresponse);
-		}
-	}
-
 	for (int k = 0; k < keyboard_count; k++) {
 		USBDevice* kd = keyboards[k];
 		for (int i = 0; i < kd->interface_count; i++) {
 			HIDInterface* hi = &kd->interfaces[i];
-			if (hi->type != 1) continue;
+			if (hi->type != 1 || hi->armed || !hi->configured) continue;
 
 			volatile uint8_t* buf = (volatile uint8_t*)alloc_table();
 			for (int j = 0; j < 4096; j++) buf[j] = 0;
@@ -1112,6 +1096,7 @@ extern "C" void kmain(void) {
 			}
 
 			uint8_t kbd_dci = hi->ep_num * 2 + 1;
+			hi->armed = true;
 			kd->hc->doorbell32[kd->slot_id] = kbd_dci;
 		}
 	}
@@ -1121,7 +1106,7 @@ extern "C" void kmain(void) {
 		USBDevice* md = mice[m];
 		for (int i = 0; i < md->interface_count; i++) {
 			HIDInterface* hi = &md->interfaces[i];
-			if (hi->type != 2) continue;
+			if (hi->type != 2 || hi->armed || !hi->configured) continue;
 
 			volatile uint8_t* buf = (volatile uint8_t*)alloc_table();
 			for (int j = 0; j < 4096; j++) buf[j] = 0;
@@ -1140,6 +1125,7 @@ extern "C" void kmain(void) {
 			}
 
 			uint8_t mouse_dci = hi->ep_num * 2 + 1;
+			hi->armed = true;
 			md->hc->doorbell32[md->slot_id] = mouse_dci;
 		}
 	}
@@ -1167,8 +1153,9 @@ extern "C" void kmain(void) {
 	while (true) {
 		event_count = 0;
 
-		// ── Drain ALL pending USB events to handle 1000Hz HID traffic ─────────
-		while (true) {
+		// Bound each batch so a noisy port cannot starve hotplug, input repeat
+		// and desktop work indefinitely. Process every controller each round.
+		while (event_count < ER_RING_SIZE) {
             bool any_resp = false;
             for (int ctrl_idx = 0; ctrl_idx < xhci_count; ctrl_idx++) {
                 if (xhci_hc[ctrl_idx].needsResetting) continue;
@@ -1179,18 +1166,20 @@ extern "C" void kmain(void) {
                 any_resp = true;
 			    event_count++;
 
+                if (hub_dispatch_control(&xhci_hc[ctrl_idx], resp)) continue;
+
 			// ── Port Status Change (type 34) ─────────────────────────────────
-			// A PSC event means something changed on a root port — a device was
-			// connected, disconnected, or reset.  Trigger a full re-enumeration.
-			// 150ms settle delay gives PORTSC time to stabilise on same-port
-			// reconnects before setupUSB scans it.
+			// Reset completion and link power changes also generate PSC. Acknowledge
+			// them here; the nonblocking sampler decides if presence changed.
 			if (resp.type == 34) {
 				uint32_t port_id = (resp.event->parameter >> 24) & 0xFF;
-				print((char*)"PSC event on port:");
-				to_str(port_id, str); print(str);
-				tsc_delay_ms(150);
-				xhci_hc[ctrl_idx].needsResetting = true;
-				goto restart;
+				XHCIController* hc = &xhci_hc[ctrl_idx];
+				if (port_id && port_id <= hc->max_ports) {
+					volatile uint32_t* portsc = (volatile uint32_t*)((uintptr_t)hc->ops + 0x400 + (port_id - 1) * 0x10);
+					uint32_t sc = *portsc;
+					usb_root_ack_changes(hc, port_id - 1, sc, _usb_rdtsc());
+				}
+				continue;
 			}
 
 			if (resp.type == 32) {   // Transfer Event
@@ -1200,49 +1189,39 @@ extern "C" void kmain(void) {
 
 				// ── Hub status-change interrupt ───────────────────────────────
 				//
-				// When any downstream port changes state (connect, disconnect,
-				// reset complete), the hub fires its interrupt IN endpoint.
-				// We get a Transfer Event here on the hub's slot.  Like Linux
-				// hub_irq() → schedule hub_event() → hub_port_status(), we
-				// restart full enumeration so every changed port is handled.
-				//
-				// 300ms settle delay before restart so PORTSC is stable on
-				// same-port reconnects.
+				// Notifications only schedule status reads. Latched reset/enable
+				// changes must be cleared, not treated as a controller failure.
 				{
 					int which_hub = -1;
 					for (int h = 0; h < hub_count; h++) {
-						if (hubs[h]->slot_id == slot_from_event && hubs[h]->hc == &xhci_hc[ctrl_idx]) { which_hub = h; break; }
+						if (hubs[h]->slot_id == slot_from_event && hubs[h]->hc == &xhci_hc[ctrl_idx] &&
+						    ((resp.ctrl >> 16) & 31) == hub_dcis[h] &&
+						    trb_ptr >= hubs[h]->hub_ring->phys &&
+						    trb_ptr < hubs[h]->hub_ring->phys + LINK_INDEX * 16u) { which_hub = h; break; }
 					}
 
 					if (which_hub >= 0 && (code == 1 || code == 13)) {
-						print((char*)"Hub status-change interrupt — re-enumerating.");
-
-						// Re-queue the status-change TRB so the pipe stays armed.
-						USBDevice* hd     = hubs[which_hub];
-						volatile TRB* nxt = &hd->hub_ring->trb[hd->hub_ring->enq];
-						nxt->parameter = ((volatile TRB*)(HHDM + trb_ptr))->parameter;
-						nxt->status    = 1;
-						nxt->control   = (1u << 10) | (1u << 5) | (hd->hub_ring->pcs & 1u);
-						if (++hd->hub_ring->enq == LINK_INDEX) {
-							hd->hub_ring->trb[LINK_INDEX].control =
-								(TRB_TYPE_LINK << 10) | (1u << 1) | (hd->hub_ring->pcs & 1u);
-							hd->hub_ring->enq = 0;
-							hd->hub_ring->pcs ^= 1;
+						if (!hub_watch[which_hub].saw_notification) {
+							print((char*)"[usb] Hub notification received; checking port status.");
+							hub_watch[which_hub].saw_notification = true;
 						}
-						hd->hc->doorbell32[hd->slot_id] = hub_dcis[which_hub];
-
-						tsc_delay_ms(150);
-						xhci_hc[ctrl_idx].needsResetting = true;
-						goto restart;
+						hub_watch[which_hub].armed = false;
+						hub_note_report(which_hub);
+						// Rearm only after latched changes are acknowledged; otherwise
+						// an interrupt storm can keep us in this drain loop forever.
+						continue;
 					}
 
-					// Transfer error on a hub slot → hub itself disconnected.
+					// A failed interrupt pipe does not establish that the hub or its
+					// children disconnected. Poll EP0; root presence handles removal.
 					if (which_hub >= 0 && code != 1 && code != 13) {
 						print((char*)"Hub transfer error, code:");
 						to_str(code, str); print(str);
-						tsc_delay_ms(150);
-						xhci_hc[ctrl_idx].needsResetting = true;
-						goto restart;
+						hub_watch[which_hub].pipe_failed = true;
+						hub_watch[which_hub].armed = false;
+						hub_watch[which_hub].poll.pending |= (1u << (hub_watch[which_hub].num_ports + 1)) - 1u;
+						hub_watch[which_hub].poll.pending_after = 0;
+						continue;
 					}
 				}
 
@@ -1262,7 +1241,9 @@ extern "C" void kmain(void) {
 						if (keyboards[k]->slot_id == slot_from_event && keyboards[k]->hc == &xhci_hc[ctrl_idx]) {
 							for (int i=0; i<keyboards[k]->interface_count; i++) {
 								if (keyboards[k]->interfaces[i].type == 1 && 
-									(keyboards[k]->interfaces[i].ep_num*2+1) == dci_from_event) {
+									(keyboards[k]->interfaces[i].ep_num*2+1) == dci_from_event &&
+									trb_ptr >= keyboards[k]->interfaces[i].ring->phys &&
+									trb_ptr < keyboards[k]->interfaces[i].ring->phys + LINK_INDEX * 16u) {
 									which_kbd = k;
 									k_hi = &keyboards[k]->interfaces[i];
 									break;
@@ -1278,7 +1259,9 @@ extern "C" void kmain(void) {
 						if (mice[m]->slot_id == slot_from_event && mice[m]->hc == &xhci_hc[ctrl_idx]) {
 							for (int i=0; i<mice[m]->interface_count; i++) {
 								if (mice[m]->interfaces[i].type == 2 && 
-									(mice[m]->interfaces[i].ep_num*2+1) == dci_from_event) {
+									(mice[m]->interfaces[i].ep_num*2+1) == dci_from_event &&
+									trb_ptr >= mice[m]->interfaces[i].ring->phys &&
+									trb_ptr < mice[m]->interfaces[i].ring->phys + LINK_INDEX * 16u) {
 									which_mouse = m;
 									m_hi = &mice[m]->interfaces[i];
 									break;
@@ -1379,24 +1362,34 @@ extern "C" void kmain(void) {
 						keyboards[k]->hc->doorbell32[slot_from_event] = dci_from_event;
 					} else if (which_mouse >= 0) {
 						int m = which_mouse;
+						uint32_t requested = completed_trb->status & 0x1ffffu;
+						uint32_t remaining = resp.event->status & 0xffffffu;
+						size_t report_bytes = requested <= m_hi->mps && remaining <= requested ? requested - remaining : 0;
+						if (m_hi->mouse_layout) {
+							HIDMouseEvent decoded;
+							if (hid_mouse_decode(*m_hi->mouse_layout, (const uint8_t*)report, report_bytes,
+							                     m_hi->held_buttons, decoded)) {
+								mouse_process_input(decoded.dx, decoded.dy, decoded.buttons);
+								if (decoded.wheel) mouse_process_scroll(-decoded.wheel);
+							}
+						} else {
 
-						// Report ID skip heuristic:
-						// Protocol 0 (Report Protocol) always has a Report ID prefix byte.
-						// Composite devices with small MPS may also use Report IDs.
+						// Legacy report-mode fallback for existing receivers. Boot
+						// reports never infer a Report ID from the button mask.
 						uint8_t* data = (uint8_t*)report;
 						bool shifted = false;
-						if (m_hi->protocol == 0 || (mice[m]->interface_count > 1 && m_hi->mps <= 8 && (report[0] == 0x01 || report[0] == 0x02))) {
+						if (m_hi->protocol == 0) {
 							data++;
 							shifted = true;
 						}
 
 						// Parse mouse report: Report Protocol mice (like wireless
 						// gaming dongles) often use 16-bit LE X/Y deltas.
-						// We use 16-bit parsing if Protocol != 2 (Boot) OR if MPS > 8 
-						// (high-res gaming mice often claim Boot mode but send larger reports).
-						{
+						// Retain their existing extended layout; new device support
+						// should use descriptor-based decoding above.
+						if (report_bytes >= (shifted ? 4u : 3u)) {
 							uint8_t buttons = data[0];
-							int16_t dx, dy;
+							int16_t dx = 0, dy = 0;
 							int8_t scroll = 0;
 
 							// Auto-switcher: Use extended 16-bit path if we established this is a Razer Dongle.
@@ -1405,7 +1398,7 @@ extern "C" void kmain(void) {
 							// apply this layout to standard composite trackpad keyboards.
 							bool is_razer_wireless = (mice[m]->is_dongle && m_hi->mps == 64 && mice[m]->interface_count == 4);
 							if (m_hi->protocol != 2 || is_razer_wireless) {
-								if (m_hi->mps >= 8) {
+								if (report_bytes >= (shifted ? 9u : 8u)) {
 									// Wireless Razer Dongle (Extended 16-bit layout)
 									// [0] Buttons
 									// [1/2] Padding
@@ -1424,11 +1417,12 @@ extern "C" void kmain(void) {
 								// [3] Scroll (8-bit signed)
 								dx = (int16_t)(int8_t)data[1];
 								dy = (int16_t)(int8_t)data[2];
-								if (m_hi->mps >= 4) scroll = (int8_t)data[3];
+								if (report_bytes >= (shifted ? 5u : 4u)) scroll = (int8_t)data[3];
 							}
 
 							mouse_process_input(dx, dy, buttons);
 							if (scroll != 0) mouse_process_scroll(-scroll);
+						}
 						}
 
 						// Re-queue transfer TRB
@@ -1466,28 +1460,23 @@ extern "C" void kmain(void) {
 		// Actual VRAM rendering is deferred to the 60 Hz compositor thread
 		// to avoid exhausting PCIe transaction limits with 1000 Hz micro-writes.
 
-		// ── Universal PORTSC Hotplug Polling (Software PSC) ───────────────────
-		// The AMD B850 chipset drops hardware PSC interrupts for ports that are
-		// disabled (PED=0) but still powered, completely missing device removals
-		// and re-insertions. We manually poll the CCS bit of all root ports every
-		// frame. If any port's physical connection state changes, we trigger a
-		// controller reset to safely handle the hotplug.
+		for (int h = 0; h < hub_count; ++h) {
+			uint8_t changed_port = hub_poll_changes(h);
+			if (changed_port) {
+				usb_hub_reconcile(hubs[h], changed_port);
+				goto restart;
+			}
+		}
+
+		// Sample all ports even if the controller misses a PSC. Require 150 ms
+		// of stable CCS before port-local enumeration; also pick up a timed-out
+		// port that becomes enabled later. Neither path resets mounted disks.
         for (int ctrl_idx = 0; ctrl_idx < xhci_count; ctrl_idx++) {
             XHCIController* hc = &xhci_hc[ctrl_idx];
             if (hc->needsResetting) continue;
-            
-            uint32_t current_ccs = 0;
-            for (uint8_t p = 0; p < hc->max_ports && p < 32; p++) {
-                volatile uint32_t* portsc = (volatile uint32_t*)((uintptr_t)hc->ops + 0x400 + p * 0x10);
-                if (*portsc & 1u) current_ccs |= (1u << p);
-            }
-            
-            if (current_ccs != hc->last_ccs) {
-                print((char*)"Root port CCS changed. Triggering software hotplug event.");
-                hc->last_ccs = current_ccs;
-                tsc_delay_ms(150);
-                hc->needsResetting = true;
-                goto restart;
+            uint64_t now = _usb_rdtsc();
+            for (uint32_t p = 0; p < hc->max_ports; p++) {
+                if (usb_root_poll(hc, p, now)) goto restart;
             }
         }
 

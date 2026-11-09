@@ -118,28 +118,7 @@ static inline void spin_delay(volatile uint64_t iters) {
 	for (volatile uint64_t i=0; i<iters; ++i) { __asm__ __volatile__("pause"); }
 }
 
-static void xhci_legacy_handoff(uint32_t hcc1, uint64_t mmio_base) {
-	uint32_t xecp_dw = (hcc1 >> 16) & 0xFFFF;
-	while (xecp_dw) {
-		volatile uint32_t *ec = (volatile uint32_t*)(mmio_base + (uint64_t)xecp_dw*4);
-		uint32_t hdr   = ec[0];
-		uint32_t capid =  hdr        & 0xFF;
-		uint32_t next  = (hdr >> 8)  & 0xFF;
-
-		if (capid == 1) {
-			volatile uint32_t *usblegsup    = ec + 0;
-			volatile uint32_t *usblegctlsts = ec + 1;
-
-			*usblegsup |= (1u << 24);
-			for (int t=0; t<1000000 && (*usblegsup & (1u<<16)); ++t) { __asm__ __volatile__("pause"); }
-
-			*usblegctlsts = 0;
-			*usblegctlsts = 0xFFFFFFFF;
-			break;
-		}
-		xecp_dw = next;
-	}
-}
+#include "xhci_legacy.h"
 
 static void intel_route_all_ports(uint64_t virt_base,
 								  uint8_t start, uint8_t bus, uint8_t dev, uint8_t fn)

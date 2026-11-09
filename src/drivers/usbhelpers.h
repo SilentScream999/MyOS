@@ -11,6 +11,9 @@
 #include "pagingstuff.h"
 #include "helpers.h"
 #include "block.h"
+#include "xhci_port_state.h"
+#include "usb_hub_poll_policy.h"
+#include "usb_hub_transfer.h"
 #include "usbhelpers.h"
 
 /* ── Ring / Event Ring sizes ──────────────────────────────── */
@@ -28,6 +31,13 @@
 #define MAX_CONTROLLERS 4
 static XHCIController xhci_hc[MAX_CONTROLLERS];
 static int xhci_count = 0;
+static uint64_t g_usb_hub_status_requests = 0;
+static XHCIPortWatch usb_root_watch[MAX_CONTROLLERS][256] = {};
+static XHCIPortWatch usb_root_ready_watch[MAX_CONTROLLERS][256] = {};
+static XHCIPortChangeLatch usb_root_changes[MAX_CONTROLLERS][256] = {};
+static USBDevice* usb_root_devices[MAX_CONTROLLERS][256] = {};
+static USBDevice* usb_slot_devices[MAX_CONTROLLERS][256] = {};
+static bool usb_root_attempted[MAX_CONTROLLERS][256] = {};
 
 // ── TSC-based delay helpers ───────────────────────────────────────────────────
 // Mirrors the timing strategy in kmain.cpp: use the invariant TSC so delays
@@ -56,6 +66,8 @@ static uint64_t _usb_tsc_hz(void) {
 }
 
 // Accurate millisecond delay — call from anywhere in usbhelpers.h
+#include "usb_probe_budget.h"
+
 static void tsc_delay_ms(uint64_t ms) {
     uint64_t irq_flags;
     __asm__ volatile("pushfq; popq %0" : "=r"(irq_flags));
@@ -164,10 +176,47 @@ static USB_Response get_usb_response(XHCIController* hc, int timeout_ms = 250) {
 }
 
 /* ── do_control_transfer ──────────────────────────────────── */
+// One synchronous command is outstanding per controller. Match its exact TRB
+// while keeping live HID/status completions for the regular dispatcher.
+static USB_Response get_usb_command_response(XHCIController* hc, int timeout_ms = 10) {
+    uint16_t previous = hc->cr.enq ? hc->cr.enq - 1 : LINK_INDEX - 1;
+    uint64_t pointer = hc->cr.phys + previous * 16u;
+    uint64_t end = usb_timeout_deadline(hc, timeout_ms);
+    do {
+        USB_Response r = get_usb_response_raw(hc, 0);
+        if (r.gotresponse) {
+            if (r.type == 33 && r.event->parameter == pointer) return r;
+            if (!usb_defer(hc, r)) break;
+        }
+        __asm__ volatile("pause");
+    } while (_usb_rdtsc() < end);
+    USB_Response result = {};
+    return result;
+}
+
+static USB_Response usb_wait_command(XHCIController* hc, const char* operation) {
+    USB_Response response = get_usb_command_response(hc, 1000);
+    if (!response.gotresponse) {
+        usb_probe_state[hc - xhci_hc].timed_out = true;
+        print((char*)"[usb] Command completion timeout:"); print((char*)operation);
+        usb_probe_expired(hc);
+    }
+    return response;
+}
+
+struct USBControlGuard {
+    uint64_t flags;
+    USBControlGuard() { __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory"); }
+    ~USBControlGuard() { if (flags & (1u << 9)) __asm__ volatile("sti" ::: "memory"); }
+};
 static USB_Response do_control_transfer(USBDevice &dev,
 										USBSetupPacket* setup,
 										volatile uint8_t* data_buffer,
 										uint16_t data_len) {
+	USBControlGuard guard;
+	if (usb_probe_expired(dev.hc)) { USB_Response empty = {}; return empty; }
+	uint64_t setup_pointer = dev.ep0_ring->phys + dev.ep0_ring->enq * 16u;
+	uint64_t data_pointer = 0;
 	uint64_t setup_dw0 =
 		((uint64_t)setup->bmRequestType)    |
 		((uint64_t)setup->bRequest   <<  8) |
@@ -184,6 +233,7 @@ static USB_Response do_control_transfer(USBDevice &dev,
 	const bool data_is_in = (setup->bmRequestType & 0x80u) != 0;
 
 	if (has_data) {
+		data_pointer = dev.ep0_ring->phys + dev.ep0_ring->enq * 16u;
 		uint64_t data_phys = (uint64_t)data_buffer - HHDM;
 		ring_push_cmd(dev.ep0_ring,
 			(TRB_TYPE_DATA_STAGE << 10) | (data_is_in ? (1u << 16) : 0u),
@@ -191,10 +241,12 @@ static USB_Response do_control_transfer(USBDevice &dev,
 	}
 
 	uint32_t status_dir = data_is_in ? 0u : (1u << 16);
+	uint64_t status_pointer = dev.ep0_ring->phys + dev.ep0_ring->enq * 16u;
 	ring_push_cmd(dev.ep0_ring,
 		(TRB_TYPE_STATUS_STAGE << 10) | status_dir | (1u << 5),
 		0, 0);
 
+	__asm__ volatile("sfence" ::: "memory");
 	dev.hc->doorbell32[dev.slot_id] = 1;
 
 	USB_Response resp;
@@ -202,16 +254,34 @@ static USB_Response do_control_transfer(USBDevice &dev,
 	
 	uint64_t hz = _usb_tsc_hz();
 	uint64_t start_time = _usb_rdtsc();
-	uint64_t end_time = start_time + (hz / 1000) * 250u; // 250ms timeout for control transfers
+	uint64_t end_time = usb_timeout_deadline(dev.hc, 250);
 
 	while (_usb_rdtsc() < end_time) {
-		resp = get_usb_response(dev.hc, 1); // 1ms chunk
+		// Poll hardware, leaving deferred HID/PSC events for the dispatcher.
+		resp = get_usb_response_raw(dev.hc, 1);
 		if (!resp.gotresponse) continue;
-		if (resp.type == 32 || resp.type == 33) return resp;
+		bool ours = resp.type == 32 && ((resp.ctrl >> 24) & 255) == dev.slot_id &&
+		            ((resp.ctrl >> 16) & 31) == 1 &&
+		            (resp.event->parameter == setup_pointer ||
+		             (has_data && resp.event->parameter == data_pointer) ||
+		             resp.event->parameter == status_pointer);
+		if (!ours) {
+			if (!usb_defer(dev.hc, resp)) break;
+			continue;
+		}
+		uint32_t code = resp.event->status >> 24;
+		if (code != 1 && code != 13) return resp;
+		// A short data-stage packet does not finish the control transaction.
+		if (resp.event->parameter == status_pointer) return resp;
 	}
 
 	resp.gotresponse = false;
+	usb_probe_state[dev.hc - xhci_hc].timed_out = true;
 	return resp;
+}
+
+static bool usb_control_ok(const USB_Response& r) {
+    return r.gotresponse && (r.event->status >> 24) == 1;
 }
 
 #include "usb_storage.h"
@@ -229,7 +299,7 @@ static bool get_device_descriptor(USBDevice &dev, volatile uint8_t* outbuf, uint
 	setup.wLength       = len;
 
 	USB_Response r = do_control_transfer(dev, &setup, buf, len);
-	if (!r.gotresponse) return false;
+	if (!usb_control_ok(r)) return false;
 	for (int i = 0; i < len; i++) outbuf[i] = buf[i];
 	return true;
 }
@@ -246,7 +316,7 @@ static bool get_configuration_descriptor(USBDevice &dev, volatile uint8_t* outbu
 	setup.wLength       = maxlen;
 
 	USB_Response r = do_control_transfer(dev, &setup, buf, maxlen);
-	if (!r.gotresponse) { print((char*)"cfg: no response"); return false; }
+	if (!usb_control_ok(r)) { print((char*)"cfg: transfer failed"); return false; }
 
 	uint16_t total = (uint16_t)buf[2] | ((uint16_t)buf[3] << 8);
 	if (total == 0) { print((char*)"cfg: wTotalLength=0"); return false; }
@@ -257,9 +327,8 @@ static bool get_configuration_descriptor(USBDevice &dev, volatile uint8_t* outbu
 }
 
 /* ── Hub class helpers ────────────────────────────────────── */
+#include "logitech_g502.h"
 static bool hub_set_port_feature(USBDevice &hub, uint16_t port, uint16_t feature) {
-	volatile uint8_t* tmp = (volatile uint8_t*)alloc_table();
-	for (int i = 0; i < 4096; i++) tmp[i] = 0;
 
 	USBSetupPacket setup;
 	setup.bmRequestType = 0x23;
@@ -268,13 +337,11 @@ static bool hub_set_port_feature(USBDevice &hub, uint16_t port, uint16_t feature
 	setup.wIndex        = port;
 	setup.wLength       = 0;
 
-	USB_Response r = do_control_transfer(hub, &setup, tmp, 0);
-	return r.gotresponse;
+	USB_Response r = do_control_transfer(hub, &setup, nullptr, 0);
+	return usb_control_ok(r);
 }
 
 static bool hub_clear_port_feature(USBDevice &hub, uint16_t port, uint16_t feature) {
-	volatile uint8_t* tmp = (volatile uint8_t*)alloc_table();
-	for (int i = 0; i < 4096; i++) tmp[i] = 0;
 
 	USBSetupPacket setup;
 	setup.bmRequestType = 0x23;
@@ -283,13 +350,17 @@ static bool hub_clear_port_feature(USBDevice &hub, uint16_t port, uint16_t featu
 	setup.wIndex        = port;
 	setup.wLength       = 0;
 
-	USB_Response r = do_control_transfer(hub, &setup, tmp, 0);
-	return r.gotresponse;
+	USB_Response r = do_control_transfer(hub, &setup, nullptr, 0);
+	return usb_control_ok(r);
 }
 
 static bool hub_get_port_status(USBDevice &hub, uint16_t port, uint8_t* status4) {
-	volatile uint8_t* tmp = (volatile uint8_t*)alloc_table();
-	for (int i = 0; i < 4096; i++) tmp[i] = 0;
+	++g_usb_hub_status_requests;
+	USBControlGuard guard;
+	static volatile uint8_t* scratch[MAX_CONTROLLERS] = {};
+	volatile uint8_t*& tmp = scratch[hub.hc - xhci_hc];
+	if (!tmp) tmp = (volatile uint8_t*)alloc_table();
+	for (int i = 0; i < 4; i++) tmp[i] = 0;
 
 	USBSetupPacket setup;
 	setup.bmRequestType = 0xA3;
@@ -299,7 +370,7 @@ static bool hub_get_port_status(USBDevice &hub, uint16_t port, uint8_t* status4)
 	setup.wLength       = 4;
 
 	USB_Response r = do_control_transfer(hub, &setup, tmp, 4);
-	if (!r.gotresponse) return false;
+	if (!usb_control_ok(r)) return false;
 	for (int i = 0; i < 4; i++) status4[i] = tmp[i];
 	return true;
 }
@@ -321,11 +392,89 @@ static  int           mouse_count = 0;
 static  USBDevice*    hubs[MAX_HUBS];
 static  uint8_t       hub_dcis[MAX_HUBS];   // DCI = ep_num*2+1 for IN
 static  int           hub_count = 0;
+#include "usb_hub_watch.h"
+static HubStatusWatch hub_watch[MAX_HUBS] = {};
+
+static bool hub_ack_hub_changes(USBDevice& hub) {
+    ++g_usb_hub_status_requests;
+    USBControlGuard guard;
+    static volatile uint8_t* buffers[MAX_CONTROLLERS] = {};
+    volatile uint8_t*& buf = buffers[hub.hc - xhci_hc];
+    if (!buf) buf = (volatile uint8_t*)alloc_table();
+    for (int b = 0; b < 4; ++b) buf[b] = 0;
+    USBSetupPacket setup;
+    setup.bmRequestType = 0xA0; setup.bRequest = 0;
+    setup.wValue = 0; setup.wIndex = 0; setup.wLength = 4;
+    if (!usb_control_ok(do_control_transfer(hub, &setup, buf, 4))) return false;
+    uint8_t changes = buf[2];
+    for (uint8_t bit = 0; bit < 2; ++bit) {
+        if (!(changes & (1u << bit))) continue;
+        setup.bmRequestType = 0x20; setup.bRequest = 1;
+        setup.wValue = bit; setup.wLength = 0;
+        if (!usb_control_ok(do_control_transfer(hub, &setup, nullptr, 0))) return false;
+    }
+    return true;
+}
+
+// USB 2 hub change bits are latched until CLEAR_FEATURE. A notification for
+// reset completion/enable/suspend is not itself a reason to reset the bus.
+static bool hub_ack_port_changes(USBDevice& hub, uint8_t port, const uint8_t* st) {
+    uint16_t changes = (uint16_t)st[2] | ((uint16_t)st[3] << 8);
+    for (uint8_t bit = 0; bit < 5; ++bit)
+        if ((changes & (1u << bit)) && !hub_clear_port_feature(hub, port, 16 + bit)) return false;
+    if (hub.speed < 4 && (changes & (1u << 5)))
+        return hub_clear_port_feature(hub, port, 23);
+    return true;
+}
+
+static void hub_prepare_watch(USBDevice* hub, uint8_t ports) {
+    for (int h = 0; h < hub_count; ++h) {
+        if (hubs[h] != hub) continue;
+        HubStatusWatch& watch = hub_watch[h];
+        watch.num_ports = ports;
+        watch.report_bytes = (ports + 8u) / 8u;
+        if (!hub_ack_hub_changes(*hub)) return;
+        for (uint8_t p = 1; p <= ports; ++p) {
+            uint8_t st[4];
+            if (!hub_get_port_status(*hub, p, st) || !hub_ack_port_changes(*hub, p, st)) return;
+            xhci_port_watch_init(watch.ports[p], st[0]);
+        }
+        watch.report = (volatile uint8_t*)alloc_table();
+        watch.control.data = (volatile uint8_t*)alloc_table();
+        watch.ready = true;
+        watch.poll.cursor = 1;
+        watch.poll.audit_after = _usb_rdtsc() + (_usb_tsc_hz() / 1000) * 250u;
+        print((char*)"[usb] Hub status watch ready.");
+    }
+}
+
+static void hub_queue_status(int h) {
+    USBDevice* hub = hubs[h];
+    HubStatusWatch& watch = hub_watch[h];
+    if (!watch.ready || watch.pipe_failed || watch.armed || watch.scan_mask) return;
+    for (uint8_t b = 0; b < watch.report_bytes; ++b) watch.report[b] = 0;
+    ring_push_cmd(hub->hub_ring, (1u << 10) | (1u << 5),
+                  (uint64_t)watch.report - HHDM, watch.report_bytes);
+    __asm__ volatile("sfence" ::: "memory");
+    watch.armed = true;
+    hub->hc->doorbell32[hub->slot_id] = hub_dcis[h];
+}
+
+static void hub_note_report(int h) {
+    HubStatusWatch& watch = hub_watch[h];
+    uint32_t mask = 0;
+    for (uint8_t b = 0; b < watch.report_bytes; ++b) mask |= (uint32_t)watch.report[b] << (b * 8u);
+    mask &= (1u << (watch.num_ports + 1)) - 1u;
+    watch.poll.pending |= mask;
+    if (watch.scan_mask) watch.recheck_mask |= mask;
+    watch.poll.pending_after = 0;
+}
+
+#include "usb_hub_async.h"
 
 
 /* ── forward declaration ── */
-static void enumerate_hub_children(USBDevice* hub, volatile XHCIOpRegs* ops,
-									struct Ring &cr, uint8_t max_depth);
+static void enumerate_hub_children(USBDevice* hub, uint8_t max_depth, uint8_t only_port = 0);
 
 /* ── enumerate_device_after_address ──────────────────────── */
 static void enumerate_device_after_address(
@@ -334,6 +483,7 @@ static void enumerate_device_after_address(
 		uint32_t             /*hcs1*/,
 		uint32_t             /*hcs2*/) {
 
+	if (usb_probe_expired(dev->hc)) return;
 	print((char*)"Enumerating device.");
 	char str[64];
     
@@ -348,7 +498,11 @@ static void enumerate_device_after_address(
 		print((char*)"Failed to read device descriptor (8B)");
 		return;
 	}
-	uint8_t mps0 = scratch[7];
+	uint16_t mps0 = usb_ep0_packet_size(dev->speed, scratch[7]);
+	if (!mps0) {
+		print((char*)"Invalid EP0 packet size in device descriptor");
+		return;
+	}
 	to_str(mps0, str); print((char*)"EP0 MPS:"); print(str);
 
 	/* ── Step 2: Evaluate Context to update EP0 MPS ── */
@@ -383,10 +537,10 @@ static void enumerate_device_after_address(
 		USB_Response resp;
 		uint64_t hz_eval = _usb_tsc_hz();
 		uint64_t start_eval = _usb_rdtsc();
-		uint64_t end_eval = start_eval + (hz_eval / 1000) * 1000u; // 1 second timeout
+		uint64_t end_eval = usb_timeout_deadline(dev->hc, 1000);
 		
 		for (;;) {
-			resp = get_usb_response(dev->hc, 10); // 10ms chunk
+			resp = get_usb_command_response(dev->hc, 10); // 10ms chunk
 			if (resp.gotresponse && resp.type == 33) break;
 			if (_usb_rdtsc() >= end_eval) {
 				print((char*)"Evaluate Context timeout!");
@@ -407,6 +561,8 @@ static void enumerate_device_after_address(
 		return;
 	}
 	uint8_t dev_class = scratch[4];
+	dev->vendor_id = (uint16_t)scratch[8] | ((uint16_t)scratch[9] << 8);
+	dev->product_id = (uint16_t)scratch[10] | ((uint16_t)scratch[11] << 8);
 
 	/* ── Step 4: configuration descriptor ── */
 	volatile uint8_t* config_buf = (volatile uint8_t*)alloc_table();
@@ -432,6 +588,8 @@ static void enumerate_device_after_address(
 	bool current_iface_is_hid = false;
 	uint8_t current_iface_num = 0;
 	uint8_t current_iface_protocol = 0;
+	uint8_t current_iface_subclass = 0;
+	uint16_t current_report_length = 0;
 
 	while (idx + 2 < conf_len) {
 		uint8_t blen  = config_buf[idx];
@@ -445,8 +603,18 @@ static void enumerate_device_after_address(
 			current_iface_is_hid = (config_buf[idx + 5] == 0x03);
 			current_iface_num = config_buf[idx + 2];
 			current_iface_protocol = config_buf[idx + 7];
+			current_iface_subclass = config_buf[idx + 6];
+			current_report_length = 0;
 			if (config_buf[idx + 5] == 0x09) found_hub = true;
 		} 
+		else if (btype == 0x21 && current_iface_is_hid && blen >= 6) {
+			for (uint8_t d = 0; d < config_buf[idx + 5]; ++d) {
+				uint16_t entry = 6u + (uint16_t)d * 3u;
+				if (entry + 3 > blen) return;
+				if (config_buf[idx + entry] == 0x22)
+					current_report_length = config_buf[idx + entry + 1] | ((uint16_t)config_buf[idx + entry + 2] << 8);
+			}
+		}
 		else if (btype == 5 && idx + 7 <= conf_len) { // Endpoint Descriptor
 			uint8_t addr = config_buf[idx + 2];
 			uint8_t attr = config_buf[idx + 3];
@@ -463,6 +631,9 @@ static void enumerate_device_after_address(
 					hi->mps = mps;
 					hi->protocol = current_iface_protocol;
 					hi->iface_num = current_iface_num;
+					hi->interval = config_buf[idx + 6];
+					hi->report_descriptor_length = current_report_length;
+					hi->boot_capable = current_iface_subclass == 1 && (hi->protocol == 1 || hi->protocol == 2);
 					hi->ring = nullptr;
 					
 					// Type mapping: Protocol 1 = Keyboard, anything else HID = Mouse fallback
@@ -499,7 +670,7 @@ static void enumerate_device_after_address(
 			uint64_t start_ds = _usb_rdtsc();
 			uint64_t end_ds = start_ds + (hz_ds / 1000) * 500u; // 500ms
 			while (_usb_rdtsc() < end_ds) {
-				resp = get_usb_response(dev->hc, 10);
+				resp = get_usb_command_response(dev->hc, 10);
 				if (resp.gotresponse && resp.type == 33) break;
 			}
 		}
@@ -519,14 +690,16 @@ static void enumerate_device_after_address(
 		sc.wLength       = 0;
 		volatile uint8_t* dummy = (volatile uint8_t*)alloc_table();
 		USB_Response r = do_control_transfer(*dev, &sc, dummy, 0);
-		if (!r.gotresponse) {
-			print((char*)"SET_CONFIGURATION failed (may still work on some devices)");
+		if (!usb_control_ok(r)) {
+			print((char*)"SET_CONFIGURATION failed");
+			return;
 		} else {
 			print((char*)"SET_CONFIGURATION ok");
 		}
 	}
 
 	if (mass_in && mass_out) {
+		USBProbePause media_readiness(dev->hc);
 		if (!usb_storage_configure(dev, mass_in, mass_in_mps, mass_out, mass_out_mps))
 			print((char*)"[storage] Unsupported or unavailable USB disk.");
 		return;
@@ -540,10 +713,8 @@ static void enumerate_device_after_address(
 	   This mirrors what Linux does in hub_probe() / hub_activate():
 	   find the status-change endpoint, submit a persistent interrupt
 	   URB (hub_irq()), and re-submit after every completion.  When
-	   any downstream port changes state, the hub sends one byte on
-	   this endpoint; we restart enumeration in response, cleanly
-	   handling both connect and disconnect without any polling or
-	   timeout hacks.
+	   downstream ports change state, the hub sends a bitmap. Read and
+	   acknowledge the latched status before rearming the endpoint.
 	   ════════════════════════════════════════════════════════════ */
 	if (found_hub) {
 		print((char*)"Found hub; setting up status-change interrupt pipe.");
@@ -619,16 +790,14 @@ static void enumerate_device_after_address(
 		// Update Context Entries in slot DW0[31:27] to cover hub_dci.
 		in_slot2[0] = (in_slot2[0] & ~(0x1Fu << 27)) | ((uint32_t)hub_dci << 27);
 
-		// For HS hubs use the bInterval value directly (2^(n-1) * 125 µs
-		// microframes); for FS/LS use it as-is in frames.
-		uint8_t interval = (dev->speed >= 4) ? 0u : hub_ep_ivl;
+		uint8_t interval = xhci_interrupt_interval(dev->speed, hub_ep_ivl);
 		in_hub_ep[0] = ((uint32_t)interval << 16);
 		// EP type 7 = Interrupt IN, CErr = 3
 		in_hub_ep[1] = (3u << 1) | (7u << 3) | ((uint32_t)hub_ep_mps << 16);
 		uint64_t deq = hub_ring->phys | 1u;
 		in_hub_ep[2] = (uint32_t)(deq & 0xFFFFFFFFu);
 		in_hub_ep[3] = (uint32_t)(deq >> 32);
-		in_hub_ep[4] = (uint32_t)hub_ep_mps;
+		in_hub_ep[4] = (uint32_t)hub_ep_mps | ((uint32_t)hub_ep_mps << 16);
 
 		ring_push_cmd(&dev->hc->cr, (12u << 10) | (dev->slot_id << 24), ictx2_phys, 0);
 		dev->hc->doorbell32[0] = 0;
@@ -637,13 +806,13 @@ static void enumerate_device_after_address(
 			USB_Response resp;
 			uint64_t hz_hub = _usb_tsc_hz();
 			uint64_t start_hub = _usb_rdtsc();
-			uint64_t end_hub = start_hub + (hz_hub / 1000) * 1000u; // 1s
+			uint64_t end_hub = usb_timeout_deadline(dev->hc, 1000);
 			for (;;) {
-				resp = get_usb_response(dev->hc, 10);
+				resp = get_usb_command_response(dev->hc, 10);
 				if (resp.gotresponse && resp.type == 33) break;
 				if (_usb_rdtsc() >= end_hub) break;
 			}
-			uint32_t code = (resp.event->status >> 24) & 0xFF;
+		uint32_t code = resp.gotresponse ? (resp.event->status >> 24) & 0xFF : 0;
 			if (code != 1) {
 				print((char*)"Hub interrupt EP configure failed, code:");
 				to_str(code, str); print(str);
@@ -657,6 +826,8 @@ static void enumerate_device_after_address(
 		// ── Register hub so kmain queues a TRB and services events ──
 		// (same pattern as keyboards[] / keyboard_count)
 		if (hub_count < MAX_HUBS) {
+			for (size_t b = 0; b < sizeof(HubStatusWatch); ++b)
+				((volatile uint8_t*)&hub_watch[hub_count])[b] = 0;
 			hubs[hub_count]     = dev;
 			hub_dcis[hub_count] = hub_dci;
 			hub_count++;
@@ -678,11 +849,16 @@ static void enumerate_device_after_address(
 
 	for (int i = 0; i < dev->interface_count; i++) {
 		HIDInterface* hi = &dev->interfaces[i];
+		if (usb_is_g502_hero(*dev)) {
+			usb_g502_prepare(*dev, *hi);
+			continue;
+		}
+		if (hi->type == 2 && usb_hid_pointer_prepare(*dev, *hi)) continue;
 		USBSetupPacket bp = {};
 		bp.bmRequestType = 0x21;
 		bp.bRequest      = 0x0B;
 		bp.wValue        = 0; // Boot Protocol (if supported)
-		bp.wIndex        = i; // Assume interface num = index in simpler devices
+		bp.wIndex        = hi->iface_num;
 		bp.wLength       = 0;
 		volatile uint8_t* tmp = (volatile uint8_t*)alloc_table();
 		do_control_transfer(*dev, &bp, tmp, 0);
@@ -691,7 +867,7 @@ static void enumerate_device_after_address(
 		si.bmRequestType = 0x21;
 		si.bRequest      = 0x0A;
 		si.wValue        = 0;
-		si.wIndex        = i;
+		si.wIndex        = hi->iface_num;
 		si.wLength       = 0;
 		do_control_transfer(*dev, &si, tmp, 0);
 	}
@@ -732,10 +908,9 @@ static void enumerate_device_after_address(
 
 	in_slot2[0] = (in_slot2[0] & ~(0x1Fu << 27)) | ((uint32_t)max_dci << 27);
 
-	uint8_t interval = (dev->speed >= 4) ? 0u : 3u;
-
 	for (int i = 0; i < dev->interface_count; i++) {
 		HIDInterface* hi = &dev->interfaces[i];
+		uint8_t interval = xhci_interrupt_interval(dev->speed, hi->interval);
 		uint8_t dci = hi->ep_num * 2 + 1;
 		volatile uint32_t* in_hi_ep = (volatile uint32_t*)((uint64_t)ictx2 + ctx_stride * ((uint64_t)dci + 1u));
 		for (int j = 0; j < dws; j++) in_hi_ep[j] = 0;
@@ -744,7 +919,7 @@ static void enumerate_device_after_address(
 		uint64_t deq = hi->ring->phys | 1u;
 		in_hi_ep[2] = (uint32_t)(deq & 0xFFFFFFFFu);
 		in_hi_ep[3] = (uint32_t)(deq >> 32);
-		in_hi_ep[4] = (uint32_t)hi->mps;
+		in_hi_ep[4] = (uint32_t)hi->mps | ((uint32_t)hi->mps << 16);
 	}
 
 	ring_push_cmd(&dev->hc->cr, (12u << 10) | (dev->slot_id << 24), ictx2_phys, 0);
@@ -754,9 +929,9 @@ static void enumerate_device_after_address(
 		USB_Response resp;
 		uint64_t hz_conf = _usb_tsc_hz();
 		uint64_t start_conf = _usb_rdtsc();
-		uint64_t end_conf = start_conf + (hz_conf / 1000) * 1000u; // 1s
+		uint64_t end_conf = usb_timeout_deadline(dev->hc, 1000);
 		for (;;) {
-			resp = get_usb_response(dev->hc, 10);
+			resp = get_usb_command_response(dev->hc, 10);
 			if (resp.gotresponse && resp.type == 33) break;
 			if (_usb_rdtsc() >= end_conf) {
 				resp.gotresponse = false;
@@ -774,14 +949,15 @@ static void enumerate_device_after_address(
 		print((char*)"Configured IN endpoints for HID interface(s).");
 	}
 
+	bool has_keyboard = false, has_mouse = false;
 	for (int i = 0; i < dev->interface_count; i++) {
 		HIDInterface* hi = &dev->interfaces[i];
-		if (hi->type == 1) {
-			if (keyboard_count < MAX_KEYBOARDS) keyboards[keyboard_count++] = dev;
-		} else {
-			if (mouse_count < MAX_MICE) mice[mouse_count++] = dev;
-		}
+		hi->configured = true;
+		if (hi->type == 1) has_keyboard = true;
+		else if (hi->type == 2) has_mouse = true;
 	}
+	if (has_keyboard && keyboard_count < MAX_KEYBOARDS) keyboards[keyboard_count++] = dev;
+	if (has_mouse && mouse_count < MAX_MICE) mice[mouse_count++] = dev;
 }
 
 
@@ -817,9 +993,15 @@ static void configure_hub_slot(USBDevice* hub, uint8_t num_ports) {
 	hub->hc->doorbell32[0] = 0;
 
 	USB_Response resp;
+	uint64_t command_deadline = usb_timeout_deadline(hub->hc, 1000);
 	for (;;) {
-		resp = get_usb_response(hub->hc, 250);
+		resp = get_usb_command_response(hub->hc, 10);
 		if (resp.gotresponse && resp.type == 33) break;
+		if (_usb_rdtsc() >= command_deadline) {
+			print((char*)"configure_hub_slot timed out");
+			hub->hc->needsResetting = true;
+			return;
+		}
 	}
 	uint32_t code = (resp.event->status >> 24) & 0xFF;
 	if (code != 1) {
@@ -835,14 +1017,24 @@ static void configure_hub_slot(USBDevice* hub, uint8_t num_ports) {
 /* ── enumerate_hub_children ───────────────────────────────── */
 static void enumerate_hub_children(
 		USBDevice*           hub,
-		uint8_t              max_depth) {
+		uint8_t              max_depth, uint8_t only_port) {
 
-	if (max_depth == 0) return;
+	if (max_depth == 0 || usb_probe_expired(hub->hc)) return;
+	USBProbeGuard probe(hub->hc);
+	if (hub->speed >= 4) {
+		print((char*)"[usb] SuperSpeed hub downstream enumeration unsupported; USB 2 companion path retained.");
+		return;
+	}
 	char str[64];
 
 	print((char*)"enumerate_hub_children entered");
 	print((char*)"hub slot_id:"); to_str(hub->slot_id, str); print(str);
 
+	uint8_t num_ports = 0;
+    if (only_port) {
+        for (int h = 0; h < hub_count; ++h) if (hubs[h] == hub) num_ports = hub_watch[h].num_ports;
+        if (!num_ports || only_port > num_ports) return;
+    } else {
 	/* ── Get hub descriptor (inlined) ── */
 	uint8_t hub_desc[16]; for (int i = 0; i < 16; i++) hub_desc[i] = 0;
 	{
@@ -880,7 +1072,7 @@ static void enumerate_hub_children(
 		for (int i = 0; i < 16; i++) hub_desc[i] = buf[i];
 	}
 
-	uint8_t num_ports = hub_desc[2];
+	num_ports = hub_desc[2];
 	print((char*)"Hub num_ports:"); to_str(num_ports, str); print(str);
 
 	if (num_ports == 0 || num_ports > 16) {
@@ -893,9 +1085,17 @@ static void enumerate_hub_children(
 	configure_hub_slot(hub, num_ports);
 	if (hub->hc->needsResetting) return;
 
+    }
+
 	size_t ctx_stride = (hub->hc->hcc1 & (1u << 2)) ? 0x40u : 0x20u;
 
 	for (uint8_t p = 1; p <= num_ports; p++) {
+		if (only_port && p != only_port) continue;
+		if (usb_probe_expired(hub->hc)) return;
+		if (hub->hc->global_port_index >= 4095) {
+			print((char*)"[usb] Hub port bookkeeping limit reached.");
+			return;
+		}
 		hub->hc->global_port_index++;
 		if (hub->hc->portfailed[hub->hc->global_port_index]) {
 			print((char*)"Skipping previously failed hub port");
@@ -915,7 +1115,7 @@ static void enumerate_hub_children(
 			if (!hub_get_port_status(*hub, p, st)) {
 				print((char*)"FAIL: get_port_status (pre-reset) failed");
 				hub->hc->portfailed[hub->hc->global_port_index] = true;
-				continue;
+				break;
 			}
 			if (st[0] & 1u) {
 				connected = true;
@@ -949,7 +1149,7 @@ static void enumerate_hub_children(
 			if (!hub_get_port_status(*hub, p, st)) {
 				print((char*)"FAIL: get_port_status during reset poll");
 				hub->hc->portfailed[hub->hc->global_port_index] = true;
-				continue;
+				break;
 			}
 			if (st[2] & (1u << 4)) {
 				reset_done = true;
@@ -1020,11 +1220,8 @@ static void enumerate_hub_children(
 		ring_push_cmd(&hub->hc->cr, (9u << 10), 0, 0);
 		hub->hc->doorbell32[0] = 0;
 
-		USB_Response resp;
-		for (;;) {
-			resp = get_usb_response(hub->hc, 10);
-			if (resp.gotresponse && resp.type == 33) break;
-		}
+		USB_Response resp = usb_wait_command(hub->hc, "Enable Slot for hub child");
+		if (!resp.gotresponse) return;
 		uint32_t code    = (resp.event->status >> 24) & 0xFF;
 		uint32_t slot_id = (resp.ctrl >> 24) & 0xFF;
 		if (code != 1) {
@@ -1076,14 +1273,15 @@ static void enumerate_hub_children(
 
 		print((char*)"Sending Address Device for hub child");
 		for (uint8_t addr_attempts = 0; addr_attempts < 5; addr_attempts++) {
+			if (usb_probe_expired(hub->hc)) return;
 			if (addr_attempts > 0) {
 				// Disable the bad slot
 				ring_push_cmd(&hub->hc->cr, (10u << 10) | (slot_id << 24), 0, 0);
 				hub->hc->doorbell32[0] = 0;
-				for (;;) {
-					resp = get_usb_response(hub->hc, 10);
-					if (resp.gotresponse && resp.type == 33) break;
-				}
+				resp = usb_wait_command(hub->hc, "Disable failed hub child slot");
+				if (!resp.gotresponse) return;
+				if ((resp.event->status >> 24) != 1) return;
+				hub->hc->dcbaa[slot_id] = 0;
 				// Exponential backoff: 100ms, 200ms, 300ms...
 				// The old spin_delay(500000 * n) was uncalibrated and potentially
 				// several seconds per attempt. 100ms per step is plenty.
@@ -1092,10 +1290,8 @@ static void enumerate_hub_children(
 				// Enable a fresh slot
 				ring_push_cmd(&hub->hc->cr, (9u << 10), 0, 0);
 				hub->hc->doorbell32[0] = 0;
-				for (;;) {
-					resp = get_usb_response(hub->hc, 10);
-					if (resp.gotresponse && resp.type == 33) break;
-				}
+				resp = usb_wait_command(hub->hc, "Re-enable hub child slot");
+				if (!resp.gotresponse) return;
 				uint32_t new_code = (resp.event->status >> 24) & 0xFF;
 				if (new_code != 1) {
 					print((char*)"Re-enable slot failed");
@@ -1108,10 +1304,8 @@ static void enumerate_hub_children(
 
 			ring_push_cmd(&hub->hc->cr, (11u << 10) | (slot_id << 24), ictx_phys, 0);
 			hub->hc->doorbell32[0] = 0;
-			for (;;) {
-				resp = get_usb_response(hub->hc, 10);
-				if (resp.gotresponse && resp.type == 33) break;
-			}
+			resp = usb_wait_command(hub->hc, "Address Device for hub child");
+			if (!resp.gotresponse) return;
 			code = (resp.event->status >> 24) & 0xFF;
 			if (code == 1) {
 				print((char*)"Hub child addressed successfully");
@@ -1130,7 +1324,8 @@ static void enumerate_hub_children(
 		USBDevice* child     = (USBDevice*)alloc_table();
 		child->slot_id       = (uint8_t)slot_id;
 		child->port_num      = p;
-		child->root_port_num = 0;
+		child->root_port_num = hub->root_port_num;
+		usb_slot_devices[hub->hc - xhci_hc][slot_id] = child;
 		child->speed         = speed;
 		child->ep0_ring      = ep0;
 		child->ep0_ring_phys = ep0->phys;
@@ -1140,6 +1335,7 @@ static void enumerate_hub_children(
 		child->interface_count = 0;
 		child->hub_ring      = nullptr;
 		child->hc            = hub->hc;
+		child->parent_hub    = hub;
 
 		enumerate_device_after_address(child, nullptr, 0, 0);
 		if (hub->hc->needsResetting) {
@@ -1152,6 +1348,7 @@ static void enumerate_hub_children(
 
 		// Cleanup logic for failed hub children (Stop EP0, Disable Slot, Drain)
 		if (!child->is_hub && child->interface_count == 0 && !usb_storage_is_device(child)) {
+			if (usb_probe_expired(hub->hc)) return;
 			print((char*)"Cleaning up non-functional hub child");
 
 			// CRITICAL: Physically disable the hub port to kill the link.
@@ -1166,7 +1363,7 @@ static void enumerate_hub_children(
 			uint64_t hz_se = _usb_tsc_hz();
 			uint64_t end_se = _usb_rdtsc() + (hz_se / 1000) * 200u;
 			while (_usb_rdtsc() < end_se) {
-				resp = get_usb_response(hub->hc, 10);
+				resp = get_usb_command_response(hub->hc, 10);
 				if (resp.gotresponse && resp.type == 33) break;
 			}
 
@@ -1175,13 +1372,14 @@ static void enumerate_hub_children(
 			hub->hc->doorbell32[0] = 0;
 			uint64_t end_ds = _usb_rdtsc() + (hz_se / 1000) * 200u;
 			while (_usb_rdtsc() < end_ds) {
-				resp = get_usb_response(hub->hc, 10);
+				resp = get_usb_command_response(hub->hc, 10);
 				if (resp.gotresponse && resp.type == 33) break;
 			}
 			
 			// Drain
-			{ USB_Response s; while ((s = get_usb_response(hub->hc, 1)).gotresponse) {} }
+
 			hub->hc->dcbaa[child->slot_id] = 0;
+			usb_slot_devices[hub->hc - xhci_hc][child->slot_id] = nullptr;
 			hub->hc->portfailed[hub->hc->global_port_index] = true;
 			continue;
 		}
@@ -1194,11 +1392,23 @@ static void enumerate_hub_children(
 			}
 		}
 	}
+	if (!only_port) hub_prepare_watch(hub, num_ports);
 }
+
+#include "usb_root_ports.h"
 
 /* ── setupUSB ─────────────────────────────────────────────── */
 static void setupUSB(XHCIController* hc) {
+	if (hc->unavailable) return;
 	usb_storage_reset_controller(hc);
+	for (int p = 0; p < 256; ++p) {
+		usb_slot_devices[hc - xhci_hc][p] = nullptr;
+		usb_root_devices[hc - xhci_hc][p] = nullptr;
+		usb_root_attempted[hc - xhci_hc][p] = false;
+		xhci_port_watch_init(usb_root_ready_watch[hc - xhci_hc][p], 0);
+		usb_root_changes[hc - xhci_hc][p].replacement = false;
+		usb_root_changes[hc - xhci_hc][p].last_change = 0;
+	}
 	uint64_t usb_virt_base = hc->virt_base;
 	uint8_t usb_start = 0, usb_bus = hc->bus, usb_dev = hc->dev, usb_fn = hc->fn;
 	
@@ -1224,6 +1434,8 @@ static void setupUSB(XHCIController* hc) {
 		if (hubs[h] && hubs[h]->hc != hc) {
 			hubs[new_hub]     = hubs[h];
 			hub_dcis[new_hub] = hub_dcis[h];
+			if (new_hub != h) for (size_t b = 0; b < sizeof(HubStatusWatch); ++b)
+				((volatile uint8_t*)&hub_watch[new_hub])[b] = ((volatile uint8_t*)&hub_watch[h])[b];
 			new_hub++;
 		}
 	}
@@ -1286,7 +1498,7 @@ static void setupUSB(XHCIController* hc) {
 	bool has_ac64 = (hcc1 & 1u);
 	if (!has_ac64) print((char*)"WARNING: xHCI controller is 32-bit only!");
 
-	xhci_legacy_handoff(hcc1, mmio_va);
+	xhci_legacy_handoff(hcc1, mmio_va, mmio_size);
 
 	print((char*)"xHCI version:");
 	to_str(ver, str); print(str);
@@ -1305,10 +1517,10 @@ static void setupUSB(XHCIController* hc) {
 
 	// Reset controller
 	ops->usbcmd &= ~1u;
-	while (!(ops->usbsts & 1u)) {}
+	if (!usb_wait_register(hc, &ops->usbsts, 1u, 1u, 1000, "halt xHCI")) return;
 	ops->usbcmd |= (1u << 1);
-	while (ops->usbcmd & (1u << 1)) {}
-	while (ops->usbsts & (1u << 11)) {}
+	if (!usb_wait_register(hc, &ops->usbcmd, 2u, 0, 1000, "reset xHCI")) return;
+	if (!usb_wait_register(hc, &ops->usbsts, 1u << 11, 0, 1000, "xHCI ready")) return;
 
 	// Command ring
 	ring_init(&hc->cr);
@@ -1363,7 +1575,7 @@ static void setupUSB(XHCIController* hc) {
 	ops->config = max_slots;
 
 	ops->usbcmd |= 1u;
-	while (ops->usbsts & 1u) {}
+	if (!usb_wait_register(hc, &ops->usbsts, 1u, 0, 1000, "run xHCI")) return;
 	ops->crcr = (hc->cr.phys & ~0x3FULL) | 1u;
 
 	print((char*)"xHCI controller running.");
@@ -1390,7 +1602,9 @@ static void setupUSB(XHCIController* hc) {
 	tsc_delay_ms(5);
 	{
 		USB_Response resp;
-		while ((resp = get_usb_response(hc, 1)).gotresponse) {
+		for (uint32_t drained = 0; drained < ER_RING_SIZE * 2; ++drained) {
+			resp = get_usb_response(hc, 1);
+			if (!resp.gotresponse) break;
 			if (resp.type == 34) {
 				uint32_t port_id = (resp.event->parameter >> 24) & 0xFF;
 				print((char*)"Early PSC on port:"); to_str(port_id, str); print(str);
@@ -1408,267 +1622,20 @@ static void setupUSB(XHCIController* hc) {
 	}
 	tsc_delay_ms(100);
 
-	auto port_reset = [&](volatile uint32_t* portsc) -> bool {
-		// Assert PR. Zero the W1C change bits (17–22) so a read-modify-write
-		// doesn't accidentally clear them — writing 1 to a W1C bit clears it.
-		uint32_t val = *portsc;
-		val &= ~0x00FE0002u;   // zero: PED(1), CSC(17), PEC(18), WRC(19),
-							//       OCC(20), PRC(21), PLC(22), CEC(23)
-		val |= PORTSC_PR;
-		*portsc = val;
-
-		// Poll PR=0 with up to 100ms (USB 2.0 spec: 50ms reset pulse + margin).
-		// We read PORTSC directly — no need to wait for a PSC event.
-		for (int ms = 0; ms < 100; ms++) {
-			tsc_delay_ms(1);
-			uint32_t sc = *portsc;
-			if (sc & PORTSC_PR) continue;           // reset still asserted
-			if (!(sc & PORTSC_PED)) {
-				print((char*)"Port reset: PED=0, device not enabled");
-				return false;
-			}
-			tsc_delay_ms(2);    // TRSTRCY: 2ms recovery is sufficient on modern hardware
-			print((char*)"Port enabled.");
-			return true;
-		}
-		print((char*)"Port reset: timed out");
-		return false;
-	};
-
-	for (uint32_t i = 0; i < max_ports; i++) {
-		hc->global_port_index++;
-		if (hc->portfailed[hc->global_port_index]) {
-			print((char*)"Skipping failed root port");
-			continue;
-		}
-
-		volatile uint32_t* portsc = (volatile uint32_t*)((uintptr_t)hc->ops + 0x400 + i * 0x10);
-
-		// All ports have already had at least 100 ms since power was applied.
-		if (!(*portsc & PORTSC_CCS)) continue;
-
-		print((char*)"Device on root port:"); to_str(i + 1, str); print(str);
-
-		if (!port_reset(portsc)) {
-			print((char*)"Skipping failed root port");
-			hc->portfailed[hc->global_port_index] = true;
-			continue;
-		}
-
-		uint32_t speed = (*portsc >> 10) & 0xF;
-		print((char*)"Speed:"); to_str(speed, str); print(str);
-
-		// Enable Slot
-		ring_push_cmd(&hc->cr, (9u << 10), 0, 0);
-		hc->doorbell32[0] = 0;
-
-		USB_Response resp;
-		uint64_t hz_slot = _usb_tsc_hz();
-		uint64_t start_slot = _usb_rdtsc();
-		uint64_t end_slot = start_slot + (hz_slot / 1000) * 1000u; // 1s
-		for (;;) {
-			resp = get_usb_response(hc, 10);
-			if (resp.gotresponse && resp.type == 33) break;
-			if (_usb_rdtsc() >= end_slot) {
-				resp.gotresponse = false;
-				break;
-			}
-		}
-
-		uint32_t code    = (resp.event->status >> 24) & 0xFF;
-		uint32_t slot_id = (resp.ctrl >> 24) & 0xFF;
-
-		if (code != 1) {
-			print((char*)"Enable Slot failed:");
-			to_str(code, str); print(str);
-			print((char*)"Skipping failed root port");
-			hc->portfailed[hc->global_port_index] = true;
-			continue;
-		}
-		print((char*)"Slot:"); to_str(slot_id, str); print(str);
-
-		USBDevice* newdev          = (USBDevice*)alloc_table();
-		newdev->slot_id            = (uint8_t)slot_id;
-		newdev->port_num           = (uint8_t)(i + 1);
-		newdev->root_port_num      = (uint8_t)(i + 1);  // directly on a root port
-		newdev->speed              = speed;
-		newdev->is_hub             = false;
-		newdev->is_dongle          = false;
-		newdev->interface_count    = 0;
-		newdev->hub_ring           = nullptr;
-		newdev->hc                 = hc;
-
-		struct Ring* ep0           = (struct Ring*)alloc_table();
-		ring_init(ep0);
-		newdev->ep0_ring           = ep0;
-		newdev->ep0_ring_phys      = ep0->phys;
-
-		volatile uint64_t* dev_ctx = (volatile uint64_t*)alloc_table();
-		uint64_t dev_ctx_phys      = (uint64_t)dev_ctx - HHDM;
-		hc->dcbaa[slot_id]         = dev_ctx_phys;
-		newdev->device_ctx         = dev_ctx;
-		newdev->dev_ctx_phys       = dev_ctx_phys;
-
-		size_t ctx_stride2 = (hc->hcc1 & (1u << 2)) ? 0x40u : 0x20u;
-
-		volatile uint64_t* ictx      = alloc_table();
-		uint64_t           ictx_phys = (uint64_t)ictx - HHDM;
-		for (int j = 0; j < 512; j++) ictx[j] = 0;
-
-		volatile InputControlCtx* icc = (volatile InputControlCtx*)ictx;
-		icc->drop_flags = 0;
-		icc->add_flags  = (1u << 0) | (1u << 1);
-
-		volatile uint32_t* slot_ctx = (volatile uint32_t*)((uint64_t)ictx + ctx_stride2);
-		volatile uint32_t* ep0_ctx  = (volatile uint32_t*)((uint64_t)ictx + ctx_stride2 * 2);
-
-		slot_ctx[0] = ((speed & 0xFu) << 20) | (1u << 27);
-		slot_ctx[1] = ((uint32_t)(i + 1) & 0xFFu) << 16;
-
-		uint16_t ep0_mps = (speed >= 4) ? 512u : (speed == 3 ? 64u : 8u);
-		ep0_ctx[0] = 0;
-		ep0_ctx[1] = (3u << 1) | (4u << 3) | ((uint32_t)ep0_mps << 16);
-		uint64_t deq = ep0->phys | 1u;
-		ep0_ctx[2] = (uint32_t)(deq & 0xFFFFFFFFu);
-		ep0_ctx[3] = (uint32_t)(deq >> 32);
-		ep0_ctx[4] = 8;
-
-		ring_push_cmd(&hc->cr, (11u << 10) | (slot_id << 24), ictx_phys, 0);
-		hc->doorbell32[0] = 0;
-
-		// Wait for Address Device completion (type 33).
-		// Count only empty polls against the timeout, not unrelated events
-		// (type 34 Port Status Change, type 32 Transfer).
-		resp.gotresponse = false;
-		{
-			uint64_t hz_addr = _usb_tsc_hz();
-			uint64_t start_addr = _usb_rdtsc();
-			uint64_t end_addr = start_addr + (hz_addr / 1000) * 1000u; // 1 second timeout
-
-			while (_usb_rdtsc() < end_addr) {
-				resp = get_usb_response(hc, 10); // 10ms chunk
-				if (resp.gotresponse && resp.type == 33) break;
-				resp.gotresponse = false; // reset for next attempt if got wrong event
-			}
-		}
-
-		if (!resp.gotresponse) {
-			print((char*)"Timeout waiting for Address Device");
-			print((char*)"Skipping failed root port");
-			hc->portfailed[hc->global_port_index] = true;
-			continue;
-		}
-
-		code = (resp.event->status >> 24) & 0xFF;
-		if (code != 1) {
-			print((char*)"Address Device failed, code:");
-			to_str(code, str); print(str);
-			print((char*)"Skipping failed root port");
-			hc->portfailed[hc->global_port_index] = true;
-			continue;
-		}
-		print((char*)"Address Device success.");
-		tsc_delay_ms(10);   // Brief stabilisation before first descriptor read
-
-		enumerate_device_after_address(newdev, nullptr, 0, 0);
-		if (hc->needsResetting) {
-			// enumerate_device_after_address set needsResetting because it couldn't
-			// read descriptors. Clear it and skip this port instead of aborting.
-			print((char*)"Skipping failed root port");
-			hc->portfailed[hc->global_port_index] = true;
-			hc->needsResetting = false;
-			// Fall through to the slot-disable cleanup below
-		}
-
-		// If the device didn't become a hub or a HID device, its slot is still
-		// in the Addressed state. The xHCI will keep polling EP0, generating
-		// stray NAK/timeout Transfer Events that flood the event ring and starve
-		// real HID devices of their events. Disable the slot now.
-		if (!newdev->is_hub && newdev->interface_count == 0 && !usb_storage_is_device(newdev)) {
-			print((char*)"Cleaning up non-functional device on root port");
-
-			// CRITICAL: Physically disable the port first. The xHC may still be
-			// retrying the timed-out EP0 transfer (e.g. config descriptor read),
-			// monopolizing the internal bus scheduler and starving other ports.
-			// Writing PED (bit 1) as W1C clears it, killing the link — this is 
-			// the software equivalent of unplugging the device.
-			volatile uint32_t* portsc = (volatile uint32_t*)((uintptr_t)hc->ops + 0x400 + i * 0x10);
-			uint32_t pval = *portsc;
-			pval &= ~0x00FE0000u;   // zero W1C change bits so we don't accidentally clear them
-			pval |= (1u << 1);       // set PED — W1C, writing 1 clears it (disables port)
-			*portsc = pval;
-			tsc_delay_ms(1);         // let the link drop
-
-			// Stop EP0 (DCI 1) so we can legally drop the slot.
-			ring_push_cmd(&hc->cr, (15u << 10) | (newdev->slot_id << 24) | (1u << 16), 0, 0);
-			hc->doorbell32[0] = 0;
-			{
-				USB_Response resp;
-				uint64_t end_se = _usb_rdtsc() + (_usb_tsc_hz() / 1000) * 200u;
-				while (_usb_rdtsc() < end_se) {
-					resp = get_usb_response(hc, 5);
-					if (resp.gotresponse && resp.type == 33) break;
-				}
-			}
-
-			// Now Disable Slot — the link is dead and endpoints are stopped.
-			ring_push_cmd(&hc->cr, (10u << 10) | (newdev->slot_id << 24), 0, 0);
-			hc->doorbell32[0] = 0;
-			{
-				USB_Response resp;
-				uint64_t end_ds = _usb_rdtsc() + (_usb_tsc_hz() / 1000) * 200u;
-				while (_usb_rdtsc() < end_ds) {
-					resp = get_usb_response(hc, 5);
-					if (resp.gotresponse && resp.type == 33) break;
-				}
-			}
-			hc->dcbaa[newdev->slot_id] = 0;
-
-			// Only re-power the port if the device was actually removed.
-			// If it's still physically connected (CCS=1), re-powering would
-			// generate a PSC that the main loop sees, triggering an infinite
-			// restart loop.
-			pval = *portsc;
-			if (!(pval & 1u)) {
-				// CCS=0: device was removed. Cycle PP so the port can
-				// detect future connections (AMD B850 quirk).
-				pval &= ~0x00FE0002u;
-				pval &= ~(1u << 9);       // clear PP
-				*portsc = pval;
-				tsc_delay_ms(5);
-				pval = *portsc;
-				pval &= ~0x00FE0002u;
-				pval |= (1u << 9);        // set PP
-				*portsc = pval;
-				tsc_delay_ms(10);
-				{ USB_Response s; while ((s = get_usb_response(hc, 2)).gotresponse) {} }
-				print((char*)"Port disabled, slot released, port re-powered.");
-			} else {
-				// CCS=1: device still connected. We DO NOT clear PP (Power) here.
-				// Clearing PP while VBUS is physically present desyncs the logical
-				// and physical state, causing the device to constantly attempt to
-				// establish a link on powerless data pins. This generates heavy 
-				// electrical noise that hits adjacent ports with Transaction Errors.
-				// By leaving PP=1 and PED=0, the link is cleanly dropped and
-				// the bus stays quiet.
-				print((char*)"Port disabled, slot released (device still connected).");
-			}
-			continue;
-		}
-
-		if (newdev->is_hub) {
-			enumerate_hub_children(newdev, 8);
-			if (hc->needsResetting) return;
-		}
-	}
+	for (uint32_t i = 0; i < max_ports; ++i) {
+        ++hc->global_port_index;
+        if (*usb_root_portsc(hc, i) & 1u) usb_root_enumerate(hc, i, true);
+    }
 
 	print((char*)"Root port enumeration complete.");
 
-	// Snapshot baseline CCS state for software hotplug tracking
-	hc->last_ccs = 0;
-	for (uint32_t i = 0; i < max_ports && i < 32; i++) {
+	// Snapshot every port, including ports above 32. Acknowledge enumeration's
+	// reset/link notifications without disabling ports or starting another reset.
+	for (uint32_t i = 0; i < max_ports; i++) {
 		volatile uint32_t* portsc = (volatile uint32_t*)((uintptr_t)hc->ops + 0x400 + i * 0x10);
-		if (*portsc & 1u) hc->last_ccs |= (1u << i);
+		uint32_t sc = *portsc;
+		xhci_port_watch_init(usb_root_watch[hc - xhci_hc][i], sc);
+		if (sc & (127u << 17)) *portsc = xhci_port_ack(sc);
 	}
 }
 
