@@ -282,15 +282,13 @@ static inline void wm_menu_refresh() {
 }
 
 // Mark the whole panel dirty so the compositor repaints it.
-// Expanded by 1px: the shadow ring is drawn just OUTSIDE the panel rect,
-// and stale ring pixels are what lingered after closing the menu.
 static inline void wm_menu_dirty_rect() {
     if (!fb) return;
     int32_t px, py, pw, ph;
     wm_menu_geom(&px, &py, &pw, &ph);
-    uint32_t x1 = (uint32_t)(px > 0 ? px - 1 : 0), y1 = (uint32_t)(py > 0 ? py - 1 : 0);
-    int32_t xe = px + pw; // shadow right edge, inclusive
-    int32_t ye = py + ph; // shadow bottom edge, inclusive
+    uint32_t x1 = (uint32_t)(px > 0 ? px : 0), y1 = (uint32_t)(py > 0 ? py : 0);
+    int32_t xe = px + pw - 1; // panel right edge, inclusive
+    int32_t ye = py + ph - 1; // panel bottom edge, inclusive
     uint32_t x2 = (xe < (int32_t)fb->width)  ? (uint32_t)xe : fb->width - 1;
     uint32_t y2 = (ye < (int32_t)fb->height) ? (uint32_t)ye : fb->height - 1;
     wm_dirty_add(x1, x2, y1, y2);
@@ -1961,16 +1959,6 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         int hover = wm_menu_hit_test(g_mouse_x, g_mouse_y);
 
         uint32_t char_h = wm_text_height(g_font_scale_100);
-
-        // ── Shadow ring: 1px dark border around the whole panel (depth without alpha)
-        for (int32_t y = py - 1; y <= py + ph; y++) {
-            if (y < (int32_t)min_y || y > (int32_t)max_y) continue;
-            if (y < 0 || (uint32_t)y >= fb->height) continue;
-            uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
-            int32_t sx = px - 1 < 0 ? 0 : px - 1;
-            int32_t ex = px + pw + 1; if (ex > (int32_t)fb->width) ex = (int32_t)fb->width;
-            if (ex > sx) memset_32(drow + sx, 0xFF0A0E1A, (uint32_t)(ex - sx));
-        }
 
         // ── Panel body: dark navy glass, same family as the taskbar
         for (int32_t y = py; y < py + ph; y++) {
