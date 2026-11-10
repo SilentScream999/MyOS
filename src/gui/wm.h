@@ -13,6 +13,7 @@
 
 #include "font8x8_basic.h"
 #include "ui_font.h"
+#include "truetype.h"
 
 // ── RDTSC Helper ─────────────────────────────────────────────────────────────
 static inline uint64_t rdtsc_val() {
@@ -461,6 +462,46 @@ static bool wm_load_wallpaper_file(const char* path) {
     vfs_close(&f);
     if (data) kfree(data);
     return ok;
+}
+
+// Boot-only selection: publish the atlas before the shell/compositor starts.
+static ttf::Atlas* g_desktop_font = nullptr;
+static void wm_load_disk_font() {
+    char path[256]; strcpy(path, "/share/fonts/selawk.ttf");
+    file config{};
+    if (vfs_open("/etc/font.cfg", 0, &config) == 0) {
+        uint64_t n = config.vn->size;
+        bool valid = n && n < sizeof(path) && vfs_read(&config, path, n) == n;
+        vfs_close(&config);
+        if (valid) {
+            path[n] = 0;
+            while (n && (path[n-1] == '\r' || path[n-1] == '\n')) path[--n] = 0;
+            valid = n && path[0] == '/';
+            for (uint64_t i=0; i<n; ++i) if ((uint8_t)path[i] < 32) valid = false;
+        }
+        if (!valid) { print((char*)"[font] Invalid /etc/font.cfg; using built-in Selawik."); return; }
+    }
+    file source{};
+    if (vfs_open(path, 0, &source) != 0) {
+        print((char*)"[font] Font unavailable; using built-in Selawik."); return;
+    }
+    uint64_t size = source.vn->size;
+    uint8_t* data = size && size <= ttf::max_file ? (uint8_t*)kmalloc(size) : nullptr;
+    uint64_t loaded = 0, started = rdtsc_val();
+    while (data && loaded < size && rdtsc_val() - started < _usb_tsc_hz()*15) {
+        uint64_t chunk = size-loaded; if (chunk>65536) chunk=65536;
+        if (vfs_read(&source, data+loaded, chunk) != chunk) break;
+        loaded += chunk; boot_splash_tick();
+    }
+    vfs_close(&source);
+    ttf::Atlas* atlas = data && loaded == size ? (ttf::Atlas*)kmalloc(sizeof(ttf::Atlas)) : nullptr;
+    ttf::Scratch* scratch = atlas ? (ttf::Scratch*)kmalloc(sizeof(ttf::Scratch)) : nullptr;
+    bool ok = scratch && ttf::bake(data, size, *atlas, *scratch);
+    kfree(scratch); kfree(data);
+    if (!ok) { kfree(atlas); print((char*)"[font] Invalid/unreadable font; using built-in Selawik."); return; }
+    g_desktop_font = atlas;
+    ui_active_fonts = atlas->fonts; ui_active_font_count = 8;
+    print((char*)"[font] Loaded desktop font:"); print(path);
 }
 
 // desktop.cfg is one absolute asset path, optionally followed by CR/LF.

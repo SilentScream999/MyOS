@@ -14,11 +14,14 @@ struct UiFont {
     const uint8_t* coverage;
 };
 #include "ui_font_data.h"
+static const UiFont* ui_active_fonts = ui_fonts;
+static unsigned ui_active_font_count = sizeof(ui_fonts) / sizeof(ui_fonts[0]);
 
 static const UiFont* ui_font_for_pixels(uint32_t pixels) {
-    const UiFont* chosen = &ui_fonts[0];
+    const UiFont* chosen = &ui_active_fonts[0];
     if (pixels <= chosen->pixels) return chosen;
-    for (const UiFont& font : ui_fonts) {
+    for (unsigned i = 0; i < ui_active_font_count; ++i) {
+        const UiFont& font = ui_active_fonts[i];
         if (pixels >= font.pixels) chosen = &font;
         else if (font.pixels - pixels < pixels - chosen->pixels) { chosen = &font; break; }
         else break;

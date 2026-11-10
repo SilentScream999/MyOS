@@ -8,12 +8,13 @@ Microsoft describes Selawik as an [open-source replacement for Segoe UI](https:/
 in WSL) to regenerate `src/gui/ui_font_data.h`. Normal builds use the checked-in
 atlas and need no new font library. Generated metadata records the TTF SHA256.
 Printable ASCII is baked at 12, 14, 16, 18, 21, 24, 28 and 32 pixels with grayscale
-coverage and proportional advances. Unknown bytes display `?`; UTF-8 shaping,
-runtime TTF selection and additional glyph ranges remain future work.
+coverage and proportional advances. Unknown bytes display `?`; UTF-8 shaping
+and additional glyph ranges remain future work. This atlas is the built-in fallback;
+the desktop normally rasterizes the original TTF file at boot.
 
-The compositor uses these atlases for window titles, Start/menu/task buttons and
+The compositor uses font atlases for window titles, Start/menu/task buttons and
 the tray clock. Shell text, boot-log contents, debug HUD and panic text retain
-their existing monospace bitmap renderer. The font is embedded in the kernel's
-read-only data; it is not loaded from the system disk during startup.
+their existing monospace bitmap renderer. See [font file support](../../../docs/FONTS.md)
+for runtime TTF selection through `/etc/font.cfg`.
 The original font license is installed as `/share/fonts/selawik.txt` on the system
 volume and in the recovery initrd.

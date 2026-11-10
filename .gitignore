@@ -4,5 +4,9 @@ wyzar-usb.img*
 __pycache__/
 /core
 core.*
-tests
+tests/*
+!tests/truetype_test.cpp
+!tests/system_volume_test.py
+!tests/qemu_font_selection_test.py
+!tests/qemu_storage_smoke.py
 tests.*

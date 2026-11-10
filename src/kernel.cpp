@@ -948,6 +948,7 @@ extern "C" void kmain(void) {
     static bool wallpaper_loaded = false;
     if (!wallpaper_loaded) {
         wallpaper_loaded = true;
+        wm_load_disk_font();
         if (disk_root_active) wm_load_disk_wallpaper();
         g_boot_assets_ready = true;
         boot_loading_screen_until_ready();

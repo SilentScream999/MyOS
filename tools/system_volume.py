@@ -189,6 +189,7 @@ def install_system(data, root):
         volume.put('bin/' + program, (root / program).read_bytes())
     volume.put('etc/root.cfg', b'WYZARROOT1\n')
     volume.put('etc/desktop.cfg', b'/share/wall.raw\n', default=True)
+    volume.put('etc/font.cfg', b'/share/fonts/selawk.ttf\n', default=True)
     volume.put('bootlog.txt', b'', default=True)
     volume.put('run/boot.log', b'', default=True)
     if (root / 'wallpaper.raw').exists():
@@ -196,5 +197,8 @@ def install_system(data, root):
     font_license = root / 'assets/fonts/selawik/LICENSE.txt'
     if font_license.exists():
         volume.put('share/fonts/selawik.txt', font_license.read_bytes())
+    font_file = root / 'assets/fonts/selawik/selawk.ttf'
+    if font_file.exists():
+        volume.put('share/fonts/selawk.ttf', font_file.read_bytes())
     volume.validate_tree()
     return volume.data

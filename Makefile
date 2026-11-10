@@ -75,7 +75,7 @@ user/win_test.o: user/win_test.c
 win_test.elf: user/win_test.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
-initrd.tar: init.elf counter.elf win_test.elf assets/fonts/selawik/LICENSE.txt
+initrd.tar: init.elf counter.elf win_test.elf assets/fonts/selawik/LICENSE.txt assets/fonts/selawik/selawk.ttf Makefile
 	rm -rf initrd_root
 	mkdir -p initrd_root/bin
 	cp init.elf initrd_root/bin/
@@ -83,6 +83,7 @@ initrd.tar: init.elf counter.elf win_test.elf assets/fonts/selawik/LICENSE.txt
 	cp win_test.elf initrd_root/bin/
 	mkdir -p initrd_root/share/fonts
 	cp assets/fonts/selawik/LICENSE.txt initrd_root/share/fonts/selawik.txt
+	cp assets/fonts/selawik/selawk.ttf initrd_root/share/fonts/selawk.ttf
 	tar -cf initrd.tar --format=ustar -C initrd_root .
 
 iso: all usb-image

@@ -83,7 +83,7 @@ options, hence the `make clean`.
 * **Input:** xHCI USB (Intel port-routing support plus an AMD quirk workaround, hubs, connect detection), USB HID keyboard and mouse, PS/2 keyboard, Synaptics touchpad over PS/2 (see `src/drivers/SynapticsGuide.md`).
 * **Platform:** ACPI (shutdown/reboot), PCI ECAM mapping and enumeration.
 * **Taskbar clock:** real time and date from the CMOS RTC (`src/arch/rtc.h`), repainted when the minute changes. Windows keeps local time in the RTC, so it matches the Windows clock by default; see the `CLOCK_*` build options in the Makefile.
-* **Desktop:** window manager with z-order, drag (ghost outline), close buttons, taskbar, HUD, wallpaper, mouse cursor. Titles, menus and taskbar use antialiased Selawik; shell text stays monospace. See [font assets and regeneration](assets/fonts/selawik/README.md).
+* **Desktop:** window manager with z-order, drag (ghost outline), close buttons, taskbar, HUD, wallpaper, mouse cursor. Titles, menus and taskbar load real TTF fonts at boot (Selawik by default); shell text stays monospace. See [font file support and selection](docs/FONTS.md).
 * **Compositor:** surface-backed windows, a damage-rect list, and the rainbow animation as a surface client (see below).
 * **Intel GPU (Gen9):** PCI discovery, MMIO + GGTT mapping, forcewake/reset, blitter (BCS) ring with fill/copy and a fence. The self-test and benchmark have run on our laptop, but the path is **off by default** (slower than the CPU copy).
 
