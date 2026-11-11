@@ -23,6 +23,84 @@ Practical constraints that shape the work:
 
 ## 2. Current state
 
+* **Remaining requested storage stages (2026-11-10):** implemented rename without
+  overwrite (82), atomic replacement (custom 138), shell atomic `write`, `append`
+  and `mv`; ext4 uses a durably written sibling temporary then a one-transaction
+  regular-file exchange, followed by old-content cleanup. A crash can leave
+  `.wy-save-N`; destination must stay complete old/new. Open/mounted destinations
+  are protected. Modified lwext4 adds `ext4_fexchange` and propagates rename
+  commit errors; retained licensing notes document the changes.
+  Capacity: `ROOT_MIB`/`--root-mib`, streaming private-file updates, atomic offline
+  `tools/expand_usb_image.py` (root/total MiB, total bytes, or trailing file space).
+  Normal updates preserve capacity. Native Linux output can be sparse;
+  Windows/DrvFS output stays dense because sparse reads proved unreliable.
+  Expansion never opens physical devices; it requires reflashing the host image.
+  Runtime I/O: a reentrant sleeping filesystem mutex replaces long IRQ masking;
+  exact controller/slot/endpoint/TRB completion mailboxes wake storage waiters.
+  USB input dispatch continues during waits. Controller reset is serialized;
+  close/refcount operations use only short IRQ guards, including scheduler cleanup.
+  RAMFS now uses the same serialization and retains deleted node objects so stale
+  lookup pointers can be rejected. Its complete node state is explicitly zeroed
+  (host tests now poison allocations). Growing RAM writes zero any gap.
+  Actual optimized syscall tests also exposed missing user argument-register
+  preservation; syscall_entry now saves/restores RDI/RSI/RDX/R8/R9/R10 in addition
+  to callee-saved state. This preserves the inline wrappers' declared ABI.
+  This supersedes older pending-stage notes below. Permissions/links/UTC time,
+  safe eject/reconnect, GPT/UAS and internal-drive installation remain future work.
+  Verified: ASan/UBSan ext4/RAMFS and real USB wait/batching fixtures; 14
+  atomic-save write-failure points with Linux replay/check and complete old/new
+  destinations; 64 MiB creation through 1.5 GiB expansion, preservation, injected
+  resize failure containment and 1 GiB refresh under a 384 MiB address-space cap.
+  Dense Windows-backed creation/expansion/refresh also passed. Fresh resets now
+  retain a recognized expanded capacity unless ROOT_MIB explicitly overrides it.
+  QEMU actual optimized syscalls passed on a 1 GiB nested-hub root, including
+  RAMFS, two atomic-save worker processes, scheduler descriptor cleanup,
+  append/mv and clean shutdown. Injected real USB timeout verified timer, keyboard,
+  mouse and desktop presentation progress before disk offlining. All four
+  connected/unplugged shutdown/restart cases and direct/nested late-discovery
+  cases passed. Standard USB image/ISO rebuilt; new Surface/physical throughput
+  and wireless-input verification remains required.
+
+* **Storage stages authorized (2026-11-10):** user selected "All of them, in
+  stages" for performance, file APIs and full-stick capacity. Stage 1 implements
+  a bounds-checked block multi-write callback with sector fallback; USB
+  WRITE(10) batches up to 128 sectors without retry; ext4 uses it while retaining
+  each library-write durability barrier. A dirty flag skips only redundant
+  flushes. Sequential directory calls resume by byte offset; mutations invalidate
+  the cursor, random indices restart; cached vnodes use parent/name hash buckets.
+  Remaining stages are tracked in NEXT_STEPS.md. Interrupt-disabled synchronous
+  I/O, fixed capacity, missing save APIs and safe removal are NOT fixed here.
+  Host tests passed with sanitizers: actual USB batching/offset/bounds/failure/
+  fallback, linear listing, cursor mutation/restart, ext4 failure containment and
+  cold journal recovery. No hardware throughput/latency claim is established.
+  Basic stage-2 save behavior is also implemented: trailing vfs_ops truncate/
+  sync callbacks, `O_TRUNC` on writable opens, syscalls 77/74, and shell `write`
+  uses truncation. ext4/RAMFS shrink and zero-filled extension preserve the open
+  descriptor offset; read-only truncate is rejected. Sanitizer tests cover
+  shorter overwrites, same-vnode size visibility, zero-filled regrowth and RAMFS
+  read-only log protection. Rename/atomic saves and remaining stages are pending.
+  Rebuilt standard USB/ISO artifacts. Three nested-hub QEMU boots verified
+  short replacements, persistence, journal recovery and clean unmount; all four
+  connected/unplugged shutdown/restart cases passed with Linux filesystem checks
+  and saved contents preserved. Physical responsiveness/throughput still needs
+  a retest; synchronous interrupt-disabled I/O remains a known limitation.
+
+* **Ext4-only system roots (2026-11-10):** user confirmed there is no legacy
+  data to migrate and authorized removing the FAT16 system backend. Removed
+  `src/fs/fat16.h`, `tools/system_volume.py`, `tools/migrate_fat16.py`,
+  `tests/system_volume_test.py`, the `migrate-usb` target, and image CLI format/
+  migration options. Kernel root selection and image updates now accept ext4
+  only. Firmware boot partition remains FAT16; only the host boot-image builder
+  handles FAT. `FRESH=1` still resets the complete image, while normal refresh
+  preserves ext4 files/settings and rejects old FAT-root layouts. Converted
+  image/font tests to ext4 and retired the FAT-specific smoke-test body; its
+  shared QEMU harness remains and direct invocation runs the ext4 suite.
+  Earlier FAT16/migration descriptions below are historical, superseded here.
+  Verified kernel/ISO build, ext4 VFS sanitizer/recovery/failure tests, image
+  creation/update/fresh/atomicity/legacy rejection, three nested-hub QEMU boots
+  with persistence and clean shutdown, and all five font-selection/recovery
+  scenarios. Standard USB image and ISO rebuilt; kernel is 31,360 bytes smaller.
+
 * **Surface boot confirmed; unplug/power fix (2026-11-10):** user reports the
   discovery-grace build works on the previously failing USB-C dock connection.
   Do not remove the protocol fixes as speculative workarounds: SS descriptors,

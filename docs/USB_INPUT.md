@@ -100,6 +100,18 @@ The user has now physically confirmed that this discovery window fixes root
 mounting on the failing Surface/ZM3310 USB-C connection. Keyboard stutter has
 not been separately confirmed resolved.
 
+Runtime filesystem I/O now uses a reentrant sleeping mutex. Disk completion
+waiters register exact controller/slot/endpoint/TRB ownership before ringing
+the doorbell. The input dispatcher can deliver those completions and wake the
+owner while continuing HID processing; waiters also have a timed wake/poll path.
+Short IRQ guards protect event dequeue/publication and descriptor refcounts.
+`tests/qemu_storage_async_test.py` injects a missing completion into an actual
+write and verifies timer, keyboard, mouse and desktop presentation progress
+before the bounded disk failure. Scripted actual-wait tests cover wrong/late
+completions, wakeup, short/error responses, queue failure and timeout. This does
+not establish that physical wireless interference or every hub hotplug delay
+has been resolved; discovery/control probes still use bounded synchronous waits.
+
 Run `python3 tests/run_usb_hub_tests.py` for sanitizer tests of the protocol
 helpers, actual hub-enumeration functions with scripted completions, mixed SS/SSP
 children, controller-reported output speeds, nested routes, USB 2 regression,

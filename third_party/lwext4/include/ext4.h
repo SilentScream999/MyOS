@@ -290,6 +290,9 @@ int ext4_flink(const char *path, const char *hardlink_path);
  * @param new_path Destination.
  * @return  Standard error code. */
 int ext4_frename(const char *path, const char *new_path);
+/* Wyzar extension: exchange two regular-file directory references in one
+ * journal transaction. File contents and link counts are unchanged. */
+int ext4_fexchange(const char *path, const char *other_path);
 
 /**@brief   File open function.
  *

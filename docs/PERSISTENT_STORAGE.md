@@ -1,9 +1,9 @@
 # Persistent system storage
 
 Updated 2026-11-10. New USB images contain a FAT EFI boot partition and a journaled
-ext4 system partition. Existing FAT16 images remain supported. See
-[EXT4.md](EXT4.md) for the new default, migration, feature profile and verification;
-FAT16-specific details below describe the legacy backend.
+ext4 system partition. System roots are ext4-only; the kernel FAT16 backend and
+legacy creation/migration tooling have been removed. See
+[EXT4.md](EXT4.md) for the feature profile and verification.
 The system partition mounts at `/`; applications do not
 use a `/disk` prefix. This is a USB system root, not an internal-drive installer.
 
@@ -28,7 +28,7 @@ in-place updater for a running/physical installation is not implemented.
 images alone. Close QEMU before updating its image; the updater locks the image
 and atomically publishes a completed replacement. It never opens physical drives.
 A failed update leaves the original image intact. The updater accepts only this
-project's recognized image layout and validates the system FAT before editing it.
+project's recognized image layout and validates/checks ext4 before editing it.
 
 `FRESH=1` intentionally resets all saved files, settings, applications and wallpaper:
 
@@ -36,16 +36,27 @@ project's recognized image layout and validates the system FAT before editing it
 make usb-image FRESH=1
 ```
 
+To create/reset a different root capacity, pass `ROOT_MIB`, for example
+`make usb-image FRESH=1 ROOT_MIB=1024`. Ordinary updates retain capacity;
+fresh resets retain a recognized existing capacity unless explicitly overridden.
+To grow an existing host image while preserving its files, use
+`python3 tools/expand_usb_image.py wyzar-usb.img --root-mib 1024`.
+`--total-bytes` instead fits the complete image to a stick's actual byte capacity.
+Expansion is offline and atomic; it does not access the stick or resize a live
+root. Reflash afterward. Windows-backed images are dense and require space for
+the full output; native Linux images can use sparse storage. Details and bounds
+are in [EXT4.md](EXT4.md).
+
 ## Layout and root selection
 
 | Partition | Size | Purpose |
 |---|---|---|
 | WYZARBOOT | 128 MiB | EFI boot, Limine, kernel, small recovery initrd and init module |
-| WYZARDATA | 256 MiB new / 64 MiB legacy | ext4 / FAT16 persistent system root `/` |
+| WYZARDATA | 256 MiB default; configurable | ext4 persistent system root `/` |
 
-The existing partition layout/labels remain compatible with older images.
-Normal refresh migrates an older data volume without formatting it. A file formerly
-seen as `/disk/hello.txt` is now `/hello.txt`; its bytes are preserved.
+Normal refresh preserves the ext4 data volume. Older FAT-root images are rejected;
+`FRESH=1` replaces them with the current layout. The boot partition remains FAT16
+for firmware compatibility and is not mounted by the kernel.
 
 | Path | Backing and purpose |
 |---|---|
@@ -125,17 +136,17 @@ The compositor reads RAM on every frame; it never reads the disk. The recovery
 initrd and Limine module list contain no duplicate wallpaper assets.
 
 Reads use 64 KiB filesystem chunks to permit preemption between synchronous
-operations. FAT16 follows FAT links to combine physically contiguous clusters
-into requests of up to 128 sectors, handling unaligned heads/tails separately.
-Fragmented links stop a run. The USB driver issues READ(10) commands for up to
+operations. The ext4 block adapter batches reads into up to 128 sectors.
+The USB driver issues READ(10) commands for up to
 128 sectors (64 KiB). Its DMA buffer is a physically contiguous, 64 KiB-aligned
 subrange of a retained 128 KiB allocation, so a transfer cannot cross xHCI's
 64 KiB buffer boundary. Other block backends can omit the optional
 multi-sector callback and retain one-sector reads. Bounds are checked at the block,
-partition and READ(10) boundaries. Writes remain one sector per command.
+partition and READ/WRITE(10) boundaries. Writes now batch up to 128 sectors
+(64 KiB) per USB command too. Every completed filesystem block write retains
+its device flush; repeated flush requests without new writes are skipped.
 
-Sequential cluster hints and a FAT-sector cache avoid repeated metadata I/O;
-FAT writes invalidate cached metadata. Large assets can still slow boot; this is
+Large assets can still slow boot; this is
 not an asynchronous I/O implementation. In diagnostic builds, wallpaper duration is logged in
 milliseconds for hardware diagnosis, split into disk read and decode/scale.
 USB discovery, disk readiness/capacity, initial desktop composition and total
@@ -205,26 +216,29 @@ rm /home/hello.txt
 open bootlog
 ```
 
-The shell's `write` creates a file or overwrites from offset zero without truncating.
-For a shorter replacement setting, remove the old file first, then write the new
-one. For example: `rm /etc/desktop.cfg`, then
-`write /etc/desktop.cfg /home/blue.raw`. Runtime wallpaper reload is not implemented.
+The shell's `write` saves via atomic replacement, so shorter replacements do not
+leave trailing bytes and an interrupted save retains complete old/new contents.
+`append <path> <text>` adds to the end, and `mv <old> <new>` renames when the
+destination is absent. Open files cannot be renamed/replaced. Atomic-save cleanup
+can leave a `.wy-save-N` sibling after interruption. Ordinary append and direct
+`O_TRUNC` writes are not atomic saves. Runtime wallpaper reload is not implemented.
 
-Disk filenames are case-insensitive DOS 8.3 names. FAT16 currently supports
-read/write/create/unlink/stat/mkdir/readdir. No seek/truncate/rename/rmdir syscall,
-shell mkdir command, long-name lookup, sparse files or directory growth exists.
-Root has 512 entries; newly created subdirectories have 126 usable slots.
-`rm` refuses directories, read-only/open files, long-name aliases and corrupt chains.
-Writes flush data, FAT metadata and directory changes; successful completion
-requires the USB device to honor SCSI SYNCHRONIZE CACHE.
+Disk filenames are case-sensitive, with up to 255 bytes per component and growing
+directories. Read/write/create/unlink/stat/mkdir/rmdir/readdir and seek are
+implemented. `O_TRUNC`, descriptor truncation (syscall 77), and sync (syscall 74)
+are available for ext4 and RAMFS. Growing with truncate zero-fills the extension;
+it allocates/writes data rather than creating a sparse hole. Rename (syscall 82,
+no overwrite) and atomic replacement (custom syscall 138) are available too.
+`rm` refuses directories and open files. Civil timestamps remain unknown until
+the OS has a UTC timestamp service. Filesystem calls remain synchronous for the
+caller, but runtime USB completion waits sleep under a reentrant filesystem
+mutex. Timer/input processing can continue. Initial probing still uses bounded
+synchronous control requests. BOT transport recovery remains future work; a
+failed transport is offlined. Successful durable writes require the device to
+honor SCSI SYNCHRONIZE CACHE. ext4 journaling supports metadata recovery; it does
+not guarantee preservation of every interrupted application write.
 
-FAT times use RTC/local civil time at two-second precision, without timezone
-metadata. Creation time survives edits. Filesystem/USB I/O still disables
-interrupts during each synchronous operation; asynchronous requests, sleeping
-locks and BOT recovery remain future work. FAT16 has no journal, so power loss can
-leave partial writes, leaked clusters or inconsistent metadata.
-
-Only USB BOT/SCSI LUN 0, 512-byte sectors, READ(10), MBR, FAT16 and the restricted
+Only USB BOT/SCSI LUN 0, 512-byte sectors, READ(10), MBR and the restricted
 ext4 system profile are supported. No UAS/GPT/FAT32/exFAT/internal SATA/NVMe
 support exists.
 Root-port status notifications are acknowledged without resetting xHCI; a
@@ -290,76 +304,34 @@ path is used.
 
 ## Verification
 
-Development checks live in the locally ignored `tests/` directory:
+Tracked ext4 and USB regression checks:
 
 ```sh
-clang++ -std=c++20 -fsanitize=address,undefined tests/scsi_retry_test.cpp -o .storage-test/scsi-retry-test
-.storage-test/scsi-retry-test
-python3 tests/system_volume_test.py
-python3 tests/image_update_test.py
-# Live-log callback/mounted metadata checks:
-clang++ -std=c++20 -fsanitize=address,undefined -iquote src/core tests/live_log_test.cpp -o .storage-test/live-log-test
-ASAN_OPTIONS=detect_leaks=0 .storage-test/live-log-test
-clang++ -std=c++20 -fsanitize=address,undefined -iquote src/core -iquote src/drivers -iquote src/fs tests/storage_test.cpp -o .storage-test/storage-test
-ASAN_OPTIONS=detect_leaks=0 .storage-test/storage-test .storage-test/root.img
-clang++ -std=c++20 -fsanitize=address,undefined tests/wallpaper_test.cpp -o .storage-test/wallpaper-test
-.storage-test/wallpaper-test
-python3 tests/qemu_storage_smoke.py --image .storage-test/root.img --features
-python3 tests/qemu_root_variants.py
-python3 tests/qemu_hub_storage_test.py
-clang++ -std=c++20 -I. -fsanitize=address,undefined -no-pie tests/xhci_port_state_test.cpp -o .storage-test/xhci-port-test
-.storage-test/xhci-port-test
-python3 tests/qemu_controller_hotplug_test.py
-python3 tests/qemu_hub_notification_test.py
-python3 tests/qemu_root_hotplug_test.py
-python3 tests/qemu_root_replacement_test.py
-clang++ -std=c++20 -I. -fsanitize=address,undefined -no-pie tests/usb_probe_budget_test.cpp -o .storage-test/usb-probe-test
-.storage-test/usb-probe-test
-python3 tests/qemu_usb_probe_failure_test.py
-clang++ -std=c++20 -I. -fsanitize=address,undefined -no-pie tests/usb_device_tree_test.cpp -o .storage-test/usb-device-tree-test
-.storage-test/usb-device-tree-test
-python3 tests/qemu_hub_hotplug_test.py
+python3 tools/make_usb_image.py --output .storage-test/ext4-usb.img --fresh
+python3 tests/run_ext4_tests.py
+python3 tests/ext4_image_test.py
+python3 tests/atomic_save_test.py
+python3 tests/capacity_image_test.py
+python3 tests/run_usb_hub_tests.py
+python3 tests/qemu_ext4_test.py --hub-depth 2
+python3 tests/qemu_late_storage_test.py
+python3 tests/qemu_usb_recovery_test.py
+python3 tests/qemu_power_action_test.py
+python3 tests/qemu_storage_api_test.py
+python3 tests/qemu_storage_async_test.py
+python3 tests/qemu_font_selection_test.py wyzar-usb.img assets/fonts/selawik/selawk.ttf
 ```
 
-Prepare the disposable image using `python3 tools/make_usb_image.py --output
-.storage-test/root.img` after `make all`; QEMU variants also require `make iso`.
-Host checks cover migration, upgrades, preservation, reclamation, full-volume and
-corruption rejection, plus VFS/FAT operations and wallpaper bounds/decoding.
-Read checks cover batching, fallback backends, overflow/bounds, unaligned and
-fragmented files, failed reads and FAT cache behavior. Live log checks verify
-growth and matching stat/read/directory sizes, including mounted placeholders.
-The QEMU `qemu_boot_log_test.py` check additionally runs a userspace probe built
-from `tests/log_metadata_probe.c` (place it at `.storage-test/log-probe.elf`)
-and `tests/read_hash_probe.c` (place it at `.storage-test/read-hash-probe.elf`). It
-compares the complete wallpaper hash after 64 KiB reads, and verifies the splash/desktop handoff and log stat/read/readdir agreement.
-QEMU checks cover cold boots, persistence across image updates, disk-selected
-wallpaper pixels, corrupt/missing assets and RAM recovery without a valid disk.
-Hub checks boot the actual USB image through one/two emulated hubs, compare the
-full wallpaper hash and retain writes across cold reboots. Hardware verification
-is still required.
-Root hotplug checks boot with no keyboard, add/remove the only keyboard five
-times (USB 1.1 and USB 2), type persistent files on the unchanged boot disk and
-verify the original USB mouse still moves. A private QEMU GDB-memory/qtest fixture
-also simulates a missed reset completion with CCS already set, verifying that
-late readiness enumerates the keyboard without resetting the controller.
-Replacement checks swap five full/high-speed mice while the guest is paused,
-forcing both physical changes to happen between samples with final CCS unchanged.
-They verify the new mouse moves, the existing keyboard still types persistent
-files, no xHCI reset occurs, and replacement after a five-second empty interval
-also works.
-Hub-local tests boot the ISO with the system disk below one/two emulated hubs,
-then repeatedly add/remove and rapidly replace accessories beside it. They verify
-the actual new keyboard/mouse works and writes persist on the unchanged sibling
-disk. The nested case disables interrupt rearming to verify polling fallback.
-`tests/usb_hub_poll_policy_test.cpp` checks idle request budgets, immediate
-notification handling, debounce, bounded retries and scheduling after slow
-requests. `tests/qemu_hub_idle_test.py` counts actual GET_STATUS requests: one/two
-eight-port hubs issued 10/24 requests in three seconds, compared with the previous
-full-scan budgets of 108/216. These measure USB traffic, not hardware CPU usage.
-`tests/usb_hub_async_test.cpp` tests the production background state machine with
-sanitizers: nonblocking progress, completion ownership, short/error responses,
-acknowledgments, debounce, timeout, late events and ring wrap. The QEMU timeout
-fixture models a missing inner-hub completion while verifying timer/mouse progress,
-a persistent write to the disk below that hub, and a healthy upstream monitor.
-Physical retest after asynchronous monitoring: user reports CPU usage returned
-to 5% and new-device detection feels instant with the tested hub setup.
+The VFS tests cover long names, directory growth, cross-block I/O, failure
+containment and journal recovery with sanitizers and Linux filesystem checks.
+Image tests verify fresh creation, preserved user files/settings, unsupported
+features and legacy-root rejection, and atomic publication on failed updates.
+QEMU tests cover persistence across cold boots through hubs, delayed storage,
+RAM recovery, custom/fallback fonts, and power actions with/without the boot disk.
+The shared `qemu_storage_smoke.py` harness also runs the ext4 persistence suite
+when invoked directly. Older local FAT-specific fixtures are retired.
+
+Protocol/port tests exercise descriptor bounds, SuperSpeed companions, route
+depth, USB 2 compatibility, root resets, debounce, async completion ownership
+and sibling device isolation. QEMU hubs exercise USB 2; physical SuperSpeed
+and Surface hardware still require their own retests after driver changes.

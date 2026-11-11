@@ -54,6 +54,10 @@ struct vfs_ops {
     int (*stat)(vnode* vn, file_info* info);
     int (*rmdir)(vnode* dir, const char* name);
     int (*statfs)(vnode* vn, fs_info* out);
+    int (*truncate)(vnode* vn, uint64_t size);
+    int (*sync)(vnode* vn);
+    int (*rename)(vnode* dir, const char* name, vnode* destination, const char* new_name);
+    int (*replace)(vnode* dir, const char* name, const void* data, uint64_t len);
 };
 
 // VNODE: A node in the VFS tree (represents a file or directory inode)
@@ -242,7 +246,9 @@ static vnode* vfs_namei_parent(const char* path, char* name) { return vfs_walk(p
 
 // Open or create a file
 static int vfs_open(const char* path, int flags, file* f) {
+    if (!f || (flags & 3) == 3 || ((flags & 0x200) && !(flags & 3))) return -1;
     vnode* vn = vfs_namei(path);
+    if (vn && (flags & 0xc0) == 0xc0) return -1; // O_CREAT | O_EXCL
     if (!vn) {
         if (!(flags & 0x40)) return -1; // O_CREAT; reads never create files.
         // File doesn't exist and O_CREAT was requested.
@@ -261,8 +267,10 @@ static int vfs_open(const char* path, int flags, file* f) {
     f->mode = flags;
     f->refcount = 1;
     
-    if (vn->ops->open) {
-        return vn->ops->open(vn, f);
+    if (vn->ops->open && vn->ops->open(vn, f) != 0) { f->vn = nullptr; return -1; }
+    if ((flags & 0x200) && (!vn->ops->truncate || vn->ops->truncate(vn, 0) != 0)) {
+        if (vn->ops->close) vn->ops->close(vn);
+        f->vn = nullptr; return -1;
     }
     
     return 0; // Success
@@ -299,6 +307,15 @@ static void vfs_close(file* f) {
         }
         f->vn = nullptr;
     }
+}
+
+static int vfs_ftruncate(file* f, uint64_t size) {
+    if (!f || !f->vn || !(f->mode & 3) || !f->vn->ops->truncate) return -1;
+    return f->vn->ops->truncate(f->vn, size);
+}
+static int vfs_fsync(file* f) {
+    if (!f || !f->vn || !f->vn->ops->sync) return -1;
+    return f->vn->ops->sync(f->vn);
 }
 
 static int vfs_mkdir(const char* path) {
@@ -359,6 +376,26 @@ static int vfs_unlink(const char* path) {
     vnode* covered = parent->ops->lookup ? parent->ops->lookup(parent, name) : nullptr;
     if (vfs_follow_mount(covered) != covered) return -1;
     return parent->ops->unlink(parent, name);
+}
+static int vfs_rename(const char* path, const char* new_path) {
+    char name[256], new_name[256];
+    vnode* parent = vfs_namei_parent(path, name);
+    vnode* destination = vfs_namei_parent(new_path, new_name);
+    if (!parent || !destination || parent->type != VnodeType::DIRECTORY || destination->type != VnodeType::DIRECTORY ||
+        !parent->ops || !parent->ops->lookup || parent->ops != destination->ops ||
+        !parent->ops->rename || !name[0] || !new_name[0]) return -1;
+    vnode* source = parent->ops->lookup(parent, name);
+    vnode* target = destination->ops->lookup(destination, new_name);
+    if (!source || vfs_follow_mount(source) != source || vfs_follow_mount(target) != target) return -1;
+    return parent->ops->rename(parent, name, destination, new_name);
+}
+static int vfs_replace(const char* path, const void* data, uint64_t len) {
+    if (!data && len) return -1;
+    char name[256]; vnode* parent = vfs_namei_parent(path, name);
+    if (!parent || !name[0] || !parent->ops->replace) return -1;
+    vnode* target = parent->ops->lookup(parent, name);
+    if (vfs_follow_mount(target) != target) return -1;
+    return parent->ops->replace(parent, name, data, len);
 }
 static int vfs_stat(const char* path, file_info* info) {
     return vfs_stat_node(vfs_namei(path), info);

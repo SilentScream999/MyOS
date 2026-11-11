@@ -40,6 +40,8 @@ def main():
             if args.hub_depth:
                 assert log.count('Hub child addressed successfully') >= args.hub_depth
             if boot == 1:
+                q.type('write /home/replacement.txt old-long-content\n')
+                q.type('write /home/replacement.txt ok\n')
                 q.type('mkdir /home/documents\n')
                 q.type('write /home/documents/long-filename.txt ext4-survived-cold-boot\n')
             else:
@@ -69,6 +71,8 @@ def main():
         subprocess.run(['e2fsck', '-fn', str(partition)], check=True, capture_output=True)
         content = subprocess.check_output(['debugfs', '-R', 'cat /home/documents/long-filename.txt', str(partition)], stderr=subprocess.DEVNULL)
         assert content == b'ext4-survived-cold-boot', content
+        replacement = subprocess.check_output(['debugfs', '-R', 'cat /home/replacement.txt', str(partition)], stderr=subprocess.DEVNULL)
+        assert replacement == b'ok', replacement
         print(f'ext4 USB boot {boot}: journal, wallpaper, persistence and Linux checker passed', flush=True)
     print('QEMU ext4 USB test passed')
 

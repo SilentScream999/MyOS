@@ -81,7 +81,7 @@ options, hence the `make clean`.
 * **Tasks:** PCB, context switch, round-robin **single-core** preemptive scheduler. Other cores are detected but never started.
 * **Syscalls:** `syscall`/`sysret` entry and a small dispatcher (table below).
 * **Userspace:** static ELF64 loading from VFS, isolated user address spaces, shell, counter and window demo. Init normally loads from disk `/bin/init.elf`; initrd/Limine modules provide recovery.
-* **Filesystem:** VFS with a journaled ext4 root on USB, legacy FAT16 support, RAM runtime mounts and initrd recovery. See [ext4 storage](docs/EXT4.md) for scope and testing.
+* **Filesystem:** VFS with a journaled ext4 root on USB, RAM runtime mounts and initrd recovery. FAT is used only for the firmware boot partition. See [ext4 storage](docs/EXT4.md) for scope and testing.
 * **Terminal:** TTY with line discipline, framebuffer terminal emulator (ANSI subset), shell with history, scrollback and live command highlighting.
 * **Input:** xHCI USB (Intel port-routing support plus an AMD quirk workaround, hubs, connect detection), USB HID keyboard and mouse, PS/2 keyboard, Synaptics touchpad over PS/2 (see `src/drivers/SynapticsGuide.md`).
 * **Platform:** ACPI (shutdown/reboot), PCI ECAM mapping and enumeration.
@@ -113,7 +113,9 @@ Convention: `rax` = number, arguments in `rdi, rsi, rdx, r10, r8`, result in `ra
 | 8 | `LSEEK` | file seek offset (SEEK_SET, SEEK_CUR, SEEK_END) |
 | 16 / 17 | `SCROLL` / `TTYRAW` | terminal scrollback, raw input mode |
 | 18 / 19 / 20 | `TTYECHO` / `TTYFLUSH_INPUT` / `TTYTAKE_LAUNCH` | echo controls, discard pending input, shell consumes a Start-menu launch |
-| 4 / 87 | `STAT` / `UNLINK` | file metadata/timestamps and short-name FAT16 file deletion |
+| 4 / 87 | `STAT` / `UNLINK` | file metadata and file deletion |
+| 74 / 77 | `FSYNC` / `FTRUNCATE` | synchronize a file or change its length (ext4/RAMFS) |
+| 82 / 138 | `RENAME` / `REPLACE` | rename without overwrite / atomically save replacement contents |
 | 79 / 80 | `GETCWD` / `CHDIR` | get and change task current working directory (CWD) |
 | 83 / 84 | `MKDIR` / `RMDIR` | create and delete directories (rmdir requires empty directory) |
 | 137 | `STATFS` | filesystem capacity, used, and free space reporting |
@@ -147,7 +149,7 @@ Window authorization and ELF/user-pointer validation still need hardening. This 
 | `src/arch/gdt.h`, `src/arch/idt.h`, `src/arch/irq.h`, `src/arch/timer.h`, `src/arch/apic_timer.h`, `src/arch/acpi.h` | CPU tables, interrupts, timers, ACPI |
 | `src/arch/rtc.h` | CMOS real-time clock for the taskbar clock; pure decode/format logic plus thin port I/O |
 | `src/drivers/usbhelpers.h`, `src/drivers/mouse.h`, `src/drivers/ps2kb.h`, `src/drivers/synaptics.h` | xHCI/USB HID, mouse state and cursor, PS/2 keyboard, touchpad |
-| `src/fs/vfs.h`, `src/fs/ramfs.h`, `src/fs/fat16.h`, `src/drivers/block.h`, `src/drivers/usb_storage.h` | VFS, RAMFS, FAT16 and USB block storage |
+| `src/fs/vfs.h`, `src/fs/ramfs.h`, `src/fs/ext4_vfs.h`, `src/drivers/block.h`, `src/drivers/usb_storage.h` | VFS, RAMFS, ext4 and USB block storage |
 | `src/drivers/intel_gpu.h`, `src/drivers/gpu_cmds.h` | Intel Gen9 kernel glue; command/ring encoding (pure, no kernel dependencies) |
 | `user/init.c`, `user/counter.c` | shell and console process demo, bundled in the initrd |
 | `user/win_test.c` | mapped-surface/input demo, launched through the shell or Start menu |

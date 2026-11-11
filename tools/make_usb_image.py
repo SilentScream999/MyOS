@@ -2,8 +2,7 @@
 """Build a UEFI USB image, optionally refreshing boot files while retaining data.
 
 New images have a FAT EFI boot partition and a journaled ext4 WYZARDATA root.
-Existing FAT16 images retain their filesystem during ordinary updates. ext4
-creation/update requires WSL/Linux, e2fsprogs and a C compiler. No devices opened.
+Creation/update requires WSL/Linux, e2fsprogs and a C compiler. No devices opened.
 """
 import argparse
 from pathlib import Path
@@ -13,17 +12,17 @@ import os
 import tempfile
 import stat
 from contextlib import contextmanager
-from system_volume import install_system
-from ext4_volume import install_ext4, EXT4_SECTORS, check as check_ext4
+from ext4_volume import install_ext4_file, EXT4_SECTORS, MIN_SECTORS, MAX_SECTORS, check_header
+from image_io import copy_sparse
 from types import SimpleNamespace
 
 SECTOR = 512
 START = 2048
 BOOT_SECTORS = 262144
-DATA_SECTORS = 131072
 
 
 class Fat16Image:
+    """Build the firmware boot partition; never used as a system root."""
     def __init__(self, sectors, label, hidden):
         self.data = bytearray(sectors * SECTOR)
         self.spc, self.fatsecs, self.roots = 8, 128, 512
@@ -43,7 +42,7 @@ class Fat16Image:
                          self.roots, 0, 0xf8, self.fatsecs, 63, 255, hidden, sectors)
         b[36] = 0x80
         b[38] = 0x29
-        struct.pack_into('<I', b, 39, 0x57595a01 if hidden == START else 0x57595a02)
+        struct.pack_into('<I', b, 39, 0x57595a01)
         b[43:54] = label.encode('ascii').ljust(11, b' ')
         b[54:62] = b'FAT16   '
         b[510:512] = b'\x55\xaa'
@@ -83,7 +82,6 @@ class Fat16Image:
             long_entries = []
         except ValueError:
             # Boot assets retain their Limine paths using VFAT long entries.
-            # The writable volume uses only 8.3 names in this first driver.
             base, _, ext = name.upper().rpartition('.')
             short = (base[:6] + '~1').ljust(8).encode() + ext[:3].ljust(3).encode()
             checksum = 0
@@ -165,25 +163,29 @@ def locked_image(path):
                 fcntl.lockf(source, fcntl.LOCK_UN)
 
 
-def validate_existing(source):
+def validate_existing(source, allow_trailing=False):
     source.seek(0)
     mbr = source.read(SECTOR)
     if mbr[510:512] != b'\x55\xaa':
         raise ValueError('Invalid image MBR')
-    data_kind = mbr[466]
-    data_count = EXT4_SECTORS if data_kind == 0x83 else DATA_SECTORS
-    if os.fstat(source.fileno()).st_size != (START + BOOT_SECTORS + data_count) * SECTOR:
+    data_count = struct.unpack_from('<I', mbr, 474)[0]
+    if data_count % 8 or not MIN_SECTORS <= data_count <= MAX_SECTORS:
+        raise ValueError('Unrecognized system partition size')
+    actual = os.fstat(source.fileno()).st_size
+    expected = (START + BOOT_SECTORS + data_count) * SECTOR
+    if actual < expected or (actual != expected and not allow_trailing):
         raise ValueError('Unrecognized image size; refusing boot update')
     for i, (kind, start, count, label) in enumerate((
         (0xef, START, BOOT_SECTORS, b'WYZARBOOT  '),
-        (0x83 if data_kind == 0x83 else 0x0e, START + BOOT_SECTORS, data_count, b'WYZARDATA  '),
+        (0x83, START + BOOT_SECTORS, data_count, b'WYZARDATA  '),
     )):
         offset = 446 + 16 * i
         if mbr[offset + 4] != kind or struct.unpack_from('<II', mbr, offset + 8) != (start, count):
             raise ValueError('Unrecognized partition layout; refusing boot update')
         source.seek(start * SECTOR)
-        if i == 1 and data_kind == 0x83:
-            check_ext4(source.read(data_count * SECTOR))
+        if i == 1:
+            source.seek(start * SECTOR + 1024)
+            check_header(source.read(1024), data_count * SECTOR)
             continue
         b = source.read(SECTOR)
         if b[43:54] != label or b[510:512] != b'\x55\xaa':
@@ -191,7 +193,7 @@ def validate_existing(source):
     for i in (2, 3):
         if any(mbr[446 + 16*i:462 + 16*i]):
             raise ValueError('Extra partitions present; refusing boot update')
-    return ('ext4' if data_kind == 0x83 else 'fat16'), data_count
+    return data_count
 
 
 def write_image(output, boot, data, mbr, update_boot=False, fresh=False, system_root=None):
@@ -210,16 +212,23 @@ def write_image(output, boot, data, mbr, update_boot=False, fresh=False, system_
                         dest.write(mbr)
                         dest.seek(START * SECTOR)
                         dest.write(boot.data)
-                        dest.write(data.data)
+                        write_partition(dest, data)
                     else:
-                        filesystem, data_count = validate_existing(source)
+                        data_count = validate_existing(source)
                         source.seek(0)
                         dest.write(source.read(START * SECTOR))
                         dest.write(boot.data)
                         source.seek((START + BOOT_SECTORS) * SECTOR)
-                        saved = source.read(data_count * SECTOR)
-                        installer = install_ext4 if filesystem == 'ext4' else install_system
-                        dest.write(installer(saved, system_root) if system_root else saved)
+                        if system_root:
+                            with tempfile.TemporaryDirectory(prefix='wyzar-update-') as directory:
+                                volume = Path(directory) / 'volume.img'
+                                with volume.open('wb') as private:
+                                    copy_sparse(source, private, data_count * SECTOR)
+                                install_ext4_file(volume, system_root)
+                                with volume.open('rb') as private:
+                                    copy_sparse(private, dest, data_count * SECTOR, sparse=data_count >= 1048576)
+                        else:
+                            copy_sparse(source, dest, data_count * SECTOR, sparse=data_count >= 1048576)
                     dest.flush()
                     os.fsync(dest.fileno())
                     # Keep lock held until the complete replacement is ready.
@@ -230,7 +239,7 @@ def write_image(output, boot, data, mbr, update_boot=False, fresh=False, system_
                 dest.write(mbr)
                 dest.seek(START * SECTOR)
                 dest.write(boot.data)
-                dest.write(data.data)
+                write_partition(dest, data)
                 dest.flush()
                 os.fsync(dest.fileno())
         if temp_path:
@@ -246,16 +255,22 @@ def write_image(output, boot, data, mbr, update_boot=False, fresh=False, system_
             temp_path.unlink()
 
 
+def write_partition(destination, data):
+    if hasattr(data, 'path'):
+        with data.path.open('rb') as source:
+            length = data.path.stat().st_size
+            copy_sparse(source, destination, length, sparse=length >= 512 * 1024 * 1024)
+    else:
+        destination.write(data.data)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=Path('wyzar-usb.img'))
+    parser.add_argument('--root-mib', type=int, help='Root capacity for new/fresh images (default 256 MiB)')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--update-boot', action='store_true', help='Refresh an existing image atomically, refreshing bundled system apps and preserving user files/settings; create it if missing')
     mode.add_argument('--fresh', action='store_true', help='Replace the complete image with a fresh one, ERASING saved files (refuses images in use)')
-    parser.add_argument('--filesystem', choices=('ext4', 'fat16'), default=None,
-                        help='Filesystem for NEW/fresh images (default ext4); updates retain the existing format')
-    parser.add_argument('--migrate-from', type=Path,
-                        help='Copy a recognized FAT16 system image into a NEW ext4 image; original is unchanged')
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     files = {
@@ -269,38 +284,38 @@ def main():
     for target, source in files.items():
         boot.add(target, (root / source).read_bytes())
     data_start = START + BOOT_SECTORS
-    filesystem = args.filesystem or 'ext4'
     updating = args.output.exists() and args.update_boot and not args.fresh
+    data_count = (args.root_mib * 2048) if args.root_mib is not None else EXT4_SECTORS
+    if not MIN_SECTORS <= data_count <= MAX_SECTORS:
+        parser.error('Root capacity must be at least 64 MiB and fit the MBR/READ(10) layout')
     if updating:
         with locked_image(args.output) as source:
-            existing_fs, _ = validate_existing(source)
-        if args.filesystem and args.filesystem != existing_fs:
-            parser.error('An update cannot change filesystem; use --migrate-from with a new output')
-        filesystem = existing_fs
-    if args.migrate_from:
-        if args.output.exists() or args.output.is_symlink() or args.fresh or args.update_boot or filesystem != 'ext4':
-            parser.error('--migrate-from requires a new ext4 output without --fresh/--update-boot')
-        from migrate_fat16 import migrate
-        data = SimpleNamespace(data=migrate(args.migrate_from, root))
-    elif updating:
-        data = None  # The locked updater reads and validates the existing partition.
-    elif filesystem == 'ext4':
-        data = SimpleNamespace(data=install_ext4(None, root))
-    else:
-        data = Fat16Image(DATA_SECTORS, 'WYZARDATA', data_start)
-        data.add('README.TXT', b'WyzarOS persistent system volume. Mounted at /.\r\n')
-        data.data = install_system(data.data, root)
-    data_count = EXT4_SECTORS if filesystem == 'ext4' else DATA_SECTORS
+            existing = validate_existing(source)
+        if args.root_mib is not None and data_count != existing:
+            parser.error('Updates preserve root capacity; use expand_usb_image.py to grow an existing image')
+        data_count = existing
+    elif args.fresh and args.root_mib is None and args.output.exists():
+        with locked_image(args.output) as source:
+            try:
+                data_count = validate_existing(source)
+            except ValueError:
+                pass  # Explicit fresh replacement can reset an obsolete layout.
     mbr = bytearray(SECTOR)
-    for i, (kind, start, count) in enumerate(((0xef, START, BOOT_SECTORS), (0x83 if filesystem == 'ext4' else 0x0e, data_start, data_count))):
+    for i, (kind, start, count) in enumerate(((0xef, START, BOOT_SECTORS), (0x83, data_start, data_count))):
         struct.pack_into('<B3sB3sII', mbr, 446 + i * 16, 0, b'\xfe\xff\xff', kind, b'\xfe\xff\xff', start, count)
     mbr[510:512] = b'\x55\xaa'
     existed = args.output.exists()
-    write_image(args.output, boot, data, mbr, args.update_boot, args.fresh, system_root=root)
+    with tempfile.TemporaryDirectory(prefix='wyzar-new-image-') as directory:
+        data = None
+        if not updating:
+            volume = Path(directory) / 'volume.img'
+            install_ext4_file(volume, root, create=True, sectors=data_count)
+            data = SimpleNamespace(path=volume)
+        write_image(args.output, boot, data, mbr, args.update_boot, args.fresh, system_root=root)
     preserved = existed and not args.fresh
     print(f'{"Updated boot files in" if preserved else "Created fresh image"} {args.output}; ' +
-          (f'{filesystem} bundled apps refreshed; user files/settings/wallpaper preserved' if preserved else
-           f'UEFI boot + {data_count // 2048} MiB {filesystem} system root'))
+          ('ext4 bundled apps refreshed; user files/settings/wallpaper preserved' if preserved else
+           f'UEFI boot + {data_count // 2048} MiB ext4 system root'))
 
 
 if __name__ == '__main__':

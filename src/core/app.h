@@ -2,7 +2,7 @@
 #define WYZAR_APP_H
 
 // Both app extensions contain a static x86-64 ELF executable. Keep name
-// matching independent of FAT16's uppercase directory entries.
+// matching independent of executable filename casing.
 static inline int app_name_equal(const char* a, const char* b) {
     while (*a && *b) {
         char x = *a++, y = *b++;

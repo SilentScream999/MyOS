@@ -16,7 +16,6 @@
 #include "arch/acpi.h"
 #include "core/syscall.h"
 #include "fs/ramfs.h"
-#include "fs/fat16.h"
 #include "fs/ext4_vfs.h"
 
 extern "C" void* wyzar_ext4_malloc(size_t n) { return kmalloc(n); }
@@ -922,6 +921,8 @@ extern "C" void kmain(void) {
 	// Serialize controller resets against synchronous filesystem I/O. Existing
 	// mounted disks are offlined by setupUSB; never rebind an open vnode.
 	__asm__ volatile("cli" ::: "memory");
+    {
+    storage_guard storage_serialization;
     for (int c = 0; c < xhci_count; c++) {
         if (xhci_hc[c].portfailed) {
             for (int _p = 0; _p < 4096; _p++) xhci_hc[c].portfailed[_p] = 0;
@@ -950,7 +951,6 @@ extern "C" void kmain(void) {
         storage_selected = true;
         vnode* candidate = nullptr;
         static wy_ext4_volume ext4_candidate;
-        bool candidate_ext4 = false;
         unsigned candidates = 0;
         const char* recovery_reason = "No USB storage device discovered before root selection.";
         for (int d = 0; d < usb_disk_count; ++d) {
@@ -960,13 +960,7 @@ extern "C" void kmain(void) {
             if (ext4_count) {
                 candidates += ext4_count;
                 ext4_candidate = probe;
-                candidate_ext4 = true;
             }
-            fat16_volume* volume = fat16_probe(&usb_disks[d].disk);
-            if (!volume) continue;
-            ++candidates;
-            candidate = &volume->root.vn;
-            candidate_ext4 = false;
         }
         if (!candidates) {
             unsigned online = 0;
@@ -979,7 +973,7 @@ extern "C" void kmain(void) {
             print((char*)"[storage] Multiple system volumes found; refusing ambiguous root selection.");
         }
         if (candidates == 1) {
-            if (candidate_ext4) candidate = wy_ext4_mount(&ext4_candidate);
+            candidate = wy_ext4_mount(&ext4_candidate);
             recovery_reason = candidate ? "System-root marker could not be read or has an invalid signature." :
                 "System partition recognized, but ext4 mount/journal initialization failed.";
             if (candidate) vfs_mount_root(candidate);
@@ -1004,11 +998,11 @@ extern "C" void kmain(void) {
                 vfs_mount(vfs_namei("/run/boot.log"), live_log) == 0) {
                 disk_root_active = true;
                 print((char*)"[storage] WYZARDATA mounted as root /.");
-                if (candidate_ext4) print((char*)"[storage] ext4 journal active on USB system root.");
+                print((char*)"[storage] ext4 journal active on USB system root.");
             } else {
                 print((char*)"[storage] System signature, init file or runtime mounts unavailable.");
                 vfs_mount_root(recovery_root);
-                if (candidate_ext4 && ext4_candidate.mounted) wy_ext4_unmount(&ext4_candidate);
+                if (ext4_candidate.mounted) wy_ext4_unmount(&ext4_candidate);
             }
         }
         if (!disk_root_active) {
@@ -1016,6 +1010,7 @@ extern "C" void kmain(void) {
             usb_storage_failure_summary();
             storage_record_recovery(runtime_run, recovery_reason);
         }
+    }
     }
 	__asm__ volatile("sti" ::: "memory");
     static bool wallpaper_loaded = false;
@@ -1251,6 +1246,7 @@ extern "C" void kmain(void) {
 		while (event_count < ER_RING_SIZE) {
             bool any_resp = false;
             for (int ctrl_idx = 0; ctrl_idx < xhci_count; ctrl_idx++) {
+                USBControlGuard event_ownership;
                 if (xhci_hc[ctrl_idx].needsResetting) continue;
 			    // 0ms timeout: fast-poll the event ring without busy-waiting.
 			    USB_Response resp = get_usb_response(&xhci_hc[ctrl_idx], 0);
@@ -1259,6 +1255,7 @@ extern "C" void kmain(void) {
                 any_resp = true;
 			    event_count++;
 
+                if (usb_storage_dispatch_completion(&xhci_hc[ctrl_idx], resp)) continue;
                 if (hub_dispatch_control(&xhci_hc[ctrl_idx], resp)) continue;
 
 			// ── Port Status Change (type 34) ─────────────────────────────────

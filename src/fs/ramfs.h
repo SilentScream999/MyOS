@@ -13,6 +13,7 @@
 #include "vfs.h"
 #include "heap.h"
 #include "helpers.h"
+#include "block.h"
 
 struct ramfs_node {
     char name[256];
@@ -21,6 +22,9 @@ struct ramfs_node {
     // Directory fields
     ramfs_node* children;
     ramfs_node* sibling;
+    ramfs_node* parent;
+    unsigned opens;
+    bool deleted;
     
     // File fields
     uint8_t* data;
@@ -41,12 +45,23 @@ static int ramfs_readdir(vnode* dir, uint64_t index, char* name_out, uint64_t* s
 static int ramfs_unlink(vnode* dir, const char* name);
 static int ramfs_rmdir(vnode* dir, const char* name);
 static int ramfs_statfs(vnode* vn, fs_info* out);
+static int ramfs_truncate(vnode* vn, uint64_t size);
+static int ramfs_sync(vnode*) { return 0; }
+static int ramfs_open(vnode* vn, file*) {
+    storage_irq_guard guard; auto* n = (ramfs_node*)vn->fs_data;
+    if (n->deleted) return -1; ++n->opens; return 0;
+}
+static void ramfs_close(vnode* vn) {
+    storage_irq_guard guard; auto* n = (ramfs_node*)vn->fs_data; if (n->opens) --n->opens;
+}
+static int ramfs_rename(vnode*, const char*, vnode*, const char*);
+static int ramfs_replace(vnode*, const char*, const void*, uint64_t);
 
 static vfs_ops ramfs_ops = {
     .read    = ramfs_read,
     .write   = ramfs_write,
-    .open    = nullptr,
-    .close   = nullptr,
+    .open    = ramfs_open,
+    .close   = ramfs_close,
     .lookup  = ramfs_lookup,
     .create  = ramfs_create,
     .mkdir   = ramfs_mkdir,
@@ -55,6 +70,10 @@ static vfs_ops ramfs_ops = {
     .stat    = nullptr,
     .rmdir   = ramfs_rmdir,
     .statfs  = ramfs_statfs,
+    .truncate = ramfs_truncate,
+    .sync = ramfs_sync,
+    .rename = ramfs_rename,
+    .replace = ramfs_replace,
 };
 
 // ── RAMFS IMPLEMENTATION ──────────────────────────────────────────────────
@@ -63,6 +82,7 @@ static vfs_ops ramfs_ops = {
 static ramfs_node* ramfs_alloc_node(const char* name, VnodeType type) {
     ramfs_node* node = (ramfs_node*)kmalloc(sizeof(ramfs_node));
     if (!node) return nullptr;
+    memset(node, 0, sizeof(*node));
     
     strcpy(node->name, name);
     node->type     = type;
@@ -91,9 +111,11 @@ static void ramfs_init() {
 }
 
 static uint64_t ramfs_read(vnode* vn, void* buf, uint64_t len, uint64_t offset) {
+    storage_guard guard;
     if (vn->type != VnodeType::FILE) return 0;
     
     ramfs_node* node = (ramfs_node*)vn->fs_data;
+    if (node->deleted) return 0;
     if (offset >= node->size) return 0; // EOF
     
     uint64_t available = node->size - offset;
@@ -104,10 +126,12 @@ static uint64_t ramfs_read(vnode* vn, void* buf, uint64_t len, uint64_t offset) 
 }
 
 static uint64_t ramfs_write(vnode* vn, const void* buf, uint64_t len, uint64_t offset) {
+    storage_guard guard;
     if (vn->type != VnodeType::FILE) return 0;
     if (len == 0) return 0;
     
     ramfs_node* node = (ramfs_node*)vn->fs_data;
+    if (node->deleted || offset > INT64_MAX || len > INT64_MAX - offset) return 0;
     uint64_t needed_capacity = offset + len;
     
     if (needed_capacity > node->capacity) {
@@ -127,6 +151,7 @@ static uint64_t ramfs_write(vnode* vn, const void* buf, uint64_t len, uint64_t o
         node->capacity = new_cap;
     }
     
+    if (offset > node->size) memset(node->data + node->size, 0, offset - node->size);
     memcpy(node->data + offset, buf, len);
     
     if (offset + len > node->size) {
@@ -137,10 +162,29 @@ static uint64_t ramfs_write(vnode* vn, const void* buf, uint64_t len, uint64_t o
     return len;
 }
 
+static int ramfs_truncate(vnode* vn, uint64_t size) {
+    storage_guard guard;
+    if (vn->type != VnodeType::FILE || size > INT64_MAX) return -1;
+    auto* n = (ramfs_node*)vn->fs_data;
+    if (n->deleted) return -1;
+    if (size > n->capacity) {
+        auto* data = (uint8_t*)kmalloc(size);
+        if (!data) return -1;
+        if (n->size) memcpy(data, n->data, n->size);
+        if (n->data) kfree(n->data);
+        n->data = data; n->capacity = size;
+    }
+    if (size > n->size) memset(n->data + n->size, 0, size - n->size);
+    n->size = vn->size = size;
+    return 0;
+}
+
 static vnode* ramfs_lookup(vnode* dir, const char* name) {
+    storage_guard guard;
     if (dir->type != VnodeType::DIRECTORY) return nullptr;
     
     ramfs_node* d_node = (ramfs_node*)dir->fs_data;
+    if (d_node->deleted) return nullptr;
     ramfs_node* child  = d_node->children;
     
     while (child) {
@@ -154,6 +198,7 @@ static vnode* ramfs_lookup(vnode* dir, const char* name) {
 }
 
 static vnode* ramfs_create(vnode* dir, const char* name) {
+    storage_guard guard;
     if (dir->type != VnodeType::DIRECTORY) return nullptr;
     
     ramfs_node* d_node = (ramfs_node*)dir->fs_data;
@@ -165,12 +210,14 @@ static vnode* ramfs_create(vnode* dir, const char* name) {
     if (!new_file) return nullptr;
     
     new_file->sibling = d_node->children;
+    new_file->parent = d_node;
     d_node->children  = new_file;
     
     return &new_file->vn;
 }
 
 static vnode* ramfs_mkdir(vnode* dir, const char* name) {
+    storage_guard guard;
     if (dir->type != VnodeType::DIRECTORY) return nullptr;
     
     ramfs_node* d_node = (ramfs_node*)dir->fs_data;
@@ -181,12 +228,14 @@ static vnode* ramfs_mkdir(vnode* dir, const char* name) {
     if (!new_dir) return nullptr;
     
     new_dir->sibling = d_node->children;
+    new_dir->parent = d_node;
     d_node->children = new_dir;
     
     return &new_dir->vn;
 }
 
 static int ramfs_readdir(vnode* dir, uint64_t index, char* name_out, uint64_t* size_out, VnodeType* type_out) {
+    storage_guard guard;
     if (dir->type != VnodeType::DIRECTORY) return -1;
     ramfs_node* d_node = (ramfs_node*)dir->fs_data;
     ramfs_node* child  = d_node->children;
@@ -211,17 +260,18 @@ static int ramfs_readdir(vnode* dir, uint64_t index, char* name_out, uint64_t* s
 }
 
 static int ramfs_unlink(vnode* dir, const char* name) {
+    storage_guard guard;
     if (dir->type != VnodeType::DIRECTORY) return -1;
     ramfs_node* d_node = (ramfs_node*)dir->fs_data;
     ramfs_node* prev = nullptr;
     ramfs_node* curr = d_node->children;
     while (curr) {
         if (strcmp(curr->name, name) == 0) {
-            if (curr->type != VnodeType::FILE) return -1;
+            if (curr->type != VnodeType::FILE || curr->opens) return -1;
             if (prev) prev->sibling = curr->sibling;
             else d_node->children = curr->sibling;
             if (curr->data) kfree(curr->data);
-            kfree(curr);
+            curr->deleted = true; curr->data = nullptr; curr->size = curr->capacity = curr->vn.size = 0;
             return 0;
         }
         prev = curr;
@@ -230,7 +280,44 @@ static int ramfs_unlink(vnode* dir, const char* name) {
     return -1;
 }
 
+static int ramfs_rename(vnode* dir, const char* name, vnode* dest, const char* new_name) {
+    storage_guard guard;
+    if (!name[0] || !new_name[0] || strlen(new_name) > 255 || !strcmp(name, ".") || !strcmp(name, "..") ||
+        !strcmp(new_name, ".") || !strcmp(new_name, "..")) return -1;
+    vnode* source = ramfs_lookup(dir, name);
+    if (!source || source->ops != &ramfs_ops) return -1;
+    auto* n = (ramfs_node*)source->fs_data;
+    if (dir == dest && !strcmp(name, new_name)) return 0;
+    if (n->opens || ramfs_lookup(dest, new_name)) return -1;
+    auto* parent = (ramfs_node*)dir->fs_data;
+    auto* destination = (ramfs_node*)dest->fs_data;
+    for (auto* p = destination; p; p = p->parent) if (p == n) return -1;
+    auto** link = &parent->children;
+    while (*link && *link != n) link = &(*link)->sibling;
+    if (!*link) return -1;
+    *link = n->sibling; n->sibling = destination->children;
+    destination->children = n; n->parent = destination; strcpy(n->name, new_name);
+    return 0;
+}
+static int ramfs_replace(vnode* dir, const char* name, const void* data, uint64_t len) {
+    storage_guard guard;
+    if (!name[0] || !strcmp(name, ".") || !strcmp(name, "..") || len > INT64_MAX) return -1;
+    vnode* target = ramfs_lookup(dir, name);
+    if (target && (target->type != VnodeType::FILE || target->ops != &ramfs_ops ||
+                   ((ramfs_node*)target->fs_data)->opens)) return -1;
+    uint8_t* replacement = len ? (uint8_t*)kmalloc(len) : nullptr;
+    if (len && !replacement) return -1;
+    if (len) memcpy(replacement, data, len);
+    if (!target) target = ramfs_create(dir, name);
+    if (!target) { if (replacement) kfree(replacement); return -1; }
+    auto* n = (ramfs_node*)target->fs_data;
+    auto* old = n->data;
+    n->data = replacement; n->capacity = n->size = target->size = len;
+    if (old) kfree(old);
+    return 0;
+}
 static int ramfs_rmdir(vnode* dir, const char* name) {
+    storage_guard guard;
     if (dir->type != VnodeType::DIRECTORY) return -1;
     ramfs_node* d_node = (ramfs_node*)dir->fs_data;
     ramfs_node* prev = nullptr;
@@ -238,10 +325,10 @@ static int ramfs_rmdir(vnode* dir, const char* name) {
     while (curr) {
         if (strcmp(curr->name, name) == 0) {
             if (curr->type != VnodeType::DIRECTORY) return -1;
-            if (curr->children != nullptr) return -1; // Directory is not empty
+            if (curr->children != nullptr || curr->opens) return -1; // Directory is not empty/in use
             if (prev) prev->sibling = curr->sibling;
             else d_node->children = curr->sibling;
-            kfree(curr);
+            curr->deleted = true;
             return 0;
         }
         prev = curr;
@@ -251,6 +338,7 @@ static int ramfs_rmdir(vnode* dir, const char* name) {
 }
 
 static int ramfs_statfs(vnode*, fs_info* out) {
+    storage_guard guard;
     if (!out) return -1;
     memset(out, 0, sizeof(*out));
     out->block_size = 4096;

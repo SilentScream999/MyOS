@@ -17,6 +17,8 @@ struct wy_ext4_node {
     char name[256];
     unsigned opens;
     bool deleted;
+    bool cursor_valid;
+    uint64_t cursor_index, cursor_offset;
 };
 struct wy_ext4_volume {
     block_device* disk;
@@ -25,10 +27,13 @@ struct wy_ext4_volume {
     ext4_blockdev bdev;
     uint8_t scratch[512];
     wy_ext4_node root;
-    wy_ext4_node* nodes;
-    bool failed, mounted;
+    wy_ext4_node* nodes[256];
+    bool failed, mounted, needs_flush;
 };
 static wy_ext4_volume* wy_ext4_system = nullptr;
+#ifdef STORAGE_HOST_TEST
+static uint64_t wy_ext4_directory_steps;
+#endif
 static int wy_ext4_unmount(wy_ext4_volume* v);
 static int wy_ext4_shutdown() { return wy_ext4_system ? wy_ext4_unmount(wy_ext4_system) : 0; }
 static uint32_t wy_ext4_u32(const uint8_t* p) {
@@ -52,18 +57,24 @@ static int wy_ext4_io_read(ext4_blockdev* bd, void* out, uint64_t lba, uint32_t 
     return EOK;
 }
 static bool wy_ext4_flush(wy_ext4_volume* v) {
-    if (!wy_ext4_ready(v) || !v->disk->flush || !v->disk->flush(v->disk)) {
+    if (!wy_ext4_ready(v)) return false;
+    if (!v->needs_flush) return true;
+    if (!v->disk->flush || !v->disk->flush(v->disk)) {
         v->failed = true; return false;
     }
+    v->needs_flush = false;
     return true;
 }
 static int wy_ext4_io_write(ext4_blockdev* bd, const void* in, uint64_t lba, uint32_t count) {
     auto* v = (wy_ext4_volume*)bd->bdif->p_user;
     if (!wy_ext4_ready(v) || !in || !count || lba >= v->sectors || count > v->sectors - lba) return EIO;
-    for (uint32_t i = 0; i < count; ++i) {
-        if (!block_write(v->disk, v->start + lba + i, (const uint8_t*)in + (uint64_t)i * 512)) {
+    v->needs_flush = true;
+    for (uint32_t done = 0; done < count; ) {
+        uint32_t n = count - done; if (n > 128) n = 128;
+        if (!block_write_sectors(v->disk, v->start + lba + done, n, (const uint8_t*)in + (uint64_t)done * 512)) {
             v->failed = true; return EIO;
         }
+        done += n;
     }
     // lwext4 has no barrier callback. Make every completed library block write
     // durable, including journal records before commit and checkpoint writes.
@@ -100,11 +111,17 @@ static bool wy_ext4_child_path(wy_ext4_node* dir, const char* name, char* out) {
     memcpy(out + n, name, len + 1); return true;
 }
 static vfs_ops wy_ext4_ops;
+static unsigned wy_ext4_bucket(wy_ext4_node* parent, const char* name) {
+    uint32_t hash = (uintptr_t)parent >> 4;
+    for (const char* p = name; *p; ++p) hash = (hash ^ (uint8_t)*p) * 16777619u;
+    return hash & 255u;
+}
 static vnode* wy_ext4_lookup(vnode* vn, const char* name) {
     storage_guard guard;
     auto* dir = (wy_ext4_node*)vn->fs_data;
     char path[512]; if (!wy_ext4_child_path(dir, name, path)) return nullptr;
-    for (auto* n = dir->volume->nodes; n; n = n->next)
+    auto*& bucket = dir->volume->nodes[wy_ext4_bucket(dir, name)];
+    for (auto* n = bucket; n; n = n->next)
         if (!n->deleted && n->parent == dir && !strcmp(n->name, name)) return &n->vn;
     uint32_t mode;
     if (ext4_mode_get(path, &mode) != EOK) return nullptr;
@@ -119,16 +136,16 @@ static vnode* wy_ext4_lookup(vnode* vn, const char* name) {
         if (ext4_fopen(&f, path, "rb") != EOK) { kfree(n); return nullptr; }
         n->vn.size = ext4_fsize(&f); ext4_fclose(&f);
     }
-    n->next = dir->volume->nodes; dir->volume->nodes = n; return &n->vn;
+    n->next = bucket; bucket = n; return &n->vn;
 }
 static int wy_ext4_open(vnode* vn, file*) {
-    storage_guard guard;
+    storage_irq_guard guard;
     auto* n = (wy_ext4_node*)vn->fs_data;
     if (n->deleted || !wy_ext4_ready(n->volume)) return -1;
     ++n->opens; return 0;
 }
 static void wy_ext4_close(vnode* vn) {
-    storage_guard guard; auto* n = (wy_ext4_node*)vn->fs_data; if (n->opens) --n->opens;
+    storage_irq_guard guard; auto* n = (wy_ext4_node*)vn->fs_data; if (n->opens) --n->opens;
 }
 static uint64_t wy_ext4_read(vnode* vn, void* out, uint64_t len, uint64_t offset) {
     storage_guard guard;
@@ -157,6 +174,7 @@ static vnode* wy_ext4_create(vnode* vn, const char* name) {
     auto* dir = (wy_ext4_node*)vn->fs_data; char path[512];
     if (!wy_ext4_child_path(dir, name, path)) return nullptr;
     uint32_t mode; if (ext4_mode_get(path, &mode) == EOK) return nullptr;
+    dir->cursor_valid = false;
     ext4_file f{};
     if (ext4_fopen(&f, path, "wb") != EOK) return nullptr;
     if (ext4_fclose(&f) != EOK || !wy_ext4_flush(dir->volume)) return nullptr;
@@ -167,6 +185,7 @@ static vnode* wy_ext4_mkdir(vnode* vn, const char* name) {
     auto* dir = (wy_ext4_node*)vn->fs_data; char path[512];
     if (!wy_ext4_child_path(dir, name, path)) return nullptr;
     uint32_t mode; if (ext4_mode_get(path, &mode) == EOK) return nullptr;
+    dir->cursor_valid = false;
     if (ext4_dir_mk(path) != EOK || !wy_ext4_flush(dir->volume)) return nullptr;
     return wy_ext4_lookup(vn, name);
 }
@@ -175,8 +194,17 @@ static int wy_ext4_readdir(vnode* vn, uint64_t index, char* name, uint64_t* size
     auto* n = (wy_ext4_node*)vn->fs_data; char path[512];
     if (!name || !wy_ext4_path(n, path)) return -1;
     ext4_dir dir{}; if (ext4_dir_open(&dir, path) != EOK) return -1;
+    uint64_t requested = index;
+    if (n->cursor_valid && index == n->cursor_index) {
+        dir.next_off = n->cursor_offset;
+        index = 0;
+    }
+    n->cursor_valid = false;
     int result = 0;
     while (const ext4_direntry* e = ext4_dir_entry_next(&dir)) {
+#ifdef STORAGE_HOST_TEST
+        ++wy_ext4_directory_steps;
+#endif
         if (!e->inode || !e->name_length ||
             (e->name_length == 1 && e->name[0] == '.') ||
             (e->name_length == 2 && e->name[0] == '.' && e->name[1] == '.')) continue;
@@ -186,6 +214,9 @@ static int wy_ext4_readdir(vnode* vn, uint64_t index, char* name, uint64_t* size
         if (!child) { result = -1; break; }
         if (size) *size = child->size;
         if (type) *type = child->type;
+        n->cursor_index = requested + 1;
+        n->cursor_offset = dir.next_off;
+        n->cursor_valid = true;
         result = 1; break;
     }
     ext4_dir_close(&dir); return wy_ext4_ready(n->volume) ? result : -1;
@@ -200,6 +231,7 @@ static int wy_ext4_remove(vnode* dir, const char* name, bool directory) {
         char child[256];
         if (wy_ext4_readdir(vn, 0, child, nullptr, nullptr) != 0) return -1;
     }
+    ((wy_ext4_node*)dir->fs_data)->cursor_valid = false;
     int rc = directory ? ext4_dir_rm(path) : ext4_fremove(path);
     if (rc != EOK) return -1;
     n->deleted = true; return wy_ext4_flush(n->volume) ? 0 : -1;
@@ -224,10 +256,99 @@ static int wy_ext4_statfs(vnode* vn, fs_info* out) {
     out->free_blocks = stats.free_blocks_count > UINT32_MAX ? UINT32_MAX : (uint32_t)stats.free_blocks_count;
     strcpy(out->fs_type, "ext4"); return 0;
 }
+static int wy_ext4_truncate(vnode* vn, uint64_t size) {
+    storage_guard guard;
+    auto* n = (wy_ext4_node*)vn->fs_data; char path[512];
+    if (vn->type != VnodeType::FILE || size > INT64_MAX || !wy_ext4_path(n, path)) return -1;
+    ext4_file f{};
+    if (ext4_fopen(&f, path, "r+b") != EOK) return -1;
+    int rc = EOK;
+    // lwext4 ftruncate only shrinks. Explicitly zero-fill extension so no old
+    // allocation bytes become visible, including the tail of a partial block.
+    if (size > ext4_fsize(&f)) {
+        uint8_t zero[4096]{};
+        rc = ext4_fseek(&f, ext4_fsize(&f), 0);
+        while (rc == EOK && ext4_fsize(&f) < size) {
+            uint64_t left = size - ext4_fsize(&f);
+            size_t amount = left > sizeof(zero) ? sizeof(zero) : (size_t)left, done = 0;
+            rc = ext4_fwrite(&f, zero, amount, &done);
+            if (rc == EOK && done != amount) rc = EIO;
+        }
+    } else rc = ext4_ftruncate(&f, size);
+    vn->size = ext4_fsize(&f);
+    if (ext4_fclose(&f) != EOK || rc != EOK || !wy_ext4_flush(n->volume)) return -1;
+    return 0;
+}
+static int wy_ext4_sync(vnode* vn) {
+    storage_guard guard;
+    auto* n = (wy_ext4_node*)vn->fs_data;
+    if (n->deleted || !wy_ext4_ready(n->volume)) return -1;
+    return ext4_cache_flush("/") == EOK && wy_ext4_flush(n->volume) ? 0 : -1;
+}
+static int wy_ext4_rename(vnode* dir, const char* name, vnode* dest, const char* new_name) {
+    storage_guard guard;
+    auto* parent = (wy_ext4_node*)dir->fs_data;
+    auto* destination = (wy_ext4_node*)dest->fs_data;
+    char old_path[512], new_path[512];
+    if (parent->volume != destination->volume || !wy_ext4_child_path(parent, name, old_path) ||
+        !wy_ext4_child_path(destination, new_name, new_path)) return -1;
+    vnode* vn = wy_ext4_lookup(dir, name);
+    if (!vn) return -1;
+    auto* n = (wy_ext4_node*)vn->fs_data;
+    if (parent == destination && !strcmp(name, new_name)) return 0;
+    if (n->opens || wy_ext4_lookup(dest, new_name)) return -1;
+    for (auto* p = destination; p; p = p->parent) if (p == n) return -1;
+    parent->cursor_valid = destination->cursor_valid = false;
+    if (ext4_frename(old_path, new_path) != EOK || !wy_ext4_flush(parent->volume)) return -1;
+    auto** link = &parent->volume->nodes[wy_ext4_bucket(parent, name)];
+    while (*link && *link != n) link = &(*link)->next;
+    if (*link) *link = n->next;
+    n->parent = destination; strcpy(n->name, new_name);
+    auto*& bucket = parent->volume->nodes[wy_ext4_bucket(destination, new_name)];
+    n->next = bucket; bucket = n;
+    return 0;
+}
+static int wy_ext4_replace(vnode* dir, const char* name, const void* data, uint64_t len) {
+    storage_guard guard;
+    auto* parent = (wy_ext4_node*)dir->fs_data;
+    char path[512], temporary[512], temporary_name[32];
+    if (len > INT64_MAX || !wy_ext4_child_path(parent, name, path)) return -1;
+    vnode* target = wy_ext4_lookup(dir, name);
+    if (target && (target->type != VnodeType::FILE || ((wy_ext4_node*)target->fs_data)->opens)) return -1;
+    uint32_t mode;
+    int exists = ext4_mode_get(path, &mode);
+    if (exists != EOK && exists != ENOENT) return -1;
+    if (exists == EOK && (!target || (mode & 0170000) != 0100000)) return -1;
+    static uint64_t serial;
+    bool available = false;
+    for (unsigned attempt = 0; attempt < 128; ++attempt) {
+        strcpy(temporary_name, ".wy-save-");
+        char digits[21]; unsigned count = 0; uint64_t value = ++serial;
+        do { digits[count++] = '0' + value % 10; value /= 10; } while (value);
+        unsigned pos = 9; while (count) temporary_name[pos++] = digits[--count]; temporary_name[pos] = 0;
+        if (!wy_ext4_child_path(parent, temporary_name, temporary)) return -1;
+        if (ext4_mode_get(temporary, &mode) == ENOENT) { available = true; break; }
+    }
+    if (!available) return -1;
+    parent->cursor_valid = false;
+    ext4_file f{}; size_t written = 0;
+    if (ext4_fopen(&f, temporary, "wb") != EOK) return -1;
+    int rc = len ? ext4_fwrite(&f, data, len, &written) : EOK;
+    int close_rc = ext4_fclose(&f);
+    if (rc != EOK || close_rc != EOK || written != len || !wy_ext4_flush(parent->volume)) return -1;
+    rc = exists == EOK ? ext4_fexchange(temporary, path) : ext4_frename(temporary, path);
+    if (rc != EOK || !wy_ext4_flush(parent->volume)) { parent->volume->failed = true; return -1; }
+    if (target) target->size = len;
+    // Publication is already durable. A crash during cleanup can leave the
+    // previous file under .wy-save-N, but cannot expose a partial destination.
+    if (exists == EOK && ext4_fremove(temporary) != EOK) return -1;
+    return wy_ext4_flush(parent->volume) ? 0 : -1;
+}
 static void wy_ext4_init_ops() {
     wy_ext4_ops = {wy_ext4_read, wy_ext4_write, wy_ext4_open, wy_ext4_close,
         wy_ext4_lookup, wy_ext4_create, wy_ext4_mkdir, wy_ext4_readdir,
-        wy_ext4_unlink, wy_ext4_stat, wy_ext4_rmdir, wy_ext4_statfs};
+        wy_ext4_unlink, wy_ext4_stat, wy_ext4_rmdir, wy_ext4_statfs,
+        wy_ext4_truncate, wy_ext4_sync, wy_ext4_rename, wy_ext4_replace};
 }
 // Returns all labelled candidates, including unsupported ones, so an invalid
 // second system partition cannot cause us to silently choose another root.

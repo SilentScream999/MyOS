@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Boot a disposable UEFI USB image in QEMU, write a file, cold boot, read it.
+"""Shared QEMU harness; direct invocation runs the ext4 persistence suite.
 
 Run in WSL from the repo root after make all and tools/make_usb_image.py.
 Requires qemu-system-x86_64, OVMF and nm. Output stays in .storage-test/.
 """
 import json
-import argparse
 from pathlib import Path
 import re
 import socket
-import struct
 import subprocess
 import time
 
@@ -105,96 +103,10 @@ class Qemu:
             self.proc.wait(timeout=5)
 
 
-def saved_file(shortname=b'HELLO   TXT', metadata=False):
-    with IMAGE.open('rb') as disk:
-        def read(lba):
-            disk.seek(lba * 512)
-            return disk.read(512)
-        mbr = read(0)
-        start = struct.unpack_from('<I', mbr, 446 + 16 + 8)[0]
-        b = read(start)
-        reserved, fats, fatsecs = struct.unpack_from('<H', b, 14)[0], b[16], struct.unpack_from('<H', b, 22)[0]
-        roots = struct.unpack_from('<H', b, 17)[0]
-        root = start + reserved + fats * fatsecs
-        data = root + (roots * 32 + 511) // 512
-        for index in range(roots):
-            e = read(root + index // 16)[index % 16 * 32:index % 16 * 32 + 32]
-            if e[:11] == shortname:
-                if metadata:
-                    return e
-                cluster, size = struct.unpack_from('<HI', e, 26)
-                return read(data + (cluster - 2) * b[13])[:size]
-    return None
-
-
 def main():
-    global IMAGE, BOOT_ISO
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--iso', action='store_true', help='Boot the current ISO with an attached persistent USB image, like make run')
-    parser.add_argument('--image', type=Path, default=IMAGE)
-    parser.add_argument('--features', action='store_true', help='Also verify timestamps, deletion, slot reuse, boot refresh and a third cold boot')
-    args = parser.parse_args()
-    IMAGE, BOOT_ISO = args.image.resolve(), args.iso
-    initial_metadata = None
-    for boot in ((1, 2, 3) if args.features else (1, 2)):
-        q = Qemu()
-        try:
-            for attempt in range(90):
-                time.sleep(2)
-                try:
-                    log = q.capture(f'boot{boot}')
-                except AssertionError as error:
-                    if 'Invalid addr' in str(error):
-                        log = 'Kernel not mapped yet'
-                        continue
-                    raise
-                if '[init] Decoupled terminal boot.' in log:
-                    time.sleep(2)
-                    break
-            else:
-                raise AssertionError('Boot did not complete: ' + log[-5000:])
-            assert '[storage] WYZARDATA mounted as root /.' in log, log[-5000:]
-            assert '[wallpaper] Loaded disk asset into RAM.' in log, log[-5000:]
-            if boot == 1:
-                q.type('write /hello.txt survived-cold-boot\n')
-                if args.features:
-                    q.type('write /gone.txt delete-me\n')
-                    q.type('stat /hello.txt\n')
-            elif args.features and boot == 2:
-                q.type('cat /hello.txt\n')
-                q.type('write /hello.txt updated-after-reboot\n')
-                q.type('stat /hello.txt\n')
-                updated = saved_file(metadata=True)
-                assert updated[13:18] == initial_metadata[13:18], 'Creation time changed during edit'
-                assert updated[22:26] != initial_metadata[22:26], 'Modification time did not advance'
-                q.capture('timestamp-edit')
-                q.type('rm /hello.txt\n')
-                q.type('rm /gone.txt\n')
-                q.type('write /reuse.txt reused-slot\n')
-            elif args.features and boot == 3:
-                q.type('cat /reuse.txt\n')
-                q.type('stat /reuse.txt\n')
-            else:
-                q.type('cat /hello.txt\n')
-                q.type('cat /readme.txt\n')
-                q.type('cat /hello.txt\n')
-                q.type('stat /hello.txt\n')
-            q.capture(f'boot{boot}-shell')
-        finally:
-            q.close()
-        if args.features and boot >= 2:
-            assert saved_file() is None and saved_file(b'GONE    TXT') is None
-            assert saved_file(b'REUSE   TXT') == b'reused-slot'
-        else:
-            assert saved_file() == b'survived-cold-boot', saved_file()
-        if args.features and boot == 1:
-            initial_metadata = saved_file(metadata=True)
-            date = struct.unpack_from('<H', initial_metadata, 16)[0]
-            assert 1980 + (date >> 9) >= 2026, 'Missing creation date'
-            subprocess.run(['python3', str(ROOT / 'tools/make_usb_image.py'), '--output', str(IMAGE), '--update-boot'], check=True)
-            assert saved_file() == b'survived-cold-boot'
-        print(f'USB cold boot {boot}: mounted; persisted contents verified', flush=True)
-    print('QEMU USB persistence smoke test passed. Screenshots/logs in .storage-test/.')
+    # Keep the shared QEMU harness, and use the ext4 persistence/recovery suite.
+    from qemu_ext4_test import main as ext4_main
+    ext4_main()
 
 
 if __name__ == '__main__':

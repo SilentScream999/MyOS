@@ -109,6 +109,10 @@ static inline uint64_t rdmsr(uint32_t msr) {
 #define SYS_SPAWN   59u
 #define SYS_EXIT    60u
 #define SYS_WAITPID 61u
+#define SYS_FSYNC   74u
+#define SYS_FTRUNCATE 77u
+#define SYS_RENAME 82u
+#define SYS_REPLACE 138u
 #define SYS_GETCWD  79u
 #define SYS_CHDIR   80u
 #define SYS_MKDIR   83u
@@ -536,6 +540,20 @@ static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uin
         case SYS_WRITE:  return sys_write(a1, a2, a3);
         case SYS_OPEN:   return sys_open(a1, a2);
         case SYS_CLOSE:  return sys_close(a1);
+        case SYS_FSYNC:
+            return g_current_task && a1 < MAX_FDS ? vfs_fsync(g_current_task->fd_table[a1]) : (uint64_t)-1;
+        case SYS_FTRUNCATE:
+            return g_current_task && a1 < MAX_FDS ? vfs_ftruncate(g_current_task->fd_table[a1], a2) : (uint64_t)-1;
+        case SYS_RENAME: {
+            char path[256], destination[256];
+            if (!get_user_path(a1, path, sizeof(path)) || !get_user_path(a2, destination, sizeof(destination))) return (uint64_t)-1;
+            return vfs_rename(path, destination);
+        }
+        case SYS_REPLACE: {
+            char path[256];
+            if (!get_user_path(a1, path, sizeof(path))) return (uint64_t)-1;
+            return vfs_replace(path, (const void*)a2, a3);
+        }
         case SYS_STAT:   return sys_stat(a1, a2);
         case SYS_LSEEK:  return (uint64_t)sys_lseek(a1, (int64_t)a2, a3);
         case SYS_UNLINK: return sys_unlink(a1);
@@ -619,9 +637,17 @@ __asm__ (
     "pushq %r14\n"
     "pushq %r13\n"
     "pushq %r12\n"
+    // Inline user syscall wrappers declare only RAX/RCX/R11 clobbered.
+    // Preserve their argument/scratch registers across the C dispatcher too.
+    "pushq %rdi\n"
+    "pushq %rsi\n"
+    "pushq %rdx\n"
+    "pushq %r8\n"
+    "pushq %r9\n"
+    "pushq %r10\n"
 
     // 5. 16-byte stack alignment:
-    // We pushed 9 items (9 * 8 = 72 bytes). Sub 8 bytes makes it 80 bytes (80 % 16 == 0).
+    // Fifteen pushes = 120 bytes; another 8 bytes aligns the C call.
     "subq $8, %rsp\n"
 
     // 6. Re-enable interrupts: we are securely on this task's private kernel stack.
@@ -645,6 +671,12 @@ __asm__ (
     "addq $8, %rsp\n"
 
     // 10. Restore user register state from the private stack.
+    "popq %r10\n"
+    "popq %r9\n"
+    "popq %r8\n"
+    "popq %rdx\n"
+    "popq %rsi\n"
+    "popq %rdi\n"
     "popq %r12\n"
     "popq %r13\n"
     "popq %r14\n"

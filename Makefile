@@ -132,7 +132,7 @@ iso: all usb-image
 
 # Each ISO build refreshes USB boot/system files; user data and settings survive.
 PERSIST_DISK ?= wyzar-usb.img
-LEGACY_IMAGE ?= wyzar-usb-fat16.img
+ROOT_MIB ?=
 FRESH ?= 0
 ifeq ($(FRESH),1)
 USB_IMAGE_FLAGS = --fresh
@@ -163,7 +163,7 @@ clean:
 
 # Refresh boot files and bundled system apps, preserving user files/settings.
 usb-image: all
-	python3 tools/make_usb_image.py --output "$(PERSIST_DISK)" $(USB_IMAGE_FLAGS)
+	python3 tools/make_usb_image.py --output "$(PERSIST_DISK)" $(USB_IMAGE_FLAGS) $(if $(ROOT_MIB),--root-mib $(ROOT_MIB),)
 
 # Boot directly from the USB image (uses its embedded kernel/initrd).
 run-usb: usb-image
@@ -173,12 +173,6 @@ run-usb: usb-image
 		-device usb-storage,drive=stick,bootindex=1 -rtc base=localtime
 
 .PHONY: usb-image run-usb
-
-# Optional migration from a separately named legacy image to a new destination.
-migrate-usb: all
-	python3 tools/make_usb_image.py --migrate-from "$(LEGACY_IMAGE)" --output "$(PERSIST_DISK)"
-
-.PHONY: migrate-usb
 
 # Generated atlas is checked in; this target alone requires system libfreetype6.
 font-atlas:

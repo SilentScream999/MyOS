@@ -1,6 +1,7 @@
 #ifndef WYZAR_USB_STORAGE_H
 #define WYZAR_USB_STORAGE_H
 #include "scsi_retry.h"
+#include "usb_storage_completion.h"
 // Included by usbhelpers.h after ring/control helpers. USB-IF BOT 1.0:
 // https://www.usb.org/sites/default/files/usbmassbulk_10.pdf
 // One LUN, transparent SCSI, READ/WRITE(10), 512-byte sectors; no UAS.
@@ -18,32 +19,64 @@ static int usb_disk_count = 0;
 // One Normal TRB can describe up to 64 KiB without crossing a physical 64 KiB
 // boundary. Reserve alignment padding rather than assuming page alignment suffices.
 static constexpr uint32_t USB_STORAGE_DMA_BYTES = 65536;
+static USBStorageCompletion usb_storage_completions[MAX_CONTROLLERS][256];
+static Task* usb_storage_waiters[MAX_CONTROLLERS][256];
+static bool usb_storage_dispatch_completion(XHCIController* hc, const USB_Response& r) {
+    USBControlGuard guard;
+    if (!r.gotresponse || (r.type != 32 && r.type != 33)) return false;
+    unsigned slot = (r.ctrl >> 24) & 255, c = hc - xhci_hc;
+    if (!usb_storage_completion_event(usb_storage_completions[c][slot], r.type,
+            r.event->parameter, r.ctrl, r.event->status)) return false;
+    Task* waiter = usb_storage_waiters[c][slot];
+    if (waiter && waiter->state == TaskState::BLOCKED) {
+        waiter->state = TaskState::READY; waiter->wake_at_tick = 0;
+    }
+    return true;
+}
+static bool usb_storage_begin_wait(USBDevice* dev, uint8_t type, uint64_t pointer, uint8_t dci) {
+    auto& completion = usb_storage_completions[dev->hc - xhci_hc][dev->slot_id];
+    if (!usb_storage_completion_arm(completion, type, dev->slot_id, dci, pointer)) return false;
+    usb_storage_waiters[dev->hc - xhci_hc][dev->slot_id] = g_current_task;
+    return true;
+}
 
-static bool usb_storage_wait(USBDevice* dev, uint32_t type, uint64_t pointer, uint8_t dci, uint32_t bytes) {
+static __attribute__((noinline)) bool usb_storage_wait(USBDevice* dev, uint32_t type, uint64_t pointer, uint8_t dci, uint32_t bytes) {
+    auto& completion = usb_storage_completions[dev->hc - xhci_hc][dev->slot_id];
+    uint64_t flags;
+    __asm__ volatile("pushfq; popq %0" : "=r"(flags));
+    bool sleep = g_scheduler_ready && g_current_task && (flags & (1u << 9));
     uint64_t end = _usb_rdtsc() + _usb_tsc_hz() * 2;
     while (_usb_rdtsc() < end) {
         boot_splash_tick();
-        USB_Response r = get_usb_response_raw(dev->hc, 1);
-        if (!r.gotresponse) continue;
-        if (r.type == type && r.event->parameter == pointer &&
-            ((r.ctrl >> 24) & 255) == dev->slot_id &&
-            (type != 32 || ((r.ctrl >> 16) & 31) == dci)) {
-            bool ok = (r.event->status >> 24) == 1 &&
-                      (type != 32 || (r.event->status & 0xffffff) == 0);
+        USBControlGuard guard;
+        if (completion.complete) {
+            uint32_t status = completion.status;
+            completion.active = false;
+            usb_storage_waiters[dev->hc - xhci_hc][dev->slot_id] = nullptr;
+            bool ok = (status >> 24) == 1 && (type != 32 || (status & 0xffffff) == 0);
             if (!ok) {
                 char detail[32];
                 print((char*)"[storage] xHCI transfer failed, status:");
-                to_hex(r.event->status, detail); print(detail);
+                to_hex(status, detail); print(detail);
                 print((char*)"[storage] Requested transfer bytes:");
                 to_str(bytes, detail); print(detail);
             }
             return ok;
         }
-        if (!usb_defer(dev->hc, r)) {
+        USB_Response r = get_usb_response_raw(dev->hc, 0);
+        if (r.gotresponse && !usb_defer(dev->hc, r)) {
             print((char*)"[storage] Deferred USB event queue full.");
+            completion.active = false;
+            usb_storage_waiters[dev->hc - xhci_hc][dev->slot_id] = nullptr;
             return false;
         }
+        // Check and block with IRQs masked so a completion cannot be lost
+        // between the test and sleeping. The dispatcher wakes us immediately;
+        // a 1 ms wake also covers missed notifications and absent input polling.
+        if (!completion.complete && sleep) task_sleep_ms(1);
     }
+    { USBControlGuard guard; completion.active = false;
+      usb_storage_waiters[dev->hc - xhci_hc][dev->slot_id] = nullptr; }
     print((char*)"[storage] Timed out waiting for xHCI completion.");
     return false;
 }
@@ -51,11 +84,15 @@ static bool usb_storage_bulk(usb_storage* s, bool in, uint32_t bytes) {
     if (!bytes || bytes > USB_STORAGE_DMA_BYTES || ((uint64_t)s->dma - HHDM) % USB_STORAGE_DMA_BYTES) return false;
     Ring* ring = in ? &s->in_ring : &s->out_ring;
     uint8_t dci = in ? s->in_dci : s->out_dci;
+    {
+    USBControlGuard guard;
     uint64_t pointer = ring->phys + ring->enq * 16;
+    if (!usb_storage_begin_wait(s->dev, 32, pointer, dci)) return false;
     ring_push_cmd(ring, (1u << 10) | (1u << 5), (uint64_t)s->dma - HHDM, bytes);
     __asm__ volatile("sfence" ::: "memory");
     s->dev->hc->doorbell32[s->dev->slot_id] = dci;
-    return usb_storage_wait(s->dev, 32, pointer, dci, bytes);
+    }
+    return usb_storage_wait(s->dev, 32, 0, dci, bytes);
 }
 static uint32_t usb_scsi_be32(const uint8_t* p) {
     return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
@@ -146,10 +183,22 @@ static bool usb_disk_read_sectors(block_device* d, uint64_t lba, uint32_t count,
 static bool usb_disk_read(block_device* d, uint64_t lba, void* data) {
     return usb_disk_read_sectors(d, lba, 1, data);
 }
-static bool usb_disk_write(block_device* d, uint64_t lba, const void* data) {
+static bool usb_disk_write_sectors(block_device* d, uint64_t lba, uint32_t count, const void* data) {
+    if (!d->online || !data || !count || lba >= d->sectors || count > d->sectors - lba ||
+        lba > 0xffffffffULL || count > 0x100000000ULL - lba) return false;
     usb_storage* s = (usb_storage*)d->context;
-    uint8_t cdb[10] = {0x2a}; usb_scsi_put32(cdb + 2, (uint32_t)lba); cdb[8] = 1;
-    return usb_storage_command(s, cdb, 10, false, (void*)data, 512) == 0;
+    while (count) {
+        uint32_t take = count > USB_STORAGE_DMA_BYTES / 512 ? USB_STORAGE_DMA_BYTES / 512 : count;
+        uint8_t cdb[10] = {0x2a}; usb_scsi_put32(cdb + 2, (uint32_t)lba);
+        cdb[7] = take >> 8; cdb[8] = take;
+        // Never retry a failed write: completion may be uncertain.
+        if (usb_storage_command(s, cdb, 10, false, (void*)data, take * 512) != 0) return false;
+        lba += take; count -= take; data = (const uint8_t*)data + take * 512;
+    }
+    return true;
+}
+static bool usb_disk_write(block_device* d, uint64_t lba, const void* data) {
+    return usb_disk_write_sectors(d, lba, 1, data);
 }
 static bool usb_disk_flush(block_device* d) {
     uint8_t cdb[10] = {0x35};
@@ -195,12 +244,14 @@ static bool usb_storage_configure(USBDevice* dev, uint8_t in_ep, uint16_t in_mps
         ep[2] = (uint32_t)r->phys | 1; ep[3] = r->phys >> 32; ep[4] = 512;
     }
     uint64_t command = dev->hc->cr.phys + dev->hc->cr.enq * 16;
+    if (!usb_storage_begin_wait(dev, 33, command, 0)) return false;
     ring_push_cmd(&dev->hc->cr, (12u << 10) | (dev->slot_id << 24), (uint64_t)ctx - HHDM, 0);
     dev->hc->doorbell32[0] = 0;
     if (!usb_storage_wait(dev, 33, command, 0, 0)) return false;
     s->disk.context = s; s->disk.online = true; s->disk.sectors = 0;
     s->disk.read = usb_disk_read; s->disk.write = usb_disk_write; s->disk.flush = usb_disk_flush;
     s->disk.read_sectors = usb_disk_read_sectors;
+    s->disk.write_sectors = usb_disk_write_sectors;
     // Give a cold device up to five seconds of readiness polling. A device
     // already ready proceeds immediately, without a fixed boot delay.
     uint8_t tur[6] = {};

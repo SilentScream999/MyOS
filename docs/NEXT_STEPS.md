@@ -1,12 +1,36 @@
 # Near-term platform work
 
-Updated 2026-11-09. Implemented foundations and planned follow-up work are marked below.
+Updated 2026-11-10. Implemented foundations and planned follow-up work are marked below.
 Current behavior and verification are in [AI_HANDOFF.md](AI_HANDOFF.md) and
 [PERSISTENT_STORAGE.md](PERSISTENT_STORAGE.md).
 
 ## 1. Verify the combined build on hardware
 
-The combined change includes the RTC taskbar clock, USB BOT/SCSI + FAT16 storage,
+### Storage stages authorized on 2026-11-10
+
+The user requested all current storage catches/bottlenecks be addressed in stages.
+Track the whole scope here; finishing a stage does not finish the remaining work.
+
+1. **Implemented:** batched USB/ext4 writes (up to 64 KiB), removal of redundant
+   flushes without new writes, sequential directory cursors with mutation
+   invalidation, and hashed vnode lookup. Durability barriers are retained.
+2. **Implemented:** `O_TRUNC`, descriptor truncate/sync, rename without overwrite,
+   and atomic replacement on ext4/RAMFS. Shell `write` uses atomic saves, `append`
+   extends content, and `mv` renames. Permission enforcement, user/group identity,
+   links and consistent UTC timestamps need explicit OS semantics too.
+3. **Implemented:** configurable new roots (`ROOT_MIB`), streamed image updates,
+   and atomic offline image expansion via `tools/expand_usb_image.py`, including
+   a target stick's exact byte capacity. Reflash the expanded host image; there
+   is no automatic live/first-boot resizing. Current MBR/READ(10) bounds remain.
+4. **Implemented:** a reentrant sleeping filesystem mutex and exact storage
+   completion ownership; runtime USB waits sleep and wake on delivery while
+   input/timers continue. Cold discovery and control probes retain their bounded
+   synchronous path. Caller-facing file calls still block until completed.
+5. **Pending:** safe eject and stable volume identity; controlled recovery from
+   media removal, broader ext4 feature profiles, and internal-drive installation.
+   Unplugging writable media during a save cannot guarantee that save survives.
+
+The combined change includes the RTC taskbar clock, USB BOT/SCSI + ext4 storage,
 file deletion/timestamps, image refresh/FRESH mode, foreground shell/menu launches,
 echo control, waiting and Ctrl+C cleanup. Build, host filesystem/image checks and
 QEMU checks have passed. Earlier desktop/Start-menu work was hardware-tested;
@@ -23,8 +47,8 @@ data; reflashing a physical stick replaces that stick's existing saved data too.
 
 Today `CLOCK_UTC_OFFSET_MIN` is a build-time number of minutes added to the RTC
 reading. Default 0 treats the RTC reading as local wall time; QEMU uses
-`-rtc base=localtime`. `CLOCK_SHOW_SECONDS` changes tray formatting. FAT creation
-and modification timestamps use the same RTC/offset, at two-second precision.
+`-rtc base=localtime`. `CLOCK_SHOW_SECONDS` changes tray formatting. The ext4
+adapter leaves civil timestamps unknown until the clock has a defined UTC basis.
 There is no named-timezone selection, automatic DST, runtime clock setting,
 userspace time syscall or network time synchronization.
 
@@ -69,8 +93,9 @@ file seeking (`SYS_LSEEK`), per-task CWD tracking (`SYS_GETCWD` / `SYS_CHDIR`),
 relative path resolution (`.`, `..`, and subdirectories across all filesystem syscalls),
 and shell `cd` / `pwd` with a dynamic `wyzar:<cwd>>` prompt.
 
-Next: test on hardware, shell truncate and rename. Replace interrupt-disabled synchronous I/O
-with asynchronous block requests and sleeping locks. Generalize root selection to
+Next: hardware-test atomic saves and runtime input responsiveness. Continue with
+safe removal, stable volume identity and internal-drive support. Replace remaining
+synchronous control probes with asynchronous control transfers. Generalize root selection to
 stable boot-volume identity; currently exactly one WYZARDATA-labelled disk is
 required, with `/etc/root.cfg` and `/bin/init.elf` checked before selection.
 
@@ -95,9 +120,8 @@ The compositor does no disk I/O. WRAW/BGRA remains the supported format; the ini
 and standalone Limine wallpaper module copies have been removed.
 
 Reads are bounded (15-second budget checked between chunks) and chunked so
-preemption can occur between reads. Aligned FAT reads now use multi-sector I/O,
-USB READ(10) batches up to 128 sectors with aligned DMA, FAT coalesces contiguous
-cluster runs, and FAT metadata sectors are cached. USB ports share one 100 ms
+preemption can occur between reads. ext4 uses multi-sector I/O and USB
+READ/WRITE(10) batches up to 128 sectors with aligned DMA. USB ports share one 100 ms
 settling window per controller instead of waiting separately on each empty port.
 Boot phase timings identify discovery, readiness, read, decode and composition costs.
 The USB backend remains synchronous. Runtime wallpaper selection/reload UI and fully

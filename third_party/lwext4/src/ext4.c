@@ -1388,7 +1388,7 @@ Finish:
 	if (r != EOK)
 		ext4_trans_abort(mp);
 	else
-		ext4_trans_stop(mp);
+		r = ext4_trans_stop(mp);
 
 	EXT4_MP_UNLOCK(mp);
 	return r;
@@ -1396,6 +1396,63 @@ Finish:
 }
 
 /****************************************************************************/
+
+/* Wyzar atomic-save primitive. The caller first durably writes its temporary
+ * file. Exchange publishes it without an absent-destination window; cleanup of
+ * the old file is a separate operation and can be retried after a crash. */
+int ext4_fexchange(const char *path, const char *other_path)
+{
+	struct ext4_mountpoint *mp = ext4_get_mount(path);
+	ext4_file a, b;
+	uint32_t ap, bp, ao, bo, ai, bi;
+	struct ext4_inode_ref ar, br;
+	struct ext4_dir_search_result ad = {0}, bd = {0};
+	bool al = false, bl = false, af = false, bf = false;
+	bool goal;
+	int r, rc;
+	if (!mp || mp != ext4_get_mount(other_path)) return EINVAL;
+	if (mp->fs.read_only) return EROFS;
+	EXT4_MP_LOCK(mp);
+	r = ext4_generic_open2(&a, path, O_RDONLY, EXT4_DE_REG_FILE, &ap, &ao);
+	if (r != EOK) goto Unlock;
+	r = ext4_generic_open2(&b, other_path, O_RDONLY, EXT4_DE_REG_FILE, &bp, &bo);
+	ai = a.inode;
+	ext4_fclose(&a);
+	if (r != EOK) goto Unlock;
+	bi = b.inode;
+	ext4_fclose(&b);
+	if (ai == bi) goto Unlock;
+	r = ext4_trans_start(mp);
+	if (r != EOK) goto Unlock;
+	r = ext4_fs_get_inode_ref(&mp->fs, ap, &ar);
+	if (r != EOK) goto Finish;
+	al = true;
+	r = ext4_fs_get_inode_ref(&mp->fs, bp, &br);
+	if (r != EOK) goto Finish;
+	bl = true;
+	r = ext4_dir_find_entry(&ad, &ar, path + ao, ext4_path_check(path + ao, &goal));
+	if (r != EOK) goto Finish;
+	af = true;
+	r = ext4_dir_find_entry(&bd, &br, other_path + bo, ext4_path_check(other_path + bo, &goal));
+	if (r != EOK) goto Finish;
+	bf = true;
+	ext4_dir_en_set_inode(ad.dentry, bi);
+	ext4_dir_en_set_inode(bd.dentry, ai);
+	ext4_dir_set_csum(&ar, (struct ext4_dir_en *)ad.block.data);
+	ext4_dir_set_csum(&br, (struct ext4_dir_en *)bd.block.data);
+	ext4_trans_set_block_dirty(ad.block.buf);
+	ext4_trans_set_block_dirty(bd.block.buf);
+Finish:
+	if (bf) { rc = ext4_dir_destroy_result(&br, &bd); if (r == EOK) r = rc; }
+	if (af) { rc = ext4_dir_destroy_result(&ar, &ad); if (r == EOK) r = rc; }
+	if (bl) { rc = ext4_fs_put_inode_ref(&br); if (r == EOK) r = rc; }
+	if (al) { rc = ext4_fs_put_inode_ref(&ar); if (r == EOK) r = rc; }
+	if (r == EOK) r = ext4_trans_stop(mp);
+	else ext4_trans_abort(mp);
+Unlock:
+	EXT4_MP_UNLOCK(mp);
+	return r;
+}
 
 int ext4_get_sblock(const char *mount_point, struct ext4_sblock **sb)
 {

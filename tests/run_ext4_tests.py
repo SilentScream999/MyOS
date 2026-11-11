@@ -15,6 +15,9 @@ def main():
     disk = OUT / 'ext4-test-run.img'
     shutil.copyfile(original, disk)
     env = dict(os.environ, ASAN_OPTIONS='detect_leaks=0', UBSAN_OPTIONS='halt_on_error=1')
+    subprocess.run(['clang++', '-std=c++20', '-O1', '-g', '-no-pie', '-fsanitize=address,undefined',
+                    '-iquote', 'src/core', '-iquote', 'src/drivers', 'tests/ramfs_save_test.cpp', '-o', str(OUT / 'ramfs-save-test')], cwd=ROOT, check=True)
+    subprocess.run([str(OUT / 'ramfs-save-test')], cwd=ROOT, env=env, check=True)
     for mode in ('normal', 'crash', 'recover', 'write-fail', 'flush-fail', 'offline'):
         subprocess.run([str(OUT / 'ext4-test'), str(disk), mode], cwd=ROOT, env=env, check=True)
         if mode in ('normal', 'recover'):

@@ -1,4 +1,4 @@
-"""ext4 updater/migration preservation and failed-update atomicity (WSL/Linux)."""
+"""ext4 creation, update preservation and failed-update atomicity (WSL/Linux)."""
 from pathlib import Path
 import hashlib
 import struct
@@ -8,11 +8,10 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
-from make_usb_image import (Fat16Image, START, BOOT_SECTORS, DATA_SECTORS,
+from make_usb_image import (Fat16Image, START, BOOT_SECTORS,
                             write_image, validate_existing)
-from system_volume import install_system
 from ext4_volume import install_ext4, check
-from migrate_fat16 import migrate
+from types import SimpleNamespace
 
 
 def digest(path):
@@ -30,25 +29,26 @@ def main():
         for name in ('init.elf', 'counter.elf', 'win_test.elf'):
             (root / name).write_bytes(b'first-' + name.encode())
         (root / 'wallpaper.raw').write_bytes(b'original wallpaper')
-        old = Fat16Image(DATA_SECTORS, 'WYZARDATA', START + BOOT_SECTORS)
-        old.data = install_system(old.data, root)
-        from system_volume import SystemVolume
-        saved = SystemVolume(old.data)
-        saved.put('home/saved.txt', b'personal document')
-        saved.put('bin/user.elf', b'personal application')
-        saved.put('etc/desktop.cfg', b'/home/custom.raw\n')
-        saved.put('home/custom.raw', b'personal wallpaper')
-        old.data = saved.data
+        partition = work / 'partition.img'
+        partition.write_bytes(install_ext4(None, root))
+        manifest = work / 'manifest'
+        lines = []
+        for i, (path, content) in enumerate((
+            ('/home/saved.txt', b'personal document'),
+            ('/bin/user.elf', b'personal application'),
+            ('/etc/desktop.cfg', b'/home/custom.raw\n'),
+            ('/home/custom.raw', b'personal wallpaper'),
+        )):
+            asset = work / f'personal-{i}'
+            asset.write_bytes(content)
+            lines.append(f'put {path} {asset}')
+        manifest.write_text('\n'.join(lines) + '\n')
+        subprocess.run([str(ROOT / '.storage-test/ext4-image-tool'), str(partition), str(manifest)], check=True)
+        data = partition.read_bytes()
         boot = Fat16Image(BOOT_SECTORS, 'WYZARBOOT', START)
         mbr = bytearray(512); mbr[510:512] = b'\x55\xaa'
-        for i, (kind, start, count) in enumerate(((0xef, START, BOOT_SECTORS), (0x0e, START + BOOT_SECTORS, DATA_SECTORS))):
+        for i, (kind, start, count) in enumerate(((0xef, START, BOOT_SECTORS), (0x83, START + BOOT_SECTORS, len(data) // 512))):
             struct.pack_into('<B3sB3sII', mbr, 446 + i * 16, 0, b'\xfe\xff\xff', kind, b'\xfe\xff\xff', start, count)
-        original = work / 'old.img'
-        write_image(original, boot, old, mbr)
-        original_hash = digest(original)
-        data = migrate(original, root)
-        assert digest(original) == original_hash
-        partition = work / 'partition.img'; partition.write_bytes(data)
 
         def read(path):
             return subprocess.check_output(['debugfs', '-R', 'cat ' + path, str(partition)], stderr=subprocess.DEVNULL)
@@ -72,14 +72,19 @@ def main():
             pass
         # Existing image refresh must remain atomic even when a bundled input is missing.
         ext4_disk = work / 'ext4.img'
-        mbr[466] = 0x83
-        struct.pack_into('<I', mbr, 474, len(data) // 512)
-        class Data:
-            pass
-        image_data = Data(); image_data.data = partition.read_bytes()
+        image_data = SimpleNamespace(data=partition.read_bytes())
         write_image(ext4_disk, boot, image_data, mbr)
         with ext4_disk.open('rb') as source:
-            assert validate_existing(source)[0] == 'ext4'
+            assert validate_existing(source) == len(data) // 512
+        (root / 'init.elf').write_bytes(b'latest shell')
+        write_image(ext4_disk, boot, None, mbr, update_boot=True, system_root=root)
+        with ext4_disk.open('rb') as source:
+            source.seek((START + BOOT_SECTORS) * 512)
+            partition.write_bytes(source.read())
+        assert read('/bin/init.elf') == b'latest shell'
+        assert read('/home/saved.txt') == b'personal document'
+        assert read('/etc/desktop.cfg') == b'/home/custom.raw\n'
+        assert read('/bin/user.elf') == b'personal application'
         old_hash = digest(ext4_disk)
         (root / 'counter.elf').unlink()
         try:
@@ -88,8 +93,22 @@ def main():
         except FileNotFoundError:
             pass
         assert digest(ext4_disk) == old_hash
-        assert digest(original) == original_hash
-    print('ext4 migration, refresh preservation, feature rejection and atomic publication passed')
+        # A FAT system partition must be rejected without changing the image.
+        with ext4_disk.open('r+b') as disk:
+            disk.seek(466)
+            disk.write(b'\x0e')
+        rejected_hash = digest(ext4_disk)
+        try:
+            write_image(ext4_disk, boot, None, mbr, update_boot=True, system_root=root)
+            raise AssertionError('Legacy system partition accepted')
+        except ValueError:
+            pass
+        assert digest(ext4_disk) == rejected_hash
+        # Explicit fresh replacement can reset an otherwise rejected layout.
+        write_image(ext4_disk, boot, image_data, mbr, fresh=True)
+        with ext4_disk.open('rb') as source:
+            assert validate_existing(source) == len(data) // 512
+    print('ext4 creation, refresh preservation, legacy/feature rejection and atomic publication passed')
 
 
 if __name__ == '__main__':

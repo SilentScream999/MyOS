@@ -9,6 +9,8 @@ import subprocess
 import tempfile
 
 EXT4_SECTORS = 524288  # 256 MiB, independently expandable in future layouts.
+MIN_SECTORS = 131072
+MAX_SECTORS = ((1 << 32) - 1 - 264192) & ~7
 FEATURES = 'none,has_journal,extent,filetype,dir_index,sparse_super,large_file,extra_isize'
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -18,39 +20,59 @@ def run(*args):
 
 
 def check(data):
-    if len(data) != EXT4_SECTORS * 512:
+    check_header(data[1024:2048], len(data))
+
+
+def check_file(path):
+    with Path(path).open('rb') as source:
+        source.seek(1024)
+        check_header(source.read(1024), Path(path).stat().st_size)
+
+
+def check_header(sb, length):
+    if length % 4096 or not MIN_SECTORS * 512 <= length <= MAX_SECTORS * 512 or len(sb) != 1024:
         raise ValueError('Unsupported ext4 partition size')
-    sb = data[1024:2048]
     if sb[56:58] != b'\x53\xef' or sb[120:136] != b'WYZARDATA'.ljust(16, b'\0'):
         raise ValueError('Unrecognized ext4 system volume')
     compat, incompat, ro = struct.unpack_from('<III', sb, 92)
     if (not compat & 4 or compat & ~0x2c or incompat & ~0x46 or ro & ~0x43 or
             struct.unpack_from('<I', sb, 24)[0] != 2 or
-            struct.unpack_from('<I', sb, 4)[0] > EXT4_SECTORS // 8 or
+            struct.unpack_from('<I', sb, 4)[0] > length // 4096 or
             struct.unpack_from('<I', sb, 228)[0] or struct.unpack_from('<I', sb, 232)[0]):
         raise ValueError('Unsupported ext4 feature profile')
 
 
-def install_ext4(data, root, seed_tree=None):
+def install_ext4(data, root):
+    """Byte-buffer compatibility wrapper for small test fixtures."""
+    with tempfile.TemporaryDirectory(prefix='wyzar-ext4-buffer-') as temporary:
+        volume = Path(temporary) / 'volume.img'
+        if data is not None:
+            volume.write_bytes(data)
+        install_ext4_file(volume, root, create=data is None)
+        return volume.read_bytes()
+
+
+def install_ext4_file(volume, root, create=False, sectors=EXT4_SECTORS):
+    """Edit only a caller-owned private partition file; never the live image."""
+    volume = Path(volume)
     for tool in ('mke2fs', 'e2fsck', 'make'):
         if not shutil.which(tool):
             raise RuntimeError('ext4 image creation requires WSL/Linux with e2fsprogs and make')
-    if data is not None:
-        check(data)
+    if not create:
+        check_file(volume)
+    elif sectors % 8 or not MIN_SECTORS <= sectors <= MAX_SECTORS:
+        raise ValueError('Unsupported ext4 partition size')
     # Dependency tracking rebuilds the helper when its source/library changes.
     subprocess.run(['make', '-s', '.storage-test/ext4-image-tool'], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix='wyzar-ext4-') as temporary:
         work = Path(temporary)
-        volume = work / 'volume.img'
-        if data is None:
+        if create:
             with volume.open('wb') as f:
-                f.truncate(EXT4_SECTORS * 512)
+                f.truncate(sectors * 512)
             run('mke2fs', '-q', '-t', 'ext4', '-F', '-b', '4096', '-I', '256', '-m', '0',
                 '-L', 'WYZARDATA', '-O', FEATURES,
                 '-E', 'lazy_itable_init=0,lazy_journal_init=0',
-                *(['-d', seed_tree] if seed_tree else []), volume)
-        else:
-            volume.write_bytes(data)
+                volume)
         # Replay/check only our private copy. Never repair the original image.
         result = subprocess.run(['e2fsck', '-p', str(volume)], capture_output=True)
         if result.returncode not in (0, 1):
@@ -84,6 +106,4 @@ def install_ext4(data, root, seed_tree=None):
         manifest.write_text('\n'.join(lines) + '\n')
         run(ROOT / '.storage-test/ext4-image-tool', volume, manifest)
         run('e2fsck', '-fn', volume)
-        result = volume.read_bytes()
-        check(result)
-        return result
+        check_file(volume)

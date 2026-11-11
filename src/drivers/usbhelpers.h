@@ -116,11 +116,18 @@ static void ring_push_cmd(struct Ring *r, uint32_t ctrl, uint64_t param, uint32_
 	}
 }
 
+struct USBControlGuard {
+    uint64_t flags;
+    USBControlGuard() { __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory"); }
+    ~USBControlGuard() { if (flags & (1u << 9)) __asm__ volatile("sti" ::: "memory"); }
+};
 /* ── get_usb_response ─────────────────────────────────────── */
 static USB_Response get_usb_response_raw(XHCIController* hc, int timeout_ms = 250) {
     uint64_t end = _usb_rdtsc() + (_usb_tsc_hz() / 1000) * (uint64_t)timeout_ms;
 
     for (;;) {
+        {
+        USBControlGuard guard;
         TRB* evt  = (TRB*)&hc->er_virt[hc->erdp_index];
         uint32_t ctrl = evt->control;
 
@@ -136,6 +143,7 @@ static USB_Response get_usb_response_raw(XHCIController* hc, int timeout_ms = 25
             resp.type        = (ctrl >> 10) & 0x3F;
             resp.ctrl        = ctrl;
             return resp;
+        }
         }
 
         // Timeout check happens after at least one attempt
@@ -157,8 +165,11 @@ struct usb_deferred_events {
     TRB delivered;
 };
 static usb_deferred_events usb_pending[MAX_CONTROLLERS] = {};
+static bool usb_storage_dispatch_completion(XHCIController* hc, const USB_Response& response);
 static usb_deferred_events* usb_pending_for(XHCIController* hc) { return &usb_pending[hc - xhci_hc]; }
 static bool usb_defer(XHCIController* hc, const USB_Response& r) {
+    USBControlGuard guard;
+    if (usb_storage_dispatch_completion(hc, r)) return true;
     usb_deferred_events* q = usb_pending_for(hc);
     if (q->count == 256) { hc->needsResetting = true; return false; }
     TRB* e = &q->events[(q->head + q->count++) % 256];
@@ -205,11 +216,6 @@ static USB_Response usb_wait_command(XHCIController* hc, const char* operation) 
     return response;
 }
 
-struct USBControlGuard {
-    uint64_t flags;
-    USBControlGuard() { __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory"); }
-    ~USBControlGuard() { if (flags & (1u << 9)) __asm__ volatile("sti" ::: "memory"); }
-};
 static USB_Response do_control_transfer(USBDevice &dev,
 										USBSetupPacket* setup,
 										volatile uint8_t* data_buffer,

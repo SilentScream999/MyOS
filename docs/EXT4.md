@@ -13,21 +13,38 @@ make usb-image   # refresh ext4 boot/system files; preserve user data
 make run-usb     # boot the ext4 USB image directly in QEMU
 ```
 
-The standard USB image and default `PERSIST_DISK` is `wyzar-usb.img`, regardless
-of filesystem. The current image has already been migrated to ext4. If there is
-no image, `make usb-image` creates a new ext4 image. Ordinary refresh retains
-the filesystem already in an image. `--filesystem fat16` remains available for
-creating legacy test images. `FRESH=1` explicitly resets the selected image.
-
-For another legacy image, optional migration creates a new destination and never
-modifies the source:
+Larger roots and offline expansion:
 
 ```sh
-make migrate-usb LEGACY_IMAGE=old-fat16.img PERSIST_DISK=new-usb.img
+make usb-image FRESH=1 ROOT_MIB=1024   # NEW/reset image with a 1 GiB root
+python3 tools/expand_usb_image.py wyzar-usb.img --root-mib 4096
+# To fit a stick, pass its actual byte capacity (not its advertised GB):
+python3 tools/expand_usb_image.py wyzar-usb.img --total-bytes CAPACITY_BYTES
 ```
 
-The destination must not already exist. Without overrides, this target reads
-`wyzar-usb-fat16.img` and creates `wyzar-usb.img`.
+Expansion operates on a regular host image, never a physical device. It grows
+the final ext4 partition offline on a private copy, checks it with e2fsprogs,
+then atomically replaces the image. Shrinking, symlinks, images in use and
+unsupported layouts are rejected. `--use-file-space` uses trailing space in an
+already enlarged image file. Normal updates retain the existing root capacity.
+`FRESH=1` retains a recognized image's capacity while resetting its contents;
+pass `ROOT_MIB` explicitly to change the fresh layout.
+Flash the complete expanded image afterward; reflashing replaces the stick's
+saved files with those in the host image. This is not automatic first-boot growth.
+
+Image creation/refresh/expansion stream data with bounded buffers. Native Linux
+storage supports sparse output; Windows/DrvFS output is dense because sparse
+reads were unreliable in integration tests. Allow disk space for the output and
+private staging copies. RAM usage no longer scales with root capacity.
+
+The standard USB image and default `PERSIST_DISK` is `wyzar-usb.img`, regardless
+of filesystem. The current image has already been migrated to ext4. If there is
+no image, `make usb-image` creates a new ext4 image. Ordinary refresh preserves
+the existing ext4 system volume. `FRESH=1` explicitly resets the selected image.
+The kernel and image updater support ext4 system roots only. FAT16 root support,
+legacy image creation and migration tooling have been removed. The boot
+partition remains FAT16 for firmware compatibility; the kernel does not mount it.
+Older FAT-root images are rejected by ordinary updates; use a fresh image.
 
 The whole `.img` is what gets written to a USB stick. Reflashing a physical stick
 replaces its saved data; refreshing the host image does not update a stick in
@@ -40,9 +57,12 @@ New image layout (MBR, 512-byte sectors):
 | WYZARBOOT | 128 MiB | FAT EFI bootloader, kernel, recovery initrd |
 | WYZARDATA | 256 MiB | Journaled ext4 system root `/` |
 
-The ext4 image size is a starting allocation, not ext4's capacity limit. Runtime
-partition/block callbacks are bounds-checked; GPT and larger image layouts remain
-future work. The USB transport still uses READ/WRITE(10).
+256 MiB remains the default root allocation. Tools accept aligned roots from
+64 MiB up to the current MBR/READ(10) limit (total disk below 2 TiB), subject to
+the supported ext4 feature profile. Larger sizes must fit the actual stick.
+GPT, READ/WRITE(16), internal disks and online filesystem growth remain future
+work. Creation/refresh/expansion were exercised through 1.5 GiB; this is not a
+claim of hardware verification at the maximum transport limit.
 
 ## Implemented behavior
 
@@ -65,19 +85,35 @@ future work. The USB transport still uses READ/WRITE(10).
 - Journal replay/start on mount; journal stop/unmount before shell shutdown or
   restart. If the disk is removed or fails, report an unsuccessful clean close
   and continue the power operation; the next mount must recover the journal.
+- Block writes use bounded multi-sector USB commands, up to 64 KiB. Backends
+  without multi-sector writes retain the sector callback fallback.
 - Underlying device flush after every completed library block write. This
   conservatively orders journal records, commits and checkpoints without relying
   on volatile USB write caches. Device errors latch the volume offline; there is
-  no write retry or silent RAM-save fallback. I/O is still synchronous.
+  no write retry or silent RAM-save fallback. File calls still block their caller.
+  Redundant flush requests with no intervening writes are skipped; journal
+  barriers are retained. Partial write/flush failure still fails the volume.
+- Sequential directory listing resumes from a saved byte offset. Create/remove
+  invalidates that directory's cursor; out-of-order indexed requests restart
+  correctly. Cached vnodes use parent/name hash buckets rather than one global
+  linear search. This avoids repeated scans for each sequential entry.
+- File calls block their calling task, but normal runtime USB waits now sleep.
+  A reentrant filesystem mutex serializes ext4/RAMFS operations without masking
+  interrupts for the whole transaction. Exact slot/endpoint/TRB completion
+  ownership lets the input task deliver disk completions and wake their owner
+  while processing keyboard/mouse events. Initial discovery and hub/control
+  probes retain their bounded synchronous path. Refcount cleanup uses a short
+  IRQ guard so scheduler cleanup cannot wait recursively on the filesystem lock.
+- Rename is available without overwriting a destination. Atomic replacement
+  uses a durably written sibling temporary file, then one journal transaction
+  to exchange existing regular-file references (or rename into an absent name).
+  Cleanup follows publication. A crash may leave `.wy-save-N` containing the
+  old contents, but the destination must remain complete old/new contents.
+  Open destinations and mounted runtime placeholders are protected.
 - Host updates edit an unpublished partition copy, check it with e2fsck, update
   bundled programs/assets, check it again, then atomically publish the whole
   image. Existing user files/apps/settings/wallpaper remain. Defaults are seeded
   only if absent.
-- FAT16 migration validates the old filesystem, copies files/directories into a
-  new ext4 volume, and installs the current OS. Short names become lowercase;
-  known wallpaper/font configuration paths are adjusted for that case change.
-  File bytes are preserved; historical timestamps/attributes are not migrated.
-  Unsupported long-name FAT entries cause failure rather than silent omission.
 
 ## Verification
 
@@ -85,14 +121,17 @@ future work. The USB transport still uses READ/WRITE(10).
 python3 tools/make_usb_image.py --output .storage-test/ext4-usb.img --fresh
 python3 tests/run_ext4_tests.py
 python3 tests/ext4_image_test.py
-python3 tests/system_volume_test.py
+python3 tests/atomic_save_test.py
+python3 tests/capacity_image_test.py
+python3 tests/qemu_storage_api_test.py
+python3 tests/qemu_storage_async_test.py
 python3 tests/qemu_ext4_test.py
 ```
 
 Host tests exercise the actual VFS adapter under address/undefined-behavior
 sanitizers, UTF-8/long names, directory growth, cross-block I/O, deletion, failure
 containment, unsupported features, cold recovery and Linux filesystem checking.
-Image tests cover migration, update preservation and failure atomicity. QEMU
+Image tests cover creation, update preservation, legacy-root rejection and failure atomicity. QEMU
 tests boot the USB system three times, verify wallpaper loading, save a long-named
 document, abruptly power off, and verify recovery/persistence and e2fsck results
 on a copy. The third boot shuts down normally and must leave a clean filesystem.
@@ -101,14 +140,19 @@ correctness for every possible power-cut point or every ext4 feature.
 
 ## Remaining desktop-storage work
 
-ext4 does not itself add missing OS APIs. Rename/truncate/fsync interfaces,
-atomic replacement saves, symlinks/hard links, permission enforcement, user/group
+The VFS supports `O_TRUNC`, descriptor truncation, sync, rename and atomic saves
+on ext4/RAMFS. Shell `write` uses atomic replacement; `append` extends content,
+and `mv` renames without overwriting an existing destination. Growth through truncate is
+explicitly zero-filled; descriptor offsets are preserved. These are synchronous
+operations. Symlinks/hard links, permission enforcement, user/group
 management and a UTC timestamp service remain separate work. The adapter leaves
 civil timestamps unknown rather than pretending the current local RTC basis is
-UTC. The shell's existing `write` still preserves trailing bytes on overwrite.
+UTC. Applications using `O_TRUNC` directly still have non-atomic overwrite semantics.
 Directory deletion/open-file behavior retains the prototype's restrictions.
+Cached vnode metadata (including deleted nodes retained to reject stale lookup
+pointers safely) is currently kept until reboot; cache reclamation remains work.
 
-Next: asynchronous block I/O and sleeping locks, safe removal, stable boot-volume
+Next: safe removal, stable boot-volume
 identity, runtime repair/recovery tooling, then GPT and NVMe/AHCI support. An
 installer should prepare an internal system volume and bootloader while retaining
 portable USB mode. No internal-drive installer is implemented in this change.

@@ -35,6 +35,16 @@ static inline int64_t sys_unlink(const char* path) {
     __asm__ volatile("syscall" : "=a"(result) : "a"(87UL), "D"(path) : "rcx", "r11", "memory");
     return result;
 }
+static inline int64_t sys_replace(const char* path, const void* data, uint64_t len) {
+    int64_t result;
+    __asm__ volatile("syscall" : "=a"(result) : "a"(138UL), "D"(path), "S"(data), "d"(len) : "rcx", "r11", "memory");
+    return result;
+}
+static inline int64_t sys_rename(const char* path, const char* destination) {
+    int64_t result;
+    __asm__ volatile("syscall" : "=a"(result) : "a"(82UL), "D"(path), "S"(destination) : "rcx", "r11", "memory");
+    return result;
+}
 static inline int64_t sys_stat(const char* path, file_info* info) {
     int64_t result;
     __asm__ volatile("syscall" : "=a"(result) : "a"(4UL), "D"(path), "S"(info) : "rcx", "r11", "memory");
@@ -203,7 +213,7 @@ void add_history(const char* cmd) {
 // Known commands for green highlighting
 static const char* known_commands[] = {
     "clear", "shutdown", "restart", "bsod", "open bootlog", "ls", "run", "help",
-    "write", "cat", "rm", "stat", "cd", "pwd", "mkdir", "rmdir", "df", 0
+    "write", "append", "mv", "cat", "rm", "stat", "cd", "pwd", "mkdir", "rmdir", "df", 0
 };
 
 static char current_dir[256] = "/";
@@ -364,6 +374,8 @@ void _start() {
             print("  write <path> <text> - Create/write a file; disk root is persistent\n");
             print("  cat <path>      - Read a file\n");
             print("  rm <path>       - Delete a closed file\n");
+            print("  mv <old> <new>  - Rename without overwriting another file\n");
+            print("  append <p> <t>  - Add text to the end of a file\n");
             print("  stat <path>     - Show size, creation and modification times\n");
             print("  run <path>      - Run a .wiz or .elf app; wait until it exits\n");
             print("  open bootlog    - Display kernel boot log\n");
@@ -430,7 +442,7 @@ void _start() {
         } else if (streq(buf, "rm", 2) && buf[2] == ' ') {
             int idx = 3; while (buf[idx] == ' ') idx++;
             if (sys_unlink(&buf[idx]) == 0) print("File deleted.\n");
-            else print("Cannot delete: check path, open handles, read-only attribute and storage. Only short-name files are supported.\n");
+            else print("Cannot delete: check the path, open handles and storage.\n");
         } else if (streq(buf, "stat", 4) && buf[4] == ' ') {
             int idx = 5; while (buf[idx] == ' ') idx++;
             file_info info;
@@ -438,26 +450,36 @@ void _start() {
             print("Size: "); print_dec(info.size); print(" bytes\n");
             print("Created:  "); print_datetime(&info.created); print("\n");
             print("Modified: "); print_datetime(&info.modified); print("\n");
-            print("Times shown to 2-second precision; quick writes may have equal times.\n");
-        } else if (streq(buf, "write", 5) && buf[5] == ' ') {
-            int idx = 6;
+        } else if ((streq(buf, "write", 5) && buf[5] == ' ') || (streq(buf, "append", 6) && buf[6] == ' ')) {
+            int append = buf[0] == 'a';
+            int idx = append ? 7 : 6;
             while (buf[idx] == ' ') idx++;
             char* path = &buf[idx];
             while (buf[idx] && buf[idx] != ' ') idx++;
-            if (!buf[idx]) { print("Usage: write <path> <text>\n"); continue; }
+            if (!buf[idx]) { print("Usage: write/append <path> <text>\n"); continue; }
             buf[idx++] = 0;
             while (buf[idx] == ' ') idx++;
-            uint64_t fd = sys_open(path, 0x41); // O_WRONLY | O_CREAT
-            if (fd == (uint64_t)-1) {
-                print("Cannot open file. Check that the parent directory exists and storage is online.\n");
-                print("Check the boot log for disk root or RAM recovery mode. Disk names must fit 8.3.\n");
-                continue;
-            }
             uint64_t len = strlen(&buf[idx]);
-            uint64_t written = sys_write(fd, &buf[idx], len);
-            sys_close(fd);
-            if (written == len) print("Write complete. Existing files keep any trailing bytes.\n");
-            else print("Write failed or incomplete.\n");
+            if (!append) {
+                if (sys_replace(path, &buf[idx], len) == 0) print("Save complete.\n");
+                else print("Save failed. Check the parent directory, open handles and storage.\n");
+            } else {
+                uint64_t fd = sys_open(path, 0x41);
+                if (fd == (uint64_t)-1) { print("Cannot open file.\n"); continue; }
+                int64_t offset = sys_lseek(fd, 0, 2);
+                uint64_t written = offset < 0 ? 0 : sys_write(fd, &buf[idx], len);
+                sys_close(fd);
+                if (offset >= 0 && written == len) print("Append complete.\n");
+                else print("Append failed or incomplete.\n");
+            }
+        } else if (streq(buf, "mv", 2) && buf[2] == ' ') {
+            int idx = 3; while (buf[idx] == ' ') ++idx;
+            char* source = &buf[idx]; while (buf[idx] && buf[idx] != ' ') ++idx;
+            if (!buf[idx]) { print("Usage: mv <old> <new>\n"); continue; }
+            buf[idx++] = 0; while (buf[idx] == ' ') ++idx;
+            if (!buf[idx] || sys_rename(source, &buf[idx]) != 0)
+                print("Rename failed. Destination must be absent, on the same filesystem, with no open source handles.\n");
+            else print("Rename complete.\n");
         } else if (streq(buf, "cat", 3) && buf[3] == ' ') {
             int idx = 4;
             while (buf[idx] == ' ') idx++;
