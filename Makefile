@@ -1,6 +1,7 @@
 CC=clang
 CXX=clang++
 LD=ld.lld
+.DEFAULT_GOAL := all
 
 LIMINE_BIN = limine/limine
 
@@ -25,22 +26,45 @@ GPU ?= 0
 CLOCK_UTC_OFFSET_MIN ?= 0
 # 1 = show seconds in the tray (handy to see at a glance that the clock is ticking).
 CLOCK_SHOW_SECONDS ?= 0
+# Extra boot performance counters are opt-in; normal logs retain errors/status.
+BOOT_DIAGNOSTICS ?= 0
 
 CXXFLAGS = $(CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -mno-red-zone -DGPU_BRINGUP=$(GPU) \
-           -DCLOCK_UTC_OFFSET_MIN=$(CLOCK_UTC_OFFSET_MIN) -DCLOCK_SHOW_SECONDS=$(CLOCK_SHOW_SECONDS)
+           -DCLOCK_UTC_OFFSET_MIN=$(CLOCK_UTC_OFFSET_MIN) -DCLOCK_SHOW_SECONDS=$(CLOCK_SHOW_SECONDS) \
+           -DBOOT_DIAGNOSTICS=$(BOOT_DIAGNOSTICS)
 
 LDFLAGS=-nostdlib -z max-page-size=0x1000
 
 SRC=src/kernel.cpp
 OBJ=$(SRC:.cpp=.o)
+include src/fs/ext4_config_flags.mk
+EXT4_OBJ = $(EXT4_SRC:.c=.o) src/fs/ext4_libc.o
+CXXFLAGS += $(EXT4_CONFIG) $(EXT4_INC) -Isrc/fs/ext4_libc
+$(OBJ) $(EXT4_OBJ): src/fs/ext4_config_flags.mk Makefile
 
 all: wyzar init.elf counter.elf win_test.elf initrd.tar
 
 # Backward compatibility alias
 myos: wyzar
 
-wyzar: $(OBJ) linker.ld
-	$(LD) $(LDFLAGS) -T linker.ld -o $@ $(OBJ)
+wyzar: $(OBJ) $(EXT4_OBJ) linker.ld
+	$(LD) $(LDFLAGS) -T linker.ld -o $@ $(OBJ) $(EXT4_OBJ)
+
+$(EXT4_OBJ): %.o: %.c
+	$(CC) -Isrc/fs/ext4_libc $(CFLAGS) -std=gnu11 $(EXT4_CONFIG) $(EXT4_INC) -MMD -MP -c $< -o $@
+
+-include $(EXT4_OBJ:.o=.d)
+
+.storage-test/ext4-image-tool: tools/ext4_image_tool.c $(EXT4_SRC) $(wildcard third_party/lwext4/include/*.h) src/fs/ext4_config_flags.mk
+	mkdir -p .storage-test
+	$(CC) -O2 -std=gnu11 $(EXT4_CONFIG) $(EXT4_INC) tools/ext4_image_tool.c $(EXT4_SRC) -o $@
+
+.storage-test/ext4-host/%.o: third_party/lwext4/src/%.c src/fs/ext4_config_flags.mk
+	mkdir -p .storage-test/ext4-host
+	$(CC) -O1 -g -fsanitize=address,undefined $(EXT4_CONFIG) $(EXT4_INC) -c $< -o $@
+
+.storage-test/ext4-test: tests/ext4_test.cpp src/fs/ext4_vfs.h src/fs/vfs.h src/drivers/block.h Makefile $(patsubst third_party/lwext4/src/%.c,.storage-test/ext4-host/%.o,$(EXT4_SRC))
+	$(CXX) -O1 -g -std=c++20 -no-pie -fsanitize=address,undefined $(EXT4_CONFIG) $(EXT4_INC) -Isrc/fs -Isrc/drivers $< $(filter %.o,$^) -o $@
 
 # Track header dependencies (wm.h, intel_gpu.h, ...) so editing a header rebuilds the kernel.
 -include $(OBJ:.o=.d)
@@ -108,6 +132,7 @@ iso: all usb-image
 
 # Each ISO build refreshes USB boot/system files; user data and settings survive.
 PERSIST_DISK ?= wyzar-usb.img
+LEGACY_IMAGE ?= wyzar-usb-fat16.img
 FRESH ?= 0
 ifeq ($(FRESH),1)
 USB_IMAGE_FLAGS = --fresh
@@ -134,7 +159,7 @@ run: iso
 
 
 clean:
-	rm -rf iso_root initrd_root $(OBJ) $(OBJ:.o=.d) user/init.o user/counter.o user/win_test.o wyzar wyzar.iso myos myos.iso init.elf counter.elf win_test.elf initrd.tar
+	rm -rf iso_root initrd_root $(OBJ) $(OBJ:.o=.d) $(EXT4_OBJ) $(EXT4_OBJ:.o=.d) user/init.o user/counter.o user/win_test.o wyzar wyzar.iso myos myos.iso init.elf counter.elf win_test.elf initrd.tar
 
 # Refresh boot files and bundled system apps, preserving user files/settings.
 usb-image: all
@@ -148,6 +173,12 @@ run-usb: usb-image
 		-device usb-storage,drive=stick,bootindex=1 -rtc base=localtime
 
 .PHONY: usb-image run-usb
+
+# Optional migration from a separately named legacy image to a new destination.
+migrate-usb: all
+	python3 tools/make_usb_image.py --migrate-from "$(LEGACY_IMAGE)" --output "$(PERSIST_DISK)"
+
+.PHONY: migrate-usb
 
 # Generated atlas is checked in; this target alone requires system libfreetype6.
 font-atlas:

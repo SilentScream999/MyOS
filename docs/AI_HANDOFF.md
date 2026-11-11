@@ -23,6 +23,153 @@ Practical constraints that shape the work:
 
 ## 2. Current state
 
+* **Surface boot confirmed; unplug/power fix (2026-11-10):** user reports the
+  discovery-grace build works on the previously failing USB-C dock connection.
+  Do not remove the protocol fixes as speculative workarounds: SS descriptors,
+  companions, TT think time and warm reset are functional protocol corrections.
+  Failure snapshots remain quiet on normal boots. Keyboard stutter has not been
+  separately retested. User then reported 100% CPU and no shutdown/restart after
+  boot-stick removal. Root cause: filesystem close failure returned from the
+  power syscall, and the shell wrappers entered unconditional busy loops.
+  Power actions now report an unsuccessful close and continue; shell wrappers
+  return to the prompt with a message if a power syscall unexpectedly returns.
+  Clean connected shutdown/restart still attempt journal stop/unmount/flush.
+  `tests/qemu_power_action_test.py` passed all four connected/unplugged and
+  shutdown/restart combinations through a hub, checking actual guest power
+  actions, clean state for connected disks, journal recovery for unplugged
+  disks, Linux filesystem checks and saved file contents. USB image/ISO rebuilt
+  with saved host-image data preserved. Physical power-action retest remains.
+
+* **Boot discovery grace (2026-11-10):** hardware recovery report now confirms
+  controllers=2, hubs=1, disks=0, online=0, keyboards=1 at root selection;
+  hub is controller 1, root port 5, speed 3, reported VID/PID 0bda:5420.
+  The user reports broken unused dock ports. This does not establish their
+  involvement; firmware loading the kernel is independent of OS enumeration.
+  A disk discovered only by runtime polling previously arrived too late for
+  root selection. Added a 1.5-second discovery grace only when no disk is online,
+  polling root ports and empty hub ports before choosing RAM recovery. Individual
+  enumeration operations retain their existing bounded timeouts. Roots never
+  change after userspace starts. Failure reports now include controller state
+  and interesting root PORTSC values to distinguish a missing SuperSpeed branch.
+  User subsequently confirmed this change fixes the Surface USB-C boot.
+  Verified delayed disk arrival both directly and below two emulated hubs;
+  ordinary two-hub ext4 boots passed three persistence/journal/Linux-checker
+  cycles without entering the grace path. USB protocol, actual enumerator,
+  async hub, polling policy, topology and root-reset sanitizer fixtures passed.
+
+* **Confirmed RAM recovery, readable failure report (2026-11-10):** user ran `df`
+  on the failing ZM3310/native USB-C setup and confirmed RAMFS. Disk detection/
+  READ CAPACITY success therefore does not mean ext4 mounted. Added a small,
+  failure-only `/run/storage.txt` in the runtime RAMFS, independent of boot-log
+  scrolling/capacity. It records the root-selection stage and USB discovery
+  snapshot. It distinguishes no disk, disks offlined after discovery, no matching
+  system partition, ext4 mount/journal failure, invalid root signature, missing
+  init, runtime mount failure and disk-init loading failure. It does not write
+  to the failing disk. The hardware cause is still unresolved; next required
+  evidence is `cat /run/storage.txt` after flashing this build. No timing logs
+  were restored, and no unverified hub-reset workarounds were added here.
+  Verified the report through the recovery shell's actual `cat` command and
+  inspected its screenshot; the deliberate bad-marker case correctly reports
+  one online disk and an invalid marker. Normal disk-root boot also passed with
+  diagnostics disabled. Standard USB image and ISO rebuilt, saved data preserved.
+
+* **ZM3310 follow-up (2026-11-10):** user reports SSP follow-up still fails to
+  mount storage through the Surface's USB-C port, and a keyboard on the same dock
+  stutters with the boot stick attached. Dock is ZMUIPNG ZM3310. Its manufacturer
+  manual lists USB 2 ports plus a 10-Gbit/s port; it does not identify the internal
+  chips. Requested the new failure messages and whether the keyboard is wired or
+  a wireless receiver. Do not claim the hub is fixed from emulator results.
+  Corrected another concrete omission: configure HS hub slot TTT from descriptor
+  wHubCharacteristics[6:5], rather than always assuming 8 FS-bit think time.
+  Fixtures cover FS/LS keyboard children with the parent's advertised TT time.
+  Added failure-only storage-discovery snapshots (controllers, registered hubs,
+  disks/online state, keyboards, VID/PID, speed, parent/port and watch readiness).
+  These distinguish enumeration from transport/root-signature failures without
+  re-enabling timing logs. Physical USB-C failure remains unresolved pending
+  the new error/topology evidence; a boot-stick test in a dock USB 2 port can
+  separate its USB 2 and SuperSpeed paths without changing the upstream USB-C.
+  User clarified: keyboard is a wireless USB receiver; the ZM3310 works through
+  a C-to-A converter, and another hub works through an A-to-C converter. Therefore
+  do not describe this as all USB-C failing. Latest reported lines (SCSI disk
+  ready and hub status watch ready) are successes, not mount results. Asked for
+  `df` filesystem type to distinguish actual RAM recovery from ext4 mounted with
+  missing assets. Root-mounted diagnosis has not yet been established. The dock
+  manual recommends USB 2 ports for wireless receivers; RF interference is a
+  possible independent issue, not proof of scheduler starvation. Verified the
+  rebuilt images with nested-hub persistence/clean shutdown and a separate ISO-
+  booted invalid-root fixture that checks failure summaries and a usable RAM shell.
+
+* **Surface USB-C follow-up (2026-11-10):** user confirmed the latest flashed
+  image still reaches the desktop without storage through USB-C. Thus the initial
+  SuperSpeed hub addition did not establish a hardware fix. Error-only boot-log
+  lines and hub identity were requested; no timing logging was re-enabled.
+  Found a separate concrete root-port bug: startup ignored xHCI Cold Attach Status
+  when CCS was clear, and root reset always used PR. Cold-attach ports are now
+  probed and use WPR; SuperSpeed inactive/compliance links also use WPR. Reset
+  polling permits CCS to rise during warm reset, stays bounded, and retains
+  normal USB 2 reset behavior. Host tests execute the real root-reset function
+  with scripted register transitions. The user then confirmed the actual error
+  is the explicit SuperSpeedPlus-unsupported rejection. Removed that rejection
+  for standard USB 3 IDs 4..7, using the compatibility behavior documented in
+  xHCI 1.22 4.19.9. SSP hubs report legacy SS status; Address Device lets the
+  controller consume Sublink Speed notifications. Read its output speed into
+  the child before endpoint setup/nested enumeration instead of assuming the
+  parent's upstream rate. Scripted fixtures cover SS children behind SSP hubs,
+  SSP output-speed updates and nested SSP hubs. No timing logs were re-enabled.
+  The follow-up still requires a Surface hardware retest.
+
+* **Quiet boot and SuperSpeed hub path (2026-11-10):** user confirmed the wallpaper
+  startup issue is resolved and requested removing the extra logs. Timing/asset
+  size output is now disabled by default (`BOOT_DIAGNOSTICS=0`); failure/status
+  messages remain. Optional investigation builds use `make -B iso
+  BOOT_DIAGNOSTICS=1`; rebuild with `make -B iso` to return to quiet defaults.
+  User also reports Surface Laptop 4 hub storage fails through USB-C but works
+  through USB-A. Found that all SuperSpeed downstream enumeration was explicitly
+  skipped. Added initial 5 Gbit/s hub descriptor/depth/routing, SS endpoint
+  companions/bursts, USB 3 port-speed decoding and change selectors. Power-good
+  delay is shared across hub ports; no controller-wide reset was added. Actual
+  enumerator tests with scripted USB 3 hubs (including nesting/failures) and USB
+  2/async-monitor regressions pass. Both diagnostic modes compile. The final quiet
+  ISO and standard USB image were rebuilt with saved data preserved; one/two-hub
+  QEMU tests each passed three boots, cold persistence, Linux filesystem checks
+  and clean shutdown, and verified absence of timing lines. QEMU tests cover
+  emulated USB 2 hubs, not the
+  Surface's physical USB-C path. SuperSpeedPlus hub speed mapping remains
+  unsupported; hardware retesting is still required. See [USB_INPUT.md](USB_INPUT.md).
+  FAT16 remains the boot partition format and a legacy kernel root backend;
+  ext4 is the current persistent root. Migration tooling still reads FAT16.
+
+* **Wallpaper startup optimization (2026-11-10):** disk wallpaper selection now
+  precedes procedural fallback generation, so successful boots skip generating
+  an unused full-screen gradient. The raw decoder uses native-width SSE2 copies
+  with opaque alpha, division-free exact nearest-neighbor X stepping for other
+  widths, and converted-row reuse for vertical upscaling. Validation still
+  completes before output writes. Added UI-init/font-load timings and asset byte
+  counts to distinguish overall startup from wallpaper I/O. Sanitizer tests
+  compare pixels to the original mapping across 600 size combinations, including
+  unaligned inputs and destination sentinels. Local 1080p QEMU sample: decode/
+  scale 96 -> 50 ms, wallpaper attempt 217 -> 180 ms, reads ~70 ms unchanged.
+  These are emulator timings, not verification of the reported ~3 s hardware
+  delay. `tests/qemu_wallpaper_perf.py` benchmarks a disposable image copy and
+  supports an expected-fallback boot. Physical timing diagnosis remains needed.
+
+* **ext4 USB system root (2026-11-10):** ext4 is the confirmed system-filesystem
+  direction. Added a pinned lwext4 dependency, freestanding libc/heap bindings,
+  bounded USB block adapter, journal replay/start/stop, VFS backend, ext4 image
+  creation/refresh and non-destructive FAT16-to-new-image migration. Default
+  `PERSIST_DISK` is `wyzar-usb.img`; legacy images retain FAT16 on refresh.
+  The EFI boot partition remains FAT. See [EXT4.md](EXT4.md) for supported feature
+  bits, commands, verification and remaining API/permission/timestamp/I/O limits.
+  Verified: kernel build, ASan/UBSan VFS tests, Linux e2fsck checks, migration/
+  update preservation and atomicity, legacy FAT16 tests, and three QEMU USB boots
+  (two abrupt poweroffs and a clean normal shutdown). The final host image was
+  migrated from `wyzar-usb.img` without changing that source. Hardware untested.
+  After verification, the user requested the standard filename: the tested ext4
+  image replaced the old FAT16 `wyzar-usb.img`; the intermediate ext4-suffixed
+  filename is no longer used. `FRESH=1` recreates the standard image with ext4.
+  USB is a permanent supported target; internal-drive drivers/installer are later.
+  The upstream dependency includes GPL-licensed code; retain its license notices.
+
 * **Asynchronous background hub monitoring (2026-11-08):** replaced busy-waiting
   runtime GET_STATUS/CLEAR_FEATURE with `usb_hub_async.h`. One persistent request
   and DMA page per hub, handled through the normal event dispatcher; no completion

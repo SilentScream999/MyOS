@@ -1,7 +1,10 @@
 # Persistent system storage
 
-Updated 2026-11-07. The USB image contains an EFI boot partition and a writable
-FAT16 system partition. The system partition mounts at `/`; applications do not
+Updated 2026-11-10. New USB images contain a FAT EFI boot partition and a journaled
+ext4 system partition. Existing FAT16 images remain supported. See
+[EXT4.md](EXT4.md) for the new default, migration, feature profile and verification;
+FAT16-specific details below describe the legacy backend.
+The system partition mounts at `/`; applications do not
 use a `/disk` prefix. This is a USB system root, not an internal-drive installer.
 
 ## Build and boot
@@ -15,7 +18,8 @@ make iso             # build recovery/live ISO and refresh the USB image
 make run             # boot ISO in QEMU, with the USB system image attached
 ```
 
-Use `wyzar-usb.img` for physical USB testing. Write the whole image with your usual
+Use `wyzar-usb.img` for physical USB testing. The standard image now uses ext4
+for its system partition. Write the whole image with your usual
 imaging program. Reflashing the whole image replaces the physical stick's saved
 files, even though refreshing the host image preserves its saved files. An
 in-place updater for a running/physical installation is not implemented.
@@ -37,7 +41,7 @@ make usb-image FRESH=1
 | Partition | Size | Purpose |
 |---|---|---|
 | WYZARBOOT | 128 MiB | EFI boot, Limine, kernel, small recovery initrd and init module |
-| WYZARDATA | 64 MiB | FAT16 persistent system root `/` |
+| WYZARDATA | 256 MiB new / 64 MiB legacy | ext4 / FAT16 persistent system root `/` |
 
 The existing partition layout/labels remain compatible with older images.
 Normal refresh migrates an older data volume without formatting it. A file formerly
@@ -108,6 +112,15 @@ validated/scaled into a separate RAM buffer. Only successful decoding replaces
 the current wallpaper. Missing/corrupt/unreadable/timed-out assets keep the procedural
 fallback. The compositor presents its first complete desktop only after this attempt
 finishes, so successful boots do not expose a temporary blue desktop.
+Native-size wallpaper conversion uses four-pixel SSE2 copies with opaque alpha;
+other sizes use exact nearest-neighbor scaling without per-pixel division and
+reuse repeated source rows. Boot generates the procedural fallback only when
+the disk wallpaper is unavailable, rather than generating and replacing it on
+every successful boot. Invalid assets still select that fallback before desktop
+presentation. Optional `BOOT_DIAGNOSTICS=1` builds separate UI initialization and
+font load/bake time from wallpaper I/O and conversion, and record the asset's
+byte count. These extra timing/size lines are off in normal builds; failure
+messages remain.
 The compositor reads RAM on every frame; it never reads the disk. The recovery
 initrd and Limine module list contain no duplicate wallpaper assets.
 
@@ -123,7 +136,7 @@ partition and READ(10) boundaries. Writes remain one sector per command.
 
 Sequential cluster hints and a FAT-sector cache avoid repeated metadata I/O;
 FAT writes invalidate cached metadata. Large assets can still slow boot; this is
-not an asynchronous I/O implementation. Wallpaper attempt duration is logged in
+not an asynchronous I/O implementation. In diagnostic builds, wallpaper duration is logged in
 milliseconds for hardware diagnosis, split into disk read and decode/scale.
 USB discovery, disk readiness/capacity, initial desktop composition and total
 kernel-to-desktop time are also logged. The latter excludes firmware/bootloader
@@ -158,6 +171,30 @@ still be retested; the original failed attempt's log was not captured.
 
 ## Shell and current limits
 
+When boot selects RAM recovery, `cat /run/storage.txt` shows a small RAM-only
+snapshot of the selection failure and USB topology. It distinguishes absent or
+offline disks, unrecognized partitions, ext4 mount/journal failure, root-marker
+or shell-file failure, and runtime-mount failure. It does not write to the USB
+device or print extra success-path timing logs. This file is created on recovery,
+not on normal disk-root boots.
+
+Before root selection, if no USB disk is online, boot allows a 1.5-second
+discovery window for late root/hub connections. Existing enumeration timeouts
+still apply and may extend this window while a probe completes. Boots with an
+already-online disk skip the wait. Root selection remains fixed after userspace
+starts. The recovery snapshot includes controller state and connected/attempted
+root-port PORTSC values, alongside hub and disk details.
+
+`python3 tests/qemu_late_storage_test.py` verifies disk arrival during this window
+and confirms that hotplug after RAM recovery does not replace the running root.
+
+Shutdown/restart attempt to close the ext4 journal first. A removed or failed
+disk cannot be flushed, so a close error is reported and the requested power
+action continues. Removing the boot drive does not permit a clean unmount or
+save outstanding writes. `python3 tests/qemu_power_action_test.py` checks both
+power actions with a connected disk and after unplugging it through a hub,
+including filesystem recovery and previously saved file contents.
+
 ```text
 ls /
 ls /bin
@@ -187,8 +224,9 @@ interrupts during each synchronous operation; asynchronous requests, sleeping
 locks and BOT recovery remain future work. FAT16 has no journal, so power loss can
 leave partial writes, leaked clusters or inconsistent metadata.
 
-Only USB BOT/SCSI LUN 0, 512-byte sectors, READ(10), MBR and FAT16 are supported.
-No UAS/GPT/FAT32/exFAT/internal SATA/NVMe support exists.
+Only USB BOT/SCSI LUN 0, 512-byte sectors, READ(10), MBR, FAT16 and the restricted
+ext4 system profile are supported. No UAS/GPT/FAT32/exFAT/internal SATA/NVMe
+support exists.
 Root-port status notifications are acknowledged without resetting xHCI; a
 CCS (connection) change must stay stable for 150 ms before re-enumeration.
 CSC flags are retained before acknowledgment, so unplug/replug between samples
@@ -227,13 +265,17 @@ read stops that hub's background monitor; it does not reset the controller or
 offline sibling disks. Reconnecting the hub recreates its monitor. Timed-out EP0
 requests are not retried without endpoint recovery; their allocations remain alive
 for late DMA. Initial enumeration and actual hotplug enumeration still use bounded
-synchronous control requests. SuperSpeed EP0 packet
-sizes are decoded as exponents; this does not add SuperSpeed hub enumeration.
-USB 2.0-class hub enumeration retains registered storage devices and supports
-nested route contexts; SuperSpeed hub descriptors/enumeration remain a separate
-compatibility gap. Test physical hardware
-before relying on the new root/asset path. The next filesystem should be chosen
-before the installer/everyday-storage milestone; see [NEXT_STEPS.md](NEXT_STEPS.md).
+synchronous control requests. SuperSpeed EP0 sizes are decoded as exponents.
+USB 2.0 hubs and 5 Gbit/s SuperSpeed hubs support downstream enumeration with
+nested route contexts. SuperSpeed uses descriptor 0x2a, SET_HUB_DEPTH, 512-byte
+EP0 packets, and endpoint companion burst/interval fields. Its port power bit
+must not be decoded as USB 2 low speed. Both paths preserve registered storage
+devices. Hub ports are powered together and given the descriptor's power-good
+delay (at least 100 ms) before connection/reset handling. SuperSpeedPlus hubs
+now use the xHCI compatibility path and controller-reported output speed, rather
+than being blanket-rejected. Nonstandard speed IDs remain unsupported. See
+[USB_INPUT.md](USB_INPUT.md) for scope and tests. Physical USB-C/Surface behavior
+still needs retesting.
 
 Hub/HID enumeration has a shared three-second probe deadline, including nested
 hubs; individual command and controller-state waits are bounded. Disk readiness
@@ -241,9 +283,10 @@ retains its separate bounded cold-start policy. Failed hub probes get a separate
 one-second best-effort slot cleanup; a failing connection can briefly pause
 synchronous enumeration but cannot wait forever. Failed controllers are parked,
 not reset indefinitely. Legacy handoff disables firmware SMI enables and follows
-the relative extended-capability chain. SuperSpeed hub downstream enumeration
-logs an unsupported diagnostic before issuing USB 2-only requests. A USB-C
-connector alone does not establish SuperSpeed hub compatibility.
+the relative extended-capability chain. Cold-attach root ports receive a warm
+reset even if CCS has not appeared; SS inactive/compliance links use warm
+recovery too. A USB-C connector alone does not establish which logical hub/speed
+path is used.
 
 ## Verification
 

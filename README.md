@@ -15,9 +15,12 @@ The long-term goal is a **Windows-like, GPU-composited desktop**. Where we are o
 ## Quick start
 
 **Persistent USB storage:** build with `make usb-image` and boot the resulting
-UEFI USB image. The FAT16 system volume mounts at `/`, with persistent apps, settings and
+UEFI USB image. The ext4 system volume mounts at `/`, with persistent apps, settings and
 wallpaper. The initrd provides RAM recovery when no valid system volume is found. See [docs/PERSISTENT_STORAGE.md](docs/PERSISTENT_STORAGE.md) for image
 writing, persistence checks, limitations, and the path toward an installer.
+See [docs/EXT4.md](docs/EXT4.md) for ext4 setup and verification. The standard
+USB image is `wyzar-usb.img`. New images default to ext4;
+ordinary refresh never silently converts an existing image.
 Use `make run-usb` for QEMU disk boot tests; the ISO is useful for recovery or
 QEMU boot with an attached system disk. `make iso` also refreshes the USB image's boot files and bundled programs while preserving user files/settings.
 In the shell, use `cd <path>` and `pwd` to navigate directories, `mkdir <path>` and
@@ -78,7 +81,7 @@ options, hence the `make clean`.
 * **Tasks:** PCB, context switch, round-robin **single-core** preemptive scheduler. Other cores are detected but never started.
 * **Syscalls:** `syscall`/`sysret` entry and a small dispatcher (table below).
 * **Userspace:** static ELF64 loading from VFS, isolated user address spaces, shell, counter and window demo. Init normally loads from disk `/bin/init.elf`; initrd/Limine modules provide recovery.
-* **Filesystem:** VFS with a persistent FAT16 root on USB, RAM runtime mounts and initrd recovery. See [persistent storage](docs/PERSISTENT_STORAGE.md) for scope and testing.
+* **Filesystem:** VFS with a journaled ext4 root on USB, legacy FAT16 support, RAM runtime mounts and initrd recovery. See [ext4 storage](docs/EXT4.md) for scope and testing.
 * **Terminal:** TTY with line discipline, framebuffer terminal emulator (ANSI subset), shell with history, scrollback and live command highlighting.
 * **Input:** xHCI USB (Intel port-routing support plus an AMD quirk workaround, hubs, connect detection), USB HID keyboard and mouse, PS/2 keyboard, Synaptics touchpad over PS/2 (see `src/drivers/SynapticsGuide.md`).
 * **Platform:** ACPI (shutdown/reboot), PCI ECAM mapping and enumeration.

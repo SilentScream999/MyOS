@@ -14,6 +14,7 @@
 #include "xhci_port_state.h"
 #include "usb_hub_poll_policy.h"
 #include "usb_hub_transfer.h"
+#include "usb_hub_protocol.h"
 #include "usbhelpers.h"
 
 /* ── Ring / Event Ring sizes ──────────────────────────────── */
@@ -419,11 +420,9 @@ static bool hub_ack_hub_changes(USBDevice& hub) {
 // USB 2 hub change bits are latched until CLEAR_FEATURE. A notification for
 // reset completion/enable/suspend is not itself a reason to reset the bus.
 static bool hub_ack_port_changes(USBDevice& hub, uint8_t port, const uint8_t* st) {
-    uint16_t changes = (uint16_t)st[2] | ((uint16_t)st[3] << 8);
-    for (uint8_t bit = 0; bit < 5; ++bit)
-        if ((changes & (1u << bit)) && !hub_clear_port_feature(hub, port, 16 + bit)) return false;
-    if (hub.speed < 4 && (changes & (1u << 5)))
-        return hub_clear_port_feature(hub, port, 23);
+    uint16_t changes = (st[2] | ((uint16_t)st[3] << 8)) & usb_hub_change_mask(hub.speed);
+    for (uint8_t bit = 0; bit < 8; ++bit)
+        if ((changes & (1u << bit)) && !hub_clear_port_feature(hub, port, usb_hub_change_feature(hub.speed, bit))) return false;
     return true;
 }
 
@@ -583,6 +582,7 @@ static void enumerate_device_after_address(
 	bool mass_found = false;
 	uint8_t mass_in = 0, mass_out = 0;
 	uint16_t mass_in_mps = 0, mass_out_mps = 0;
+	uint8_t mass_in_burst = 0, mass_out_burst = 0;
 	
 	dev->interface_count = 0;
 	bool current_iface_is_hid = false;
@@ -620,8 +620,12 @@ static void enumerate_device_after_address(
 			uint8_t attr = config_buf[idx + 3];
 			uint16_t mps = (uint16_t)config_buf[idx + 4] | ((uint16_t)config_buf[idx + 5] << 8);
 			if (mass_interface && (attr & 3) == 2 && (addr & 15) && mps <= 1024) {
-				if (addr & 0x80) { mass_in = addr & 15; mass_in_mps = mps; }
-				else { mass_out = addr & 15; mass_out_mps = mps; }
+				USBSSCompanion companion{};
+				if (dev->speed >= 4 && !usb_ss_companion(config_buf, conf_len, idx, companion)) {
+					print((char*)"[storage] Invalid or unsupported SuperSpeed bulk companion descriptor."); return;
+				}
+				if (addr & 0x80) { mass_in = addr & 15; mass_in_mps = mps; mass_in_burst = companion.burst; }
+				else { mass_out = addr & 15; mass_out_mps = mps; mass_out_burst = companion.burst; }
 			}
 			
 			if (current_iface_is_hid && (addr & 0x80u) && (attr & 0x03u) == 0x03) { // Interrupt IN
@@ -700,7 +704,7 @@ static void enumerate_device_after_address(
 
 	if (mass_in && mass_out) {
 		USBProbePause media_readiness(dev->hc);
-		if (!usb_storage_configure(dev, mass_in, mass_in_mps, mass_out, mass_out_mps))
+		if (!usb_storage_configure(dev, mass_in, mass_in_mps, mass_out, mass_out_mps, mass_in_burst, mass_out_burst))
 			print((char*)"[storage] Unsupported or unavailable USB disk.");
 		return;
 	}
@@ -723,6 +727,7 @@ static void enumerate_device_after_address(
 		uint8_t  hub_ep_num  = 0;
 		uint16_t hub_ep_mps  = 1;
 		uint8_t  hub_ep_ivl  = 0xFF;
+		USBSSCompanion hub_companion{};
 
 		int scan     = 0;
 		int scan_len = (int)((uint16_t)config_buf[2] | ((uint16_t)config_buf[3] << 8));
@@ -738,6 +743,9 @@ static void enumerate_device_after_address(
 				uint8_t  ivl  = config_buf[scan + 6];
 				// Interrupt IN: direction bit set, transfer type == 3
 				if ((addr & 0x80u) && (attr & 0x03u) == 3) {
+					if (dev->speed >= 4 && !usb_ss_companion(config_buf, scan_len, scan, hub_companion)) {
+						print((char*)"[usb] Invalid SuperSpeed hub interrupt companion descriptor."); return;
+					}
 					hub_ep_num = addr & 0x0Fu;
 					hub_ep_mps = mps;
 					hub_ep_ivl = ivl;
@@ -793,11 +801,12 @@ static void enumerate_device_after_address(
 		uint8_t interval = xhci_interrupt_interval(dev->speed, hub_ep_ivl);
 		in_hub_ep[0] = ((uint32_t)interval << 16);
 		// EP type 7 = Interrupt IN, CErr = 3
-		in_hub_ep[1] = (3u << 1) | (7u << 3) | ((uint32_t)hub_ep_mps << 16);
+		in_hub_ep[1] = (3u << 1) | (7u << 3) | ((uint32_t)hub_companion.burst << 8) | ((uint32_t)hub_ep_mps << 16);
 		uint64_t deq = hub_ring->phys | 1u;
 		in_hub_ep[2] = (uint32_t)(deq & 0xFFFFFFFFu);
 		in_hub_ep[3] = (uint32_t)(deq >> 32);
-		in_hub_ep[4] = (uint32_t)hub_ep_mps | ((uint32_t)hub_ep_mps << 16);
+		uint16_t interval_bytes = dev->speed >= 4 ? hub_companion.interval_bytes : hub_ep_mps;
+		in_hub_ep[4] = (uint32_t)hub_ep_mps | ((uint32_t)interval_bytes << 16);
 
 		ring_push_cmd(&dev->hc->cr, (12u << 10) | (dev->slot_id << 24), ictx2_phys, 0);
 		dev->hc->doorbell32[0] = 0;
@@ -962,7 +971,7 @@ static void enumerate_device_after_address(
 
 
 /* ── configure_hub_slot ───────────────────────────────────── */
-static void configure_hub_slot(USBDevice* hub, uint8_t num_ports) {
+static void configure_hub_slot(USBDevice* hub, uint8_t num_ports, uint8_t tt_think_time = 0) {
 	char str[64];
 	size_t ctx_stride = (hub->hc->hcc1 & (1u << 2)) ? 0x40u : 0x20u;
 
@@ -981,6 +990,14 @@ static void configure_hub_slot(USBDevice* hub, uint8_t num_ports) {
 
 	// Set Hub bit in DW0[26]
 	in_slot[0] = in_slot[0] | (1u << 26);
+	if (hub->speed >= 4) {
+		in_slot[0] = in_slot[0] & ~(1u << 25); // MTT applies only to high-speed USB 2 hubs.
+		in_slot[2] = in_slot[2] & ~0x3ffffu;   // No transaction translator on a SuperSpeed hub.
+	} else if (hub->speed == 3) {
+		// Hub descriptor wHubCharacteristics[6:5] encodes 8/16/24/32 FS-bit
+		// TT think time. Zero is not a safe assumption for every physical dock.
+		in_slot[2] = (in_slot[2] & ~(3u << 16)) | ((uint32_t)(tt_think_time & 3u) << 16);
+	}
 
 	// Number of Ports lives in DW1[31:24], NOT DW1[15:8].
 	// DW1[15:8] is the low byte of Max Exit Latency — corrupting that field
@@ -1021,8 +1038,8 @@ static void enumerate_hub_children(
 
 	if (max_depth == 0 || usb_probe_expired(hub->hc)) return;
 	USBProbeGuard probe(hub->hc);
-	if (hub->speed >= 4) {
-		print((char*)"[usb] SuperSpeed hub downstream enumeration unsupported; USB 2 companion path retained.");
+	if (hub->speed > 7) {
+		print((char*)"[usb] Unsupported USB hub controller speed ID.");
 		return;
 	}
 	char str[64];
@@ -1044,12 +1061,12 @@ static void enumerate_hub_children(
 		USBSetupPacket setup;
 		setup.bmRequestType = 0xA0;
 		setup.bRequest      = 0x06;
-		setup.wValue        = (0x29u << 8);
+		setup.wValue        = (uint16_t)usb_hub_descriptor_type(hub->speed) << 8;
 		setup.wIndex        = 0;
-		setup.wLength       = 16;
+		setup.wLength       = hub->speed >= 4 ? 12 : 16;
 
 		print((char*)"hub desc: sending control transfer");
-		USB_Response r = do_control_transfer(*hub, &setup, buf, 16);
+		USB_Response r = do_control_transfer(*hub, &setup, buf, setup.wLength);
 		print((char*)"hub desc: gotresponse="); to_str(r.gotresponse, str); print(str);
 
 		if (!r.gotresponse) {
@@ -1075,15 +1092,36 @@ static void enumerate_hub_children(
 	num_ports = hub_desc[2];
 	print((char*)"Hub num_ports:"); to_str(num_ports, str); print(str);
 
-	if (num_ports == 0 || num_ports > 16) {
+	if (!usb_hub_descriptor_valid(hub->speed, hub_desc, sizeof(hub_desc))) {
 		print((char*)"FAIL: implausible num_ports");
 		for (int i = 0; i < 8; i++) { to_hex(hub_desc[i], str); print(str); }
 		return;
 	}
 
 	// Tell the xHCI this slot is a hub before addressing any child.
-	configure_hub_slot(hub, num_ports);
+	configure_hub_slot(hub, num_ports, (hub_desc[3] >> 5) & 3u);
 	if (hub->hc->needsResetting) return;
+	if (hub->speed >= 4) {
+		int depth = usb_hub_route_depth(((volatile uint32_t*)hub->device_ctx)[0] & 0xfffffu);
+		if (depth < 0 || depth > 4) { print((char*)"[usb] Invalid SuperSpeed hub depth."); return; }
+		USBSetupPacket depth_request{};
+		depth_request.bmRequestType = 0x20; depth_request.bRequest = 12;
+		depth_request.wValue = depth;
+		if (!usb_control_ok(do_control_transfer(*hub, &depth_request, nullptr, 0))) {
+			print((char*)"[usb] SET_HUB_DEPTH failed."); return;
+		}
+	}
+	// Power all downstream ports together, then honor the descriptor's
+	// power-good delay once. Per-port delays can miss USB-C hub link training.
+	for (uint8_t p = 1; p <= num_ports; ++p) {
+		if (usb_probe_expired(hub->hc)) return;
+		if ((hub_desc[3] & 3u) < 2 && !hub_set_port_feature(*hub, p, 8)) {
+			print((char*)"[usb] Hub port power request failed."); return;
+		}
+	}
+	uint32_t power_delay = (uint32_t)hub_desc[5] * 2;
+	if (power_delay < 100) power_delay = 100;
+	tsc_delay_ms(power_delay);
 
     }
 
@@ -1105,7 +1143,7 @@ static void enumerate_hub_children(
 		print((char*)"Checking hub port:"); to_str(p, str); print(str);
 
 		// Power the port (feature 8 = PORT_POWER)
-		hub_set_port_feature(*hub, p, 8);
+		if (only_port) hub_set_port_feature(*hub, p, 8);
 
 		// Wait for connection to stabilize. Poll up to 50ms.
 		bool connected = false;
@@ -1196,10 +1234,8 @@ static void enumerate_hub_children(
 		//   bit 10 = PORT_HIGH_SPEED → xHCI speed code 3
 		//   neither                  → Full Speed → xHCI speed code 1
 		uint16_t port_status = (uint16_t)status4[0] | ((uint16_t)status4[1] << 8);
-		uint32_t speed;
-		if      (port_status & (1u << 9))  speed = 2;   // Low Speed  (xHCI code 2)
-		else if (port_status & (1u << 10)) speed = 3;   // High Speed (xHCI code 3)
-		else                               speed = 1;   // Full Speed (xHCI code 1)
+		uint32_t speed = usb_hub_child_speed(hub->speed, port_status);
+		if (!speed) { print((char*)"[usb] Unsupported hub child speed/status."); continue; }
 		print((char*)"Hub child speed:"); to_str(speed, str); print(str);
 
 		// Preserve the whole hub chain and the upstream root port. Replacing
@@ -1326,7 +1362,11 @@ static void enumerate_hub_children(
 		child->port_num      = p;
 		child->root_port_num = hub->root_port_num;
 		usb_slot_devices[hub->hc - xhci_hc][slot_id] = child;
-		child->speed         = speed;
+		// Address Device can replace the legacy SS input speed using an SSP
+		// Sublink Speed notification. Preserve its negotiated output value for
+		// subsequent EP0/endpoint configuration and nested hub enumeration.
+		uint32_t negotiated_speed = (((volatile uint32_t*)dev_ctx)[0] >> 20) & 15u;
+		child->speed         = negotiated_speed ? negotiated_speed : speed;
 		child->ep0_ring      = ep0;
 		child->ep0_ring_phys = ep0->phys;
 		child->device_ctx    = dev_ctx;
@@ -1354,7 +1394,8 @@ static void enumerate_hub_children(
 			// CRITICAL: Physically disable the hub port to kill the link.
 			// This is the hub equivalent of clearing PED on a root port.
 			// It stops the xHC from retrying the failed device and frees the bus.
-			hub_clear_port_feature(*hub, p, 1); // feature 1 = PORT_ENABLE
+			if (hub->speed < 4) hub_clear_port_feature(*hub, p, 1);
+			else hub_set_port_feature(*hub, (uint16_t)p | (3u << 8), 5); // SS U3 link state.
 			tsc_delay_ms(2);
 
 			// Stop EP0
@@ -1396,6 +1437,109 @@ static void enumerate_hub_children(
 }
 
 #include "usb_root_ports.h"
+
+static bool usb_boot_has_storage() {
+    for (int d = 0; d < usb_disk_count; ++d) if (usb_disks[d].disk.online) return true;
+    return false;
+}
+static void usb_wait_for_boot_storage() {
+    if (usb_boot_has_storage()) return;
+    print((char*)"[storage] Waiting for USB system storage discovery.");
+    uint64_t started = _usb_rdtsc(), ticks_per_ms = _usb_tsc_hz() / 1000;
+    uint64_t deadline = started + ticks_per_ms * 1500u, next_hub_scan = started;
+    // Startup only: roots remain fixed once userspace begins. Check the grace
+    // deadline between probes; each actual enumeration has its existing bound.
+    while (_usb_rdtsc() < deadline) {
+        for (int c = 0; c < xhci_count; ++c) {
+            XHCIController* hc = &xhci_hc[c];
+            if (hc->unavailable || hc->needsResetting) continue;
+            for (uint32_t p = 0; p < hc->max_ports; ++p) {
+                usb_root_poll(hc, p, _usb_rdtsc());
+                if (usb_boot_has_storage() || _usb_rdtsc() >= deadline) return;
+            }
+        }
+        uint64_t now = _usb_rdtsc();
+        if (now >= next_hub_scan) {
+            next_hub_scan = now + ticks_per_ms * 50u;
+            bool reconciled = false;
+            for (int h = 0; h < hub_count && !reconciled; ++h) {
+                USBDevice* hub = hubs[h];
+                HubStatusWatch& watch = hub_watch[h];
+                if (!watch.ready) continue;
+                for (uint8_t p = 1; p <= watch.num_ports; ++p) {
+                    // Already-present input/peripheral branches are untouched.
+                    if (watch.ports[p].baseline) continue;
+                    uint8_t status[4]{};
+                    if (!hub_get_port_status(*hub, p, status)) {
+                        // An errored EP0 must not be blindly reused. Retain its
+                        // children/DMA; another root or hub can still supply disk.
+                        watch.ready = false;
+                        print((char*)"[usb] Boot hub status failed; existing devices retained.");
+                        break;
+                    }
+                    if (xhci_port_watch_changed(watch.ports[p], status[0], _usb_rdtsc(), ticks_per_ms * 150u)) {
+                        usb_hub_reconcile(hub, p);
+                        reconciled = true; // Reconciliation can compact hub lists.
+                        break;
+                    }
+                    if (_usb_rdtsc() >= deadline) return;
+                }
+            }
+        }
+        if (usb_boot_has_storage()) return;
+        boot_splash_tick(); tsc_delay_ms(8);
+    }
+}
+
+// Failure-only snapshot: distinguish discovery, transport and root-selection
+// failures on hardware without enabling verbose success-path/timing logging.
+static void usb_storage_failure_summary(void (*sink)(const char*) = nullptr) {
+    char line[224]; char* cursor = line;
+    auto emit = [&]() { if (sink) sink(line); else print(line); };
+    auto text = [&](const char* s) {
+        while (*s && cursor < line + sizeof(line) - 1) *cursor++ = *s++;
+        *cursor = 0;
+    };
+    auto number = [&](uint64_t value) { char n[32]; to_str(value, n); text(n); };
+    auto id = [&](USBDevice* dev) {
+        char n[32]; to_hex(((uint32_t)dev->vendor_id << 16) | dev->product_id, n); text(n);
+    };
+    unsigned online = 0;
+    for (int d = 0; d < usb_disk_count; ++d) if (usb_disks[d].disk.online) ++online;
+    text("[storage] Discovery: controllers="); number(xhci_count);
+    text(" hubs="); number(hub_count); text(" disks="); number(usb_disk_count);
+    text(" online="); number(online); text(" keyboards="); number(keyboard_count); emit();
+    for (int c = 0; c < xhci_count; ++c) {
+        XHCIController* hc = &xhci_hc[c]; cursor = line;
+        text("[storage] Controller: id="); number(c);
+        text(" unavailable="); number(hc->unavailable); text(" reset="); number(hc->needsResetting);
+        text(" ports="); number(hc->max_ports); emit();
+        if (hc->unavailable || !hc->ops) continue;
+        for (uint32_t p = 0; p < hc->max_ports; ++p) {
+            uint32_t sc = *usb_root_portsc(hc, p);
+            USBDevice* dev = usb_root_devices[c][p];
+            if (!xhci_port_probe_needed(sc) && !dev && !usb_root_attempted[c][p]) continue;
+            cursor = line; text("[storage] Root: controller="); number(c); text(" port="); number(p + 1);
+            char value[32]; to_hex(sc, value); text(" PORTSC="); text(value);
+            text(" attempted="); number(usb_root_attempted[c][p]); text(" slot="); number(dev ? dev->slot_id : 0);
+            if (dev) { text(" speed="); number(dev->speed); text(" vid:pid="); id(dev); }
+            emit();
+        }
+    }
+    for (int h = 0; h < hub_count; ++h) {
+        USBDevice* hub = hubs[h]; cursor = line;
+        text("[storage] Hub: controller="); number(hub->hc - xhci_hc);
+        text(" slot="); number(hub->slot_id); text(" parent="); number(hub->parent_hub ? hub->parent_hub->slot_id : 0);
+        text(" port="); number(hub->port_num); text(" speed="); number(hub->speed);
+        text(" vid:pid="); id(hub); text(" watch="); text(hub_watch[h].ready ? "ready" : "off"); emit();
+    }
+    for (int d = 0; d < usb_disk_count; ++d) {
+        usb_storage* disk = &usb_disks[d]; cursor = line;
+        text("[storage] Disk: slot="); number(disk->dev->slot_id);
+        text(" speed="); number(disk->dev->speed); text(" vid:pid="); id(disk->dev);
+        text(" online="); number(disk->disk.online); text(" sectors="); number(disk->disk.sectors); emit();
+    }
+}
 
 /* ── setupUSB ─────────────────────────────────────────────── */
 static void setupUSB(XHCIController* hc) {
@@ -1624,7 +1768,7 @@ static void setupUSB(XHCIController* hc) {
 
 	for (uint32_t i = 0; i < max_ports; ++i) {
         ++hc->global_port_index;
-        if (*usb_root_portsc(hc, i) & 1u) usb_root_enumerate(hc, i, true);
+        if (xhci_port_probe_needed(*usb_root_portsc(hc, i))) usb_root_enumerate(hc, i, true);
     }
 
 	print((char*)"Root port enumeration complete.");

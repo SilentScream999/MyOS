@@ -278,7 +278,16 @@ static inline void outw(uint16_t port, uint16_t val) {
     __asm__ volatile ("outw %0, %1" : : "a"(val), "Nd"(port));
 }
 
+static void storage_prepare_poweroff() {
+    if (vfs_shutdown_hook && vfs_shutdown_hook() != 0) {
+        // A removed/failed root cannot be flushed. It must not prevent the
+        // requested power action; leave its journal for next-boot recovery.
+        print((char*)"[storage] System filesystem could not close cleanly; continuing power action.");
+    }
+}
+
 static uint64_t sys_shutdown() {
+    storage_prepare_poweroff();
     // Real Hardware ACPI poweroff (prefers UEFI ResetSystem, falls back to raw AML parsing)
     hardware_shutdown();
 
@@ -553,7 +562,9 @@ static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uin
         case SYS_RMDIR:  return sys_rmdir(a1);
         case SYS_STATFS: return sys_statfs(a1, a2);
         case SYS_SHUTDOWN: return sys_shutdown();
-        case SYS_REBOOT:   hardware_reset(); return 0;
+        case SYS_REBOOT:
+            storage_prepare_poweroff();
+            hardware_reset(); return 0;
         
         case SYS_WIN_CREATE: return sys_win_create(a1, a2, a3, a4, a5, 0); // 6th arg flags omitted for now or added
         case SYS_WIN_SYNC:   return sys_win_sync(a1);

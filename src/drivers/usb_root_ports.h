@@ -38,15 +38,16 @@ static void usb_root_ack_changes(XHCIController* hc, uint32_t port, uint32_t sc,
 static bool usb_root_reset(XHCIController* hc, uint32_t port) {
     volatile uint32_t* portsc = usb_root_portsc(hc, port);
     uint32_t sc = *portsc;
-    if (!(sc & 1u)) return false;
+    if (!xhci_port_probe_needed(sc)) return false;
     // Do not restart an already-running reset. Allow PED to settle too; PR
     // clearing before PED rises must not permanently blacklist the port.
-    if (!(sc & (1u << 4))) *portsc = xhci_port_ack(sc) | (1u << 4);
+    if (!(sc & ((1u << 4) | (1u << 31))))
+        *portsc = xhci_port_ack(sc) | xhci_port_reset_bit(sc);
     uint64_t end = usb_timeout_deadline(hc, 500);
     do {
         sc = *portsc;
-        if (!(sc & 1u)) return false;
-        if (!(sc & ((1u << 4) | (1u << 31))) && (sc & 2u)) {
+        if (!xhci_port_probe_needed(sc) && !(sc & ((1u << 4) | (1u << 31)))) return false;
+        if (!(sc & ((1u << 4) | (1u << 31))) && (sc & 3u) == 3u) {
             tsc_delay_ms(10);
             if (*portsc & (127u << 17)) *portsc = xhci_port_ack(*portsc);
             return true;
@@ -142,7 +143,7 @@ static void usb_root_enumerate(XHCIController* hc, uint32_t port, bool reset) {
     volatile uint32_t* portsc = usb_root_portsc(hc, port);
     uint32_t sc = *portsc;
     usb_root_attempted[c][port] = true;
-    if (!(sc & 1u)) return;
+    if (!xhci_port_probe_needed(sc)) return;
     if (reset && !usb_root_reset(hc, port)) {
         // A later PED transition is a chance to enumerate this port locally,
         // not an invitation to reset the entire controller again.
@@ -216,7 +217,8 @@ static bool usb_root_poll(XHCIController* hc, uint32_t port, uint64_t now) {
     bool replaced = xhci_port_replaced(usb_root_changes[c][port], sc, now, settle);
     bool late_ready = !usb_root_devices[c][port] && !usb_root_attempted[c][port] &&
         xhci_port_watch_changed(usb_root_ready_watch[c][port],
-                               ((sc & 3u) == 3u && !(sc & ((1u << 4) | (1u << 31)))) ? 1u : 0u,
+                               (((sc & 3u) == 3u || (sc & (1u << 24))) &&
+                                !(sc & ((1u << 4) | (1u << 31)))) ? 1u : 0u,
                                now, settle);
     if (!changed && !replaced && !late_ready) return false;
     USBControlGuard guard;
@@ -228,11 +230,11 @@ static bool usb_root_poll(XHCIController* hc, uint32_t port, uint64_t now) {
     print((char*)"PORTSC:"); to_hex(sc, detail); print(detail);
     usb_root_changes[c][port].replacement = false;
     if (changed || replaced) usb_root_detach(hc, port);
-    if (sc & 1u) {
+    if (xhci_port_probe_needed(sc)) {
         // Clear only transient enumeration failure bookkeeping, not live slots.
         hc->global_port_index = 0;
         if (hc->portfailed) for (int p = 0; p < 4096; ++p) hc->portfailed[p] = false;
-        usb_root_enumerate(hc, port, replaced || !late_ready);
+        usb_root_enumerate(hc, port, replaced || !late_ready || xhci_port_reset_bit(sc) == (1u << 31));
     } else usb_root_attempted[c][port] = false;
     xhci_port_watch_init(usb_root_watch[c][port], *reg);
     xhci_port_watch_init(usb_root_ready_watch[c][port], 0);

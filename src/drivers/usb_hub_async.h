@@ -1,5 +1,6 @@
 #ifndef WYZAR_USB_HUB_ASYNC_H
 #define WYZAR_USB_HUB_ASYNC_H
+#include "usb_hub_protocol.h"
 
 // Background hub monitoring only. Enumeration retains its bounded synchronous
 // control path. Submit once, then let the input task sleep/process other events.
@@ -87,7 +88,7 @@ static uint8_t hub_poll_changes(int h) {
                 uint8_t port = watch.scan_port;
                 xhci_port_note_change(watch.changes[port], watch.ports[port].baseline,
                     watch.status[0] | ((watch.status[2] & 1u) ? (1u << 17) : 0u), watch.sampled_at);
-                watch.clear_bits = (watch.status[2] | (watch.status[3] << 8)) & (hub.speed < 4 ? 63u : 31u);
+                watch.clear_bits = (watch.status[2] | (watch.status[3] << 8)) & usb_hub_change_mask(hub.speed);
             } else watch.clear_bits = watch.status[2] & 3u;
             watch.phase = 2;
         }
@@ -97,7 +98,7 @@ static uint8_t hub_poll_changes(int h) {
             uint8_t bit = 0;
             while (!(watch.clear_bits & (1u << bit))) ++bit;
             watch.clear_bits &= ~(1u << bit);
-            uint16_t feature = watch.scan_port ? (bit == 5 ? 23 : 16 + bit) : bit;
+            uint16_t feature = watch.scan_port ? usb_hub_change_feature(hub.speed, bit) : bit;
             hub_submit_status_request(h, true, feature);
             return 0;
         }

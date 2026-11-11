@@ -130,13 +130,13 @@ static inline int64_t sys_waitpid(uint64_t pid, uint64_t* code) {
 }
 
 static inline void sys_reboot() {
-    __asm__ volatile ("syscall" : : "a"(169) : "rcx", "r11", "memory");
-    for(;;) {}
+    uint64_t result;
+    __asm__ volatile ("syscall" : "=a"(result) : "a"(169) : "rcx", "r11", "memory");
 }
 
 static inline void sys_shutdown() {
-    __asm__ volatile ("syscall" : : "a"(88) : "rcx", "r11", "memory");
-    for(;;) {}
+    uint64_t result;
+    __asm__ volatile ("syscall" : "=a"(result) : "a"(88) : "rcx", "r11", "memory");
 }
 
 int strlen(const char* s) {
@@ -473,7 +473,7 @@ void _start() {
                 while (buf[idx] == ' ') idx++;
                 if (buf[idx] != '\0') path = &buf[idx];
             }
-            char name[128];
+            char name[256];
             uint64_t sz = 0;
             uint64_t type = 0;
             uint64_t idx = 0;
@@ -540,8 +540,10 @@ void _start() {
             __asm__ volatile ("ud2");
         } else if (streq(buf, "shutdown", 8)) {
             sys_shutdown();
+            print("Shutdown request returned without powering off.\n");
         } else if (streq(buf, "restart", 7)) {
             sys_reboot();
+            print("Restart request returned without restarting.\n");
         } else if (streq(buf, "open bootlog", 12)) {
             uint64_t fd = sys_open("/bootlog.txt", 0);
             if (fd != (uint64_t)-1) {

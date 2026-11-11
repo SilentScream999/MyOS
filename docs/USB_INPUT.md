@@ -34,6 +34,88 @@ required; the boot log should contain:
 
 ## Verification
 
+### SuperSpeed hubs and USB-C storage
+
+USB-C is a connector, not a distinct storage protocol. As of 2026-11-10 the hub
+driver supports the USB 2 path, 5 Gbit/s SuperSpeed hubs, and the xHCI legacy
+compatibility path for SuperSpeedPlus hubs.
+The earlier code explicitly skipped all SuperSpeed hub children, which is a
+possible explanation for the reported Surface Laptop 4 USB-C hub storage failure
+while the USB-A path works. The user retested that initial change and still saw
+missing storage, then confirmed the explicit SuperSpeedPlus-unsupported message.
+The blanket SuperSpeedPlus rejection has now been removed; hardware retesting
+of this follow-up is still needed.
+
+The user subsequently confirmed continued failure and identified the dock as a
+ZMUIPNG ZM3310, with keyboard stutter when the boot stick shares the dock. This
+remains an unresolved hardware issue; neither hub identity nor stutter proves
+one cause. The driver's high-speed hub TTT field now follows the descriptor's
+advertised think time, including FS/LS keyboard children. On storage-root failure
+only, the boot log now emits a compact discovery/topology snapshot with hub and
+disk VID/PID, speed and readiness. Successful boots keep this output suppressed.
+Run `python3 tests/qemu_usb_recovery_test.py` to verify this recovery-report path
+on a disposable copy with an invalid root marker.
+The fixture uses ISO boot to separate OS root validation from OVMF removable-
+media boot selection. The ZM3310 manual recommends its USB 2.0 ports for wireless
+receivers; wireless stutter alone does not establish CPU or USB event starvation.
+Manufacturer manual: [ZM3310 PDF](https://m.media-amazon.com/images/I/81%2BBUjbxAFL.pdf).
+
+The SuperSpeed path requests descriptor 0x2a, sets the hub's depth after
+configuration, uses 512-byte EP0 packets for children, and preserves the complete
+nested route/root-port context without USB 2 transaction-translator fields.
+Hub interrupt endpoints and BOT bulk endpoints parse their SuperSpeed endpoint
+companion descriptors for Max Burst and interval payload. Stream-enabled bulk
+endpoints remain unsupported. Port change acknowledgments use USB 3 selectors,
+including warm-reset, link-state and configuration-error changes. Failed children
+enter U3 rather than sending the USB 2-only CLEAR_FEATURE(PORT_ENABLE).
+
+For standard USB 3 speed IDs 4..7, child addressing uses the SuperSpeed-compatible
+port status value. xHCI 1.22 section 4.19.9 requires SSP controllers to consume
+Sublink Speed notifications and report the actual negotiated speed in the output
+slot context. The driver reads that output value before configuring the child
+or recursing through a nested hub. A 5-Gbit/s child behind an SSP hub remains
+5-Gbit/s; the upstream speed is not blindly copied to every child. This uses the
+specified compatibility path, not a new BOS/extended-port-status implementation.
+Nonstandard controller speed IDs outside 1..7 remain unsupported.
+
+All hub ports power up together and get the descriptor's power-good delay
+(minimum 100 ms). Root ports with Cold Attach Status are probed even before CCS
+appears and receive a warm reset; inactive/compliance SuperSpeed links also use
+warm recovery. Actual reset waits remain bounded. UAS, Type-C/PD policy and
+firmware boot issues remain outside this change. Root selection still
+happens once before userspace, so a disk arriving after recovery starts does not
+silently replace the running root.
+
+The latest physical recovery snapshot shows two controllers, one high-speed hub
+(controller 1, root port 5, reported VID/PID 0bda:5420), one keyboard and no disks
+at root selection. The user also reports damaged unused dock ports. The failure
+is OS discovery, before filesystem parsing; damaged ports are not a proven cause.
+Boot now gives late devices a 1.5-second discovery window only if no disk is
+already online, checking root ports and empty hub ports before root selection.
+Individual probes retain their bounded timeouts. Run
+`python3 tests/qemu_late_storage_test.py` for startup/post-recovery arrival tests.
+Recovery reports include controller availability/reset state and raw root-port
+PORTSC values; normal disk-root boots keep these diagnostics suppressed.
+The user has now physically confirmed that this discovery window fixes root
+mounting on the failing Surface/ZM3310 USB-C connection. Keyboard stutter has
+not been separately confirmed resolved.
+
+Run `python3 tests/run_usb_hub_tests.py` for sanitizer tests of the protocol
+helpers, actual hub-enumeration functions with scripted completions, mixed SS/SSP
+children, controller-reported output speeds, nested routes, USB 2 regression,
+real root-reset loops, malformed descriptors, SET_HUB_DEPTH failure and the
+asynchronous monitor's USB 2/3 acknowledgment selectors. QEMU's emulated hubs
+exercise the USB 2 path, not a physical USB 3 hub. Test ext4 boot/persistence with
+`python3 tests/qemu_ext4_test.py --hub-depth 1` and `--hub-depth 2` after copying
+the current `wyzar-usb.img` to `.storage-test/ext4-usb.img`.
+
+Protocol references: [SuperSpeed hub descriptor](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/usbspec/ns-usbspec-_usb_30_hub_descriptor),
+[USB hub request/status definitions](https://github.com/torvalds/linux/blob/master/include/uapi/linux/usb/ch11.h).
+SSP compatibility and cold attach: sections 4.19.8–4.19.9 of the
+[Intel xHCI 1.22 specification](https://www.intel.com/content/dam/www/public/us/en/documents/technical-specifications/extensible-host-controler-interface-usb-xhci.pdf).
+
+### Pointer input
+
 Local regression fixtures are in the ignored `tests/` directory:
 
 ```sh

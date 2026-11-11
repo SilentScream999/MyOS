@@ -431,6 +431,10 @@ static bool wm_load_wallpaper_file(const char* path) {
         return false;
     }
     uint64_t size = f.vn->size;
+#if BOOT_DIAGNOSTICS
+    char asset_size[32]; to_str(size, asset_size);
+    print((char*)"[wallpaper] Asset bytes:"); print(asset_size);
+#endif
     // Bound allocations even when disk metadata is corrupt.
     uint8_t* data = size && size <= 64 * 1024 * 1024 ? (uint8_t*)kmalloc(size) : nullptr;
     uint64_t loaded = 0;
@@ -452,13 +456,17 @@ static bool wm_load_wallpaper_file(const char* path) {
         loaded += count;
         boot_splash_tick();
     }
+#if BOOT_DIAGNOSTICS
     char elapsed[32];
     to_str((rdtsc_val() - started) / (_usb_tsc_hz() / 1000), elapsed);
     print((char*)"[wallpaper] Disk-read milliseconds:"); print(elapsed);
     uint64_t decode_started = rdtsc_val();
+#endif
     bool ok = data && loaded == size && wm_load_wallpaper_from_raw(data, size);
+#if BOOT_DIAGNOSTICS
     to_str((rdtsc_val() - decode_started) / (_usb_tsc_hz() / 1000), elapsed);
     print((char*)"[wallpaper] Decode/scale milliseconds:"); print(elapsed);
+#endif
     vfs_close(&f);
     if (data) kfree(data);
     return ok;
@@ -522,14 +530,18 @@ static void wm_load_disk_wallpaper() {
         vfs_close(&config);
     }
     print((char*)"[wallpaper] Loading disk asset...");
+#if BOOT_DIAGNOSTICS
     uint64_t started = rdtsc_val();
+#endif
     print((char*)(wm_load_wallpaper_file(path) ?
         "[wallpaper] Loaded disk asset into RAM." :
         "[wallpaper] Missing, unreadable or invalid asset; keeping fallback."));
+#if BOOT_DIAGNOSTICS
     char elapsed[32];
     to_str((rdtsc_val() - started) / (_usb_tsc_hz() / 1000), elapsed);
     print((char*)"[wallpaper] Load attempt milliseconds:");
     print(elapsed);
+#endif
 }
 
 // ── WIN_LOG: independent scrollable text window ──────────────────────────────
@@ -1477,7 +1489,8 @@ static inline void wm_init() {
     }
     for (int j = 0; j < 720; j++) g_rainbow_wide[j] = g_rainbow_lut[j / 2];
 
-    wm_init_wallpaper();
+    // Boot selects the disk wallpaper before the compositor's first frame.
+    // Generate the procedural fallback only if that attempt fails.
 
     term_dirty_all();
 }

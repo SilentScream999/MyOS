@@ -166,7 +166,8 @@ static void usb_storage_reset_controller(XHCIController* hc) {
         if (usb_disks[i].dev->hc == hc) usb_disks[i].disk.online = false;
     usb_deferred_events* q = usb_pending_for(hc); q->head = q->count = 0;
 }
-static bool usb_storage_configure(USBDevice* dev, uint8_t in_ep, uint16_t in_mps, uint8_t out_ep, uint16_t out_mps) {
+static bool usb_storage_configure(USBDevice* dev, uint8_t in_ep, uint16_t in_mps, uint8_t out_ep, uint16_t out_mps,
+                                   uint8_t in_burst = 0, uint8_t out_burst = 0) {
     if (usb_disk_count == 8 || !in_ep || !out_ep || !in_mps || !out_mps) return false;
     usb_storage* s = &usb_disks[usb_disk_count++];
     s->dev = dev; s->in_dci = in_ep * 2 + 1; s->out_dci = out_ep * 2; s->tag = 0;
@@ -189,7 +190,8 @@ static bool usb_storage_configure(USBDevice* dev, uint8_t in_ep, uint16_t in_mps
         uint16_t mps = direction ? in_mps : out_mps;
         Ring* r = direction ? &s->in_ring : &s->out_ring;
         volatile uint32_t* ep = (volatile uint32_t*)((uint64_t)ctx + stride * (dci + 1));
-        ep[1] = (3u << 1) | ((direction ? 6u : 2u) << 3) | (uint32_t)mps << 16;
+        uint8_t burst = direction ? in_burst : out_burst;
+        ep[1] = (3u << 1) | ((direction ? 6u : 2u) << 3) | ((uint32_t)burst << 8) | (uint32_t)mps << 16;
         ep[2] = (uint32_t)r->phys | 1; ep[3] = r->phys >> 32; ep[4] = 512;
     }
     uint64_t command = dev->hc->cr.phys + dev->hc->cr.enq * 16;
@@ -203,7 +205,9 @@ static bool usb_storage_configure(USBDevice* dev, uint8_t in_ep, uint16_t in_mps
     // already ready proceeds immediately, without a fixed boot delay.
     uint8_t tur[6] = {};
     print((char*)"[storage] Checking cold-start disk readiness...");
+#if BOOT_DIAGNOSTICS
     uint64_t readiness_started = usb_scsi_retry_now(nullptr);
+#endif
     bool ready = usb_scsi_read_retry(s, tur, 6, false, nullptr, 0, 5000, true);
     uint8_t cdb[10] = {0x25}, capacity[8];
     if (!ready || !usb_scsi_read_retry(s, cdb, 10, true, capacity, 8, 2000, true) ||
@@ -212,8 +216,10 @@ static bool usb_storage_configure(USBDevice* dev, uint8_t in_ep, uint16_t in_mps
         s->disk.online = false; return false;
     }
     s->disk.sectors = (uint64_t)usb_scsi_be32(capacity) + 1;
+#if BOOT_DIAGNOSTICS
     char elapsed[32]; to_str(usb_scsi_retry_now(nullptr) - readiness_started, elapsed);
     print((char*)"[storage] Readiness/capacity milliseconds:"); print(elapsed);
+#endif
     print((char*)"[storage] USB SCSI disk ready (512-byte sectors).");
     return true;
 }

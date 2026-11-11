@@ -74,6 +74,8 @@ struct file {
 
 // GLOBAL VFS STATE
 static vnode* vfs_root = nullptr;
+// Called before poweroff/reset; filesystems may commit and close their journal.
+static int (*vfs_shutdown_hook)() = nullptr;
 struct vfs_mount_entry { vnode* point; vnode* root; };
 static vfs_mount_entry vfs_mounts[16];
 static unsigned vfs_mount_count = 0;

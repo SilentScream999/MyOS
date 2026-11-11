@@ -17,6 +17,11 @@
 #include "core/syscall.h"
 #include "fs/ramfs.h"
 #include "fs/fat16.h"
+#include "fs/ext4_vfs.h"
+
+extern "C" void* wyzar_ext4_malloc(size_t n) { return kmalloc(n); }
+extern "C" void* wyzar_ext4_realloc(void* p, size_t n) { return krealloc(p, n); }
+extern "C" void wyzar_ext4_free(void* p) { kfree(p); }
 #include "fs/tar.h"
 #include "core/exec.h"
 #include "gui/graphics.h"
@@ -200,6 +205,26 @@ volatile bool g_needs_refresh = true;
 volatile bool g_desktop_ready = false;
 static volatile bool g_boot_assets_ready = false;
 static uint64_t g_boot_started_tsc = 0;
+static vnode* g_storage_report = nullptr;
+static uint64_t g_storage_report_offset = 0;
+static void storage_report_line(const char* line) {
+    if (!g_storage_report || !g_storage_report->ops->write) return;
+    uint64_t size = strlen(line);
+    g_storage_report_offset += g_storage_report->ops->write(g_storage_report, line, size, g_storage_report_offset);
+    g_storage_report_offset += g_storage_report->ops->write(g_storage_report, "\n", 1, g_storage_report_offset);
+}
+static void storage_record_recovery(vnode* runtime_run, const char* reason) {
+    // Write directly to the runtime RAM node, never to the failing USB device.
+    if (!runtime_run || runtime_run->type != VnodeType::DIRECTORY || runtime_run->ops != &ramfs_ops) return;
+    g_storage_report = ramfs_lookup(runtime_run, "storage.txt");
+    if (!g_storage_report) g_storage_report = ramfs_create(runtime_run, "storage.txt");
+    if (!g_storage_report || g_storage_report->type != VnodeType::FILE) return;
+    ((ramfs_node*)g_storage_report->fs_data)->size = g_storage_report->size = 0;
+    g_storage_report_offset = 0;
+    storage_report_line("System root: RAMFS recovery");
+    storage_report_line(reason);
+    usb_storage_failure_summary(storage_report_line);
+}
 volatile uint32_t g_mouse_btns_prev = 0;
 
 #include "drivers/mouse.h"
@@ -489,14 +514,18 @@ void compositor_thread_main() {
             print((char*)"[clock] RTC read failed (no RTC, or invalid values). Tray shows --:--.");
         }
     }
+#if BOOT_DIAGNOSTICS
     uint64_t first_frame_started = rdtsc();
+#endif
     wm_compose_dirty(0, fb->width - 1, 0, fb->height - 1, false, false);
     if (!boot_splash_present_desktop(g_master_backbuffer)) hcf();
+#if BOOT_DIAGNOSTICS
     char boot_elapsed[32];
     to_str((rdtsc() - first_frame_started) / (_usb_tsc_hz() / 1000), boot_elapsed);
     print((char*)"[boot] First desktop compose/present milliseconds:"); print(boot_elapsed);
     to_str((rdtsc() - g_boot_started_tsc) / (_usb_tsc_hz() / 1000), boot_elapsed);
     print((char*)"[boot] Kernel-to-desktop milliseconds:"); print(boot_elapsed);
+#endif
     wm_overlay_update(g_mouse_x, g_mouse_y, g_mouse_buttons);
     g_desktop_ready = true;
 
@@ -779,11 +808,19 @@ extern "C" void kmain(void) {
     }
 
 
-	scheduler_init();
+    scheduler_init();
     // Initializing graphical UI components
+#if BOOT_DIAGNOSTICS
+    uint64_t ui_started = rdtsc();
+#endif
     wm_init();     // Initialize window manager and UI scaling first
     g_task_exit_hook = process_exit_ui;
     wm_log_init(); // Then initialize the log buffer with the correct scaled dimensions
+#if BOOT_DIAGNOSTICS
+    char ui_elapsed[32];
+    to_str((rdtsc() - ui_started) / (_usb_tsc_hz() / 1000), ui_elapsed);
+    print((char*)"[boot] UI initialization milliseconds:"); print(ui_elapsed);
+#endif
     
     // Spawn compositor thread extremely early so it guarantees 60fps
     // screen refreshes regardless of whether USB enumeration blocks.
@@ -878,7 +915,9 @@ extern "C" void kmain(void) {
 	// re-enumerate all ports, reinitialise per-keyboard state, re-queue TRBs,
 	// and re-enter the main loop.
 	restart:
+#if BOOT_DIAGNOSTICS
 	uint64_t usb_scan_started = _usb_rdtsc();
+#endif
 	bool usb_restarted[MAX_CONTROLLERS] = {};
 	// Serialize controller resets against synchronous filesystem I/O. Existing
 	// mounted disks are offlined by setupUSB; never rebind an open vnode.
@@ -900,35 +939,63 @@ extern "C" void kmain(void) {
             }
         }
 
+#if BOOT_DIAGNOSTICS
     to_str((_usb_rdtsc() - usb_scan_started) / (_usb_tsc_hz() / 1000), str);
     print((char*)"[boot] USB discovery milliseconds:"); print(str);
+#endif
 
     // Select once before launching userspace; never switch roots after unplug/replug.
     if (!storage_selected) {
+        usb_wait_for_boot_storage();
         storage_selected = true;
-        fat16_volume* candidate = nullptr;
+        vnode* candidate = nullptr;
+        static wy_ext4_volume ext4_candidate;
+        bool candidate_ext4 = false;
         unsigned candidates = 0;
+        const char* recovery_reason = "No USB storage device discovered before root selection.";
         for (int d = 0; d < usb_disk_count; ++d) {
             if (!usb_disks[d].disk.online) continue;
+            wy_ext4_volume probe{};
+            unsigned ext4_count = wy_ext4_probe(&usb_disks[d].disk, &probe);
+            if (ext4_count) {
+                candidates += ext4_count;
+                ext4_candidate = probe;
+                candidate_ext4 = true;
+            }
             fat16_volume* volume = fat16_probe(&usb_disks[d].disk);
             if (!volume) continue;
             ++candidates;
-            candidate = volume;
+            candidate = &volume->root.vn;
+            candidate_ext4 = false;
         }
-        if (!candidates) print((char*)"[storage] No readable WYZARDATA system partition found.");
-        else if (candidates > 1) print((char*)"[storage] Multiple system volumes found; refusing ambiguous root selection.");
+        if (!candidates) {
+            unsigned online = 0;
+            for (int d = 0; d < usb_disk_count; ++d) if (usb_disks[d].disk.online) ++online;
+            if (online) recovery_reason = "USB disk online, but no readable WYZARDATA partition was recognized.";
+            else if (usb_disk_count) recovery_reason = "USB disk was discovered, but was offline before root selection.";
+            print((char*)"[storage] No readable WYZARDATA system partition found.");
+        } else if (candidates > 1) {
+            recovery_reason = "Multiple system volumes found; root selection is ambiguous.";
+            print((char*)"[storage] Multiple system volumes found; refusing ambiguous root selection.");
+        }
         if (candidates == 1) {
-            vfs_mount_root(&candidate->root.vn);
+            if (candidate_ext4) candidate = wy_ext4_mount(&ext4_candidate);
+            recovery_reason = candidate ? "System-root marker could not be read or has an invalid signature." :
+                "System partition recognized, but ext4 mount/journal initialization failed.";
+            if (candidate) vfs_mount_root(candidate);
             file marker{};
             char signature[12] = {};
-            bool valid = vfs_open("/etc/root.cfg", 0, &marker) == 0;
+            bool valid = candidate && vfs_open("/etc/root.cfg", 0, &marker) == 0;
             if (valid) {
                 valid = vfs_read(&marker, signature, 11) == 11 &&
                         strncmp(signature, "WYZARROOT1\n", 11) == 0;
                 vfs_close(&marker);
             }
             vnode* shell = vfs_namei("/bin/init.elf");
+            if (valid && (!shell || shell->type != VnodeType::FILE || !shell->size))
+                recovery_reason = "System-root signature valid, but /bin/init.elf is missing or empty.";
             valid = valid && shell && shell->type == VnodeType::FILE && shell->size > 0;
+            if (valid) recovery_reason = "System root validated, but runtime mounts could not be attached.";
             vnode* tmp_point = vfs_namei("/tmp");
             vnode* run_point = vfs_namei("/run");
             vnode* log_point = vfs_namei("/bootlog.txt");
@@ -937,19 +1004,43 @@ extern "C" void kmain(void) {
                 vfs_mount(vfs_namei("/run/boot.log"), live_log) == 0) {
                 disk_root_active = true;
                 print((char*)"[storage] WYZARDATA mounted as root /.");
+                if (candidate_ext4) print((char*)"[storage] ext4 journal active on USB system root.");
             } else {
                 print((char*)"[storage] System signature, init file or runtime mounts unavailable.");
                 vfs_mount_root(recovery_root);
+                if (candidate_ext4 && ext4_candidate.mounted) wy_ext4_unmount(&ext4_candidate);
             }
         }
-        if (!disk_root_active) print((char*)"[storage] No unique valid system volume; RAM recovery mode.");
+        if (!disk_root_active) {
+            print((char*)"[storage] No unique valid system volume; RAM recovery mode.");
+            usb_storage_failure_summary();
+            storage_record_recovery(runtime_run, recovery_reason);
+        }
     }
 	__asm__ volatile("sti" ::: "memory");
     static bool wallpaper_loaded = false;
     if (!wallpaper_loaded) {
         wallpaper_loaded = true;
+#if BOOT_DIAGNOSTICS
+        uint64_t font_started = rdtsc();
+#endif
         wm_load_disk_font();
+#if BOOT_DIAGNOSTICS
+        char asset_elapsed[32];
+        to_str((rdtsc() - font_started) / (_usb_tsc_hz() / 1000), asset_elapsed);
+        print((char*)"[font] Load/bake milliseconds:"); print(asset_elapsed);
+#endif
         if (disk_root_active) wm_load_disk_wallpaper();
+        if (!g_wallpaper) {
+#if BOOT_DIAGNOSTICS
+            uint64_t fallback_started = rdtsc();
+#endif
+            wm_init_wallpaper();
+#if BOOT_DIAGNOSTICS
+            to_str((rdtsc() - fallback_started) / (_usb_tsc_hz() / 1000), asset_elapsed);
+            print((char*)"[wallpaper] Fallback generation milliseconds:"); print(asset_elapsed);
+#endif
+        }
         g_boot_assets_ready = true;
         boot_loading_screen_until_ready();
     }
@@ -1001,6 +1092,7 @@ extern "C" void kmain(void) {
             vfs_mount_root(recovery_root);
             disk_root_active = false;
             print((char*)"[storage] Disk init failed; RAM recovery mode.");
+            storage_record_recovery(runtime_run, "System partition mounted, but loading /bin/init.elf failed.");
             init_task = execve_path("/bin/init.elf");
         }
         if (!init_task && module_req.response) {

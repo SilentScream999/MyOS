@@ -1,5 +1,8 @@
 #ifndef helpers_h
 #define helpers_h
+#ifndef BOOT_DIAGNOSTICS
+#define BOOT_DIAGNOSTICS 0
+#endif
 
 #include "structures.h"
 #include "string.h"

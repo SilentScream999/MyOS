@@ -2,6 +2,15 @@
 #define WYZAR_XHCI_PORT_STATE_H
 #include <stdint.h>
 
+// xHCI 4.19.1: a USB 3 port with Cold Attach Status needs a warm reset,
+// including when CCS has not risen yet. Inactive/compliance links also need
+// warm recovery rather than repeatedly issuing a USB 2-style hot reset.
+static inline bool xhci_port_probe_needed(uint32_t sc) { return sc & ((1u << 24) | 1u); }
+static inline uint32_t xhci_port_reset_bit(uint32_t sc) {
+    uint32_t speed = (sc >> 10) & 15u, link = (sc >> 5) & 15u;
+    return (sc & (1u << 24)) || (speed >= 4 && (link == 6 || link == 10)) ? 1u << 31 : 1u << 4;
+}
+
 // USB 3 encodes EP0's packet size as an exponent (9 means 512 bytes).
 // USB 2 uses the byte count directly.
 static inline uint16_t usb_ep0_packet_size(uint8_t speed, uint8_t encoded) {

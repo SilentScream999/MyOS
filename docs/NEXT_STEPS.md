@@ -74,11 +74,12 @@ with asynchronous block requests and sleeping locks. Generalize root selection t
 stable boot-volume identity; currently exactly one WYZARDATA-labelled disk is
 required, with `/etc/root.cfg` and `/bin/init.elf` checked before selection.
 
-Upgrade beyond FAT16 after this root/recovery foundation and core file operations
-are stable, before the installer/everyday-storage milestone. Ext2 is a candidate,
-not a committed choice; journaling/crash-recovery requirements need a decision.
-Keep the EFI boot partition independent of the system filesystem. Then add
-internal-drive support and an installer using the same block/VFS abstractions.
+ext4 is confirmed and the initial USB system-root implementation is in place.
+See [EXT4.md](EXT4.md) for the supported profile, migration, tests and limits.
+USB remains a permanent supported system-drive target. Keep the FAT EFI boot
+partition independent of ext4. Next complete everyday file APIs, responsive I/O,
+stable boot-volume identity and recovery tooling, then add internal-drive support
+and an installer using the same block/VFS abstractions.
 
 ## 4. Disk wallpaper
 
