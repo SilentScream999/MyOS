@@ -220,6 +220,7 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf_va, uint64_t len) {
     if (len == 0) return 0;
     
     if (fd == 0) { // stdin
+        if (g_current_task->pid==g_terminal_shell_pid) g_terminal_shell_ready=true;
         char tmp[128];
         size_t to_read = len > 128 ? 128 : len;
         size_t read_bytes = tty_read(tmp, to_read);

@@ -1,5 +1,7 @@
 # Desktop font files
 
+Updated 2026-11-11.
+
 Wyzar reads real TrueType files at boot and rasterizes them into antialiased
 desktop glyphs. Titles, taskbar labels, menus and the clock use the selected
 font. The terminal, boot log and early boot diagnostics retain their bitmap font.
@@ -15,10 +17,11 @@ To select a different font once file transfer is available:
 2. Set `/etc/font.cfg` to `/share/fonts/custom.ttf`.
 3. Reboot.
 
-For development today, use `tools/system_volume.py`'s `SystemVolume.put` to
-install the font and setting in an **offline, disposable** USB image. Image
-updates preserve the selection and custom files, while refreshing bundled
-Selawik. No font conversion or atlas-generation step is required.
+For development, `tests/qemu_font_selection_test.py` demonstrates installing a
+TTF and setting in an offline disposable image. It uses the current ext4 image
+helper on an extracted partition; the removed FAT `SystemVolume` tool is not
+part of this workflow. Image updates preserve custom fonts/settings while
+refreshing bundled Selawik. No font conversion or atlas-generation is required.
 
 The current text API displays printable ASCII, with `?` fallback. The decoder
 supports Unicode cmap formats 4/12, short/long loca tables, simple quadratic
@@ -32,10 +35,4 @@ The TTF file buffer and temporary rasterizer storage are freed after loading.
 
 Format reference: [Microsoft OpenType specification](https://learn.microsoft.com/en-us/typography/opentype/spec/otff).
 
-Validation in WSL:
-
-```sh
-clang++ -std=c++20 -O1 -g -fsanitize=address,undefined tests/truetype_test.cpp -o /tmp/ttf-test
-/tmp/ttf-test assets/fonts/selawik/selawk.ttf
-python3 tests/qemu_font_selection_test.py wyzar-usb.img assets/fonts/selawik/selawk.ttf
-```
+The runtime test command and prerequisites are in [TESTING](TESTING.md).

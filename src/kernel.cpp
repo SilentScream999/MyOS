@@ -16,6 +16,8 @@
 #include "arch/acpi.h"
 #include "core/syscall.h"
 #include "fs/ramfs.h"
+#include "fs/recovery.h"
+#include "arch/boot_module.h"
 #include "fs/ext4_vfs.h"
 #include "fs/usb_autogrow.h"
 
@@ -52,6 +54,16 @@ static volatile struct limine_module_request module_req = {
     .id = LIMINE_MODULE_REQUEST,
     .revision = 0
 };
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_kernel_address_request kernel_address_req = {
+    .id = LIMINE_KERNEL_ADDRESS_REQUEST,
+    .revision = 0
+};
+extern "C" char _kernel_start[], _kernel_end[];
+static bool g_recovery_retired = false;
+static uint64_t g_recovery_heap_bytes = 0, g_recovery_archive_bytes = 0;
+static uint64_t g_recovery_fallback_bytes = 0;
 
 __attribute__((used, section(".limine_requests")))
 volatile struct limine_efi_system_table_request efi_st_req = {
@@ -355,6 +367,7 @@ extern "C" void mouse_process_scroll(int8_t scroll_dy) {
 
 extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
     if (!fb) return;
+    ResourceRead resource_read; // Keep hit-test identity and launch path in one snapshot.
 
     g_mouse_prev_buttons = (uint8_t)g_mouse_buttons;
     g_mouse_buttons      = buttons;
@@ -404,7 +417,7 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
             int menu_hit = wm_menu_hit_test(mx, my);
             if (menu_hit >= 0) {
                 // Launch the selected app from /bin
-                if (tty_queue_launch(g_menu_paths[menu_hit])) {
+                if (tty_queue_launch(g_resources_catalog->apps[menu_hit].app.exec)) {
                     for (int i = 0; i < g_window_count; ++i)
                         if (g_window_list[i] == g_win_terminal) { wm_raise_window(i); break; }
                 } else print((char*)"[launcher] Terminal busy; finish or interrupt its foreground program first.");
@@ -679,7 +692,10 @@ extern "C" void kmain(void) {
 	if (!LIMINE_BASE_REVISION_SUPPORTED) hcf();
 	if (!fb_req.response || fb_req.response->framebuffer_count < 1) hcf();
 
-	fb = fb_req.response->framebuffers[0];
+	// Keep all rendering disabled until we own a valid framebuffer mapping.
+    // Some firmware/loader modes provide its HHDM address without mapping the
+    // aperture; drawing the splash first faults before an IDT exists.
+    struct limine_framebuffer* boot_framebuffer=fb_req.response->framebuffers[0];
 
     // --- SSE & SIMD Enablement (CR0, CR4) ---
     {
@@ -696,10 +712,11 @@ extern "C" void kmain(void) {
         __asm__ volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
     }
 
-	if (!fb->address || fb->bpp != 32 || fb->pitch < fb->width * 4) hcf();
-	boot_splash_begin();
+	if (!boot_framebuffer || !boot_framebuffer->address || boot_framebuffer->bpp != 32 ||
+        !boot_framebuffer->width || !boot_framebuffer->height ||
+        boot_framebuffer->width>UINT64_MAX/4 || boot_framebuffer->pitch<boot_framebuffer->width*4 ||
+        boot_framebuffer->pitch>UINT64_MAX/boot_framebuffer->height) hcf();
 	print((char*)"[boot] Kernel entered. Limine handoff complete (BSP only).");
-	print_fb_pixel_format();
 
 	// ── NEW ──────────────────────────────────────
 	init_gdt();
@@ -748,19 +765,27 @@ extern "C" void kmain(void) {
 	print((char*)"[boot] Usable RAM mapped.");
 	setup_pat();
 	
-	// Explicitly map the framebuffer in our new page tables if it's not already covered
-	// by the usable RAM map. This ensures sys_write works from user tasks.
-	if (fb_req.response && fb_req.response->framebuffer_count > 0) {
-		struct limine_framebuffer *f = fb_req.response->framebuffers[0];
-		uint64_t phys = (uint64_t)f->address - HHDM;
-		uint64_t size = f->pitch * f->height;
+	// Explicitly map framebuffer pages before the first splash/log write. Include
+    // both boundary pages if firmware returns a framebuffer with a byte offset.
+	{
+        uint64_t address=(uint64_t)boot_framebuffer->address;
+        uint64_t base=address&~(PAGE_SIZE-1);
+        if (base<HHDM) hcf();
+		uint64_t phys=base-HHDM;
+		uint64_t size=boot_framebuffer->pitch*boot_framebuffer->height;
+        if (size>UINT64_MAX-(address-base) || base>UINT64_MAX-size-(address-base)) hcf();
+        size+=address-base;
 		// Map it into the HHDM range explicitly with Write-Combining (WC) enabled via PCD bit.
 		// PCD (bit 4) selects PAT entry that is typically WC on modern x86.
 		uint64_t flags = PRESENT | WRITABLE | (1ULL << 4); 
 		for (uint64_t offset = 0; offset < size; offset += 4096) {
-			map_page((uint64_t)f->address + offset, phys + offset, flags);
+			map_page(base + offset, phys + offset, flags);
 		}
 	}
+    fb=boot_framebuffer;
+    boot_splash_begin();
+    print((char*)"[boot] Framebuffer mapped before first draw.");
+    print_fb_pixel_format();
 
 	// LAPIC/HPET fallback needs MMIO mappings, so start the timer after PMM/VMM.
 	init_boot_timer();
@@ -804,6 +829,7 @@ extern "C" void kmain(void) {
     }
     static bool storage_selected = false;
     static bool disk_root_active = false;
+    limine_file* recovery_archive = nullptr;
 
     // Check for initrd tar archive in Limine modules and unpack into ramfs
     if (module_req.response) {
@@ -813,6 +839,7 @@ extern "C" void kmain(void) {
                 const char* magic = (const char*)mod->address + 257;
                 if (magic[0] == 'u' && magic[1] == 's' && magic[2] == 't' && magic[3] == 'a' && magic[4] == 'r') {
                     tar_unpack((const uint8_t*)mod->address, mod->size);
+                    recovery_archive=mod;
                     break;
                 }
             }
@@ -1041,6 +1068,9 @@ extern "C" void kmain(void) {
         print((char*)"[font] Load/bake milliseconds:"); print(asset_elapsed);
 #endif
         if (disk_root_active) wm_load_disk_wallpaper();
+        g_resources_requested=false;
+        wm_resources_reload();
+        scheduler_add_task(task_create(wm_resource_worker,16));
         if (!g_wallpaper) {
 #if BOOT_DIAGNOSTICS
             uint64_t fallback_started = rdtsc();
@@ -1101,6 +1131,7 @@ extern "C" void kmain(void) {
             // Failed disk shell: enter the complete RAM recovery environment.
             vfs_mount_root(recovery_root);
             disk_root_active = false;
+            g_resources_refresh=true; g_resources_requested=true; ++g_resource_demand_generation;
             print((char*)"[storage] Disk init failed; RAM recovery mode.");
             storage_record_recovery(runtime_run, "System partition mounted, but loading /bin/init.elf failed.");
             init_task = execve_path("/bin/init.elf");
@@ -1119,6 +1150,7 @@ extern "C" void kmain(void) {
             }
         }
 		if (init_task) {
+			g_terminal_shell_ready=false;
 			g_terminal_shell_pid = init_task->pid;
 			// Phase 9: register post-flip chrome hook
 			g_pre_flip_hook = nullptr; // Phase 18: handled by wm_compose_full
@@ -1647,6 +1679,43 @@ extern "C" void kmain(void) {
 			}
 		}
 
+        if (disk_root_active && !g_recovery_retired && g_terminal_shell_ready) {
+            // No more boot fallback after the disk shell has entered its input
+            // loop. Runtime RAM mounts and the live log remain in use by VFS.
+            vnode* retained[]={runtime_tmp,runtime_run,live_log};
+            recovery::Released released{};
+            if (recovery::release(&recovery_root,retained,3,&released)) {
+                g_recovery_heap_bytes=released.bytes;
+                if (kernel_address_req.response) {
+                    uint64_t flags;
+                    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+                    g_recovery_archive_bytes=boot_module_release(recovery_archive,module_req.response,
+                        memmap_req.response,HHDM,kernel_address_req.response->physical_base,
+                        (uint64_t)_kernel_end-(uint64_t)_kernel_start,free_phys_page);
+                    // The separately supplied init.elf is the last-resort boot
+                    // fallback. Its bytes have no consumers after disk success.
+                    if (module_req.response) for (uint64_t m=0;m<module_req.response->module_count;++m) {
+                        auto* mod=module_req.response->modules[m];
+                        const char* base=mod ? mod->path : nullptr;
+                        if (!base) continue;
+                        for (const char* p=base;*p;++p) if (*p=='/') base=p+1;
+                        if (strcmp(base,"init.elf")==0)
+                            g_recovery_fallback_bytes+=boot_module_release(mod,module_req.response,
+                                memmap_req.response,HHDM,kernel_address_req.response->physical_base,
+                                (uint64_t)_kernel_end-(uint64_t)_kernel_start,free_phys_page);
+                    }
+                    total_usable_ram+=g_recovery_archive_bytes+g_recovery_fallback_bytes;
+                    if (flags&(1u<<9)) __asm__ volatile("sti" ::: "memory");
+                }
+                recovery_archive=nullptr; g_recovery_retired=true;
+                print((char*)"[recovery] Disk shell ready; released recovery heap bytes:");
+                to_str(g_recovery_heap_bytes,str); print(str);
+                print((char*)"[recovery] Released archive pages in bytes:");
+                to_str(g_recovery_archive_bytes,str); print(str);
+                print((char*)"[recovery] Released fallback module pages in bytes:");
+                to_str(g_recovery_fallback_bytes,str); print(str);
+            }
+        }
         // Standardize input polling to ~125Hz. This reduces scheduler thrashing
         // and gives the high-priority compositor more airtime during input-heavy
         // tasks like scrolling.

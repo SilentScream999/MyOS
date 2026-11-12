@@ -70,6 +70,7 @@ struct Task {
     uint8_t   _pad[2];
 
     char      cwd[256];    // Current working directory (always canonical absolute)
+    char      executable[256]; // Runtime app identity; never inferred from a window title.
 
     // ── Saved CPU context ─────────────────────────────────────────────────────
     // After a context switch OUT, the stack contains (from high to low):

@@ -1,151 +1,88 @@
-# USB pointer input
+# USB and pointer input
 
-Relative USB pointers, including wireless keyboard/trackpad combo receivers, use
-`src/drivers/hid_pointer_setup.h`. The wired Logitech G502 HERO (`046d:c08b`) has
-a model-specific wrapper in `src/drivers/logitech_g502.h`. The configuration parser records each HID
-interface's report-descriptor length and actual interface number. The G502 path
-reads those descriptors and selects report protocol for its pointer interface.
-Pointer setup ignores non-pointer HID interfaces, so keyboard/consumer/HID++ packets cannot
-be mistaken for mouse movement or button releases.
+Updated 2026-11-11. Storage boot behavior is in
+[PERSISTENT_STORAGE](PERSISTENT_STORAGE.md); test commands are in [TESTING](TESTING.md).
 
-`src/drivers/hid_mouse_report.h` decodes relative mouse collections with optional
-report IDs, signed X/Y, button usages 1–8 and vertical scroll. It accounts for
-padding, bit offsets, global push/pop, report size/count and collection scope.
-Unknown report IDs and incomplete packets leave held buttons unchanged. Input
-packet length comes from the xHCI transfer's residual-byte count, rather than
-assuming the entire endpoint buffer was filled. The existing GUI receives signed
-16-bit movement and an 8-bit button mask; larger movement fields are saturated.
+## HID pointers
 
-The previous boot-mouse heuristic interpreted left/right button masks as report
-IDs on composite devices, shifting movement fields. Boot reports now retain byte
-0 as their button mask. Numbered combo receivers explicitly select report
-protocol and use declared field offsets, preserving horizontal and vertical
-movement. The older receiver fallback remains when no supported descriptor layout
-is available; keyboard boot reports use their existing separate path.
+`src/drivers/hid_pointer_setup.h` configures relative pointers, including composite
+receivers. `logitech_g502.h` wraps the G502 HERO (`046d:c08b`). Setup records the
+actual interface number/report-descriptor length, selects the pointer interface
+and uses report protocol where required. Keyboard/consumer/HID++ packets are not
+treated as pointer reports.
 
-This is pointer input support. DPI/RGB configuration, programmable bindings,
-horizontal scroll and auxiliary keyboard/macro reports are not implemented.
-The driver does not modify onboard settings. Physical G502 testing is still
-required; the boot log should contain:
+`hid_mouse_report.h` handles relative collections, optional report IDs, signed
+X/Y, button usages 1–8, vertical scroll, padding/bit offsets, push/pop and
+collection scope. Transfer length uses xHCI residual-byte counts. Unknown IDs
+or short packets leave held buttons unchanged. Boot report byte 0 remains the
+button mask. The GUI receives signed 16-bit movement and an 8-bit button mask;
+larger fields are saturated. Receiver fallback remains for unsupported layouts.
 
-```text
-[hid] Logitech G502 HERO pointer ready (descriptor-based reports).
-```
+DPI/RGB programming, custom bindings, horizontal scroll and auxiliary macro
+reports are not implemented; onboard settings are not changed. Model-specific
+hardware still needs verification after driver changes. For PS/2/Synaptics see
+[the integration guide](../src/drivers/SynapticsGuide.md).
 
-## Verification
+## Hubs and speeds
 
-### SuperSpeed hubs and USB-C storage
+The driver supports USB 2 hubs, SuperSpeed hubs and the xHCI compatibility path
+for SuperSpeedPlus hubs. USB-C describes a connector, not a storage protocol.
 
-USB-C is a connector, not a distinct storage protocol. As of 2026-11-10 the hub
-driver supports the USB 2 path, 5 Gbit/s SuperSpeed hubs, and the xHCI legacy
-compatibility path for SuperSpeedPlus hubs.
-The earlier code explicitly skipped all SuperSpeed hub children, which is a
-possible explanation for the reported Surface Laptop 4 USB-C hub storage failure
-while the USB-A path works. The user retested that initial change and still saw
-missing storage, then confirmed the explicit SuperSpeedPlus-unsupported message.
-The blanket SuperSpeedPlus rejection has now been removed; hardware retesting
-of this follow-up is still needed.
+Protocol rules that must survive refactoring:
 
-The user subsequently confirmed continued failure and identified the dock as a
-ZMUIPNG ZM3310, with keyboard stutter when the boot stick shares the dock. This
-remains an unresolved hardware issue; neither hub identity nor stutter proves
-one cause. The driver's high-speed hub TTT field now follows the descriptor's
-advertised think time, including FS/LS keyboard children. On storage-root failure
-only, the boot log now emits a compact discovery/topology snapshot with hub and
-disk VID/PID, speed and readiness. Successful boots keep this output suppressed.
-Run `python3 tests/qemu_usb_recovery_test.py` to verify this recovery-report path
-on a disposable copy with an invalid root marker.
-The fixture uses ISO boot to separate OS root validation from OVMF removable-
-media boot selection. The ZM3310 manual recommends its USB 2.0 ports for wireless
-receivers; wireless stutter alone does not establish CPU or USB event starvation.
-Manufacturer manual: [ZM3310 PDF](https://m.media-amazon.com/images/I/81%2BBUjbxAFL.pdf).
+- USB 2 transaction-translator fields, including think time, follow the hub
+  descriptor and actual downstream topology.
+- SuperSpeed uses descriptor `0x2a`, `SET_HUB_DEPTH`, 512-byte child EP0 packets,
+  nested root/route context and endpoint companion burst/interval fields.
+- Decode SuperSpeed EP0 packet-size exponents. Do not interpret the USB 3 power
+  bit as USB 2 low speed, or send USB 2-only port-disable requests on USB 3 failure.
+- Standard speed IDs 4–7 use compatible child addressing; read the controller's
+  negotiated output slot speed before configuring/recursing. Do not copy the
+  upstream hub's speed to every child. Nonstandard speed IDs remain unsupported.
+- USB 3 port-change acknowledgments include reset/link/configuration selectors;
+  failed children enter U3. Bulk streams, UAS and Type-C/PD policy are absent.
 
-The SuperSpeed path requests descriptor 0x2a, sets the hub's depth after
-configuration, uses 512-byte EP0 packets for children, and preserves the complete
-nested route/root-port context without USB 2 transaction-translator fields.
-Hub interrupt endpoints and BOT bulk endpoints parse their SuperSpeed endpoint
-companion descriptors for Max Burst and interval payload. Stream-enabled bulk
-endpoints remain unsupported. Port change acknowledgments use USB 3 selectors,
-including warm-reset, link-state and configuration-error changes. Failed children
-enter U3 rather than sending the USB 2-only CLEAR_FEATURE(PORT_ENABLE).
+Ports power up together and receive the descriptor's power-good delay (at least
+100 ms). Root Cold Attach and inactive/compliance links use bounded warm-reset
+handling; do not require CCS to appear before cold-attach recovery.
 
-For standard USB 3 speed IDs 4..7, child addressing uses the SuperSpeed-compatible
-port status value. xHCI 1.22 section 4.19.9 requires SSP controllers to consume
-Sublink Speed notifications and report the actual negotiated speed in the output
-slot context. The driver reads that output value before configuring the child
-or recursing through a nested hub. A 5-Gbit/s child behind an SSP hub remains
-5-Gbit/s; the upstream speed is not blindly copied to every child. This uses the
-specified compatibility path, not a new BOS/extended-port-status implementation.
-Nonstandard controller speed IDs outside 1..7 remain unsupported.
+## Polling, enumeration and ownership
 
-All hub ports power up together and get the descriptor's power-good delay
-(minimum 100 ms). Root ports with Cold Attach Status are probed even before CCS
-appears and receive a warm reset; inactive/compliance SuperSpeed links also use
-warm recovery. Actual reset waits remain bounded. UAS, Type-C/PD policy and
-firmware boot issues remain outside this change. Root selection still
-happens once before userspace, so a disk arriving after recovery starts does not
-silently replace the running root.
+Root hotplug work stays local to the affected port. Do not reset a whole
+controller or replace block-device objects just because one port changes.
+Disconnect offlines devices under that root; old mounted handles stay offline
+after reconnect. Preserve sibling HID/storage ownership.
 
-The latest physical recovery snapshot shows two controllers, one high-speed hub
-(controller 1, root port 5, reported VID/PID 0bda:5420), one keyboard and no disks
-at root selection. The user also reports damaged unused dock ports. The failure
-is OS discovery, before filesystem parsing; damaged ports are not a proven cause.
-Boot now gives late devices a 1.5-second discovery window only if no disk is
-already online, checking root ports and empty hub ports before root selection.
-Individual probes retain their bounded timeouts. Run
-`python3 tests/qemu_late_storage_test.py` for startup/post-recovery arrival tests.
-Recovery reports include controller availability/reset state and raw root-port
-PORTSC values; normal disk-root boots keep these diagnostics suppressed.
-The user has now physically confirmed that this discovery window fixes root
-mounting on the failing Surface/ZM3310 USB-C connection. Keyboard stutter has
-not been separately confirmed resolved.
+Background hub monitoring uses asynchronous requests and bounded completion
+handling. Quiet audits are staggered instead of scanning all ports every input
+tick; `usb_hub_poll_policy.h` schedules audits from completion time. Initial and
+actual hotplug enumeration still use bounded synchronous control requests with
+a shared probe deadline. Failed controllers/ports must not enter reset storms.
+Timed-out control transfers retain DMA ownership until safely recovered; do not
+free their buffers simply because the caller's deadline expired.
 
-Runtime filesystem I/O now uses a reentrant sleeping mutex. Disk completion
-waiters register exact controller/slot/endpoint/TRB ownership before ringing
-the doorbell. The input dispatcher can deliver those completions and wake the
-owner while continuing HID processing; waiters also have a timed wake/poll path.
-Short IRQ guards protect event dequeue/publication and descriptor refcounts.
-`tests/qemu_storage_async_test.py` injects a missing completion into an actual
-write and verifies timer, keyboard, mouse and desktop presentation progress
-before the bounded disk failure. Scripted actual-wait tests cover wrong/late
-completions, wakeup, short/error responses, queue failure and timeout. This does
-not establish that physical wireless interference or every hub hotplug delay
-has been resolved; discovery/control probes still use bounded synchronous waits.
+Runtime disk I/O uses the sleeping filesystem mutex and exact controller/slot/
+endpoint/TRB completion ownership. The input dispatcher can wake disk waiters
+while processing HID. This does not make every discovery/control probe asynchronous.
+See [EXT4](EXT4.md) for file/write semantics.
 
-Run `python3 tests/run_usb_hub_tests.py` for sanitizer tests of the protocol
-helpers, actual hub-enumeration functions with scripted completions, mixed SS/SSP
-children, controller-reported output speeds, nested routes, USB 2 regression,
-real root-reset loops, malformed descriptors, SET_HUB_DEPTH failure and the
-asynchronous monitor's USB 2/3 acknowledgment selectors. QEMU's emulated hubs
-exercise the USB 2 path, not a physical USB 3 hub. Test ext4 boot/persistence with
-`python3 tests/qemu_ext4_test.py --hub-depth 1` and `--hub-depth 2` after copying
-the current `wyzar-usb.img` to `.storage-test/ext4-usb.img`.
+## Hardware status and diagnostics
 
-Protocol references: [SuperSpeed hub descriptor](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/usbspec/ns-usbspec-_usb_30_hub_descriptor),
-[USB hub request/status definitions](https://github.com/torvalds/linux/blob/master/include/uapi/linux/usb/ch11.h).
-SSP compatibility and cold attach: sections 4.19.8–4.19.9 of the
-[Intel xHCI 1.22 specification](https://www.intel.com/content/dam/www/public/us/en/documents/technical-specifications/extensible-host-controler-interface-usb-xhci.pdf).
+The owner confirmed that the 1.5-second no-disk discovery grace window restored
+root mounting on a Surface Laptop 4 with a ZMUIPNG ZM3310 dock. Earlier recovery
+logs showed a high-speed hub (`0bda:5420`), a keyboard and no disks at selection.
+Damaged unused ports were reported but were not proven to cause the failure.
+Wireless keyboard stutter on that dock has not been separately confirmed fixed.
 
-### Pointer input
+Failure-only topology/controller/PORTSC details are available in the boot log
+and `/run/storage.txt` during RAM recovery. Normal successful boots suppress the
+extra snapshot. A device arriving after recovery starts does not replace root.
+Physical G502, wireless and SuperSpeed behavior requires its own test result;
+QEMU's emulated hubs exercise USB 2 rather than physical USB 3 links.
 
-Local regression fixtures are in the ignored `tests/` directory:
-
-```sh
-clang++ -std=c++20 -I. -fsanitize=address,undefined -no-pie tests/hid_mouse_report_test.cpp -o .storage-test/hid-mouse-test
-.storage-test/hid-mouse-test
-clang++ -std=c++20 -I. -Isrc/drivers -fsanitize=address,undefined -no-pie tests/g502_driver_test.cpp -o .storage-test/g502-driver-test
-.storage-test/g502-driver-test
-python3 tests/qemu_mouse_drag_test.py
-python3 tests/qemu_root_replacement_test.py
-```
-
-Parser checks cover all 256 button masks, signed 16-bit movement, 1,000 held-drag
-frames without a false release, numbered/split reports, unrelated vendor/keyboard
-IDs, incomplete packets and malformed descriptors. Driver setup checks use
-scripted USB control responses to verify descriptor requests, nonzero interface
-numbers, report-mode selection, auxiliary filtering and failed requests. QEMU
-checks ordinary mouse movement/dragging and replacement with a live disk; it
-does not emulate a physical G502.
-
-Protocol references: [USB HID 1.11](https://www.usb.org/sites/default/files/hid1_11.pdf)
-and [libratbag's G502 HERO identity](https://github.com/libratbag/libratbag/blob/master/data/devices/logitech-g502-hero.device).
+Protocol references for further work:
+[USB HID 1.11](https://www.usb.org/sites/default/files/hid1_11.pdf),
+[USB 3 hub descriptor](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/usbspec/ns-usbspec-_usb_30_hub_descriptor),
+[Linux hub definitions](https://github.com/torvalds/linux/blob/master/include/uapi/linux/usb/ch11.h),
+[Intel xHCI 1.22](https://www.intel.com/content/dam/www/public/us/en/documents/technical-specifications/extensible-host-controler-interface-usb-xhci.pdf)
+and the [ZM3310 manual](https://m.media-amazon.com/images/I/81%2BBUjbxAFL.pdf).

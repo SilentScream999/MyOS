@@ -36,7 +36,7 @@ CXXFLAGS = $(CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -mno-red-zone -DGPU_BR
 LDFLAGS=-nostdlib -z max-page-size=0x1000
 
 SRC=src/kernel.cpp
-OBJ=$(SRC:.cpp=.o)
+OBJ=$(SRC:.cpp=.o) src/gui/image.o
 include src/fs/ext4_config_flags.mk
 EXT4_OBJ = $(EXT4_SRC:.c=.o) src/fs/ext4_libc.o
 CXXFLAGS += $(EXT4_CONFIG) $(EXT4_INC) -Isrc/fs/ext4_libc
@@ -52,6 +52,11 @@ wyzar: $(OBJ) $(EXT4_OBJ) linker.ld
 
 $(EXT4_OBJ): %.o: %.c
 	$(CC) -Isrc/fs/ext4_libc $(CFLAGS) -std=gnu11 $(EXT4_CONFIG) $(EXT4_INC) -MMD -MP -c $< -o $@
+
+# The decoder uses the freestanding libc shim and the kernel heap. Optimize the
+# per-pixel codec paths even when the rest of the kernel is a debug build.
+src/gui/image.o: src/gui/image.cpp src/gui/image.h third_party/stb/stb_image.h
+	$(CXX) -Isrc/fs/ext4_libc $(CXXFLAGS) -O2 -MMD -MP -c $< -o $@
 
 -include $(EXT4_OBJ:.o=.d)
 
@@ -102,7 +107,7 @@ user/win_test.o: user/win_test.c
 win_test.elf: user/win_test.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
-initrd.tar: init.elf counter.elf win_test.elf assets/fonts/selawik/LICENSE.txt assets/fonts/selawik/selawk.ttf Makefile
+initrd.tar: init.elf counter.elf win_test.elf assets/fonts/selawik/LICENSE.txt assets/fonts/selawik/selawk.ttf $(wildcard assets/icons/hicolor/*/apps/*.png) third_party/stb/LICENSE Makefile
 	rm -rf initrd_root
 	mkdir -p initrd_root/bin
 	cp init.elf initrd_root/bin/
@@ -111,6 +116,9 @@ initrd.tar: init.elf counter.elf win_test.elf assets/fonts/selawik/LICENSE.txt a
 	mkdir -p initrd_root/share/fonts
 	cp assets/fonts/selawik/LICENSE.txt initrd_root/share/fonts/selawik.txt
 	cp assets/fonts/selawik/selawk.ttf initrd_root/share/fonts/selawk.ttf
+	mkdir -p initrd_root/share/icons
+	cp -r assets/icons/hicolor initrd_root/share/icons/
+	cp third_party/stb/LICENSE initrd_root/share/stb-image-license.txt
 	tar -cf initrd.tar --format=ustar -C initrd_root .
 
 iso: all usb-image
@@ -135,6 +143,8 @@ iso: all usb-image
 
 # Each ISO build refreshes USB boot/system files; user data and settings survive.
 PERSIST_DISK ?= wyzar-usb.img
+# Prefer a supplied firmware file; WSL installations commonly provide this path.
+OVMF ?= $(firstword $(wildcard OVMF.fd /usr/share/OVMF/OVMF_CODE.fd))
 ROOT_MIB ?=
 DEBUG ?= 0
 ifneq ($(filter $(DEBUG),0 1),$(DEBUG))
@@ -151,10 +161,11 @@ USB_IMAGE_FLAGS += --debug
 endif
 
 run: iso
+	$(if $(OVMF),,$(error No OVMF firmware found; set OVMF=/path/to/OVMF_CODE.fd))
 	qemu-system-x86_64 \
 		-machine q35 \
 		-m 512M \
-		-bios OVMF.fd \
+		-bios $(OVMF) \
 		-drive if=none,id=bootcd,media=cdrom,readonly=on,file=wyzar.iso \
 		-device ide-cd,drive=bootcd,bootindex=1 \
 		-rtc base=localtime \
@@ -177,7 +188,8 @@ usb-image: all
 
 # Boot directly from the USB image (uses its embedded kernel/initrd).
 run-usb: usb-image
-	qemu-system-x86_64 -machine q35 -m 512M -bios OVMF.fd \
+	$(if $(OVMF),,$(error No OVMF firmware found; set OVMF=/path/to/OVMF_CODE.fd))
+	qemu-system-x86_64 -machine q35 -m 512M -bios $(OVMF) \
 		-device qemu-xhci,id=xhci -device usb-kbd -device usb-mouse \
 		-drive if=none,id=stick,format=raw,file=$(PERSIST_DISK) \
 		-device usb-storage,drive=stick,bootindex=1 -rtc base=localtime

@@ -38,6 +38,8 @@ def main():
             ('/bin/user.elf', b'personal application'),
             ('/etc/desktop.cfg', b'/home/custom.raw\n'),
             ('/home/custom.raw', b'personal wallpaper'),
+            ('/etc/icons.cfg', b'personal-theme\n'),
+            ('/share/icons/hicolor/32x32/apps/terminal.png', b'personal PNG replacement'),
         )):
             asset = work / f'personal-{i}'
             asset.write_bytes(content)
@@ -63,6 +65,9 @@ def main():
         assert read('/etc/desktop.cfg') == b'/home/custom.raw\n'
         assert read('/bin/user.elf') == b'personal application'
         assert read('/share/wall.raw') == b'original wallpaper'
+        assert read('/etc/icons.cfg') == b'personal-theme\n'
+        assert read('/share/icons/hicolor/32x32/apps/terminal.png') == b'personal PNG replacement'
+        assert read('/share/icons/hicolor/24x24/apps/application-default.png').startswith(b'\x89PNG')
         invalid = bytearray(partition.read_bytes())
         struct.pack_into('<I', invalid, 1024 + 96, 0x80000000)
         try:

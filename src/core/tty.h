@@ -15,6 +15,7 @@ static bool tty_raw_mode = false;
 static bool tty_echo_enabled = true;
 static char tty_launch_path[124];
 static bool tty_launch_pending = false;
+static volatile bool g_terminal_shell_ready = false; // Shell reached its first input request.
 
 static bool tty_queue_launch(const char* path) {
     uint64_t flags;

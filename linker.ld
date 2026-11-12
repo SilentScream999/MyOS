@@ -13,6 +13,7 @@ PHDRS {
 SECTIONS {
 	/* Limine mandates the higher-half (topmost 2GiB). */
 	. = 0xffffffff80000000;
+	_kernel_start = .;
 
 	/* Limine requests live in a dedicated segment. */
 	.limine_requests : {
@@ -35,6 +36,7 @@ SECTIONS {
 		*(.bss .bss.*)
 		*(COMMON)
 	} :data
+	_kernel_end = .;
 
 	/DISCARD/ : {
 		*(.eh_frame*)

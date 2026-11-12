@@ -1,46 +1,23 @@
-Synaptics Trackpad Integration Guide
-If you need to re-enable trackpad support later, follow these 4 essential steps:
+# Synaptics PS/2 integration
 
-1. The Driver (
-synaptics.h
-)
-Keep this file in src/. It contains the initialization sequence and the IRQ12 handler.
+Updated 2026-11-11. The current driver is `src/drivers/synaptics.h`, included by
+`src/kernel.cpp`. See [USB/input](../../docs/USB_INPUT.md) for other pointer paths.
 
-Key Function: 
-synaptics_init()
- sends the 'knock' and enables data reporting.
-Key Handler: 
-synaptics_irq_handler()
- reads port 0x60 and calls the unified input handler.
-2. IRQ Unmasking (
-irq.h
-)
-Ensure 
-irq_register
- handles the Master PIC cascade line (IRQ2).
+`synaptics_init()` initializes the auxiliary PS/2 device and installs
+`synaptics_irq_handler()` on IRQ12. `kmain` calls it after framebuffer mapping
+and boot-timer setup, before PS/2 keyboard setup. Preserve PIC cascade IRQ2
+unmasking for slave IRQs in `src/arch/irq.h`.
 
-cpp
-if (irq >= 8u) {
-    outb(PIC1_DATA, (uint8_t)(inb(PIC1_DATA) & ~(1u << 2u)));
-}
-3. Unified Input Logic (
-kernel.cpp
-)
-Ensure the Window Manager logic is extracted into a shared function:
+The handler assembles six-byte absolute packets, derives relative movement,
+handles touchpad/TrackPoint buttons and routes motion through:
 
-cpp
-extern "C" void mouse_process_input(int8_t dx, int8_t dy, uint8_t buttons);
-This function handles g_mouse_x/y clamping, window dragging, and raising.
+```cpp
+extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons);
+extern "C" void mouse_process_scroll(int8_t scroll_dy);
+```
 
-4. Boilerplate Setup
-Header: Include 
-synaptics.h
- in 
-kernel.cpp
- (after defining the global fb).
-Global Scope: Ensure extern struct limine_framebuffer *fb; is used instead of static in 
-framebufferstuff.h
-.
-Activation: Call 
-synaptics_init();
- in kmain after interrupts are enabled.
+Keep cursor clamping, dragging, focus and window events in that common input
+path. Do not add a second desktop-specific pointer implementation to this driver.
+The framebuffer is a shared `extern` pointer; it must not become a separate
+header-local `static` instance. Device-specific behavior still needs physical
+verification; QEMU USB pointer tests do not establish Synaptics compatibility.

@@ -1,6 +1,7 @@
 # WyzarOS Window Management API
 
-*Last updated: 2026-11-07.* Mapped user surfaces, owner tracking, input events and exit cleanup are implemented. The remaining limitations below still apply.
+Updated 2026-11-11. Mapped user surfaces, owner tracking, input events and exit
+cleanup are implemented. The remaining authorization/mapping limitations apply.
 
 The built `win_test.elf` exercises this API from ring 3. Terminal and Start-menu
 launches share a foreground session; Ctrl+C cancels the program even with its GUI
@@ -9,7 +10,9 @@ verified in QEMU. See [the handoff](../docs/AI_HANDOFF.md) for verification scop
 
 ## Calling convention
 
-`syscall` instruction: `rax` = number, arguments in `rdi, rsi, rdx, r10, r8`, result in `rax`.
+`syscall`: `rax` = number, five dispatched arguments in `rdi, rsi, rdx, r10, r8`,
+result in `rax`. The sixth window-create flags argument is not dispatched.
+General calls are listed in [Syscalls](Syscalls.md).
 
 ## Syscalls
 
@@ -24,12 +27,16 @@ verified in QEMU. See [the handoff](../docs/AI_HANDOFF.md) for verification scop
 
 ## Surface format
 
-32-bit **ARGB8888**, `buffer_pitch = w * 4` bytes, row-major. `0xFFFF0000` is solid red. **The compositor currently ignores the alpha byte:** all windows
-are composited opaque. Alpha will be defined (premultiplied or straight) in roadmap stage A2.
+32-bit **ARGB8888**, `buffer_pitch = w * 4` bytes, row-major. `0xFFFF0000` is
+solid red. Window surfaces are composed opaque: their alpha byte is ignored.
+The desktop's PNG/font blending does not change this ABI. A future window-alpha
+contract must define straight/premultiplied semantics explicitly; see the
+[display roadmap](../docs/GPU_DESKTOP_ROADMAP.md).
 
 ## Lifecycle (as implemented)
 
-1. `WIN_CREATE`: the kernel allocates the window and a zero-filled surface, appends it to the window list and schedules a redraw.
+1. `WIN_CREATE`: the kernel allocates/maps a surface, appends the window and
+   schedules a redraw. The application initializes its pixels before presenting.
 2. Draw into the surface, then call `WIN_SYNC` (everything) or `WIN_DAMAGE` (a rect). The compositor runs at about 60 Hz and copies damaged areas.
 3. Clicking a user window's close button requests `WIN_EVENT_CLOSE` (type `7`, other fields zero). This request is stored separately from the input queue so mouse/key traffic cannot discard it. The next poll delivers it before queued input. Repeated clicks before delivery coalesce into one request.
 4. The application handles the request: exit for a single-window app, destroy just that window, or show a save prompt. The window stays alive and visible until the app responds. `win_test` exits with status 0, waking the waiting shell and restoring its prompt without Ctrl+C.
@@ -37,6 +44,11 @@ are composited opaque. Alpha will be defined (premultiplied or straight) in road
 
 Terminal, Boot Log, Visual Test and Rainbow are system windows with surfaces. All
 windows use the generic compositor surface path.
+
+Title-bar/taskbar icons are selected from app metadata by the creating process's
+executable path. They load on demand through the desktop resource worker; they
+are not drawn by changing the user surface's pixel format. See
+[app resources](../docs/IMAGES.md).
 
 ## Known problems
 

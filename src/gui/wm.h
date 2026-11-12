@@ -14,6 +14,44 @@
 #include "font8x8_basic.h"
 #include "ui_font.h"
 #include "truetype.h"
+#include "resources.h"
+
+void* image_allocate(uint64_t size) { return kmalloc(size); }
+void image_deallocate(void* pointer) { kfree(pointer); }
+
+static resources::Catalog g_empty_catalog{};
+static resources::Catalog* g_resources_catalog = &g_empty_catalog;
+static volatile bool g_resources_requested = true;
+static volatile bool g_resources_refresh = true;
+static uint64_t g_resource_demand_generation = 0;
+static unsigned g_resource_readers = 0;
+// Publication waits for readers to finish. Readers never wait or touch disk.
+struct ResourceRead {
+    ResourceRead() { __atomic_add_fetch(&g_resource_readers, 1u, __ATOMIC_ACQUIRE); }
+    ~ResourceRead() { __atomic_sub_fetch(&g_resource_readers, 1u, __ATOMIC_RELEASE); }
+};
+static inline uint64_t rdtsc_val();
+
+static uint8_t* wm_resource_read(const char* path, uint64_t limit, uint64_t* size) {
+    file f{}; *size=0;
+    if (vfs_open(path,0,&f)!=0) return nullptr;
+    uint64_t count=f.vn->size;
+    uint8_t* data=f.vn->type==VnodeType::FILE && count && count<=limit ? (uint8_t*)kmalloc(count) : nullptr;
+    uint64_t loaded=0,started=rdtsc_val();
+    while (data && loaded<count && rdtsc_val()-started<_usb_tsc_hz()*15) {
+        uint64_t chunk=count-loaded; if (chunk>65536) chunk=65536;
+        if (vfs_read(&f,data+loaded,chunk)!=chunk) break;
+        loaded+=chunk;
+    }
+    vfs_close(&f);
+    if (!data || loaded!=count) { kfree(data); return nullptr; }
+    *size=count; return data;
+}
+static int wm_resource_list(const char* path, uint64_t index, char* name, bool* directory) {
+    uint64_t size=0; VnodeType type=VnodeType::FILE;
+    int result=vfs_readdir(path,index,name,&size,&type);
+    *directory=type==VnodeType::DIRECTORY; return result;
+}
 
 // ── RDTSC Helper ─────────────────────────────────────────────────────────────
 static inline uint64_t rdtsc_val() {
@@ -85,6 +123,7 @@ struct WinEvent {
 struct Window {
     int id;
     char title[64];
+    char executable[256];
     int32_t x, y, w, h;
     uint32_t* buffer;
     uint32_t buffer_pitch;
@@ -214,10 +253,7 @@ static uint32_t g_sb_w = 92;
 static uint32_t g_wbtn_w = 124;
 
 // ── Start Menu (taskbar popup) ────────────────────────────────
-#define MENU_MAX_APPS 16
-static char  g_menu_apps[MENU_MAX_APPS][29]; // display names, app extension stripped
-static char  g_menu_paths[MENU_MAX_APPS][124]; // exact paths, within the TTY launch limit
-static int   g_menu_app_count = 0;
+#define g_menu_app_count ((int)g_resources_catalog->count)
 static bool  g_menu_open = false;
 
 // Panel geometry (scaled like the rest of the UI). The app list starts below the header.
@@ -263,23 +299,9 @@ static inline int wm_menu_hit_test(int32_t mx, int32_t my, bool* in_panel = null
 // Rebuild the app list from /bin/*.elf and /bin/*.wiz, excluding the shell.
 
 static inline void wm_menu_refresh() {
-    g_menu_app_count = 0;
-    char name[256];
-    uint64_t sz = 0;
-    VnodeType vt = VnodeType::FILE;
-    for (uint64_t i = 0; vfs_readdir("/bin", i, name, &sz, &vt) > 0 && g_menu_app_count < MENU_MAX_APPS; i++) {
-        if (vt != VnodeType::FILE) continue;
-        int n = strlen(name);
-        if (n + 5 >= (int)sizeof(g_menu_paths[0]) || !app_name_supported(name)) continue;
-        if (app_name_is_shell(name)) continue;
-        strcpy(g_menu_paths[g_menu_app_count], "/bin/");
-        strcpy(g_menu_paths[g_menu_app_count] + 5, name);
-        char* d = g_menu_apps[g_menu_app_count];
-        int len = n - 4; if (len > 28) len = 28;
-        for (int k = 0; k < len; k++) d[k] = name[k];
-        d[len] = '\0';
-        g_menu_app_count++;
-    }
+    g_resources_refresh = true;
+    ++g_resource_demand_generation;
+    g_resources_requested = true;
 }
 
 // Mark the whole panel dirty so the compositor repaints it.
@@ -297,14 +319,16 @@ static inline void wm_menu_dirty_rect() {
 }
 
 static inline void wm_menu_open() {
-    wm_menu_refresh();
     g_menu_open = true;
+    wm_menu_refresh();
     wm_menu_dirty_rect();
 }
 
 static inline void wm_menu_close() {
     if (!g_menu_open) return;
     g_menu_open = false;
+    ++g_resource_demand_generation;
+    g_resources_requested = true;
     wm_menu_dirty_rect(); // geometry unchanged: the list stays cached until next open
 }
 
@@ -312,6 +336,88 @@ static inline void wm_menu_close() {
 static inline void wm_menu_hover_dirty() {
     if (!g_menu_open) return;
     wm_menu_dirty_rect();
+}
+
+static uint32_t wm_icon_size(uint32_t value, uint32_t minimum, uint32_t maximum) {
+    return value<minimum ? minimum : value>maximum ? maximum : value;
+}
+static resources::Store g_resource_store{{wm_resource_read,wm_resource_list}};
+static void wm_resources_reload() {
+    uint32_t row=wm_icon_size(fb->height*38/1080,26,256);
+    resources::Demand demand{};
+    uint64_t flags,generation;
+    bool refresh;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    generation=g_resource_demand_generation;
+    refresh=g_resources_refresh; g_resources_refresh=false;
+    if (g_menu_open) {
+        int32_t header=fb->height*36/1080; if (header<24) header=24;
+        int32_t pad=fb->height*10/1080; if (pad<6) pad=6;
+        int32_t room=(int32_t)(fb->height*740/1080)-header-pad*2;
+        if (room>0) demand.menu_rows=(room+row-1)/row;
+    }
+    for (int i=0;i<g_window_count;++i) {
+        const Window* win=g_window_list[i];
+        if (!win || !win->visible) continue;
+        if (win->is_system && win->type>=0 && win->type<4) demand.system[win->type]=true;
+        else if (!win->is_system && demand.window_count<32) {
+            resources::copy(demand.executables[demand.window_count++],256,win->executable);
+            bool registered=false;
+            for (unsigned k=0;k<g_resources_catalog->count;++k)
+                if (resources::equal(win->executable,g_resources_catalog->apps[k].app.exec)) registered=true;
+            if (!registered) demand.system[4]=true;
+        }
+    }
+    if (flags&(1u<<9)) __asm__ volatile("sti" ::: "memory");
+    auto* next=resources::build(g_resource_store,wm_icon_size(row-10,14,128),
+                                wm_icon_size(g_title_h-8,12,64),wm_icon_size(g_taskbar_h-16,16,64),
+                                demand,refresh ? nullptr : g_resources_catalog);
+    if (!next) { if (refresh) g_resources_refresh=true; return; }
+    resources::Catalog* previous;
+    // The compositor can be preempted halfway through a draw; never free its
+    // snapshot or change the menu geometry until that read has finished.
+    for (;;) {
+        uint64_t flags;
+        __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+        if (generation!=g_resource_demand_generation) {
+            g_resources_requested=true;
+            if (refresh) g_resources_refresh=true;
+            if (flags&(1u<<9)) __asm__ volatile("sti" ::: "memory");
+            resources::release(next); return;
+        }
+        if (!__atomic_load_n(&g_resource_readers,__ATOMIC_ACQUIRE)) {
+            if (g_menu_open) wm_menu_dirty_rect();
+            previous=g_resources_catalog; g_resources_catalog=next;
+            wm_dirty_add(0,fb->width-1,0,fb->height-1); g_needs_refresh=true;
+            if (flags&(1u<<9)) __asm__ volatile("sti" ::: "memory");
+            break;
+        }
+        if (flags&(1u<<9)) __asm__ volatile("sti" ::: "memory");
+        task_sleep_ms(1);
+    }
+    if (previous!=&g_empty_catalog) resources::release(previous);
+}
+static void wm_resource_worker() {
+    for (;;) {
+        if (g_resources_requested) {
+            g_resources_requested=false;
+            wm_resources_reload();
+        }
+        task_sleep_ms(50);
+    }
+}
+static const resources::Icons& wm_window_icons(const Window* window) {
+    if (window->is_system && window->type>=0 && window->type<4)
+        return g_resources_catalog->system[window->type];
+    for (unsigned i=0;i<g_resources_catalog->count;++i)
+        if (resources::equal(window->executable,g_resources_catalog->apps[i].app.exec))
+            return g_resources_catalog->apps[i].icons;
+    return g_resources_catalog->system[4];
+}
+static void wm_draw_icon(const Image& image, int32_t x, int32_t y,
+                          int32_t left, int32_t top, int32_t right, int32_t bottom) {
+    image_draw(image,(uint32_t*)g_master_backbuffer,fb->width,fb->height,fb->pitch/4,
+               x,y,left,top,right,bottom);
 }
 
 // Optional precomputed wallpaper backing store (same size as framebuffer).
@@ -407,7 +513,19 @@ static bool wm_load_wallpaper_from_raw(const uint8_t* data, uint64_t size) {
     if (!fb || !fb->width || !fb->height || fb->width > 16384 || fb->height > 16384) return false;
     uint32_t* replacement = (uint32_t*)kmalloc((uint64_t)fb->width * fb->height * 4);
     if (!replacement) return false;
-    if (!wallpaper_decode(data, size, fb->width, fb->height, replacement)) {
+    Image decoded{},scaled{};
+    bool standard=image_decode(data,size,&decoded);
+    bool ok=standard && image_resize(decoded,fb->width,fb->height,&scaled);
+    if (ok) {
+        for (uint64_t i=0;i<(uint64_t)fb->width*fb->height;++i)
+            replacement[i]=image_over(0xff171d30,scaled.pixels[i]);
+    } else if (!standard) {
+        bool encoded=(size>=8 && wallpaper_u32(data)==0x474e5089 && wallpaper_u32(data+4)==0x0a1a0a0d) ||
+                     (size>=2 && data[0]==255 && data[1]==216);
+        if (!encoded) ok=wallpaper_decode(data,size,fb->width,fb->height,replacement);
+    }
+    image_free(&scaled); image_free(&decoded);
+    if (!ok) {
         kfree(replacement);
         return false;
     }
@@ -823,7 +941,7 @@ static inline void wm_clock_damage() {
     g_needs_refresh = true;
 }
 
-static inline void wm_draw_window_chrome(int32_t x, int32_t y, int32_t w, int32_t h, const char* title, bool closable, int32_t min_y, int32_t max_y, bool focused = false) {
+static inline void wm_draw_window_chrome(int32_t x, int32_t y, int32_t w, int32_t h, const char* title, bool closable, int32_t min_y, int32_t max_y, bool focused = false, const Image* icon = nullptr) {
     if (!g_master_backbuffer) return;
     // Title bar background: active blue accent if focused, muted dark grey if inactive
     uint32_t bar_clr  = focused ? 0xFF2A4268 : 0xFF22242B;
@@ -843,8 +961,15 @@ static inline void wm_draw_window_chrome(int32_t x, int32_t y, int32_t w, int32_
     uint32_t char_h = wm_text_height(g_font_scale_100);
     int32_t text_y = y + (int32_t)(g_title_h - char_h) / 2;
     uint32_t text_clr = focused ? 0xFFFFFFFF : 0xFF9094A0;
-    if (text_y + (int32_t)char_h >= min_y && text_y <= max_y)
-        wm_draw_string(x + 10, text_y, title, text_clr, g_font_scale_100, w > (int32_t)g_title_h + 24 ? w - g_title_h - 24 : 0);
+    int32_t text_x=x+10;
+    if (icon && icon->pixels) {
+        wm_draw_icon(*icon,x+6,y+((int32_t)g_title_h-(int32_t)icon->height)/2,
+                     x,min_y,x+w-(int32_t)g_title_h,max_y+1);
+        text_x=x+12+icon->width;
+    }
+    int32_t title_space=w-(int32_t)g_title_h-(text_x-x)-14;
+    if (title_space>0 && text_y + (int32_t)char_h >= min_y && text_y <= max_y)
+        wm_draw_string(text_x, text_y, title, text_clr, g_font_scale_100, title_space);
     
     // Close button (Scaled with title bar)
     int32_t btn_pad = (int32_t)(4 * g_title_h) / 42;
@@ -1151,6 +1276,7 @@ static inline void wm_close_window(int idx) {
         return;
     }
     win->visible = false;
+    ++g_resource_demand_generation; g_resources_requested=true;
     if (g_focused_win_id == win->id) {
         g_focused_win_id = -1;
         for (int s = g_window_count - 1; s >= 0; s--) {
@@ -1190,6 +1316,8 @@ static inline Window* wm_create_window(const char* title, int32_t x, int32_t y, 
     win->is_system = is_system;
     win->type = type;
     win->owner_pid = owner;
+    if (!is_system && g_current_task && g_current_task->pid==owner)
+        resources::copy(win->executable,sizeof(win->executable),g_current_task->executable);
     
     uint64_t buf_bytes = (uint64_t)w * h * 4;
     uint64_t pages = (buf_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -1215,6 +1343,7 @@ static inline Window* wm_create_window(const char* title, int32_t x, int32_t y, 
     g_window_list[idx] = win;
     g_window_order[idx] = idx;
     g_window_count++;
+    ++g_resource_demand_generation; g_resources_requested=true;
     
     wm_damage_window_full(win);
     return win;
@@ -1338,6 +1467,7 @@ static inline void wm_destroy_window(int id) {
         for (int i = 0; i < g_window_count - 1; i++) if (g_window_order[i] > idx) g_window_order[i]--;
     }
     g_window_count--;
+    ++g_resource_demand_generation; g_resources_requested=true;
     
     if (fb) {
         g_dirty_min_x = 0; g_dirty_max_x = fb->width - 1;
@@ -1522,6 +1652,7 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
     if (min_y >= fb->height) min_y = 0;
     if (max_y >= fb->height) max_y = fb->height - 1;
     if (min_y > max_y || min_x > max_x) return false;
+    ResourceRead resource_read;
 
     // Chrome/taskbar currently repaint whole horizontal spans on damaged rows.
     // Restore text across those same spans, clipping vertically to avoid blending
@@ -1636,7 +1767,7 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         if (dr1 >= dr2) continue;
 
         // Unified surface compositor: every window (system or user) is backed by its surface buffer
-        wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, win->closable, min_y, max_y, win->id == g_focused_win_id);
+        wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, win->closable, min_y, max_y, win->id == g_focused_win_id, &wm_window_icons(win).title);
         if (win->buffer) {
             for (int32_t y = dr1; y < dr2; y++) {
                 if (y < r.y1 + (int32_t)g_title_h) continue;
@@ -1809,10 +1940,17 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                 }
             }
 
-            wm_draw_string(cur_x + 8, sb_y + (int32_t)(sb_h - char_h) / 2,
+            const Image& task_icon=wm_window_icons(win).task;
+            int32_t text_offset=8;
+            if (task_icon.pixels) {
+                wm_draw_icon(task_icon,cur_x+6,sb_y+((int32_t)sb_h-(int32_t)task_icon.height)/2,
+                             cur_x,min_y,cur_x+(int32_t)g_wbtn_w,max_y+1);
+                text_offset=12+task_icon.width;
+            }
+            wm_draw_string(cur_x + text_offset, sb_y + (int32_t)(sb_h - char_h) / 2,
                         win->title,
                         active ? 0xFFEEEEFF : 0xFF8888AA,
-                        g_font_scale_100, g_wbtn_w - 16);
+                        g_font_scale_100, g_wbtn_w - text_offset - 8);
 
             cur_x += g_wbtn_w + WBTN_GAP;
         }
@@ -2076,14 +2214,17 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                 }
             }
 
-            // Icon: deterministic per-app color from the rainbow LUT
-            int hash = 0;
-            for (const char* q = g_menu_apps[i]; *q; q++) hash = hash * 31 + (int)*q;
-            uint32_t icon_c = g_rainbow_lut[(uint32_t)(hash & 0x7FFFFFFF) % 360];
-
-            int32_t isz = row_h - 10; if (isz < 14) isz = 14;
+            const auto& entry=g_resources_catalog->apps[i];
+            uint32_t hash = 0;
+            for (const char* q = entry.app.id; *q; q++) hash = hash * 31u + (uint8_t)*q;
+            uint32_t icon_c = g_rainbow_lut[hash % 360];
+            int32_t isz = wm_icon_size(row_h-10,14,128);
             int32_t ix = px + pad, iy = ry + (row_h - isz) / 2;
-            for (int32_t y = iy; y < iy + isz; y++) {
+            if (entry.icons.menu.pixels) {
+                const Image& icon=entry.icons.menu;
+                wm_draw_icon(icon,ix+(isz-(int32_t)icon.width)/2,iy+(isz-(int32_t)icon.height)/2,
+                             px+pad,min_y,px+pw-pad,max_y+1);
+            } else for (int32_t y = iy; y < iy + isz; y++) {
                 if (y < (int32_t)min_y || y > (int32_t)max_y) continue;
                 if (y < 0 || (uint32_t)y >= fb->height) continue;
                 uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
@@ -2095,14 +2236,14 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
             uint32_t txt_clr = hov ? 0xFFFFFFFF : 0xFFE4E8F5;
             int32_t ty = ry + (row_h - (int32_t)char_h) / 2;
             if (ty + (int32_t)char_h >= (int32_t)min_y && ty <= (int32_t)max_y)
-                wm_draw_string((uint32_t)(ix + isz + 8), (uint32_t)ty, g_menu_apps[i], txt_clr, g_font_scale_100, px + pw - pad - (ix + isz + 8));
+                wm_draw_string((uint32_t)(ix + isz + 8), (uint32_t)ty, entry.app.name, txt_clr, g_font_scale_100, px + pw - pad - (ix + isz + 8));
         }
 
         // Empty state
         if (g_menu_app_count == 0 && list_top < py + ph - pad) {
             int32_t ty = list_top + (row_h - (int32_t)char_h) / 2;
             if (ty + (int32_t)char_h >= (int32_t)min_y && ty <= (int32_t)max_y)
-                wm_draw_string((uint32_t)(px + pad), (uint32_t)ty, "No apps in /bin", 0xFF8890A8, g_font_scale_100);
+                wm_draw_string((uint32_t)(px + pad), (uint32_t)ty, "No installed apps", 0xFF8890A8, g_font_scale_100);
         }
     }
 

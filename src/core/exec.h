@@ -132,6 +132,8 @@ static Task* execve_path(const char* path) {
     }
 
     Task* t = execve_memory(buf);
+    if (t) vfs_resolve_path(g_current_task ? g_current_task->cwd : "/", path,
+                            t->executable, sizeof(t->executable));
     kfree(buf);
     return t;
 }

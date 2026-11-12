@@ -78,7 +78,7 @@ def install_ext4_file(volume, root, create=False, sectors=EXT4_SECTORS):
         if result.returncode not in (0, 1):
             raise ValueError('ext4 check/recovery failed: ' + result.stdout.decode(errors='replace'))
         lines = []
-        for directory in ('bin', 'etc', 'home', 'share', 'share/fonts', 'tmp', 'run', 'dev', 'mnt'):
+        for directory in ('bin', 'apps', 'etc', 'home', 'share', 'share/fonts', 'share/icons', 'tmp', 'run', 'dev', 'mnt'):
             lines.append('mkdir /' + directory)
 
         def put(target, content, default=False):
@@ -91,6 +91,7 @@ def install_ext4_file(volume, root, create=False, sectors=EXT4_SECTORS):
         put('etc/root.cfg', b'WYZARROOT1\n')
         put('etc/desktop.cfg', b'/share/wall.raw\n', True)
         put('etc/font.cfg', b'/share/fonts/selawk.ttf\n', True)
+        put('etc/icons.cfg', b'hicolor\n', True)
         put('bootlog.txt', b'', True)
         put('run/boot.log', b'', True)
         for target, source, default in (
@@ -102,6 +103,15 @@ def install_ext4_file(volume, root, create=False, sectors=EXT4_SECTORS):
                 put(target, (root / source).read_bytes(), default)
         # Ship the dependency license alongside installed OS files.
         put('share/lwext4-license.txt', (ROOT / 'third_party/lwext4/LICENSE').read_bytes())
+        put('share/stb-image-license.txt', (ROOT / 'third_party/stb/LICENSE').read_bytes())
+        # Seed replaceable default artwork without overwriting installed themes.
+        for asset in sorted((ROOT / 'assets/icons/hicolor').rglob('*.png')):
+            relative = asset.relative_to(ROOT / 'assets/icons').as_posix()
+            parent = 'share/icons/' + relative.rpartition('/')[0]
+            parts = parent.split('/')
+            for index in range(3, len(parts)+1):
+                lines.append('mkdir /' + '/'.join(parts[:index]))
+            put('share/icons/' + relative, asset.read_bytes(), True)
         manifest = work / 'manifest'
         manifest.write_text('\n'.join(lines) + '\n')
         run(ROOT / '.storage-test/ext4-image-tool', volume, manifest)

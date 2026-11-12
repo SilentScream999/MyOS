@@ -15,7 +15,9 @@ src/kernel.o: src/kernel.cpp src/core/helpers.h src/core/structures.h \
   src/core/tty.h src/core/terminal.h src/arch/acpi.h src/core/syscall.h \
   src/core/app.h src/gui/wm.h src/gui/graphics.h src/drivers/mouse.h \
   src/gui/surface.h src/gui/ui_font.h src/gui/ui_font_data.h \
-  src/gui/truetype.h src/gui/wallpaper.h src/fs/ramfs.h \
+  src/gui/truetype.h src/gui/resources.h src/gui/image.h \
+  src/gui/../core/app.h src/gui/wallpaper.h src/fs/ramfs.h \
+  src/fs/recovery.h src/arch/boot_module.h src/arch/../../limine.h \
   src/fs/ext4_vfs.h third_party/lwext4/include/ext4.h \
   third_party/lwext4/include/ext4_config.h \
   third_party/lwext4/include/ext4_types.h \
@@ -133,9 +135,21 @@ src/gui/ui_font_data.h:
 
 src/gui/truetype.h:
 
+src/gui/resources.h:
+
+src/gui/image.h:
+
+src/gui/../core/app.h:
+
 src/gui/wallpaper.h:
 
 src/fs/ramfs.h:
+
+src/fs/recovery.h:
+
+src/arch/boot_module.h:
+
+src/arch/../../limine.h:
 
 src/fs/ext4_vfs.h:
 
