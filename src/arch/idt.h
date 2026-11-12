@@ -185,8 +185,10 @@ static const char* const exception_names[32] = {
 //   vector 64     : local APIC timer (handler sends LAPIC EOI before scheduling)
 //   vector 255    : local APIC spurious interrupt (no EOI)
 //   other 48+     : unregistered → kpanic
+static void scheduler_idle_interrupt();
 extern "C" __attribute__((used))
 void exception_dispatch(ExceptionFrame* f) {
+    scheduler_idle_interrupt();
     if (f->vector == LOCAL_SPURIOUS_VECTOR) return; // APIC spurious: no EOI
     if (f->vector == LOCAL_TIMER_VECTOR && g_local_timer_handler) {
         g_local_timer_handler();

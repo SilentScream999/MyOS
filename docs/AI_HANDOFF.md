@@ -43,10 +43,16 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
 - Separate parser/state logic from MMIO so host tests can exercise actual code.
 - Single-core IRQ guards are not SMP locks. Storage uses a sleeping mutex plus
   short IRQ guards; do not restore interrupt-disabled runtime disk transactions.
+- TTY reads block until input, a queued shell launch or cancellation wakes them;
+  do not replace them with runnable yield loops. CPU idle intervals end at
+  interrupt entry, before a handler can switch tasks, to exclude scheduled work.
 - Renderers must not read files or decode images. Resource work publishes
   complete snapshots only after input/compositor readers finish.
 - Surface rectangles have exclusive right/bottom edges; the dirty-region
   presenter takes inclusive bounds. Preserve conversions and cursor ordering.
+- Rainbow animation damages exposed client regions only and skips rendering
+  when fully covered/off-screen. Keep the complete backing surface current when
+  exposed; the visibility calculation assumes today's opaque client windows.
 - Kernel string helpers are local definitions, not a hosted C runtime.
   Compiler-generated libc calls and the ext4/codec shim need deliberate linkage.
 - Do not remove USB protocol fixes as speculative workarounds. Preserve bounded

@@ -10,6 +10,7 @@
 #include "mouse.h"
 #include "string.h"
 #include "surface.h"
+#include "visibility.h"
 
 #include "font8x8_basic.h"
 #include "ui_font.h"
@@ -1395,22 +1396,50 @@ static inline void wm_dispatch_key(char c, uint32_t scancode, bool is_down, uint
     wm_win_push_event(focused, ev);
 }
 
-// The rainbow as a CLIENT: draws its own surface, reports damage. (If it has no surface because the
-// allocation failed, the compositor's direct-draw branch still handles it and we dirty its whole rect.)
-static inline void wm_rain_render(Window* win) {
-    if (!win) return;
-    if (win->buffer) {
-        uint64_t t0 = rdtsc_val();
-        rainbow_render_surface(win->buffer, (uint32_t)win->w, (uint32_t)win->h, win->buffer_pitch, rain_scroll, g_rainbow_wide);
-        g_client_render_ticks = rdtsc_val() - t0;
+// Current client surfaces are opaque. Only windows above this client can hide
+// its animation; ghost outlines are overlays and must not count as occluders.
+static inline void wm_visible_client(Window* win, VisibleRegion* region) {
+    region->count = 0;
+    if (!win || !win->visible || !win->buffer || !fb) return;
+    int32_t width = (int32_t)fb->width;
+    int32_t height = fb->height > g_taskbar_h ? (int32_t)(fb->height-g_taskbar_h) : 0;
+    VisibleRect client = visibility_clip(win->x,win->y,win->w,win->h,0,width,height);
+    if (!visibility_valid(client)) return;
+    region->rects[region->count++] = client;
+    bool above = false;
+    for (int s = 0; s < g_window_count; ++s) {
+        Window* other = g_window_list[g_window_order[s]];
+        if (other == win) { above = true; continue; }
+        if (!above || !other || !other->visible || !other->buffer) continue;
+        VisibleRect cover = visibility_clip(other->x,other->y,other->w,other->h,
+                                             (int32_t)g_title_h,width,height);
+        if (!visibility_subtract(region,cover)) {
+            region->count = 1; region->rects[0] = client;
+            return; // Conservative fallback for pathological fragmentation.
+        }
+        if (!region->count) return;
+    }
+}
+
+static uint64_t g_rain_render_count = 0;
+static uint64_t g_rain_damage_pixels = 0;
+
+// Keep a complete backing surface whenever exposed, but only request repaint
+// for pixels people can see. The compositor remains independent of client type.
+static inline void wm_rain_render(Window* win, const VisibleRegion& region) {
+    if (!win || !win->buffer || !region.count) return;
+    uint64_t t0 = rdtsc_val();
+    rainbow_render_surface(win->buffer, (uint32_t)win->w, (uint32_t)win->h, win->buffer_pitch, rain_scroll, g_rainbow_wide);
+    g_client_render_ticks = rdtsc_val() - t0;
+    ++g_rain_render_count;
+    if (!win->chrome_drawn) {
         wm_surface_damage_all(win);
-    } else {
-        WinRect r; wm_get_win_rect(win, &r);
-        if (r.x1 >= 0 && (uint32_t)r.x1 < g_dirty_min_x) g_dirty_min_x = (uint32_t)r.x1;
-        if (r.x2 >= 0 && (uint32_t)r.x2 > g_dirty_max_x) g_dirty_max_x = (uint32_t)r.x2;
-        if (r.y1 >= 0 && (uint32_t)r.y1 < g_dirty_min_y) g_dirty_min_y = (uint32_t)r.y1;
-        if (r.y2 >= 0 && (uint32_t)r.y2 > g_dirty_max_y) g_dirty_max_y = (uint32_t)r.y2;
-        g_needs_refresh = true;
+        return;
+    }
+    for (unsigned i = 0; i < region.count; ++i) {
+        VisibleRect r = region.rects[i];
+        wm_dirty_add(r.x1,r.x2-1,r.y1,r.y2-1);
+        g_rain_damage_pixels += (uint64_t)(r.x2-r.x1)*(r.y2-r.y1);
     }
 }
 
@@ -2016,24 +2045,13 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         }
 
         // ── CPU usage via TSC idle measurement ───────────────────────────────
-        static uint64_t last_total_tsc  = 0;
-        static uint64_t last_idle_tsc   = 0;
-        static uint32_t g_cpu_usage_pct = 0;
+        static CpuUsageSample usage;
 
         uint64_t now_tsc;
         __asm__ volatile("rdtsc; shl $32, %%rdx; or %%rdx, %%rax" : "=a"(now_tsc) :: "rdx");
 
-        uint64_t cur_idle  = g_idle_tsc_accum;
-        uint64_t elapsed   = now_tsc  - last_total_tsc;
-        uint64_t idle_diff = cur_idle - last_idle_tsc;
-        if (elapsed > 0 && elapsed < idle_diff) idle_diff = elapsed; // clamp
-
-        if (elapsed > tsc_hz) { // Update exactly once per second
-            uint64_t busy = (elapsed > idle_diff) ? (elapsed - idle_diff) : 0;
-            g_cpu_usage_pct = (uint32_t)((busy * 100) / elapsed);
-            last_total_tsc  = now_tsc;
-            last_idle_tsc   = cur_idle;
-        }
+        usage.update(now_tsc,g_idle_tsc_accum,tsc_hz);
+        uint32_t g_cpu_usage_pct=usage.percent;
 
         // ── Extended Topology core count (Level 0xB) ────────────────────────
         static uint32_t g_vthr = 0, g_cores = 0;

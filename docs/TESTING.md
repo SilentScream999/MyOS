@@ -26,6 +26,35 @@ I/O, cache replacement/eviction and safe recovery-tree/module-page reclamation.
 QEMU covers default-VGA ISO boot, USB boot, RAM recovery, live icon/manifest
 replacement, menu/window resource lifetimes and failed-disk-shell fallback.
 
+## CPU usage and terminal wakeups
+
+```sh
+clang++ -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/tty_idle_test.cpp -o .storage-test/tty-idle-test
+.storage-test/tty-idle-test
+python3 tests/qemu_cpu_idle_test.py
+```
+
+The host test covers idle intervals interrupted by scheduled work, sample
+initialization and raw/canonical/launch/cancellation wakeups. QEMU verifies that
+an untouched prompt blocks, Counter returns to the same sleeping prompt, real
+input and Start wake the shell, and a busy loop reports busy CPU time. The HUD
+includes desktop/driver work; an idle prompt does not imply a zero-percent OS.
+
+For rainbow animation visibility and repaint cost:
+
+```sh
+clang++ -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/visibility_test.cpp -o .storage-test/visibility-test
+.storage-test/visibility-test
+python3 tools/make_usb_image.py --output .storage-test/rainbow-base.img --debug
+python3 tests/qemu_rainbow_test.py
+```
+
+Refresh an existing fixture with `--update-boot --debug`. Host checks compare
+exposed coverage with a pixel mask, including clipping and bounded-region
+overflow. QEMU drags actual windows, verifies fully covered animation stops and
+resumes on exposure, and records CPU/frame costs and screenshots. Timings depend
+on the host; this does not measure physical GPU performance.
+
 ## Storage and capacity
 
 Prepare the dedicated ext4 fixture before its dependent tests:

@@ -83,8 +83,24 @@ static bool task_request_interrupt(pid_t pid) {
 }
 static void task_complete(Task* exiting, uint64_t code);
 
-// CPU idle cycle tracker (accumulates TSC cycles spent in hlt each window)
+// CPU idle cycles end before interrupt work or scheduler preemption.
 extern volatile uint64_t g_idle_tsc_accum;
+#include "cpu_idle.h"
+static CpuIdleClock g_cpu_idle_clock{};
+static void scheduler_idle_interrupt() {
+    uint64_t now;
+    __asm__ volatile("rdtsc; shl $32, %%rdx; or %%rdx, %%rax" : "=a"(now) :: "rdx");
+    g_idle_tsc_accum=g_idle_tsc_accum+g_cpu_idle_clock.end(now);
+}
+// Caller holds IRQs disabled. Interrupt entry closes the interval even if the
+// handler schedules another task before this suspended stack can resume.
+static void scheduler_idle_halt() {
+    uint64_t now;
+    __asm__ volatile("rdtsc; shl $32, %%rdx; or %%rdx, %%rax" : "=a"(now) :: "rdx");
+    g_cpu_idle_clock.begin(now);
+    __asm__ volatile("sti; hlt; cli" ::: "memory");
+    scheduler_idle_interrupt();
+}
 
 // Forward declaration from timer.h (cannot include timer.h here due to circular deps)
 extern volatile uint64_t g_tick_count;
@@ -265,12 +281,7 @@ switch_now:
         if (g_current_task && g_current_task->yielded) {
              g_current_task->yielded = false;
              // Voluntary yield with no one else ready: idle until next interrupt.
-             uint64_t t0;
-             __asm__ volatile("rdtsc; shl $32, %%rdx; or %%rdx, %%rax" : "=a"(t0) :: "rdx");
-             __asm__ volatile("sti; hlt; cli");
-             uint64_t t1;
-             __asm__ volatile("rdtsc; shl $32, %%rdx; or %%rdx, %%rax" : "=a"(t1) :: "rdx");
-             __sync_fetch_and_add(&g_idle_tsc_accum, t1 - t0);
+             scheduler_idle_halt();
         }
         __asm__ volatile("push %0; popfq" :: "r"(rflags) : "memory", "cc");
         return;
@@ -320,12 +331,7 @@ static void task_sleep_ms(uint64_t ms) {
     while (self->state == TaskState::BLOCKED) {
         schedule();
         if (self->state == TaskState::BLOCKED) {
-            uint64_t t0;
-            __asm__ volatile("rdtsc; shl $32, %%rdx; or %%rdx, %%rax" : "=a"(t0) :: "rdx");
-            __asm__ volatile("sti; hlt; cli" ::: "memory");
-            uint64_t t1;
-            __asm__ volatile("rdtsc; shl $32, %%rdx; or %%rdx, %%rax" : "=a"(t1) :: "rdx");
-            __sync_fetch_and_add(&g_idle_tsc_accum, t1 - t0);
+            scheduler_idle_halt();
         }
     }
     __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
@@ -368,7 +374,7 @@ static int64_t task_wait_child(pid_t pid, uint64_t* exit_code) {
         parent->state = TaskState::BLOCKED;
         schedule();
         if (parent->state == TaskState::BLOCKED)
-            __asm__ volatile("sti; hlt; cli" ::: "memory");
+            scheduler_idle_halt();
     }
 }
 
@@ -405,7 +411,7 @@ static void task_complete(Task* exiting, uint64_t code) {
     // another task instead of halting the whole OS.
     for (;;) {
         schedule();
-        __asm__ volatile("sti; hlt; cli" ::: "memory");
+        scheduler_idle_halt();
     }
 }
 

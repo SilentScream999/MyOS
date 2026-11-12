@@ -565,10 +565,15 @@ void compositor_thread_main() {
         // Run one frame of compositor logic
         uint64_t now_refresh = rdtsc();
         
-        // If rainbow window is visible, always force a refresh for animation
+        // Keep the animation's phase, but spend no frame work on hidden pixels.
+        Window* rain_win = nullptr;
+        VisibleRegion rain_region{};
         for (int i = 0; i < g_window_count; i++) {
             if (g_window_list[i] && g_window_list[i]->visible && g_window_list[i]->type == WIN_TYPE_RAIN) {
-                g_needs_refresh = true;
+                rain_win = g_window_list[i];
+                rain_scroll += 4;
+                wm_visible_client(rain_win, &rain_region);
+                if (rain_region.count) g_needs_refresh = true;
                 break;
             }
         }
@@ -599,18 +604,8 @@ void compositor_thread_main() {
             // Drain and render any pending terminal output
             term_process_ring_buffer();
 
-            Window* rain_win = nullptr;
-            for (int i = 0; i < g_window_count; i++) {
-                if (g_window_list[i] && g_window_list[i]->visible && g_window_list[i]->type == WIN_TYPE_RAIN) {
-                    rain_win = g_window_list[i];
-                    break;
-                }
-            }
-
-            if (rain_win) {
-                rain_scroll += 4;
-                wm_rain_render(rain_win);   // client draws its surface + reports damage; compositor stays generic
-            }
+            g_client_render_ticks = 0;
+            wm_rain_render(rain_win, rain_region);
 
             __asm__ volatile("cli");
 			uint32_t fx1 = g_dirty_min_x, fx2 = g_dirty_max_x;

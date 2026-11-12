@@ -56,8 +56,8 @@ void _start() {
         print_num(i);
         print(" of 5\n");
 
-        // Block the task for 500 ms — the scheduler gives the CPU to other
-        // tasks while we sleep, so CPU usage drops to near zero.
+        // Sleep between prints instead of busy-waiting. Other tasks and the
+        // desktop still contribute to total CPU usage while Counter sleeps.
         sys_sleep(500);
     }
 

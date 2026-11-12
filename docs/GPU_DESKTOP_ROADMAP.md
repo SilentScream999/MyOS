@@ -11,6 +11,11 @@ Limine's scanout framebuffer using CPU/SSE stores. Terminal, Boot Log and demos
 use the same surface composition path as user windows. Damage lists hold up to
 eight rectangles, with a full/global box used by some writers.
 
+Rainbow requests animation damage only for exposed client regions and skips
+surface rendering when fully covered or off-screen. When exposed it updates its
+complete backing surface at the same cadence, so uncovering reveals current
+pixels. Visibility subtraction currently relies on opaque client windows.
+
 Fonts and PNG icons already use CPU alpha blending. Icon images use
 premultiplied pixels; that does not change the client-window ABI. Window surface
 alpha is currently ignored, and the taskbar's gradient is not transparency.

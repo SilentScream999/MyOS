@@ -110,6 +110,7 @@ struct Task {
     bool exit_collected;
     bool in_syscall;
     bool interrupt_requested;
+    bool waiting_tty_input;
 };
 
 // ── Global PID counter ─────────────────────────────────────────────────────────
