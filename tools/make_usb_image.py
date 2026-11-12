@@ -11,6 +11,7 @@ import datetime
 import os
 import tempfile
 import stat
+import zlib
 from contextlib import contextmanager
 from ext4_volume import install_ext4_file, EXT4_SECTORS, MIN_SECTORS, MAX_SECTORS, check_header
 from image_io import copy_sparse
@@ -196,7 +197,14 @@ def validate_existing(source, allow_trailing=False):
     return data_count
 
 
-def write_image(output, boot, data, mbr, update_boot=False, fresh=False, system_root=None):
+def storage_policy(uuid, sectors, automatic):
+    result = bytearray(512)
+    struct.pack_into('<16sIIQQ16s', result, 0, b'WYZAR-AUTOGROW1', 1, int(automatic), START + BOOT_SECTORS, sectors, uuid)
+    struct.pack_into('<I', result, 508, zlib.crc32(result[:508]))
+    return result
+
+
+def write_image(output, boot, data, mbr, update_boot=False, fresh=False, system_root=None, policy=None):
     # Atomic replacement: a failed refresh leaves the previous complete image.
     # Lock the old image against QEMU's sector writes throughout the copy.
     exists = output.exists() or output.is_symlink()
@@ -210,6 +218,8 @@ def write_image(output, boot, data, mbr, update_boot=False, fresh=False, system_
                 with locked_image(output) as source:
                     if fresh:
                         dest.write(mbr)
+                        if policy is not None:
+                            dest.seek(512); dest.write(policy)
                         dest.seek(START * SECTOR)
                         dest.write(boot.data)
                         write_partition(dest, data)
@@ -217,6 +227,9 @@ def write_image(output, boot, data, mbr, update_boot=False, fresh=False, system_
                         data_count = validate_existing(source)
                         source.seek(0)
                         dest.write(source.read(START * SECTOR))
+                        if policy is not None:
+                            dest.seek(512); dest.write(policy)
+                            dest.seek(START * SECTOR)
                         dest.write(boot.data)
                         source.seek((START + BOOT_SECTORS) * SECTOR)
                         if system_root:
@@ -237,6 +250,8 @@ def write_image(output, boot, data, mbr, update_boot=False, fresh=False, system_
                         temp_path = None
             else:
                 dest.write(mbr)
+                if policy is not None:
+                    dest.seek(512); dest.write(policy)
                 dest.seek(START * SECTOR)
                 dest.write(boot.data)
                 write_partition(dest, data)
@@ -268,10 +283,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=Path('wyzar-usb.img'))
     parser.add_argument('--root-mib', type=int, help='Root capacity for new/fresh images (default 256 MiB)')
+    parser.add_argument('--debug', action='store_true', help='Fixed 256 MiB root; skip automatic first-boot setup')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--update-boot', action='store_true', help='Refresh an existing image atomically, refreshing bundled system apps and preserving user files/settings; create it if missing')
     mode.add_argument('--fresh', action='store_true', help='Replace the complete image with a fresh one, ERASING saved files (refuses images in use)')
     args = parser.parse_args()
+    if args.debug and args.root_mib not in (None, 256):
+        parser.error('--debug uses a fixed 256 MiB root')
     root = Path(__file__).resolve().parent.parent
     files = {
         'EFI/BOOT/BOOTX64.EFI': 'limine/BOOTX64.EFI',
@@ -294,12 +312,8 @@ def main():
         if args.root_mib is not None and data_count != existing:
             parser.error('Updates preserve root capacity; use expand_usb_image.py to grow an existing image')
         data_count = existing
-    elif args.fresh and args.root_mib is None and args.output.exists():
-        with locked_image(args.output) as source:
-            try:
-                data_count = validate_existing(source)
-            except ValueError:
-                pass  # Explicit fresh replacement can reset an obsolete layout.
+        if args.debug and existing != EXT4_SECTORS:
+            parser.error('DEBUG=1 needs a 256 MiB root; use FRESH=1 to reset a larger image')
     mbr = bytearray(SECTOR)
     for i, (kind, start, count) in enumerate(((0xef, START, BOOT_SECTORS), (0x83, data_start, data_count))):
         struct.pack_into('<B3sB3sII', mbr, 446 + i * 16, 0, b'\xfe\xff\xff', kind, b'\xfe\xff\xff', start, count)
@@ -311,11 +325,18 @@ def main():
             volume = Path(directory) / 'volume.img'
             install_ext4_file(volume, root, create=True, sectors=data_count)
             data = SimpleNamespace(path=volume)
-        write_image(args.output, boot, data, mbr, args.update_boot, args.fresh, system_root=root)
+            with volume.open('rb') as source:
+                source.seek(1024 + 104); uuid = source.read(16)
+        else:
+            with locked_image(args.output) as source:
+                source.seek(data_start * SECTOR + 1024 + 104); uuid = source.read(16)
+        policy = storage_policy(uuid, data_count, not args.debug)
+        write_image(args.output, boot, data, mbr, args.update_boot, args.fresh, system_root=root, policy=policy)
     preserved = existed and not args.fresh
     print(f'{"Updated boot files in" if preserved else "Created fresh image"} {args.output}; ' +
           ('ext4 bundled apps refreshed; user files/settings/wallpaper preserved' if preserved else
-           f'UEFI boot + {data_count // 2048} MiB ext4 system root'))
+           f'UEFI boot + {data_count // 2048} MiB ext4 seed root'))
+    print('Storage mode: fixed 256 MiB debug' if args.debug else 'Storage mode: automatic first-boot setup on larger USB media')
 
 
 if __name__ == '__main__':

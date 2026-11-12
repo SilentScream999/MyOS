@@ -18,10 +18,11 @@ Track the whole scope here; finishing a stage does not finish the remaining work
    and atomic replacement on ext4/RAMFS. Shell `write` uses atomic saves, `append`
    extends content, and `mv` renames. Permission enforcement, user/group identity,
    links and consistent UTC timestamps need explicit OS semantics too.
-3. **Implemented:** configurable new roots (`ROOT_MIB`), streamed image updates,
-   and atomic offline image expansion via `tools/expand_usb_image.py`, including
-   a target stick's exact byte capacity. Reflash the expanded host image; there
-   is no automatic live/first-boot resizing. Current MBR/READ(10) bounds remain.
+3. **Implemented:** small seed images and automatic first-boot provisioning of
+   a larger USB root, with copy/verification before partition publication.
+   `DEBUG=1` keeps a fixed 256 MiB root. Boot+recovery seed reserve 385 MiB;
+   reclaiming the seed, in-place/live resizing and GPT remain future work.
+   Streamed image updates and offline expansion remain development tools.
 4. **Implemented:** a reentrant sleeping filesystem mutex and exact storage
    completion ownership; runtime USB waits sleep and wake on delivery while
    input/timers continue. Cold discovery and control probes retain their bounded

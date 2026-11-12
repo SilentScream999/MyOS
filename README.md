@@ -29,6 +29,10 @@ delete a closed file, and `stat /home/FILE.TXT` to display creation and modifica
 Relative paths, `.`, and `..` are supported across all file commands.
 For a clean image on each test, use `make clean && make run FRESH=1`.
 The flag resets saved files; ordinary builds preserve them.
+Normal images prepare larger USB storage once on first boot. Use
+`make iso FRESH=1 DEBUG=1` for a fixed 256 MiB root (385 MiB complete image).
+Boot plus the retained recovery seed reserve 385 MiB on normal sticks; see the
+storage documentation for setup progress and retry behavior.
 `run /bin/counter.elf` runs in the foreground: the shell waits for exit and then
 prints a fresh prompt automatically. Keep `tools/make_usb_image.py` for image
 builds; the `tests/` directory contains optional development checks.
@@ -53,6 +57,9 @@ The Makefile calls `clang`, `clang++` and `ld.lld` directly.
 
 **Build and run**
 
+Copy-and-paste WSL commands for normal, fresh and fixed-size debug builds are in
+[BUILD_CONFIGS.txt](BUILD_CONFIGS.txt).
+
     make clean && make iso          # builds wyzar, init.elf and wyzar.iso
     make run                        # QEMU (needs OVMF.fd in the project root; it is not in the repo)
 
@@ -65,6 +72,7 @@ QEMU has **no Intel GPU**, so anything GPU-related (the `GPU:` boot-log lines an
 |---|---|---|
 | `OPT=-O2` | `-O0` | Kernel optimisation level. `-O2` compiles and links but has **not** been run on hardware; test it on its own. |
 | `GPU=1` | `0` | Run the Intel GPU bring-up, self-test and benchmark at boot (briefly paints test squares). Off by default because the CPU copy is currently faster. |
+| `DEBUG=1` | `0` | Build a fixed 256 MiB ext4 root; skip automatic first-boot capacity setup. Does not require `make clean`. |
 | `CLOCK_UTC_OFFSET_MIN=-420` | `0` | Minutes to add to the RTC value for the taskbar clock. `0` suits Windows machines (they keep local time in the RTC); use e.g. `-420` if the RTC holds UTC and you are at UTC-7. |
 | `CLOCK_SHOW_SECONDS=1` | `0` | Show seconds in the taskbar clock. |
 

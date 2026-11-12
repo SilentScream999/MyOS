@@ -1,0 +1,62 @@
+WyzarOS build configurations (WSL)
+================================
+
+Copy and paste a command below into WSL. Close QEMU before rebuilding its image.
+
+NORMAL: clean build, create ISO, then run; preserve saved image files
+cd /mnt/c/Users/kaihe/Downloads/MyOS && make clean && make iso && make run
+
+FRESH: clean build, create ISO, then run; RESET saved image files
+cd /mnt/c/Users/kaihe/Downloads/MyOS && make clean && make iso FRESH=1 && make run
+
+DEBUG: fixed 256 MiB root, preserve existing debug image files
+cd /mnt/c/Users/kaihe/Downloads/MyOS && make clean && make iso DEBUG=1 && make run DEBUG=1
+
+FRESH DEBUG: fixed 256 MiB root; RESET saved image files
+cd /mnt/c/Users/kaihe/Downloads/MyOS && make clean && make iso FRESH=1 DEBUG=1 && make run DEBUG=1
+
+BUILD ONLY: normal image/ISO for flashing a USB stick, preserve image files
+cd /mnt/c/Users/kaihe/Downloads/MyOS && make clean && make iso
+
+BUILD ONLY, FRESH: normal image/ISO for flashing; RESET saved image files
+cd /mnt/c/Users/kaihe/Downloads/MyOS && make clean && make iso FRESH=1
+
+BUILD ONLY, FRESH DEBUG: fixed 256 MiB root for flashing; RESET saved image files
+cd /mnt/c/Users/kaihe/Downloads/MyOS && make clean && make iso FRESH=1 DEBUG=1
+
+Shorter build-and-run commands
+-----------------------------
+make run already builds the ISO and refreshes the USB image. These avoid the
+second ISO/image refresh in the longer commands above:
+
+Normal, preserve:
+cd /mnt/c/Users/kaihe/Downloads/MyOS && make clean && make run
+
+Normal, fresh:
+cd /mnt/c/Users/kaihe/Downloads/MyOS && make clean && make run FRESH=1
+
+Debug, preserve:
+cd /mnt/c/Users/kaihe/Downloads/MyOS && make clean && make run DEBUG=1
+
+Debug, fresh:
+cd /mnt/c/Users/kaihe/Downloads/MyOS && make clean && make run FRESH=1 DEBUG=1
+
+Flag and output notes
+---------------------
+- FRESH=1 erases the selected host image's saved files/settings. It does not
+  erase a physical USB stick; flashing the complete image replaces stick data.
+- make clean removes build outputs, but leaves saved USB images alone.
+- Normal new/fresh images have a 256 MiB seed root. First boot on a larger USB
+  stick prepares expanded storage once, reserving about 385 MiB for boot/seed.
+- DEBUG=1 keeps the root at 256 MiB; the complete image is 385 MiB with EFI space.
+  It controls storage policy, not compiler optimization or diagnostic logging.
+- Repeat DEBUG=1 on each make invocation that builds/refreshes a debug image.
+  Flags do not persist between separate make commands.
+- Switching a larger host image to debug size requires FRESH=1.
+- Outputs: wyzar-usb.img (flash the whole file), wyzar.iso (ISO/recovery boot).
+- PERSIST_DISK=another.img selects a separate image. Repeat it on each make
+  invocation in a chain. QEMU run/run-usb require OVMF.fd in the repository root.
+- The normal QEMU image has no extra disk space, so automatic expansion is best
+  checked after flashing a larger physical stick (or enlarging a test disk).
+
+More details: docs/PERSISTENT_STORAGE.md and docs/EXT4.md.

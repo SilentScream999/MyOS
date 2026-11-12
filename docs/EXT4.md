@@ -1,6 +1,6 @@
 # ext4 system storage
 
-Updated 2026-11-10. ext4 is the confirmed system-filesystem direction. USB is a
+Updated 2026-11-11. ext4 is the confirmed system-filesystem direction. USB is a
 permanent supported installation target; internal-drive installation and a
 portable USB system must share the same block/VFS interfaces.
 
@@ -13,24 +13,44 @@ make usb-image   # refresh ext4 boot/system files; preserve user data
 make run-usb     # boot the ext4 USB image directly in QEMU
 ```
 
-Larger roots and offline expansion:
+Automatic USB capacity and fixed-size testing:
 
 ```sh
-make usb-image FRESH=1 ROOT_MIB=1024   # NEW/reset image with a 1 GiB root
-python3 tools/expand_usb_image.py wyzar-usb.img --root-mib 4096
-# To fit a stick, pass its actual byte capacity (not its advertised GB):
-python3 tools/expand_usb_image.py wyzar-usb.img --total-bytes CAPACITY_BYTES
+make iso FRESH=1           # reset to a small seed; prepare larger USB on first boot
+make iso FRESH=1 DEBUG=1   # reset to a fixed 256 MiB root; never expand on boot
 ```
 
-Expansion operates on a regular host image, never a physical device. It grows
-the final ext4 partition offline on a private copy, checks it with e2fsprogs,
-then atomically replaces the image. Shrinking, symlinks, images in use and
-unsupported layouts are rejected. `--use-file-space` uses trailing space in an
-already enlarged image file. Normal updates retain the existing root capacity.
-`FRESH=1` retains a recognized image's capacity while resetting its contents;
-pass `ROOT_MIB` explicitly to change the fresh layout.
-Flash the complete expanded image afterward; reflashing replaces the stick's
-saved files with those in the host image. This is not automatic first-boot growth.
+Normal new/fresh builds contain a 256 MiB ext4 seed and 128 MiB EFI partition:
+the complete image stays 385 MiB regardless of the destination stick's capacity.
+After flashing, first boot reads a checksummed setup policy in reserved sector 1,
+checks the seed UUID and exact partition layout, and prepares a larger ext4 root
+in the unused tail. It copies regular files/directories, rereads every file to
+verify size/CRC, cleanly closes and flushes the new filesystem, then publishes
+its partition entry. The boot splash reports setup phases. Later boots mount
+the prepared root directly; preparation does not repeat.
+
+The original seed remains reserved as a recovery source. Usable root capacity is
+approximately the stick's capacity minus 385 MiB, including the boot partition
+and seed. A 1 GiB stick gets a 639 MiB root. If the tail would be no larger than
+the seed, keep the original 256 MiB root. This is replacement provisioning,
+not in-place resizing; reclaiming the seed and online growth remain future work.
+Setup time depends on USB speed, metadata formatting and copied file sizes;
+it does not zero the whole stick. Leave it connected until setup completes.
+
+Failures before publication retain the original partition entry and select RAM
+recovery; reboot retries setup. An uncertain partition write offlines storage
+until reboot. Sector publication still depends on the device honoring flushes;
+power loss or a torn MBR write can require reflashing. Unsupported file types or
+an oversized inventory abort setup rather than silently omitting files. This
+copies file contents/directories, not Linux permission/ownership/link semantics.
+
+`DEBUG=1` controls image policy, independently of optimization/timing flags.
+It fixes root at 256 MiB (385 MiB complete image), including on larger sticks.
+Ordinary image updates preserve files and capacity and refresh the policy;
+use `FRESH=1` to reset a previously enlarged host image to debug size.
+Fresh resets now default back to the small seed. The legacy `ROOT_MIB` and
+offline `tools/expand_usb_image.py` remain available for development fixtures;
+manual host expansion is no longer required for the standard USB workflow.
 
 Image creation/refresh/expansion stream data with bounded buffers. Native Linux
 storage supports sparse output; Windows/DrvFS output is dense because sparse
@@ -55,14 +75,14 @@ New image layout (MBR, 512-byte sectors):
 | Partition | Size | Purpose |
 |---|---|---|
 | WYZARBOOT | 128 MiB | FAT EFI bootloader, kernel, recovery initrd |
-| WYZARDATA | 256 MiB | Journaled ext4 system root `/` |
+| WYZARDATA | 256 MiB seed; automatic larger root at first boot | Journaled ext4 system root `/` |
 
-256 MiB remains the default root allocation. Tools accept aligned roots from
+256 MiB remains the seed/debug allocation. Tools accept aligned roots from
 64 MiB up to the current MBR/READ(10) limit (total disk below 2 TiB), subject to
 the supported ext4 feature profile. Larger sizes must fit the actual stick.
 GPT, READ/WRITE(16), internal disks and online filesystem growth remain future
-work. Creation/refresh/expansion were exercised through 1.5 GiB; this is not a
-claim of hardware verification at the maximum transport limit.
+work. Automatic provisioning passed on a 1 GiB QEMU disk, formatter geometry
+passed through 32 GiB with Linux checks; maximum-capacity hardware is unverified.
 
 ## Implemented behavior
 
@@ -87,12 +107,14 @@ claim of hardware verification at the maximum transport limit.
   and continue the power operation; the next mount must recover the journal.
 - Block writes use bounded multi-sector USB commands, up to 64 KiB. Backends
   without multi-sector writes retain the sector callback fallback.
-- Underlying device flush after every completed library block write. This
+- Underlying device flush after every completed library block write on mounted roots. This
   conservatively orders journal records, commits and checkpoints without relying
   on volatile USB write caches. Device errors latch the volume offline; there is
   no write retry or silent RAM-save fallback. File calls still block their caller.
   Redundant flush requests with no intervening writes are skipped; journal
   barriers are retained. Partial write/flush failure still fails the volume.
+  First-boot unpublished targets defer flushes until format/copy completion;
+  they become visible only after verification and the final durable close.
 - Sequential directory listing resumes from a saved byte offset. Create/remove
   invalidates that directory's cursor; out-of-order indexed requests restart
   correctly. Cached vnodes use parent/name hash buckets rather than one global
@@ -137,6 +159,17 @@ document, abruptly power off, and verify recovery/persistence and e2fsck results
 on a copy. The third boot shuts down normally and must leave a clean filesystem.
 Physical hardware still needs testing. These tests do not establish
 correctness for every possible power-cut point or every ext4 feature.
+
+Automatic setup regression checks:
+
+```sh
+python3 tests/run_autogrow_tests.py
+python3 tests/qemu_autogrow_test.py
+```
+
+The native tests inject target-format/copy and partition-publication failures,
+retry from the seed, reject invalid policy/UUID, and check fixed/small media and
+32 GiB formatter geometry with e2fsck. QEMU boots normal and DEBUG=1 twice each.
 
 ## Remaining desktop-storage work
 

@@ -66,6 +66,9 @@ $(EXT4_OBJ): %.o: %.c
 .storage-test/ext4-test: tests/ext4_test.cpp src/fs/ext4_vfs.h src/fs/vfs.h src/drivers/block.h Makefile $(patsubst third_party/lwext4/src/%.c,.storage-test/ext4-host/%.o,$(EXT4_SRC))
 	$(CXX) -O1 -g -std=c++20 -no-pie -fsanitize=address,undefined $(EXT4_CONFIG) $(EXT4_INC) -Isrc/fs -Isrc/drivers $< $(filter %.o,$^) -o $@
 
+.storage-test/autogrow-test: tests/autogrow_test.cpp src/fs/usb_autogrow.h src/fs/storage_policy.h src/fs/ext4_vfs.h src/fs/vfs.h src/drivers/block.h Makefile $(patsubst third_party/lwext4/src/%.c,.storage-test/ext4-host/%.o,$(EXT4_SRC))
+	$(CXX) -O1 -g -std=c++20 -no-pie -fsanitize=address,undefined $(EXT4_CONFIG) $(EXT4_INC) -Isrc/fs -Isrc/drivers $< $(filter %.o,$^) -o $@
+
 # Track header dependencies (wm.h, intel_gpu.h, ...) so editing a header rebuilds the kernel.
 -include $(OBJ:.o=.d)
 
@@ -133,11 +136,18 @@ iso: all usb-image
 # Each ISO build refreshes USB boot/system files; user data and settings survive.
 PERSIST_DISK ?= wyzar-usb.img
 ROOT_MIB ?=
+DEBUG ?= 0
+ifneq ($(filter $(DEBUG),0 1),$(DEBUG))
+$(error DEBUG must be 0 or 1)
+endif
 FRESH ?= 0
 ifeq ($(FRESH),1)
 USB_IMAGE_FLAGS = --fresh
 else
 USB_IMAGE_FLAGS = --update-boot
+endif
+ifeq ($(DEBUG),1)
+USB_IMAGE_FLAGS += --debug
 endif
 
 run: iso

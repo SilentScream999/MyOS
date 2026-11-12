@@ -86,7 +86,7 @@ def main():
         subprocess.run([sys.executable, 'tools/make_usb_image.py', '--output', str(image), '--fresh'],
                        cwd=ROOT, preexec_fn=bounded, check=True)
         with image.open('rb') as source:
-            assert validate_existing(source) == 1536 * 2048, 'Fresh reset must retain an expanded layout'
+            assert validate_existing(source) == 256 * 2048, 'Fresh reset must return to the small automatic seed'
     # Workspace output exercises the dense DrvFS path separately from native
     # Linux sparse images. It must be readable immediately after publication.
     with tempfile.TemporaryDirectory(prefix='dense-capacity-', dir=ROOT / '.storage-test') as directory:

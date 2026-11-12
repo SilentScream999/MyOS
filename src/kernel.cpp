@@ -17,6 +17,7 @@
 #include "core/syscall.h"
 #include "fs/ramfs.h"
 #include "fs/ext4_vfs.h"
+#include "fs/usb_autogrow.h"
 
 extern "C" void* wyzar_ext4_malloc(size_t n) { return kmalloc(n); }
 extern "C" void* wyzar_ext4_realloc(void* p, size_t n) { return krealloc(p, n); }
@@ -153,6 +154,18 @@ static inline void vram_draw_string_8x8(int32_t x, int32_t y, const char* s, uin
 }
 
 #include "gui/boot_splash.h"
+
+static void storage_setup_progress(const char* message) {
+    print((char*)message);
+    if (!g_boot_splash_active || !fb) return;
+    int32_t y = (int32_t)fb->height / 2 + 60;
+    for (int32_t row = y; row < y + 12 && row < (int32_t)fb->height; ++row)
+        for (uint32_t x = 0; x < fb->width; ++x) vram_putpx(x, row, BOOT_SPLASH_BG);
+    int32_t x = ((int32_t)fb->width - (int32_t)strlen(message) * 8) / 2;
+    if (x < 0) x = 0;
+    vram_draw_string_8x8(x, y, message, 0xffc6d6ee);
+    vram_fence();
+}
 
 // ── Syscall globals ───────────────────────────────────────────────────────────
 alignas(16) static uint8_t g_boot_kstack[4096];
@@ -973,9 +986,11 @@ extern "C" void kmain(void) {
             print((char*)"[storage] Multiple system volumes found; refusing ambiguous root selection.");
         }
         if (candidates == 1) {
-            candidate = wy_ext4_mount(&ext4_candidate);
+            int setup = wy_usb_autogrow(&ext4_candidate, storage_setup_progress);
+            if (setup >= 0) candidate = wy_ext4_mount(&ext4_candidate);
             recovery_reason = candidate ? "System-root marker could not be read or has an invalid signature." :
-                "System partition recognized, but ext4 mount/journal initialization failed.";
+                (setup < 0 ? "Automatic storage setup failed; seed preserved. Reboot to retry." :
+                "System partition recognized, but ext4 mount/journal initialization failed.");
             if (candidate) vfs_mount_root(candidate);
             file marker{};
             char signature[12] = {};

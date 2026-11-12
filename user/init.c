@@ -225,22 +225,33 @@ static void update_cwd() {
     }
 }
 
+static void print_column(const char* text, unsigned width, int right) {
+    unsigned length = strlen(text);
+    if (right) for (unsigned i = length; i < width; ++i) print(" ");
+    print(text);
+    if (!right) for (unsigned i = length; i < width; ++i) print(" ");
+    print(" ");
+}
+
+static void print_number_column(uint64_t value, const char* suffix, unsigned width) {
+    unsigned length = 1 + strlen(suffix);
+    for (uint64_t remaining = value; remaining >= 10; remaining /= 10) ++length;
+    for (unsigned i = length; i < width; ++i) print(" ");
+    print_dec(value); print(suffix); print(" ");
+}
+
 static void print_size_mb(uint64_t bytes) {
     if (bytes >= 1024 * 1024 * 1024) {
         uint64_t gb = bytes / (1024 * 1024 * 1024);
-        print_dec(gb);
-        print("G");
+        print_number_column(gb, "G", 7);
     } else if (bytes >= 1024 * 1024) {
         uint64_t mb = bytes / (1024 * 1024);
-        print_dec(mb);
-        print("M");
+        print_number_column(mb, "M", 7);
     } else if (bytes >= 1024) {
         uint64_t kb = bytes / 1024;
-        print_dec(kb);
-        print("K");
+        print_number_column(kb, "K", 7);
     } else {
-        print_dec(bytes);
-        print("B");
+        print_number_column(bytes, "B", 7);
     }
 }
 
@@ -421,21 +432,18 @@ void _start() {
         } else if (streq(buf, "df", 2) && (buf[2] == ' ' || buf[2] == '\0')) {
             fs_info st;
             if (sys_statfs("/", &st) == 0) {
-                print("Filesystem     Type    Size    Used    Free   Use% Mounted on\n");
-                print("/dev/root      ");
-                print(st.fs_type);
-                int pad = 8 - strlen(st.fs_type);
-                while (pad-- > 0) print(" ");
+                print_column("Filesystem", 12, 0); print_column("Type", 6, 0);
+                print_column("Size", 7, 1); print_column("Used", 7, 1);
+                print_column("Free", 7, 1); print_column("Use%", 5, 1);
+                print("Mounted on\n");
+                print_column("/dev/root", 12, 0); print_column(st.fs_type, 6, 0);
                 print_size_mb(st.total_bytes);
-                print("    ");
                 uint64_t used = st.total_bytes >= st.free_bytes ? st.total_bytes - st.free_bytes : 0;
                 print_size_mb(used);
-                print("    ");
                 print_size_mb(st.free_bytes);
-                print("   ");
                 uint64_t pct = st.total_bytes ? (used * 100) / st.total_bytes : 0;
-                print_dec(pct);
-                print("%   /\n");
+                print_number_column(pct, "%", 5);
+                print("/\n");
             } else {
                 print("df: failed to get filesystem statistics\n");
             }

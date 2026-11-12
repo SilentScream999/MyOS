@@ -28,7 +28,7 @@ struct wy_ext4_volume {
     uint8_t scratch[512];
     wy_ext4_node root;
     wy_ext4_node* nodes[256];
-    bool failed, mounted, needs_flush;
+    bool failed, mounted, needs_flush, unpublished;
 };
 static wy_ext4_volume* wy_ext4_system = nullptr;
 #ifdef STORAGE_HOST_TEST
@@ -79,7 +79,7 @@ static int wy_ext4_io_write(ext4_blockdev* bd, const void* in, uint64_t lba, uin
     // lwext4 has no barrier callback. Make every completed library block write
     // durable, including journal records before commit and checkpoint writes.
     // Conservative and slow, but never acknowledge a volatile journal commit.
-    return wy_ext4_flush(v) ? EOK : EIO;
+    return v->unpublished || wy_ext4_flush(v) ? EOK : EIO;
 }
 static int wy_ext4_io_close(ext4_blockdev* bd) {
     return wy_ext4_flush((wy_ext4_volume*)bd->bdif->p_user) ? EOK : EIO;
@@ -367,6 +367,20 @@ static unsigned wy_ext4_probe(block_device* disk, wy_ext4_volume* out) {
     }
     return found;
 }
+static void wy_ext4_bind(wy_ext4_volume* v) {
+    memset(&v->iface, 0, sizeof(v->iface)); memset(&v->bdev, 0, sizeof(v->bdev));
+    v->iface.open = wy_ext4_io_open; v->iface.bread = wy_ext4_io_read;
+    v->iface.bwrite = wy_ext4_io_write; v->iface.close = wy_ext4_io_close;
+    v->iface.ph_bsize = 512; v->iface.ph_bcnt = v->sectors;
+    v->iface.ph_bbuf = v->scratch; v->iface.p_user = v;
+    v->bdev.bdif = &v->iface; v->bdev.part_size = v->sectors * 512;
+}
+static bool wy_ext4_supported_profile(const uint8_t* sb, uint64_t sectors) {
+    uint32_t compat = wy_ext4_u32(sb + 92), incompat = wy_ext4_u32(sb + 96), ro = wy_ext4_u32(sb + 100);
+    return (compat & 4) && !(compat & ~0x2cu) && !(incompat & ~0x46u) && !(ro & ~0x43u) &&
+        wy_ext4_u32(sb + 24) == 2 && wy_ext4_u32(sb + 4) <= sectors / 8 &&
+        !wy_ext4_u32(sb + 232) && !wy_ext4_u32(sb + 228);
+}
 static vnode* wy_ext4_mount(wy_ext4_volume* v) {
     storage_guard guard;
     if (!wy_ext4_ready(v) || !v->disk->flush) return nullptr;
@@ -374,15 +388,8 @@ static vnode* wy_ext4_mount(wy_ext4_volume* v) {
     // mount an arbitrary modern ext4 volume with unsupported write semantics.
     uint8_t sb[1024];
     if (!block_read_sectors(v->disk, v->start + 2, 2, sb)) return nullptr;
-    uint32_t compat = wy_ext4_u32(sb + 92), incompat = wy_ext4_u32(sb + 96), ro = wy_ext4_u32(sb + 100);
-    if (!(compat & 4) || (compat & ~0x2cu) || (incompat & ~0x46u) || (ro & ~0x43u) ||
-        wy_ext4_u32(sb + 24) != 2 || wy_ext4_u32(sb + 4) > v->sectors / 8 ||
-        wy_ext4_u32(sb + 232) || wy_ext4_u32(sb + 228)) return nullptr;
-    v->iface.open = wy_ext4_io_open; v->iface.bread = wy_ext4_io_read;
-    v->iface.bwrite = wy_ext4_io_write; v->iface.close = wy_ext4_io_close;
-    v->iface.ph_bsize = 512; v->iface.ph_bcnt = v->sectors;
-    v->iface.ph_bbuf = v->scratch; v->iface.p_user = v;
-    v->bdev.bdif = &v->iface; v->bdev.part_size = v->sectors * 512;
+    if (!wy_ext4_supported_profile(sb, v->sectors)) return nullptr;
+    wy_ext4_bind(v);
     if (ext4_device_register(&v->bdev, "system") != EOK) return nullptr;
     if (ext4_mount("system", "/", false) != EOK) { ext4_device_unregister("system"); return nullptr; }
     if (ext4_recover("/") != EOK || ext4_journal_start("/") != EOK || !wy_ext4_flush(v)) {

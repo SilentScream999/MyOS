@@ -9,6 +9,9 @@ tests/*
 !tests/qemu_font_selection_test.py
 !tests/qemu_storage_smoke.py
 !tests/ext4_test.cpp
+!tests/autogrow_test.cpp
+!tests/run_autogrow_tests.py
+!tests/qemu_autogrow_test.py
 !tests/atomic_save_test.py
 !tests/capacity_image_test.py
 !tests/ramfs_save_test.cpp

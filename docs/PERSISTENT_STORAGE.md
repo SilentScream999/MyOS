@@ -1,6 +1,6 @@
 # Persistent system storage
 
-Updated 2026-11-10. New USB images contain a FAT EFI boot partition and a journaled
+Updated 2026-11-11. New USB images contain a FAT EFI boot partition and a journaled
 ext4 system partition. System roots are ext4-only; the kernel FAT16 backend and
 legacy creation/migration tooling have been removed. See
 [EXT4.md](EXT4.md) for the feature profile and verification.
@@ -36,23 +36,28 @@ project's recognized image layout and validates/checks ext4 before editing it.
 make usb-image FRESH=1
 ```
 
-To create/reset a different root capacity, pass `ROOT_MIB`, for example
-`make usb-image FRESH=1 ROOT_MIB=1024`. Ordinary updates retain capacity;
-fresh resets retain a recognized existing capacity unless explicitly overridden.
-To grow an existing host image while preserving its files, use
-`python3 tools/expand_usb_image.py wyzar-usb.img --root-mib 1024`.
-`--total-bytes` instead fits the complete image to a stick's actual byte capacity.
-Expansion is offline and atomic; it does not access the stick or resize a live
-root. Reflash afterward. Windows-backed images are dense and require space for
-the full output; native Linux images can use sparse storage. Details and bounds
-are in [EXT4.md](EXT4.md).
+Normal new/fresh images stay small: 256 MiB seed root, 385 MiB complete image.
+The first USB boot automatically prepares a larger root in the unused tail,
+copies and verifies the seed files, then activates it. Later boots skip setup.
+Keep the stick connected while the setup phases appear on the splash.
+The original seed remains reserved, so usable root capacity is approximately
+stick capacity minus 385 MiB. Small sticks keep the seed when expansion would
+not provide a larger root. No manual host expansion is needed.
+
+For fixed-size feature tests, use `make iso FRESH=1 DEBUG=1`. The ext4 root stays
+256 MiB even on a large stick; EFI space makes the whole image 385 MiB.
+`DEBUG=1` changes image policy only. Ordinary refresh preserves files/capacity;
+`FRESH=1` resets contents and defaults back to the small seed. Switching a larger
+host image to debug mode requires an explicit fresh reset. Windows/DrvFS images
+remain dense; native Linux output can be sparse. Setup failure/retry behavior,
+recovery reserve and capacity bounds are detailed in [EXT4.md](EXT4.md).
 
 ## Layout and root selection
 
 | Partition | Size | Purpose |
 |---|---|---|
 | WYZARBOOT | 128 MiB | EFI boot, Limine, kernel, small recovery initrd and init module |
-| WYZARDATA | 256 MiB default; configurable | ext4 persistent system root `/` |
+| WYZARDATA | 256 MiB seed/debug; larger root automatically on first boot | ext4 persistent system root `/` |
 
 Normal refresh preserves the ext4 data volume. Older FAT-root images are rejected;
 `FRESH=1` replaces them with the current layout. The boot partition remains FAT16

@@ -175,6 +175,7 @@ static int create_fs_aux_info(struct fs_aux_info *aux_info,
 	if (last_group_size > 0 && last_group_size < last_header_size) {
 		aux_info->groups--;
 		aux_info->len_blocks -= last_group_size;
+		info->inodes = aux_info->groups * info->inodes_per_group;
 	}
 
 	aux_info->sb = ext4_calloc(1, EXT4_SUPERBLOCK_SIZE);
@@ -355,18 +356,16 @@ static int write_bgroups(struct ext4_blockdev *bd, struct fs_aux_info *aux_info,
 
 	for (i = 0; i < aux_info->groups; i++) {
 		uint64_t bg_start_block = aux_info->first_data_block +
-			aux_info->first_data_block + i * info->blocks_per_group;
+			(uint64_t)i * info->blocks_per_group;
 		uint32_t blk_off = 0;
 
 		bg_desc = (void *)(aux_info->bg_desc_blk + k * dsc_size);
-		bg_free_blk = info->blocks_per_group -
-				aux_info->inode_table_blocks;
+		uint64_t available = aux_info->len_blocks - bg_start_block;
+		if (available > info->blocks_per_group) available = info->blocks_per_group;
+		bg_free_blk = (uint32_t)available - aux_info->inode_table_blocks;
 
 		bg_free_blk -= 2;
 		blk_off += aux_info->bg_desc_blocks;
-
-		if (i == (aux_info->groups - 1))
-			bg_free_blk -= aux_info->first_data_block;
 
 		if (has_superblock(info, i)) {
 			bg_start_block++;

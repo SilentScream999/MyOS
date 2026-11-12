@@ -33,6 +33,12 @@ int strncmp(const char *a, const char *b, size_t n) {
     return 0;
 }
 char *strcpy(char *d, const char *s) { char *p = d; while ((*p++ = *s++)) {} return d; }
+char *strncpy(char *d, const char *s, size_t n) {
+    char *result = d;
+    while (n && *s) { *d++ = *s++; --n; }
+    while (n--) *d++ = 0;
+    return result;
+}
 void *calloc(size_t n, size_t size) {
     if (size && n > SIZE_MAX / size) return NULL;
     void *p = malloc(n * size); if (p) memset(p, 0, n * size); return p;

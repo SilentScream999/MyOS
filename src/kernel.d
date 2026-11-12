@@ -27,9 +27,13 @@ src/kernel.o: src/kernel.cpp src/core/helpers.h src/core/structures.h \
   third_party/lwext4/include/ext4_errno.h \
   third_party/lwext4/include/ext4_oflags.h \
   third_party/lwext4/include/ext4_debug.h src/fs/ext4_libc/inttypes.h \
-  src/fs/tar.h src/core/exec.h src/core/elf.h src/drivers/intel_gpu.h \
-  src/drivers/gpu_cmds.h src/arch/apic_timer.h src/gui/boot_splash.h \
-  src/drivers/synaptics.h src/drivers/ps2kb.h
+  src/fs/usb_autogrow.h src/fs/storage_policy.h \
+  third_party/lwext4/include/ext4_mkfs.h \
+  third_party/lwext4/include/ext4_fs.h \
+  third_party/lwext4/include/ext4_misc.h src/fs/tar.h src/core/exec.h \
+  src/core/elf.h src/drivers/intel_gpu.h src/drivers/gpu_cmds.h \
+  src/arch/apic_timer.h src/gui/boot_splash.h src/drivers/synaptics.h \
+  src/drivers/ps2kb.h
 
 src/core/helpers.h:
 
@@ -158,6 +162,16 @@ third_party/lwext4/include/ext4_oflags.h:
 third_party/lwext4/include/ext4_debug.h:
 
 src/fs/ext4_libc/inttypes.h:
+
+src/fs/usb_autogrow.h:
+
+src/fs/storage_policy.h:
+
+third_party/lwext4/include/ext4_mkfs.h:
+
+third_party/lwext4/include/ext4_fs.h:
+
+third_party/lwext4/include/ext4_misc.h:
 
 src/fs/tar.h:
 

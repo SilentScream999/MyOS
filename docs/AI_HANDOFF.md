@@ -1,7 +1,7 @@
 # Project handoff
 
 Current status, conventions, known issues and next steps, written so that anyone picking the project up cold (a new contributor, or an
-AI assistant given this file as context) can get productive without the history. *Last updated: 2026-11-08 (persistent storage, UI typography, reset-storm fixes and port-local root USB hotplug).*
+AI assistant given this file as context) can get productive without the history. *Last updated: 2026-11-11 (automatic USB capacity and fixed debug images).*
 Read this, then `docs/GPU_DESKTOP_ROADMAP.md` and `docs/APP_LOADING.md`.
 The shared near-term plan is [NEXT_STEPS.md](NEXT_STEPS.md): hardware verification,
 runtime timezones, expanded disk operations and installation. Disk-backed root,
@@ -22,6 +22,30 @@ Practical constraints that shape the work:
 * Keep risky experiments out of safe changes so the safe part can be committed on its own.
 
 ## 2. Current state
+
+* **Automatic USB capacity (2026-11-11):** normal new/fresh images contain a
+  256 MiB seed root (385 MiB complete image). Reserved LBA1 stores a CRC-protected
+  policy bound to seed UUID/start/count. Before userspace, the unique recognized
+  root can provision a larger ext4 in unused tail space, copy/CRC-verify files,
+  cleanly close/flush, then publish/read back the MBR root entry. The original
+  seed remains reserved; usable root is stick capacity minus 385 MiB. This is
+  replacement provisioning, not in-place resize. Fixed `DEBUG=1` always keeps
+  root at 256 MiB. `make iso FRESH=1 DEBUG=1` resets to debug size; ordinary
+  updates preserve data/capacity, while default fresh resets now return to 256
+  MiB (supersedes the older retained-fresh-capacity behavior below).
+  Unpublished targets defer barriers and are populated without a live journal;
+  ordinary root mount starts journaling and keeps all existing write barriers.
+  Setup failures select RAM recovery and retry on reboot; uncertain publication
+  offlines storage. Torn partition-sector writes still need recovery/reflashing.
+  Native sanitizer tests cover copy preservation, format/copy failures/retries,
+  invalid policy and UUID, publication failures, and formatter group geometry.
+  QEMU verified first boot to a 639 MiB root on 1 GiB media, repeat boot without
+  setup, two DEBUG=1 boots at 256 MiB, normal shutdown and Linux checks. Real
+  Surface/USB first-boot setup remains to verify. See `tests/run_autogrow_tests.py`
+  and `tests/qemu_autogrow_test.py`; run QEMU suites sequentially (shared QMP port).
+  User confirmed automatic storage and `mv` work on a physical 4 GB USB stick.
+  Shell `df` now uses consistent field widths for headings and values, with
+  right-aligned sizes/percentages so different digit counts do not shift columns.
 
 * **Remaining requested storage stages (2026-11-10):** implemented rename without
   overwrite (82), atomic replacement (custom 138), shell atomic `write`, `append`
