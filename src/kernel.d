@@ -17,9 +17,10 @@ src/kernel.o: src/kernel.cpp src/core/helpers.h src/core/structures.h \
   src/gui/graphics.h src/drivers/mouse.h src/gui/surface.h \
   src/gui/visibility.h src/gui/ui_font.h src/gui/ui_font_data.h \
   src/gui/truetype.h src/gui/resources.h src/gui/image.h \
-  src/gui/../core/app.h src/gui/wallpaper.h src/fs/ramfs.h \
-  src/fs/recovery.h src/arch/boot_module.h src/arch/../../limine.h \
-  src/fs/ext4_vfs.h third_party/lwext4/include/ext4.h \
+  src/gui/../core/app.h src/gui/../core/wiz.h src/gui/wallpaper.h \
+  src/fs/ramfs.h src/fs/recovery.h src/arch/boot_module.h \
+  src/arch/../../limine.h src/fs/ext4_vfs.h \
+  third_party/lwext4/include/ext4.h \
   third_party/lwext4/include/ext4_config.h \
   third_party/lwext4/include/ext4_types.h \
   third_party/lwext4/include/ext4_blockdev.h \
@@ -34,9 +35,9 @@ src/kernel.o: src/kernel.cpp src/core/helpers.h src/core/structures.h \
   third_party/lwext4/include/ext4_mkfs.h \
   third_party/lwext4/include/ext4_fs.h \
   third_party/lwext4/include/ext4_misc.h src/fs/tar.h src/core/exec.h \
-  src/core/elf.h src/drivers/intel_gpu.h src/drivers/gpu_cmds.h \
-  src/arch/apic_timer.h src/gui/boot_splash.h src/drivers/synaptics.h \
-  src/drivers/ps2kb.h
+  src/core/elf.h src/core/wiz.h src/drivers/intel_gpu.h \
+  src/drivers/gpu_cmds.h src/arch/apic_timer.h src/gui/boot_splash.h \
+  src/drivers/synaptics.h src/drivers/ps2kb.h
 
 src/core/helpers.h:
 
@@ -146,6 +147,8 @@ src/gui/image.h:
 
 src/gui/../core/app.h:
 
+src/gui/../core/wiz.h:
+
 src/gui/wallpaper.h:
 
 src/fs/ramfs.h:
@@ -197,6 +200,8 @@ src/fs/tar.h:
 src/core/exec.h:
 
 src/core/elf.h:
+
+src/core/wiz.h:
 
 src/drivers/intel_gpu.h:
 

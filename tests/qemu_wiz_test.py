@@ -23,7 +23,7 @@ def main():
     with smoke.IMAGE.open('r+b') as image:
         image.seek(offset)
         volume = SystemVolume(image.read(DATA_SECTORS * 512))
-        volume.put('bin/counter.wiz', (ROOT / 'counter.wiz').read_bytes())
+        volume.put('bin/counter.wiz', (ROOT / 'build/packages/counter.wiz').read_bytes())
         volume.put('bin/init.wiz', (ROOT / 'init.elf').read_bytes())
         volume.put('bin/bad.wiz', b'bad')
         volume.validate_tree()

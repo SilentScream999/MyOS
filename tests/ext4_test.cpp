@@ -63,6 +63,28 @@ int main(int argc, char** argv) {
     file f{}; char out[32]{};
     assert(vfs_open("/etc/root.cfg", 0, &f) == 0);
     assert(vfs_read(&f, out, 11) == 11 && !memcmp(out, "WYZARROOT1\n", 11)); vfs_close(&f);
+    if (!strcmp(argv[2], "exchange-fault")) {
+        assert(argc == 4);
+        assert(vfs_replace("/home/app.wiz", "old-complete", 12) == 0);
+        assert(vfs_replace("/home/install.tmp", "new-complete-app", 16) == 0);
+        m.writes = atoi(argv[3]);
+        (void)vfs_exchange("/home/install.tmp", "/home/app.wiz");
+        // Snapshot at the injected failure, without a clean unmount.
+        std::ofstream saved(argv[1], std::ios::binary | std::ios::trunc);
+        saved.write((const char*)m.bytes.data(), m.bytes.size()); assert(saved.good());
+        return 0;
+    }
+    if (!strcmp(argv[2], "exchange-recover")) {
+        assert(vfs_open("/home/app.wiz", 0, &f) == 0);
+        uint64_t n = vfs_read(&f, out, sizeof(out)); vfs_close(&f);
+        assert((n == 12 && !memcmp(out, "old-complete", 12)) ||
+               (n == 16 && !memcmp(out, "new-complete-app", 16)));
+        assert(wy_ext4_unmount(&v) == 0);
+        std::ofstream saved(argv[1], std::ios::binary | std::ios::trunc);
+        saved.write((const char*)m.bytes.data(), m.bytes.size()); assert(saved.good());
+        puts("ext4 exchange crash recovery passed");
+        return 0;
+    }
     if (!strcmp(argv[2], "atomic-fault")) {
         assert(argc == 4);
         assert(vfs_replace("/home/atomic.txt", "old-complete", 12) == 0);
@@ -93,6 +115,16 @@ int main(int argc, char** argv) {
             assert(!vfs_namei("/home/atomic.txt") && vfs_namei("/home/moved.txt") == cached);
             assert(vfs_replace("/home/atomic.txt", "other", 5) == 0);
             assert(vfs_rename("/home/moved.txt", "/home/atomic.txt") == -1);
+            vnode* other = vfs_namei("/home/atomic.txt");
+            assert(vfs_exchange("/home/moved.txt", "/home/missing.txt") == -1);
+            assert(vfs_open("/home/moved.txt", 0, &f) == 0);
+            assert(vfs_exchange("/home/moved.txt", "/home/atomic.txt") == -1);
+            vfs_close(&f);
+            assert(vfs_exchange("/home/moved.txt", "/home/atomic.txt") == 0);
+            assert(vfs_namei("/home/moved.txt") == cached && cached->size == 5);
+            assert(vfs_namei("/home/atomic.txt") == other && other->size == 3);
+            assert(vfs_open("/home/atomic.txt", 0, &f) == 0);
+            assert(vfs_read(&f, out, sizeof(out)) == 3 && !memcmp(out, "new", 3)); vfs_close(&f);
             assert(vfs_replace("/home/atomic.txt", nullptr, 0) == 0);
             assert(vfs_namei("/home/atomic.txt")->size == 0);
             assert(vfs_mkdir("/home/rename-dir") == 0);

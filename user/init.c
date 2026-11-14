@@ -45,6 +45,11 @@ static inline int64_t sys_rename(const char* path, const char* destination) {
     __asm__ volatile("syscall" : "=a"(result) : "a"(82UL), "D"(path), "S"(destination) : "rcx", "r11", "memory");
     return result;
 }
+static inline int64_t sys_exchange(const char* path, const char* destination) {
+    int64_t result;
+    __asm__ volatile("syscall" : "=a"(result) : "a"(211UL), "D"(path), "S"(destination) : "rcx", "r11", "memory");
+    return result;
+}
 static inline int64_t sys_stat(const char* path, file_info* info) {
     int64_t result;
     __asm__ volatile("syscall" : "=a"(result) : "a"(4UL), "D"(path), "S"(info) : "rcx", "r11", "memory");
@@ -213,7 +218,7 @@ void add_history(const char* cmd) {
 // Known commands for green highlighting
 static const char* known_commands[] = {
     "clear", "shutdown", "restart", "bsod", "open bootlog", "ls", "run", "help",
-    "write", "append", "mv", "cat", "rm", "stat", "cd", "pwd", "mkdir", "rmdir", "df", 0
+    "write", "append", "mv", "cat", "rm", "stat", "cd", "pwd", "mkdir", "rmdir", "df", "wiz", 0
 };
 
 static char current_dir[256] = "/";
@@ -289,6 +294,9 @@ static void redraw_line(const char* buf, int len) {
     // Erase any leftover characters to the right
     print("\x1b[K");
 }
+
+// `wiz`: inspect, install, pin and remove .wiz application packages.
+#include "user/wiz_cmd.h"
 
 void _start() {
     print("\x1b[2J\x1b[H"); 
@@ -389,6 +397,7 @@ void _start() {
             print("  append <p> <t>  - Add text to the end of a file\n");
             print("  stat <path>     - Show size, creation and modification times\n");
             print("  run <path>      - Run a .wiz or .elf app; wait until it exits\n");
+            print("  wiz <command>   - Inspect/install/pin/remove .wiz app packages (try 'wiz')\n");
             print("  open bootlog    - Display kernel boot log\n");
             print("  clear           - Clear screen\n");
             print("  bsod            - Trigger crash screen\n");
@@ -528,6 +537,8 @@ void _start() {
                 print(path);
                 print("\n");
             }
+        } else if (streq(buf, "wiz", 3) && (buf[3] == ' ' || buf[3] == '\0')) {
+            wiz_command(&buf[3]);
         } else if (streq(buf, "run", 3) && buf[3] == ' ') {
             int idx = 3;
             while (buf[idx] == ' ') idx++;

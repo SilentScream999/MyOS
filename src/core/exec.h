@@ -12,6 +12,7 @@
 #include "task.h"
 #include "helpers.h"
 #include "syscall.h" // For enter_usermode
+#include "wiz.h"
 
 // ── exec_trampoline ───────────────────────────────────────────────────────────
 // This is the kernel-level stub that the scheduler jumps to when it first
@@ -100,8 +101,37 @@ static Task* execve_memory(const uint8_t* elf_data) {
 }
 
 // ── execve_path ───────────────────────────────────────────────────────────────
-// Load a .wiz or .elf app from VFS. Both use ELF contents; the filename
-// extension does not select a different loader or change the syscall ABI.
+// Load a .wiz or .elf app from VFS. The filename extension does not select a
+// loader. A file that ends in a valid .wiz footer is a package: only its ELF
+// image is read into memory (icons and data stay on disk), and its manifest
+// must be well-formed and not demand a newer ABI. Anything else is a plain ELF.
+static int exec_wiz_read(void* ctx, wiz_u64 offset, void* buf, wiz_u64 len) {
+    file* f = (file*)ctx;
+    if (!len) return 1;
+    f->offset = offset;
+    return vfs_read(f, buf, len) == len;
+}
+
+static bool exec_check_package(file* f, uint64_t file_size, uint64_t* load_size) {
+    wiz_package pkg;
+    int status = wiz_open(&pkg, exec_wiz_read, f, file_size);
+    if (status == WIZ_E_NOT_WIZ) { f->offset = 0; return true; }       // ordinary ELF
+    if (status == 0) {
+        // Task stacks are small and this kernel builds at -O0: keep the 5 KiB of
+        // manifest state on the heap.
+        wiz_manifest* manifest = (wiz_manifest*)kmalloc(sizeof(wiz_manifest));
+        wiz_u8* scratch = (wiz_u8*)kmalloc(WIZ_MAX_MANIFEST);
+        if (!manifest || !scratch) { kfree(manifest); kfree(scratch); return false; }
+        status = wiz_read_manifest_with(&pkg, manifest, scratch);
+        if (status == 0) status = wiz_manifest_check_package(manifest);
+        kfree(manifest); kfree(scratch);
+        if (status == 0) { *load_size = pkg.footer.elf_size; f->offset = 0; return true; }
+    }
+    print((char*)"[exec] rejected .wiz package: ");
+    print((char*)wiz_error_text(status));
+    return false;
+}
+
 static Task* execve_path(const char* path) {
     if (!path) return nullptr;
     file f;
@@ -112,6 +142,14 @@ static Task* execve_path(const char* path) {
     }
 
     uint64_t sz = f.vn->size;
+    if (sz < sizeof(Elf64_Ehdr)) {
+        vfs_close(&f);
+        return nullptr;
+    }
+    if (sz >= WIZ_FOOTER_SIZE && !exec_check_package(&f, sz, &sz)) {
+        vfs_close(&f);
+        return nullptr;
+    }
     if (sz < sizeof(Elf64_Ehdr) || sz > 32 * 1024 * 1024) {
         vfs_close(&f);
         return nullptr;

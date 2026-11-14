@@ -57,7 +57,7 @@ options; header dependencies are tracked automatically.
 
 - Limine boot, ACPI power actions, physical/page/heap allocation, per-task kernel
   stacks/address spaces and a single-core preemptive scheduler.
-- Native `.wiz`/`.elf` programs, spawn/wait/exit, foreground Ctrl+C and mapped
+- Native `.wiz` packages (icons/metadata inside, portable or installed) and `.elf` programs, spawn/wait/exit, foreground Ctrl+C and mapped
   user-window surfaces/events. Both extensions currently contain WyzarOS ELFs.
 - Surface-backed desktop windows, damage tracking, taskbar, Start menu and
   CPU/SSE presentation. Terminal and compositor demos remain built-in fixtures.
@@ -83,6 +83,7 @@ console app; `run /bin/win_test.elf` demonstrates mapped GUI surfaces.
 | [Storage](docs/PERSISTENT_STORAGE.md) | Boot layout, persistence, updates, recovery and diagnostics |
 | [ext4 internals](docs/EXT4.md) | Supported profile, capacity setup and write/recovery semantics |
 | [Applications](docs/APP_LOADING.md) | `.wiz`/`.elf`, manifests, launch and process lifecycle |
+| [App packages](docs/APP_PACKAGES.md) | Self-contained `.wiz` apps: icons, metadata, portable vs installed, `wiz` command |
 | [Images/icons](docs/IMAGES.md) | Runtime resources, formats, themes, caching and memory lifetime |
 | [Fonts](docs/FONTS.md) | Runtime TTF selection and limits |
 | [USB/input](docs/USB_INPUT.md) | HID, hubs, reset/probe rules and hardware caveats |

@@ -5,14 +5,20 @@ Updated 2026-11-11. See [IMAGES](IMAGES.md) for resources and
 
 ## `.wiz` and `.elf`
 
-Both extensions contain the same static x86-64 ELF executable built for the
-WyzarOS syscall ABI. `make counter.wiz` copies `counter.elf`; renaming needs no
-conversion. Windows executables and ordinary Linux ELFs are not made compatible.
-A `.wiz` file does not yet embed icons or metadata.
+Both extensions contain a static x86-64 ELF executable built for the WyzarOS
+syscall ABI. A `.elf` is a bare executable. A `.wiz` is an ELF plus an appended
+package (manifest, icons, data) and a footer, so one file carries everything an
+app needs and runs from anywhere; see [App packages](APP_PACKAGES.md) for the
+format, the `wiz install/pin/remove` commands and the portable/installed model.
+A `.wiz` without a footer (an older plain copy) still loads as an ordinary ELF.
+Windows executables and ordinary Linux ELFs are not made compatible.
 
 The loader in `src/core/exec.h` reads ELF contents through VFS and creates a
-private address space, user stack and ring-3 task. The path loader caps files
-at 32 MiB. Boot uses the fixed shell path `/bin/init.elf`.
+private address space, user stack and ring-3 task. For a package it checks the
+footer, requires a valid manifest and a supported `abi`, and reads only the
+ELF image into memory (the 32 MiB cap applies to that image, not to bundled
+data). A file whose footer magic is present but invalid is refused. Boot uses
+the fixed shell path `/bin/init.elf`.
 
 ## Registration and resources
 
@@ -36,8 +42,13 @@ is the stable ID. `name` and an absolute `exec` path are required; `icon` can be
 a PNG path or theme name and defaults to the ID. [IMAGES](IMAGES.md) defines the
 syntax, limits, theme paths and lazy loading.
 
-Start discovers `/apps/<id>/app.manifest`, then `/bin/*.wiz` and `/bin/*.elf`
-files not registered by executable path. Extension matching is case-insensitive;
+Start discovers `/apps/<id>/app.manifest` (installed or pinned apps), then
+`/bin` and `/home/Applications` for `*.wiz` and `*.elf` files not registered by
+executable path. A manifest whose `exec` is a `.wiz` may omit `name`, `icon` and
+`description`; they come from the package. A package id appears once, so an
+installed copy hides a portable duplicate. A package that needs a newer `abi` is
+hidden. A pinned app whose file is missing is shown dimmed and cannot be
+launched. Extension matching is case-insensitive;
 ext4 filenames remain case-sensitive. The legacy scan omits `init`. The current
 menu holds at most 16 apps.
 

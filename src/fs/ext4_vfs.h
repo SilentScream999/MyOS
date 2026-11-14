@@ -308,6 +308,25 @@ static int wy_ext4_rename(vnode* dir, const char* name, vnode* dest, const char*
     n->next = bucket; bucket = n;
     return 0;
 }
+static int wy_ext4_exchange(vnode* dir, const char* name, const char* other) {
+    storage_guard guard;
+    auto* parent = (wy_ext4_node*)dir->fs_data;
+    char path[512], other_path[512];
+    if (!wy_ext4_child_path(parent, name, path) || !wy_ext4_child_path(parent, other, other_path)) return -1;
+    vnode* a = wy_ext4_lookup(dir, name);
+    vnode* b = wy_ext4_lookup(dir, other);
+    if (!a || !b || a->type != VnodeType::FILE || b->type != VnodeType::FILE ||
+        ((wy_ext4_node*)a->fs_data)->opens || ((wy_ext4_node*)b->fs_data)->opens) return -1;
+    if (a == b) return 0;
+    parent->cursor_valid = false;
+    if (ext4_fexchange(path, other_path) != EOK || !wy_ext4_flush(parent->volume)) {
+        parent->volume->failed = true;
+        return -1;
+    }
+    // Cached vnodes identify paths, so retain them and refresh their sizes.
+    uint64_t size = a->size; a->size = b->size; b->size = size;
+    return 0;
+}
 static int wy_ext4_replace(vnode* dir, const char* name, const void* data, uint64_t len) {
     storage_guard guard;
     auto* parent = (wy_ext4_node*)dir->fs_data;
@@ -348,7 +367,7 @@ static void wy_ext4_init_ops() {
     wy_ext4_ops = {wy_ext4_read, wy_ext4_write, wy_ext4_open, wy_ext4_close,
         wy_ext4_lookup, wy_ext4_create, wy_ext4_mkdir, wy_ext4_readdir,
         wy_ext4_unlink, wy_ext4_stat, wy_ext4_rmdir, wy_ext4_statfs,
-        wy_ext4_truncate, wy_ext4_sync, wy_ext4_rename, wy_ext4_replace};
+        wy_ext4_truncate, wy_ext4_sync, wy_ext4_rename, wy_ext4_replace, wy_ext4_exchange};
 }
 // Returns all labelled candidates, including unsupported ones, so an invalid
 // second system partition cannot cause us to silently choose another root.

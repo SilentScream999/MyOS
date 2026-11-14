@@ -14,6 +14,7 @@ do not use a live/personal system image as a disposable fixture.
 ```sh
 make iso
 python3 tests/run_image_tests.py
+python3 tests/run_wiz_tests.py        # or: make test-wiz (.wiz format, desktop, shell, app library)
 python3 tests/qemu_boot_framebuffer_test.py
 python3 tools/make_usb_image.py --output .storage-test/image-runtime.img --debug
 python3 tests/qemu_image_test.py .storage-test/image-runtime.img
@@ -66,8 +67,25 @@ python3 tests/qemu_ext4_test.py --hub-depth 2
 ```
 
 The ext4 runner exercises the real adapter with ASan/UBSan, failure containment,
-cold journal recovery and Linux filesystem checking. The QEMU suite writes its
+cold journal recovery, atomic package exchanges at 24 injected write boundaries,
+and Linux filesystem checking. The QEMU suite writes its
 fixture across repeated boots, including unclean poweroff and normal shutdown.
+
+For package-specific checks, use a freshly built fixture containing the sample
+packages (the QEMU test boots its own disposable copy):
+
+```sh
+make all
+make test-wiz
+python3 tools/make_usb_image.py --output .storage-test/ext4-usb.img --update-boot
+python3 tests/qemu_wiz_packages_test.py
+```
+
+The host suite covers checksum detection throughout the executable and payload,
+legacy v1 reading, first-entry duplicate semantics, failed upgrade publication,
+57/64-character IDs, desktop discovery/icons and the bundle library. QEMU checks
+portable execution, install/reinstall through the actual exchange syscall,
+inspection, pinning, removal, purge and preservation of saved app data.
 
 | Command | Coverage |
 |---|---|

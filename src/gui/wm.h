@@ -48,6 +48,26 @@ static uint8_t* wm_resource_read(const char* path, uint64_t limit, uint64_t* siz
     if (!data || loaded!=count) { kfree(data); return nullptr; }
     *size=count; return data;
 }
+// Ranged read for .wiz metadata: fetches only `len` bytes at `offset`, so the
+// desktop can read a name and icon from a package without loading all of it.
+// len == 0 just reports the file size.
+static bool wm_resource_range(const char* path, uint64_t offset, void* buffer, uint64_t len, uint64_t* total) {
+    file f{};
+    if (vfs_open(path,0,&f)!=0) return false;
+    bool ok=f.vn->type==VnodeType::FILE;
+    if (ok) *total=f.vn->size;
+    if (ok && len) {
+        ok=buffer && offset<=f.vn->size && len<=f.vn->size-offset;
+        uint64_t done=0,started=rdtsc_val();
+        if (ok) f.offset=offset;
+        while (ok && done<len) {
+            uint64_t chunk=len-done; if (chunk>65536) chunk=65536;
+            if (vfs_read(&f,(uint8_t*)buffer+done,chunk)!=chunk || rdtsc_val()-started>_usb_tsc_hz()*15) ok=false;
+            else done+=chunk;
+        }
+    }
+    vfs_close(&f); return ok;
+}
 static int wm_resource_list(const char* path, uint64_t index, char* name, bool* directory) {
     uint64_t size=0; VnodeType type=VnodeType::FILE;
     int result=vfs_readdir(path,index,name,&size,&type);
@@ -297,7 +317,7 @@ static inline int wm_menu_hit_test(int32_t mx, int32_t my, bool* in_panel = null
     return idx;
 }
 
-// Rebuild the app list from /bin/*.elf and /bin/*.wiz, excluding the shell.
+// Rebuild the app list: /apps registrations, then /bin and /home/Applications (.wiz and .elf), excluding the shell.
 
 static inline void wm_menu_refresh() {
     g_resources_refresh = true;
@@ -342,7 +362,7 @@ static inline void wm_menu_hover_dirty() {
 static uint32_t wm_icon_size(uint32_t value, uint32_t minimum, uint32_t maximum) {
     return value<minimum ? minimum : value>maximum ? maximum : value;
 }
-static resources::Store g_resource_store{{wm_resource_read,wm_resource_list}};
+static resources::Store g_resource_store{{wm_resource_read,wm_resource_list,wm_resource_range}};
 static void wm_resources_reload() {
     uint32_t row=wm_icon_size(fb->height*38/1080,26,256);
     resources::Demand demand{};
@@ -366,6 +386,8 @@ static void wm_resources_reload() {
             bool registered=false;
             for (unsigned k=0;k<g_resources_catalog->count;++k)
                 if (resources::equal(win->executable,g_resources_catalog->apps[k].app.exec)) registered=true;
+            for (unsigned k=0;k<g_resources_catalog->extra_count && k<resources::max_extra;++k)
+                if (resources::equal(win->executable,g_resources_catalog->extra[k].app.exec)) registered=true;
             if (!registered) demand.system[4]=true;
         }
     }
@@ -413,6 +435,9 @@ static const resources::Icons& wm_window_icons(const Window* window) {
     for (unsigned i=0;i<g_resources_catalog->count;++i)
         if (resources::equal(window->executable,g_resources_catalog->apps[i].app.exec))
             return g_resources_catalog->apps[i].icons;
+    for (unsigned i=0;i<g_resources_catalog->extra_count && i<resources::max_extra;++i)
+        if (resources::equal(window->executable,g_resources_catalog->extra[i].app.exec))
+            return g_resources_catalog->extra[i].icons;
     return g_resources_catalog->system[4];
 }
 static void wm_draw_icon(const Image& image, int32_t x, int32_t y,
@@ -2252,6 +2277,7 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
             }
 
             uint32_t txt_clr = hov ? 0xFFFFFFFF : 0xFFE4E8F5;
+            if (!entry.app.available) txt_clr = 0xFF6A7088; // pinned app whose file/drive is missing
             int32_t ty = ry + (row_h - (int32_t)char_h) / 2;
             if (ty + (int32_t)char_h >= (int32_t)min_y && ty <= (int32_t)max_y)
                 wm_draw_string((uint32_t)(ix + isz + 8), (uint32_t)ty, entry.app.name, txt_clr, g_font_scale_100, px + pw - pad - (ix + isz + 8));

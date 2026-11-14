@@ -114,6 +114,8 @@ static inline uint64_t rdmsr(uint32_t msr) {
 #define SYS_RENAME 82u
 #define SYS_REPLACE 138u
 #define SYS_GETCWD  79u
+#define SYS_EXEPATH 210u   // path of the calling program (like /proc/self/exe)
+#define SYS_EXCHANGE 211u  // atomically swap two closed files in one directory
 #define SYS_CHDIR   80u
 #define SYS_MKDIR   83u
 #define SYS_RMDIR   84u
@@ -441,6 +443,17 @@ static uint64_t sys_chdir(uint64_t path_va) {
     return 0;
 }
 
+// Copy the absolute path of the caller's own executable into buf. Returns its
+// length (excluding the NUL) or -1. Lets a portable .wiz open its own bundle.
+static uint64_t sys_exepath(uint64_t buf_va, uint64_t size) {
+    if (!g_current_task || !buf_va || !size || buf_va >= USERSPACE_END) return (uint64_t)-1;
+    const char* path = g_current_task->executable;
+    uint64_t len = strlen(path);
+    if (!len || size < len + 1 || len + 1 > USERSPACE_END - buf_va) return (uint64_t)-1;
+    copy_string_to_user(buf_va, path, len + 1);
+    return len;
+}
+
 static uint64_t sys_getcwd(uint64_t buf_va, uint64_t size) {
     if (!g_current_task || !buf_va || !size || buf_va >= USERSPACE_END) return 0;
     const char* cwd = g_current_task->cwd[0] ? g_current_task->cwd : "/";
@@ -545,10 +558,11 @@ static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uin
             return g_current_task && a1 < MAX_FDS ? vfs_fsync(g_current_task->fd_table[a1]) : (uint64_t)-1;
         case SYS_FTRUNCATE:
             return g_current_task && a1 < MAX_FDS ? vfs_ftruncate(g_current_task->fd_table[a1], a2) : (uint64_t)-1;
+        case SYS_EXCHANGE:
         case SYS_RENAME: {
             char path[256], destination[256];
             if (!get_user_path(a1, path, sizeof(path)) || !get_user_path(a2, destination, sizeof(destination))) return (uint64_t)-1;
-            return vfs_rename(path, destination);
+            return nr == SYS_EXCHANGE ? vfs_exchange(path, destination) : vfs_rename(path, destination);
         }
         case SYS_REPLACE: {
             char path[256];
@@ -576,6 +590,7 @@ static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uin
             return (uint64_t)pid;
         }
         case SYS_GETCWD: return sys_getcwd(a1, a2);
+        case SYS_EXEPATH: return sys_exepath(a1, a2);
         case SYS_CHDIR:  return sys_chdir(a1);
         case SYS_MKDIR:  return sys_mkdir(a1, a2);
         case SYS_RMDIR:  return sys_rmdir(a1);

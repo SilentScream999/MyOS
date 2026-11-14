@@ -1,0 +1,7 @@
+# Embedded into win_test.wiz by tools/wiz_pack.py.
+id=win_test
+name=Window Test
+version=1.0.0
+abi=1
+description=Opens a client window and reacts to mouse and keyboard events.
+icon=win_test

@@ -41,7 +41,22 @@ int main() {
     assert(!vfs_namei("/save.txt") && vfs_namei("/renamed.txt"));
     assert(vfs_replace("/save.txt", nullptr, 0) == 0);
     assert(vfs_rename("/renamed.txt", "/save.txt") == -1);
+    vnode* cached = vfs_namei("/renamed.txt");
+    assert(vfs_exchange("/renamed.txt", "/missing") == -1);
+    assert(vfs_open("/renamed.txt", 0, &f) == 0);
+    assert(vfs_exchange("/renamed.txt", "/save.txt") == -1);
+    vfs_close(&f);
+    assert(vfs_exchange("/renamed.txt", "/save.txt") == 0);
+    assert(vfs_namei("/renamed.txt") == cached && cached->size == 0);
+    assert(vfs_open("/save.txt", 0, &f) == 0);
+    assert(vfs_read(&f, data, sizeof(data)) == 11 && !memcmp(data, "replacement", 11));
+    vfs_close(&f);
+    assert(vfs_mkdir("/folder") == 0);
+    assert(vfs_replace("/folder/file", "other", 5) == 0);
+    assert(vfs_exchange("/save.txt", "/folder/file") == -1);
+    assert(vfs_exchange("/save.txt", "/folder") == -1);
     ramfs_mount_klog();
     assert(vfs_open("/bootlog.txt", 0x201, &f) == -1);
     assert(vfs_replace("/bootlog.txt", "bad", 3) == -1);
+    assert(vfs_exchange("/bootlog.txt", "/save.txt") == -1);
 }

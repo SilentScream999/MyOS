@@ -34,7 +34,8 @@ icon=/apps/photo-viewer/icon.png
 
 The directory name is the stable ID. `name` and an absolute, preferably canonical
 `exec` path are required. `icon` accepts a PNG path or a theme icon name; it
-defaults to the ID. A `.wiz`/`.elf` executable does not embed these assets today.
+defaults to the ID. A `.wiz` package embeds its own manifest and icons (see
+[App packages](APP_PACKAGES.md)); a bare `.elf` does not.
 
 Manifests use ASCII `key=value`, accepting blank lines, `#` comments, LF/CRLF and
 surrounding whitespace. Duplicate recognized keys, invalid required values and
@@ -48,9 +49,13 @@ oversized input are rejected; unknown keys are reserved for future metadata.
 | Executable path | 123 bytes |
 | Icon path | 255 bytes |
 
-Discovery also supports unregistered `/bin/*.elf` and `/bin/*.wiz` files, omitting
-`init` and suppressing entries registered by executable path. Their default icon
-name is the executable basename without its extension. The menu holds at most
+Discovery also supports unregistered `*.elf` and `*.wiz` files in `/bin` and
+`/home/Applications`, omitting `init` and suppressing entries registered by
+executable path. An `.elf` icon name defaults to the basename without its
+extension; a `.wiz` uses its embedded `id`/`icon`. Icon resolution order is user
+theme, system theme, hicolor, the icon embedded in the package (nearest size),
+then `application-default`. Embedded icons are cached under
+`<package>#icons/<N>.png` and fingerprinted like files. The menu holds at most
 16 apps. Windows match catalog entries by owner executable path, not title;
 windows without a matching entry use the generic icon.
 

@@ -1,0 +1,7 @@
+# Embedded into bundle_demo.wiz by tools/wiz_pack.py.
+id=bundle-demo
+name=Bundle Demo
+version=1.0.0
+abi=1
+description=Shows how an app reads its own .wiz bundle and keeps data outside it.
+icon=counter

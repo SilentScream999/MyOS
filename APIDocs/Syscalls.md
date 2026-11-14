@@ -24,6 +24,8 @@ for `rcx`/`r11` and memory effects. User-pointer validation remains incomplete.
 | 88 / 169 | `SHUTDOWN` / `REBOOT` | Attempt filesystem close, then power action |
 | 137 | `STATFS` | Filesystem capacity/free space |
 | 138 | `REPLACE` | Atomic file replacement from supplied bytes |
+| 210 | `EXEPATH` | Copy the caller's own executable path to a buffer; returns its length or -1 (like `/proc/self/exe`). Lets a `.wiz` open its own bundle |
+| 211 | `EXCHANGE` | Atomically swap two existing, closed regular files in the same directory; two path arguments, returns 0 or -1. Used to publish package upgrades without deleting the previous version first |
 | 200–205 | Window operations | See [Window API](WindowAPI.md) |
 
 Paths accept absolute and CWD-relative forms, `.` and `..`, with a current

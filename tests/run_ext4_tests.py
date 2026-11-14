@@ -26,6 +26,18 @@ def main():
                 source.seek((2048 + 262144) * 512)
                 partition.write_bytes(source.read())
             subprocess.run(['e2fsck', '-fn', str(partition)], check=True, capture_output=True)
+    # Model power loss at each write boundary in the package publication
+    # transaction. Recovery must expose a complete old or complete new app.
+    for budget in (*range(24), 1000):
+        shutil.copyfile(original, disk)
+        subprocess.run([str(OUT / 'ext4-test'), str(disk), 'exchange-fault', str(budget)],
+                       cwd=ROOT, env=env, check=True)
+        subprocess.run([str(OUT / 'ext4-test'), str(disk), 'exchange-recover'],
+                       cwd=ROOT, env=env, check=True)
+        with disk.open('rb') as source:
+            source.seek((2048 + 262144) * 512)
+            partition.write_bytes(source.read())
+        subprocess.run(['e2fsck', '-fn', str(partition)], check=True, capture_output=True)
     print('ext4 sanitizer, cold recovery, failure containment and Linux checker tests passed')
 
 

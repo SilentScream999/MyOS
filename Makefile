@@ -84,16 +84,35 @@ USER_CFLAGS = -O0 -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
               -mno-red-zone -target x86_64-elf -fno-builtin \
               -fno-unwind-tables -fno-asynchronous-unwind-tables
 
-user/init.o: user/init.c src/core/app.h src/fs/fileinfo.h
+user/init.o: user/init.c user/wiz_cmd.h src/core/wiz.h src/core/app.h src/fs/fileinfo.h
 	$(CC) $(USER_CFLAGS) -I. -c $< -o $@
 
 init.elf: user/init.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
-# Wyzar app names use the same static ELF contents and ABI.
-# Example: make counter.wiz (keep counter.elf available too).
-%.wiz: %.elf
-	cp $< $@
+# A .wiz is a static ELF plus an appended package (manifest, icons, data); see
+# docs/APP_PACKAGES.md. `make build/packages/NAME.wiz` packs NAME.elf using assets/apps/NAME/
+# (app.manifest, optional data/) and the icon named by the manifest from the
+# icon theme. Without assets/apps/NAME/app.manifest it is a plain copy, which is
+# still a valid (unpackaged) .wiz. Keep NAME.elf available too.
+WIZ_ASSETS = tools/wiz_pack.py $(wildcard assets/apps/*/app.manifest) $(wildcard assets/apps/*/data/*) \
+             $(wildcard assets/icons/hicolor/*/apps/*.png)
+PACKAGE_DIR := build/packages
+PACKAGES := $(addprefix $(PACKAGE_DIR)/,counter.wiz win_test.wiz bundle_demo.wiz)
+$(PACKAGE_DIR)/%.wiz: %.elf $(WIZ_ASSETS)
+	mkdir -p $(@D)
+	$(if $(wildcard assets/apps/$*/app.manifest),python3 tools/wiz_pack.py pack --elf $< --manifest assets/apps/$*/app.manifest --icons assets/icons/hicolor $(if $(wildcard assets/apps/$*/data),--data assets/apps/$*/data,) -o $@,cp $< $@)
+
+packages: $(PACKAGES)
+# Keep the existing sample shortcuts without creating files at the repo root.
+$(notdir $(PACKAGES)): %.wiz: $(PACKAGE_DIR)/%.wiz
+	@:
+.PHONY: packages $(notdir $(PACKAGES))
+
+# Host tests for the .wiz format, desktop integration, shell command and app library.
+test-wiz:
+	python3 tests/run_wiz_tests.py
+.PHONY: test-wiz
 
 user/counter.o: user/counter.c
 	$(CC) $(USER_CFLAGS) -I. -c $< -o $@
@@ -104,15 +123,23 @@ counter.elf: user/counter.o
 user/win_test.o: user/win_test.c
 	$(CC) $(USER_CFLAGS) -I. -c $< -o $@
 
+user/bundle_demo.o: user/bundle_demo.c user/wizlib.h src/core/wiz.h
+	$(CC) $(USER_CFLAGS) -I. -c $< -o $@
+
+bundle_demo.elf: user/bundle_demo.o
+	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
+
 win_test.elf: user/win_test.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
-initrd.tar: init.elf counter.elf win_test.elf assets/fonts/selawik/LICENSE.txt assets/fonts/selawik/selawk.ttf $(wildcard assets/icons/hicolor/*/apps/*.png) third_party/stb/LICENSE Makefile
+initrd.tar: init.elf counter.elf win_test.elf $(PACKAGES) assets/fonts/selawik/LICENSE.txt assets/fonts/selawik/selawk.ttf $(wildcard assets/icons/hicolor/*/apps/*.png) third_party/stb/LICENSE Makefile
 	rm -rf initrd_root
 	mkdir -p initrd_root/bin
 	cp init.elf initrd_root/bin/
 	cp counter.elf initrd_root/bin/
 	cp win_test.elf initrd_root/bin/
+	mkdir -p initrd_root/share/samples
+	cp $(PACKAGES) initrd_root/share/samples/
 	mkdir -p initrd_root/share/fonts
 	cp assets/fonts/selawik/LICENSE.txt initrd_root/share/fonts/selawik.txt
 	cp assets/fonts/selawik/selawk.ttf initrd_root/share/fonts/selawk.ttf
@@ -180,7 +207,7 @@ run: iso
 
 
 clean:
-	rm -rf iso_root initrd_root $(OBJ) $(OBJ:.o=.d) $(EXT4_OBJ) $(EXT4_OBJ:.o=.d) user/init.o user/counter.o user/win_test.o wyzar wyzar.iso myos myos.iso init.elf counter.elf win_test.elf initrd.tar
+	rm -rf iso_root initrd_root $(PACKAGE_DIR) $(OBJ) $(OBJ:.o=.d) $(EXT4_OBJ) $(EXT4_OBJ:.o=.d) user/init.o user/counter.o user/win_test.o user/bundle_demo.o wyzar wyzar.iso myos myos.iso init.elf counter.elf win_test.elf bundle_demo.elf counter.wiz win_test.wiz bundle_demo.wiz initrd.tar
 
 # Refresh boot files and bundled system apps, preserving user files/settings.
 usb-image: all

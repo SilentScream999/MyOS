@@ -415,8 +415,12 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
             }
         } else {
             int menu_hit = wm_menu_hit_test(mx, my);
-            if (menu_hit >= 0) {
-                // Launch the selected app from /bin
+            if (menu_hit >= 0 && !g_resources_catalog->apps[menu_hit].app.available) {
+                // Pinned app whose file or drive is missing: nothing to launch.
+                print((char*)"[launcher] That app is unavailable (its file or drive is missing).");
+                wm_menu_close();
+            } else if (menu_hit >= 0) {
+                // Launch the selected app (installed, pinned, or found in /bin or /home/Applications)
                 if (tty_queue_launch(g_resources_catalog->apps[menu_hit].app.exec)) {
                     for (int i = 0; i < g_window_count; ++i)
                         if (g_window_list[i] == g_win_terminal) { wm_raise_window(i); break; }

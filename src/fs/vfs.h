@@ -58,6 +58,8 @@ struct vfs_ops {
     int (*sync)(vnode* vn);
     int (*rename)(vnode* dir, const char* name, vnode* destination, const char* new_name);
     int (*replace)(vnode* dir, const char* name, const void* data, uint64_t len);
+    // Atomically swap two closed regular files in the same directory.
+    int (*exchange)(vnode* dir, const char* name, const char* other);
 };
 
 // VNODE: A node in the VFS tree (represents a file or directory inode)
@@ -388,6 +390,18 @@ static int vfs_rename(const char* path, const char* new_path) {
     vnode* target = destination->ops->lookup(destination, new_name);
     if (!source || vfs_follow_mount(source) != source || vfs_follow_mount(target) != target) return -1;
     return parent->ops->rename(parent, name, destination, new_name);
+}
+static int vfs_exchange(const char* path, const char* other_path) {
+    char name[256], other[256];
+    vnode* parent = vfs_namei_parent(path, name);
+    vnode* destination = vfs_namei_parent(other_path, other);
+    if (!parent || parent != destination || !name[0] || !other[0] ||
+        !parent->ops || !parent->ops->lookup || !parent->ops->exchange) return -1;
+    vnode* a = parent->ops->lookup(parent, name);
+    vnode* b = parent->ops->lookup(parent, other);
+    if (!a || !b || a->type != VnodeType::FILE || b->type != VnodeType::FILE ||
+        vfs_follow_mount(a) != a || vfs_follow_mount(b) != b) return -1;
+    return parent->ops->exchange(parent, name, other);
 }
 static int vfs_replace(const char* path, const void* data, uint64_t len) {
     if (!data && len) return -1;

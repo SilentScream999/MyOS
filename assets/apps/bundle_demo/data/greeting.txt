@@ -1,0 +1,2 @@
+Hello from inside the package!
+This file is bundled data: it travels with the .wiz.

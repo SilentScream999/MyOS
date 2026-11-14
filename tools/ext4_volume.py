@@ -78,7 +78,7 @@ def install_ext4_file(volume, root, create=False, sectors=EXT4_SECTORS):
         if result.returncode not in (0, 1):
             raise ValueError('ext4 check/recovery failed: ' + result.stdout.decode(errors='replace'))
         lines = []
-        for directory in ('bin', 'apps', 'etc', 'home', 'share', 'share/fonts', 'share/icons', 'tmp', 'run', 'dev', 'mnt'):
+        for directory in ('bin', 'apps', 'etc', 'home', 'share', 'share/fonts', 'share/icons', 'share/samples', 'home/Applications', 'tmp', 'run', 'dev', 'mnt'):
             lines.append('mkdir /' + directory)
 
         def put(target, content, default=False):
@@ -88,6 +88,11 @@ def install_ext4_file(volume, root, create=False, sectors=EXT4_SECTORS):
 
         for program in ('init.elf', 'counter.elf', 'win_test.elf'):
             put('bin/' + program, (root / program).read_bytes())
+        # Sample packages: run them in place or `wiz install` them (docs/APP_PACKAGES.md).
+        for package in ('counter.wiz', 'win_test.wiz', 'bundle_demo.wiz'):
+            source = root / 'build' / 'packages' / package
+            if source.exists():
+                put('share/samples/' + package, source.read_bytes())
         put('etc/root.cfg', b'WYZARROOT1\n')
         put('etc/desktop.cfg', b'/share/wall.raw\n', True)
         put('etc/font.cfg', b'/share/fonts/selawk.ttf\n', True)

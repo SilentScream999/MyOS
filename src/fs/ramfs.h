@@ -56,6 +56,7 @@ static void ramfs_close(vnode* vn) {
 }
 static int ramfs_rename(vnode*, const char*, vnode*, const char*);
 static int ramfs_replace(vnode*, const char*, const void*, uint64_t);
+static int ramfs_exchange(vnode*, const char*, const char*);
 
 static vfs_ops ramfs_ops = {
     .read    = ramfs_read,
@@ -74,6 +75,7 @@ static vfs_ops ramfs_ops = {
     .sync = ramfs_sync,
     .rename = ramfs_rename,
     .replace = ramfs_replace,
+    .exchange = ramfs_exchange,
 };
 
 // ── RAMFS IMPLEMENTATION ──────────────────────────────────────────────────
@@ -297,6 +299,20 @@ static int ramfs_rename(vnode* dir, const char* name, vnode* dest, const char* n
     if (!*link) return -1;
     *link = n->sibling; n->sibling = destination->children;
     destination->children = n; n->parent = destination; strcpy(n->name, new_name);
+    return 0;
+}
+static int ramfs_exchange(vnode* dir, const char* name, const char* other) {
+    storage_guard guard;
+    vnode* a = ramfs_lookup(dir, name);
+    vnode* b = ramfs_lookup(dir, other);
+    if (!a || !b || a->ops != &ramfs_ops || b->ops != &ramfs_ops ||
+        a->type != VnodeType::FILE || b->type != VnodeType::FILE) return -1;
+    auto* x = (ramfs_node*)a->fs_data;
+    auto* y = (ramfs_node*)b->fs_data;
+    if (x->opens || y->opens) return -1;
+    auto* data = x->data; x->data = y->data; y->data = data;
+    uint64_t size = x->size; x->size = a->size = y->size; y->size = b->size = size;
+    uint64_t capacity = x->capacity; x->capacity = y->capacity; y->capacity = capacity;
     return 0;
 }
 static int ramfs_replace(vnode* dir, const char* name, const void* data, uint64_t len) {
