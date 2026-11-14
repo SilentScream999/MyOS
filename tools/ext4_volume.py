@@ -76,7 +76,12 @@ def install_ext4_file(volume, root, create=False, sectors=EXT4_SECTORS):
         # Replay/check only our private copy. Never repair the original image.
         result = subprocess.run(['e2fsck', '-p', str(volume)], capture_output=True)
         if result.returncode not in (0, 1):
-            raise ValueError('ext4 check/recovery failed: ' + result.stdout.decode(errors='replace'))
+            details = (result.stdout + result.stderr).decode(errors='replace').strip()
+            raise ValueError(f'ext4 check/recovery failed (e2fsck exit {result.returncode}): {details}\n'
+                             'The original USB image has not been changed. Close QEMU, then run '
+                             'python3 tools/repair_usb_image.py <your USB image> to create a separate '
+                             'recovered image. Inspect the repair report before using that image; '
+                             'repair can remove invalid entries or reconnect files in /lost+found.')
         lines = []
         for directory in ('bin', 'apps', 'etc', 'home', 'share', 'share/fonts', 'share/icons', 'share/samples', 'share/system', 'home/Applications', 'tmp', 'run', 'dev', 'mnt'):
             lines.append('mkdir /' + directory)

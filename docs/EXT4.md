@@ -96,6 +96,16 @@ output can be sparse; Windows/DrvFS output is dense because sparse reads were
 unreliable in integration tests. Buffer usage is bounded, but staging still
 requires disk space. Normal refresh preserves personal files and settings.
 
+If a build stops at `ext4 check/recovery failed`, close QEMU and run
+`python3 tools/repair_usb_image.py wyzar-usb.img` in WSL/Linux. This runs a full
+repair on a private partition copy and verifies it read-only before creating
+`wyzar-usb.recovered.img`. The original is preserved and existing output files
+are never overwritten. Inspect the checker report: invalid entries may be
+removed and orphaned files may be reconnected under `/lost+found`. To refresh
+and use the recovered copy, run `make iso PERSIST_DISK=wyzar-usb.recovered.img`
+or `make run PERSIST_DISK=wyzar-usb.recovered.img`. Keep the original until you
+have checked your files. `FRESH=1` creates a new filesystem and erases saved data.
+
 Remaining semantics: permissions/user identity, links, UTC timestamps, safe
 eject/reconnect, stable boot-volume identity and broader ext4 features. The
 adapter leaves civil timestamps unknown while RTC interpretation is undefined.

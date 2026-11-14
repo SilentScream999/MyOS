@@ -143,7 +143,9 @@ class Fat16Image:
 def locked_image(path):
     if path.is_symlink() or not stat.S_ISREG(path.stat().st_mode):
         raise ValueError('Boot updates require a regular image file, not a device or symlink')
-    with path.open('r+b') as source:
+    # Windows locks start at the OS file position. Buffered seeks can leave
+    # that position ahead of tell(), causing unlock to target the wrong range.
+    with path.open('r+b', buffering=0) as source:
         length = os.fstat(source.fileno()).st_size
         try:
             if os.name == 'nt':

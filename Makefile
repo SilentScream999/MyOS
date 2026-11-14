@@ -132,6 +132,8 @@ test-resize:
 	mkdir -p .storage-test
 	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/window_resize_test.cpp -o .storage-test/window-resize-test
 	.storage-test/window-resize-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/window_overlay_test.cpp -o .storage-test/window-overlay-test
+	.storage-test/window-overlay-test
 .PHONY: test-resize
 
 user/counter.o: user/counter.c

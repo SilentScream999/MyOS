@@ -482,7 +482,10 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
                         wm_toggle_maximize(win);last_title_id=-1;
                     }else {
                         last_title_click=now;last_title_id=win->id;last_title_x=mx;last_title_y=my;
-                        if(!win->maximized){win->ghost_dragging=true;win->ghost_x=win->x;win->ghost_y=win->y;
+                        if(win->maximized){win->restore_drag_pending=true;
+                            win->resize_mouse_x=mx;win->resize_mouse_y=my;
+                            win->drag_off_x=mx-win->x;win->drag_off_y=my-(win->y-(int)g_title_h);
+                        }else {win->ghost_dragging=true;win->ghost_x=win->x;win->ghost_y=win->y;
                             win->drag_off_x=mx-win->x;win->drag_off_y=my-win->y;}
                     }
                 } else if(!wm_is_in_title(idx,mx,my)) {
@@ -505,9 +508,19 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
         }
     }
 
-    // 3. Update ghost position while dragging (zero cost — just two int adds)
+    // 3. Restore a maximized title drag, then update the drag/resize outline.
     for (int i = 0; i < g_window_count; i++) {
         Window* win = g_window_list[i];
+        if(win&&win->restore_drag_pending&&btn_held){
+            int move_x=g_mouse_x-win->resize_mouse_x,move_y=g_mouse_y-win->resize_mouse_y;
+            if(move_x<=-4||move_x>=4||move_y<=-4||move_y>=4){
+                ResizeRect target=restore_drag_rect(win->restore_rect,win->w,win->drag_off_x,win->drag_off_y,
+                    g_mouse_x,g_mouse_y,g_title_h,fb->width);
+                wm_toggle_maximize(win);
+                win->restore_drag_pending=false;win->ghost_dragging=true;
+                win->drag_off_x=g_mouse_x-target.x;win->drag_off_y=g_mouse_y-target.y;
+            }
+        }
         if (win && win->ghost_dragging) {
             win->ghost_x = g_mouse_x - win->drag_off_x;
             win->ghost_y = g_mouse_y - win->drag_off_y;
@@ -525,6 +538,7 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
         bool dragged = false;
         for (int i = 0; i < g_window_count; i++) {
             Window* win = g_window_list[i];
+            if(win)win->restore_drag_pending=false;
             if(win&&win->resize_edges){wm_commit_resize(win);dragged=true;}
             if (win && win->ghost_dragging) {
                 win->x = win->ghost_x;
@@ -710,7 +724,7 @@ void compositor_thread_main() {
 						a_lock += g_time_lock_ticks; a_vram += g_time_vram_ticks;
 					}
 				}
-				// Safety net: the overlay (cursor, ghost outlines) must run exactly once per frame.
+				// Safety net for frames with no completed scene blit (for example, pointer-only motion).
 				if (!overlay_done) wm_overlay_update(g_mouse_x, g_mouse_y, g_mouse_buttons);
 				// HUD shows the whole frame, not just the last rect.
 				g_snap_bg = a_bg; g_snap_win = a_win; g_snap_rain = a_rain + g_client_render_ticks;

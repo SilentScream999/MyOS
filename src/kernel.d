@@ -18,10 +18,10 @@ src/kernel.o: src/kernel.cpp src/core/helpers.h src/core/structures.h \
   src/gui/visibility.h src/gui/ui_font.h src/gui/ui_font_data.h \
   src/gui/truetype.h src/gui/resources.h src/gui/image.h \
   src/gui/../core/app.h src/gui/../core/wiz.h src/gui/window_resize.h \
-  src/gui/window_decorations.h src/gui/wallpaper.h \
-  src/core/app_console.h src/fs/ramfs.h src/fs/recovery.h \
-  src/arch/boot_module.h src/arch/../../limine.h src/fs/ext4_vfs.h \
-  third_party/lwext4/include/ext4.h \
+  src/gui/window_decorations.h src/gui/window_overlay.h \
+  src/gui/wallpaper.h src/core/app_console.h src/fs/ramfs.h \
+  src/fs/recovery.h src/arch/boot_module.h src/arch/../../limine.h \
+  src/fs/ext4_vfs.h third_party/lwext4/include/ext4.h \
   third_party/lwext4/include/ext4_config.h \
   third_party/lwext4/include/ext4_types.h \
   third_party/lwext4/include/ext4_blockdev.h \
@@ -153,6 +153,8 @@ src/gui/../core/wiz.h:
 src/gui/window_resize.h:
 
 src/gui/window_decorations.h:
+
+src/gui/window_overlay.h:
 
 src/gui/wallpaper.h:
 

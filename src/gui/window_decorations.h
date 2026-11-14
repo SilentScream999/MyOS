@@ -29,21 +29,35 @@ static bool window_control_ink(int control,bool maximized,int x,int y) {
     if(!maximized)return box(x,y,-5,-5,5,5);
     return box(x,y,-5,-2,2,5)||(box(x,y,-2,-5,5,2)&&(y<-2||x>2));
 }
-static bool resize_cursor_ink(unsigned edges,int x,int y) {
-    bool horizontal=edges&(RESIZE_LEFT|RESIZE_RIGHT),vertical=edges&(RESIZE_TOP|RESIZE_BOTTOM);
-    int u=x,v=y,tip=10,base=5,shaft=1;
-    if(horizontal&&vertical){
-        bool down=edges==(RESIZE_LEFT|RESIZE_TOP)||edges==(RESIZE_RIGHT|RESIZE_BOTTOM);
-        u=x+(down?y:-y);v=x-(down?y:-y);tip=16;base=8;shaft=2;
-    }else if(vertical){u=y;v=x;}
-    if(u<0)u=-u;if(v<0)v=-v;
-    return (u<=base+1&&v<=shaft)||(u>=base&&u<=tip&&v<=tip-u);
+static bool resize_arrow_ink(int x,int y) {
+    if(x<0)x=-x;if(y<0)y=-y;
+    return (x<=6&&y==0)||(x>=5&&x<=8&&y<=8-x);
 }
 // 0 = transparent, 1 = dark outline, 2 = light fill.
-static unsigned resize_cursor_pixel(unsigned edges,int x,int y) {
-    if(resize_cursor_ink(edges,x,y))return 2;
+static unsigned resize_arrow_pixel(int x,int y) {
+    if(resize_arrow_ink(x,y))return 2;
     for(int dy=-1;dy<=1;++dy)for(int dx=-1;dx<=1;++dx)
-        if(resize_cursor_ink(edges,x+dx,y+dy))return 1;
+        if(resize_arrow_ink(x+dx,y+dy))return 1;
     return 0;
+}
+static unsigned resize_cursor_pixel(unsigned edges,int x,int y) {
+    bool horizontal=edges&(RESIZE_LEFT|RESIZE_RIGHT),vertical=edges&(RESIZE_TOP|RESIZE_BOTTOM);
+    if(horizontal&&vertical){
+        bool down=edges==(RESIZE_LEFT|RESIZE_TOP)||edges==(RESIZE_RIGHT|RESIZE_BOTTOM);
+        int dy=down?y:-y;
+        // Rotate the arrow geometry before rasterizing, rather than rotating
+        // rounded bitmap samples (which turn the small triangle into a box).
+        // 181/256 approximates 1/sqrt(2); coordinates retain subpixel precision.
+        int u=(x+dy)*181,v=(x-dy)*181;
+        if(u<0)u=-u;if(v<0)v=-v;
+        bool shaft=u<=1664&&v<=128; // half-length 6.5, half-width 0.5
+        bool head=u>=1152&&u+v<=2176; // triangle from 4.5 to 8.5
+        if(shaft||head)return 2;
+        // Offset the same shapes by one pixel for a consistent dark border.
+        bool shaft_border=u<=1920&&v<=384;
+        bool head_border=u>=896&&u+v<=2538;
+        return shaft_border||head_border?1:0;
+    }
+    return vertical?resize_arrow_pixel(y,x):resize_arrow_pixel(x,y);
 }
 #endif

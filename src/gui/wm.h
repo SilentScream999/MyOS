@@ -18,6 +18,7 @@
 #include "resources.h"
 #include "window_resize.h"
 #include "window_decorations.h"
+#include "window_overlay.h"
 
 void* image_allocate(uint64_t size) { return kmalloc(size); }
 void image_deallocate(void* pointer) { kfree(pointer); }
@@ -162,10 +163,11 @@ struct Window {
     bool close_pending; // separate from the bounded input queue: cannot be dropped
     int type;      // For system windows
     bool ghost_dragging;
+    bool restore_drag_pending;
     int32_t ghost_x, ghost_y;
     int32_t drag_off_x, drag_off_y;
-    int32_t last_ghost_fx, last_ghost_fy, last_ghost_fw, last_ghost_fh;
-    bool last_ghost_active;
+
+
 
     // Per-window event queue
     WinEvent event_queue[WIN_EVENT_QUEUE_SIZE];
@@ -1060,113 +1062,28 @@ static inline void wm_draw_window_chrome(int32_t x, int32_t y, int32_t w, int32_
 // =============================================================================
 
 // Currently live on VRAM beyond master_backbuffer:
-static int32_t ov_cx = -999, ov_cy = -999;
-
-// ─── Low-level VRAM helpers ──────────────────────────────────────────────────
-
-// Restore a rectangle in VRAM from the cursor-free master_backbuffer.
-// This is the only "erase" we ever need for overlays.
-static inline void vram_restore_rect(int32_t x1, int32_t y1,
-                                      int32_t x2, int32_t y2) {
-    if (!fb || !g_master_backbuffer) return;
-    if (x1 < 0) x1 = 0;
-    if (y1 < 0) y1 = 0;
-    if ((uint32_t)x2 >= fb->width)  x2 = (int32_t)fb->width  - 1;
-    if ((uint32_t)y2 >= fb->height) y2 = (int32_t)fb->height - 1;
-    if (x1 > x2 || y1 > y2) return;
-    uint32_t bw = (uint32_t)(x2 - x1 + 1) * 4;
-    for (int32_t y = y1; y <= y2; y++) {
-        uint64_t off = (uint64_t)y * fb->pitch + (uint64_t)x1 * 4;
-        memcpy_vram_sse_headless((uint8_t*)fb->address + off,
-                                  g_master_backbuffer   + off, bw);
+static OverlayFrame g_presented_overlay{{-999,-999,0,0},{},0};
+static uint32_t wm_cursor_color(unsigned edges,int x,int y,uint8_t buttons);
+static void wm_capture_overlay(OverlayFrame* frame,const OverlayCursor& cursor) {
+    static_assert(OverlayFrame::capacity>=MAX_WINDOWS);
+    frame->cursor=cursor;frame->count=0;
+    for(int i=0;i<g_window_count;++i){
+        Window* win=g_window_list[i];
+        if(!win||!win->visible||win->minimized||(!win->ghost_dragging&&!win->resize_edges))continue;
+        auto& r=frame->outlines[frame->count++];
+        wm_get_win_rect_from_pos(win,win->ghost_x,win->ghost_y,&r.x,&r.y,&r.w,&r.h);
+        if(win->resize_edges){r.w=win->ghost_w;r.h=win->ghost_h+(int)g_title_h;}
     }
 }
-
-// Erase only the 4 border strips of a ghost outline (not the interior).
-// Much cheaper than restoring a full bounding box for large windows.
-// Single top-to-bottom pass that erases the old outline and draws the new one
-// simultaneously. Every scanline is fully settled (old pixels restored, new
-// pixels written) before we advance, so the display can never catch a row
-// where the old left/right border has vanished but the new one hasn't landed.
-//
-// has_old=false → draw only (no erase).  has_new=false → erase only.
-// w/h are frame dimensions as used by vram_draw_outline (x2 = x + w - 1).
-static inline void vram_transition_outline(
-    int32_t ox, int32_t oy, int32_t ow, int32_t oh, bool has_old,
-    int32_t nx, int32_t ny, int32_t nw, int32_t nh, bool has_new)
-{
-    if (!fb || !g_master_backbuffer) return;
-    if (!has_old && !has_new) return;
-
-    const uint32_t W = fb->width, H = fb->height;
-    const uint32_t P = fb->pitch / 4;
-    const uint32_t COL_OUTER = 0xFFFFFFFF, COL_INNER = 0xFF888888;
-
-    // Right-edge pixel (vram_draw_outline uses x2 = x + w - 1)
-    int32_t ox2 = ox + ow - 1, oy2 = oy + oh - 1;
-    int32_t nx2 = nx + nw - 1, ny2 = ny + nh - 1;
-
-    // Y range covering everything we need to touch
-    int32_t y_lo = 0x7fffffff, y_hi = -0x7fffffff;
-    if (has_old) { y_lo = oy - 2; y_hi = oy2 + 2; }
-    if (has_new) {
-        if (ny - 2 < y_lo) y_lo = ny - 2;
-        if (ny2 + 2 > y_hi) y_hi = ny2 + 2;
-    }
-    if (y_lo < 0) y_lo = 0;
-    if (y_hi >= (int32_t)H) y_hi = (int32_t)H - 1;
-    if (y_lo > y_hi) return;
-
-    for (int32_t y = y_lo; y <= y_hi; y++) {
-        uint32_t* vrow = (uint32_t*)((uint8_t*)fb->address      + (uint64_t)y * fb->pitch);
-        
-        // ── Step 1: restore old outline's pixels on this scanline ────────────
-        if (has_old) {
-            bool on_top = (y >= oy - 2 && y <= oy + 3);
-            bool on_bot = (y >= oy2 - 3 && y <= oy2 + 2);
-            bool on_ls  = (y >= oy + 4 && y <= oy2 - 4);
-            
-            auto restore_strip = [&](int32_t ix1, int32_t ix2) {
-                if (ix1 < 0) ix1 = 0; 
-                if (ix2 >= (int32_t)W) ix2 = (int32_t)W - 1;
-                if (ix1 <= ix2) {
-                    uint64_t off = (uint64_t)y * fb->pitch + (uint64_t)ix1 * 4;
-                    uint32_t len = (uint32_t)(ix2 - ix1 + 1) * 4;
-                    // Use scalar memcpy for these tiny 24-byte strips; SSE overhead 
-                    // and alignment quirks on small lengths can cause artifacts.
-                    memcpy((uint8_t*)fb->address + off, g_master_backbuffer + off, len);
-                }
-            };
-
-            if (on_top || on_bot) {
-                restore_strip(ox - 2, ox2 + 2);
-            } else if (on_ls) {
-                // ONLY restore the left side and right side borders!
-                restore_strip(ox - 2, ox + 3);
-                restore_strip(ox2 - 3, ox2 + 2);
-            }
-        }
-
-        // ── Step 2: draw new outline's pixels ────────────────────────────────
-        if (has_new) {
-            uint32_t clr = 0xFFFFFFFF;
-            if (y >= ny && y <= ny + 1) { // Top hlines
-                int32_t ix1 = nx, ix2 = nx + nw - 1;
-                if (ix1 < 0) ix1 = 0; if (ix2 >= (int32_t)W) ix2 = (int32_t)W - 1;
-                if (ix1 <= ix2) for (int32_t sx = ix1; sx <= ix2; sx++) vrow[sx] = clr;
-            } else if (y >= ny2 - 2 && y <= ny2 - 1) { // Bottom hlines
-                int32_t ix1 = nx, ix2 = nx + nw - 1;
-                if (ix1 < 0) ix1 = 0; if (ix2 >= (int32_t)W) ix2 = (int32_t)W - 1;
-                if (ix1 <= ix2) for (int32_t sx = ix1; sx <= ix2; sx++) vrow[sx] = clr;
-            } else if (y >= ny && y < ny2) { // Vertical edges
-                if (nx >= 0 && nx < (int32_t)W) { vrow[nx] = clr; if (nx + 1 < (int32_t)W) vrow[nx+1] = clr; }
-                int32_t nx_r = nx + nw - 1;
-                if (nx_r >= 0 && nx_r < (int32_t)W) { vrow[nx_r] = clr; if (nx_r - 1 >= 0) vrow[nx_r-1] = clr; }
-            }
-        }
-    }
+static inline void vram_present_span(int left,int right,int y,const OverlayFrame& frame) {
+    if(left<0)left=0;if(right>(int)fb->width)right=fb->width;
+    if(left>=right||y<0||y>=(int)fb->height)return;
+    auto* source=(uint32_t*)(g_master_backbuffer+(uint64_t)y*fb->pitch);
+    auto* dest=(uint32_t*)((uint8_t*)fb->address+(uint64_t)y*fb->pitch);
+    overlay_present_row(dest,source,left,right,y,frame,
+        [](const OverlayCursor& cursor,int x,int cy){return wm_cursor_color(cursor.edges,x,cy,cursor.buttons);},
+        [](uint32_t* d,const uint32_t* s,int bytes){memcpy_vram_sse_headless(d,s,bytes);});
 }
-
 // Draw a 2px ghost outline rectangle directly to VRAM (not master_backbuffer).
 static inline void vram_draw_outline(int32_t x, int32_t y,
                                       int32_t w, int32_t h) {
@@ -1251,7 +1168,6 @@ static inline void wm_draw_rainbow_content(uint32_t* row, int32_t rw, uint32_t b
 
 // Both compositor presentation and the direct VRAM overlay use this sprite.
 // Resize cursors are centered on the actual edge/corner, unlike the arrow's tip.
-constexpr int CURSOR_SPRITE_SIZE=32,CURSOR_SPRITE_ORIGIN=12;
 static unsigned wm_cursor_edges(int mx,int my) {
     for(int i=0;i<g_window_count;++i)if(g_window_list[i]->resize_edges)return g_window_list[i]->resize_edges;
     for(int s=g_window_count-1;s>=0;--s){Window* win=g_window_list[g_window_order[s]];
@@ -1270,17 +1186,6 @@ static uint32_t wm_cursor_color(unsigned edges,int x,int y,uint8_t buttons) {
     unsigned pixel=g_cursor_bitmap[y][x];
     return pixel==1?0xFFFFFFFF:pixel==2?((buttons&1)?0xFFFF0000:(buttons&2)?0xFF00FFFF:0xFF000000):0;
 }
-static inline void vram_draw_cursor(int32_t mx,int32_t my,uint8_t buttons) {
-    if(!fb)return;
-    unsigned edges=wm_cursor_edges(mx,my);
-    for(int y=0;y<CURSOR_SPRITE_SIZE;++y)for(int x=0;x<CURSOR_SPRITE_SIZE;++x){
-        int rx=x-CURSOR_SPRITE_ORIGIN,ry=y-CURSOR_SPRITE_ORIGIN;
-        int sx=mx+rx,sy=my+ry;if(sx<0||sy<0||sx>=(int)fb->width||sy>=(int)fb->height)continue;
-        uint32_t color=wm_cursor_color(edges,rx,ry,buttons);
-        if(color)((uint32_t*)((uint8_t*)fb->address+(uint64_t)sy*fb->pitch))[sx]=color;
-    }
-}
-
 // ─── Ghost frame geometry ────────────────────────────────────────────────────
 
 static inline int wm_find_top_window(int32_t mx, int32_t my) {
@@ -1321,7 +1226,7 @@ static inline bool wm_is_in_title(int idx, int32_t mx, int32_t my) {
 static inline void wm_minimize_window(int idx) {
     if(idx<0||idx>=g_window_count)return;
     Window* win=g_window_list[idx];win->minimized=true;
-    win->ghost_dragging=false;win->resize_edges=0;
+    win->ghost_dragging=false;win->restore_drag_pending=false;win->resize_edges=0;
     if(g_focused_win_id==win->id){
         g_focused_win_id=-1;
         for(int s=g_window_count-1;s>=0;--s){auto* other=g_window_list[g_window_order[s]];
@@ -1506,7 +1411,7 @@ static void wm_toggle_maximize(Window* win) {
         int height=(int)fb->height-g_title_h-g_taskbar_h;if(height>2160)height=2160;
         target={0,(int)g_title_h,width,height};
     }
-    win->ghost_dragging=false;win->resize_edges=0;
+    win->ghost_dragging=false;win->restore_drag_pending=false;win->resize_edges=0;
     win->ghost_x=target.x;win->ghost_y=target.y;win->ghost_w=target.w;win->ghost_h=target.h;
     wm_commit_resize(win);
 }
@@ -1678,39 +1583,22 @@ volatile bool g_vram_lock = false;
 // =============================================================================
 //  wm_overlay_update_unlocked
 // =============================================================================
-static inline void wm_overlay_update_unlocked(int32_t new_cx, int32_t new_cy, uint8_t mb) {
-    if (!fb || !g_master_backbuffer) return;
-
-    // Erase old cursor from VRAM
-    vram_restore_rect(ov_cx - CURSOR_SPRITE_ORIGIN, ov_cy - CURSOR_SPRITE_ORIGIN,
-                      ov_cx + CURSOR_SPRITE_SIZE-CURSOR_SPRITE_ORIGIN, ov_cy + CURSOR_SPRITE_SIZE-CURSOR_SPRITE_ORIGIN);
-
-    for (int i = 0; i < g_window_count; i++) {
-        Window* win = g_window_list[i];
-        if (!win) continue;
-        
-        int32_t nfx = 0, nfy = 0, nfw = 0, nfh = 0;
-        bool dn = win->ghost_dragging || win->resize_edges;
-        if (dn) wm_get_win_rect_from_pos(win, win->ghost_x, win->ghost_y, &nfx, &nfy, &nfw, &nfh);
-        if(win->resize_edges){nfw=win->ghost_w;nfh=win->ghost_h+(int32_t)g_title_h;}
-        
-        vram_transition_outline(win->last_ghost_fx, win->last_ghost_fy, win->last_ghost_fw, win->last_ghost_fh, win->last_ghost_active,
-                                nfx,     nfy,     nfw,     nfh,     dn);
-                                
-        win->last_ghost_active = dn;
-        if (dn) {
-            win->last_ghost_fx = nfx; win->last_ghost_fy = nfy;
-            win->last_ghost_fw = nfw; win->last_ghost_fh = nfh;
-        }
-    }
-
-    // Draw cursor on top of everything
-    vram_draw_cursor(new_cx, new_cy, mb);
-    ov_cx = new_cx; ov_cy = new_cy;
-
+static inline void wm_overlay_present_unlocked(const OverlayFrame& frame) {
+    if(!fb||!g_master_backbuffer)return;
+    overlay_transition(g_presented_overlay,frame,fb->height,[&](int left,int right,int y){
+        vram_present_span(left,right,y,frame);
+    });
+    // Remember exactly what these writes presented, never re-read live windows
+    // here: input can change them between a scene snapshot and its final blit.
+    g_presented_overlay.cursor=frame.cursor;
+    g_presented_overlay.count=frame.count;
+    for(unsigned i=0;i<frame.count;++i)g_presented_overlay.outlines[i]=frame.outlines[i];
     vram_fence();
 }
-
+static inline void wm_overlay_update_unlocked(int32_t x,int32_t y,uint8_t buttons) {
+    OverlayFrame frame;wm_capture_overlay(&frame,{x,y,wm_cursor_edges(x,y),buttons});
+    wm_overlay_present_unlocked(frame);
+}
 static inline void wm_overlay_update(int32_t new_cx, int32_t new_cy, uint8_t mb) {
     while (__sync_lock_test_and_set(&g_vram_lock, 1)) { __asm__ volatile("pause"); }
     wm_overlay_update_unlocked(new_cx, new_cy, mb);
@@ -1823,7 +1711,7 @@ static uint32_t g_overlay_backup[256];
 // Composes and flips ONE dirty rect. Returns true if it also ran the cursor/ghost-outline overlay.
 // With present=false, prepare the backbuffer only (boot's first desktop frame).
 // When several rects are composed in one frame the caller passes do_overlay=true only for the LAST one:
-// the overlay draws straight onto VRAM, so a later flip would overwrite what an earlier overlay drew.
+// each completed blit presents/tracks its own snapshot; the final call reports completion.
 static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                                      uint32_t min_y, uint32_t max_y, bool do_overlay = true,
                                      bool present = true) {
@@ -2470,6 +2358,7 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
     uint8_t cmb = g_mouse_buttons;
     static uint32_t cursor_save_buf[CURSOR_SPRITE_SIZE * CURSOR_SPRITE_SIZE];
     unsigned cursor_edges=wm_cursor_edges(ccx,ccy);
+    OverlayFrame overlays;wm_capture_overlay(&overlays,{ccx,ccy,cursor_edges,cmb});
     for(int y=0;y<CURSOR_SPRITE_SIZE;++y){
         int sy=ccy+y-CURSOR_SPRITE_ORIGIN;if(sy<0||sy>=(int)fb->height)continue;
         auto* pixels=(uint32_t*)(g_master_backbuffer+(uint64_t)sy*ptch);
@@ -2489,14 +2378,16 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
 
     // GPU path: one blitter copy of the whole dirty rect (synchronous: returns after the
     // fence, so the cursor restore below cannot race the blit). Falls back to the CPU
-    // loop if the hook is unset or the GPU reported a problem.
+    // loop if the hook is unset or the GPU reported a problem. Active outlines
+    // use the CPU span compositor so each blit includes their final pixels.
     bool gpu_done = false;
-    if (g_gpu_flip_hook) gpu_done = g_gpu_flip_hook(min_x_aligned, min_y, max_x_aligned, max_y + 1);
+    if (g_gpu_flip_hook && !overlays.count) gpu_done = g_gpu_flip_hook(min_x_aligned, min_y, max_x_aligned, max_y + 1);
     if (!gpu_done) {
         for (uint32_t y = min_y; y <= max_y; y++) {
             uint8_t* dst = (uint8_t*)fb->address + (uint64_t)y * ptch + (uint64_t)min_x_aligned * 4;
             uint8_t* src = g_master_backbuffer   + (uint64_t)y * ptch + (uint64_t)min_x_aligned * 4;
-            memcpy_vram_sse_headless(dst, src, bw_aligned);
+            if(overlays.count)vram_present_span(min_x_aligned,max_x_aligned,y,overlays);
+            else memcpy_vram_sse_headless(dst, src, bw_aligned);
         }
     }
     __asm__ volatile("sfence" : : : "memory");
@@ -2519,12 +2410,10 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         }
     }
 
-    // Draw ghost outlines to VRAM and update cursor position tracking.
-    // Ghost outlines are direct-VRAM-only (not baked into backbuffer).
-    // NOTE: do NOT set ov_cx/ov_cy here — wm_overlay_update_unlocked needs
-    // the OLD values to erase the previous cursor position from VRAM.
-    if (do_overlay) wm_overlay_update_unlocked(ccx, ccy, cmb);
-
+    // Each dirty blit can introduce a new outline snapshot. Transition and
+    // remember that exact snapshot even when this is not the final dirty rect.
+    // Otherwise a later snapshot can leave fragments of this one untracked.
+    wm_overlay_present_unlocked(overlays);
     __sync_lock_release(&g_vram_lock);
     return do_overlay;
 }

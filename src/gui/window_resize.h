@@ -3,6 +3,16 @@
 #include <stdint.h>
 enum { RESIZE_LEFT=1,RESIZE_RIGHT=2,RESIZE_TOP=4,RESIZE_BOTTOM=8 };
 struct ResizeRect { int32_t x,y,w,h; };
+// Preserve the horizontal grab fraction and the height within the title bar.
+static ResizeRect restore_drag_rect(ResizeRect restored,int maximized_width,int grab_x,int grab_y,int mx,int my,int title,int desktop_width) {
+    int offset=(int64_t)grab_x*restored.w/maximized_width;
+    restored.x=mx-offset;
+    if(restored.x+restored.w>desktop_width)restored.x=desktop_width-restored.w;
+    if(restored.x<0)restored.x=0;
+    restored.y=my-grab_y+title;
+    if(restored.y<title)restored.y=title;
+    return restored;
+}
 static unsigned resize_hit(const ResizeRect& r,int title,int x,int y,int grip=6) {
     if(x<r.x||x>=r.x+r.w||y<r.y-title||y>=r.y+r.h)return 0;
     unsigned edges=0;
