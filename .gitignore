@@ -1,5 +1,6 @@
 .storage-test/
 /build/packages/
+/build/console.elf
 wyzar-usb.img*
 *.tmp
 __pycache__/

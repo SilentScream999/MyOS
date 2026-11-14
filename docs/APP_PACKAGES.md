@@ -54,7 +54,8 @@ wiz: installed Counter 1.0.0
      It now appears in the Start menu.
 ```
 
-Sample packages ship in `/share/samples/` (Counter, Window Test, Bundle Demo).
+Sample packages ship in `/share/samples/` (Counter, Window Test, Bundle Demo and
+File Explorer). Explorer also ships in `/bin/explorer.wiz` and appears in Start.
 `wiz install` verifies the whole package (every header and a CRC-32 covering the
 executable and payload in format v2) before
 touching `/apps`, copies to a temporary name, re-verifies the copy, and only then
@@ -90,6 +91,15 @@ Unknown keys are ignored, so newer packages stay readable on older systems.
 A package with a higher `abi` than the OS provides is **refused by the loader and
 hidden from Start**, rather than starting and crashing.
 
+The current OS supports ABI 3 (independent desktop launches and private console
+sessions). ABI 1 and 2 packages remain supported; File Explorer requires ABI 3.
+
+Use `type=gui` for windowed apps or `type=console` for terminal programs. An
+omitted type defaults to console for legacy compatibility. Start and Explorer
+open console apps in a private terminal; GUI apps open directly. Shell `run`
+keeps console programs in the current terminal and returns immediately for GUI
+packages. Bare `.elf` files default to console when launched from the desktop.
+
 ### Where icons come from
 
 The first match wins:
@@ -110,7 +120,7 @@ Upgrades keep your edits.
 
 ```text
 make counter.wiz          # shortcut; writes build/packages/counter.wiz
-make packages             # all three sample packages in build/packages/
+make packages             # all sample packages in build/packages/
 python3 tools/wiz_pack.py info build/packages/counter.wiz
 ```
 

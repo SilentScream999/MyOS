@@ -24,7 +24,7 @@ from pathlib import Path
 
 FOOTER_SIZE = 40
 FORMAT_VERSION = 2
-ABI = 1
+ABI = 3
 ICON_SIZES = (16, 24, 32, 48, 64, 128, 256, 512)
 MAX_MANIFEST = 4096
 MAX_ICON = 4 * 1024 * 1024
@@ -36,7 +36,7 @@ NAME_CHARS = re.compile(r'^[A-Za-z0-9._/-]+$')
 
 # key -> (max length including NUL, kind)
 MANIFEST_KEYS = {'id': 96, 'name': 64, 'version': 32, 'description': 128,
-                 'icon': 256, 'exec': 256, 'kind': 16, 'source': 256, 'abi': None}
+                 'icon': 256, 'exec': 256, 'kind': 16, 'source': 256, 'type': 16, 'abi': None}
 
 
 class PackError(Exception):
@@ -91,6 +91,8 @@ def parse_manifest(data):
 
 
 def check_package_manifest(values):
+    if 'type' in values and values['type'] not in ('gui', 'console'):
+        raise PackError('type must be gui or console')
     for key in ('id', 'name', 'version', 'abi'):
         if key not in values:
             raise PackError('manifest needs %s=' % key)

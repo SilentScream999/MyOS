@@ -6,7 +6,7 @@ Pending work is in [NEXT_STEPS](NEXT_STEPS.md); commands are in [TESTING](TESTIN
 
 ## Current system
 
-WyzarOS is a single-core x86-64 OS with a C++ kernel, C userspace, Limine boot,
+WyzarOS is a single-core x86-64 OS with a C++ kernel, C/C++ userspace, Limine boot,
 preemptive tasks, static ELF loading and a framebuffer desktop. The long-term
 target is a GPU-composited desktop with installable applications.
 
@@ -15,7 +15,8 @@ target is a GPU-composited desktop with installable applications.
 | Boot | ISO/UEFI USB; framebuffer mapped before drawing; RAM recovery | [Storage](PERSISTENT_STORAGE.md) |
 | Processes | Private kernel stacks/address spaces, spawn, exact-child wait, foreground cancellation | [Apps](APP_LOADING.md) |
 | Desktop | Surface-backed windows, damage tracking, taskbar, Start, CPU presentation | [Display roadmap](GPU_DESKTOP_ROADMAP.md) |
-| App resources | `/apps` manifests plus `/bin` discovery; `.wiz` and `.elf` use ELF contents | [Apps](APP_LOADING.md) |
+| App resources | Portable `.wiz` packages, verified install/pin/remove, metadata/icons, `/apps` and `/bin` discovery | [Packages](APP_PACKAGES.md) |
+| File Explorer | Native userspace browser, file operations, text previews and app launching | [Explorer](EXPLORER.md) |
 | Images | PNG/JPEG wallpapers; lazy PNG icons, alpha, themes and bounded caching | [Images](IMAGES.md) |
 | Fonts | Runtime TTF selection with built-in fallback; printable ASCII UI | [Fonts](FONTS.md) |
 | Storage | Journaled ext4 USB root, persistent apps/settings/files, atomic saves, automatic capacity setup | [ext4](EXT4.md) |

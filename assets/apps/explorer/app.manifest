@@ -1,0 +1,7 @@
+id=explorer
+name=File Explorer
+version=1.0.0
+abi=3
+type=gui
+icon=explorer
+description=Browse folders, manage files, preview text and launch or install Wyzar apps.

@@ -43,7 +43,7 @@ typedef unsigned long long wiz_u64;
 
 #define WIZ_FOOTER_SIZE    40u
 #define WIZ_FORMAT_VERSION 2u
-#define WIZ_ABI            1u          // syscall/window ABI this OS provides
+#define WIZ_ABI            3u          // ABI 3 adds desktop launch and private console sessions
 #define WIZ_MAX_MANIFEST   4096u
 #define WIZ_MAX_ICON       (4u * 1024u * 1024u)
 #define WIZ_MAX_ENTRIES    512u
@@ -319,9 +319,10 @@ static inline unsigned wiz_icon_mask(const wiz_package* pkg) {
 #define WIZ_KEY_ABI         0x40u
 #define WIZ_KEY_KIND        0x80u
 #define WIZ_KEY_SOURCE      0x100u
+#define WIZ_KEY_TYPE        0x200u
 
 typedef struct {
-    char id[96], name[64], version[32], description[128], icon[256], exec[256], kind[16], source[256];
+    char id[96], name[64], version[32], description[128], icon[256], exec[256], kind[16], source[256], type[16];
     wiz_u32 abi;
     wiz_u32 seen;   // WIZ_KEY_* bits that were present
 } wiz_manifest;
@@ -367,6 +368,7 @@ static inline int wiz_manifest_parse(const wiz_u8* data, wiz_u64 size, wiz_manif
         else if (wiz_str_equal(key, "description")) { bit = WIZ_KEY_DESCRIPTION; target = m.description; capacity = sizeof(m.description); }
         else if (wiz_str_equal(key, "kind"))        { bit = WIZ_KEY_KIND;        target = m.kind;        capacity = sizeof(m.kind); }
         else if (wiz_str_equal(key, "source"))      { bit = WIZ_KEY_SOURCE;      target = m.source;      capacity = sizeof(m.source); }
+        else if (wiz_str_equal(key, "type"))        { bit = WIZ_KEY_TYPE;        target = m.type;        capacity = sizeof(m.type); }
         else if (wiz_str_equal(key, "abi"))         { bit = WIZ_KEY_ABI; }
         else continue;                                   // future metadata is not an error
         if ((m.seen & bit) || !*value) return WIZ_E_MANIFEST;
@@ -403,6 +405,7 @@ static inline int wiz_manifest_check_package(const wiz_manifest* m) {
     if ((m->seen & required) != required) return WIZ_E_MANIFEST;
     if (!wiz_identifier(m->id) || wiz_str_len(m->id) > 64) return WIZ_E_MANIFEST;
     if ((m->seen & WIZ_KEY_ICON) && !wiz_identifier(m->icon)) return WIZ_E_MANIFEST;
+    if ((m->seen & WIZ_KEY_TYPE) && !wiz_str_equal(m->type,"gui") && !wiz_str_equal(m->type,"console")) return WIZ_E_MANIFEST;
     if (m->abi == 0) return WIZ_E_MANIFEST;
     if (m->abi > WIZ_ABI) return WIZ_E_ABI;
     return 0;

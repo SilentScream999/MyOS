@@ -1,5 +1,5 @@
 // Host test for user/wizlib.h with the syscalls faked over a sandbox directory.
-//   wizlib_host ROOT PACKAGE_PATH PLAIN_ELF_PATH ABI2_PACKAGE_PATH
+//   wizlib_host ROOT PACKAGE_PATH PLAIN_ELF_PATH FUTURE_ABI_PACKAGE_PATH
 #define _GNU_SOURCE
 #include <assert.h>
 #include <fcntl.h>

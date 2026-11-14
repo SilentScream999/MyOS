@@ -89,7 +89,8 @@ static void test_manifest_parser() {
     assert(!std::strcmp(m.id, "a.b") && !std::strcmp(m.name, "Two Words") && m.abi == 1);
     assert(m.seen == (WIZ_KEY_ID | WIZ_KEY_NAME | WIZ_KEY_VERSION | WIZ_KEY_ABI));
     assert(wiz_manifest_check_package(&m) == 0);
-    m.abi = 2; assert(wiz_manifest_check_package(&m) == WIZ_E_ABI);
+    m.abi = WIZ_ABI; assert(wiz_manifest_check_package(&m) == 0);
+    m.abi = WIZ_ABI + 1; assert(wiz_manifest_check_package(&m) == WIZ_E_ABI);
     wiz_manifest sentinel; std::memset(&sentinel, 0x5a, sizeof(sentinel));
     std::vector<std::string> bad = {
         "id=a\nid=b", "id", "id=", "name=\x01", "name=caf\xc3\xa9", "abi=12345", "abi=1x", "abi=",
@@ -103,6 +104,9 @@ static void test_manifest_parser() {
     assert(wiz_manifest_parse(nullptr, 5, &m) != 0 && wiz_manifest_parse((const uint8_t*)"x", 0, &m) != 0);
     std::string big(WIZ_MAX_MANIFEST + 1, '#'); assert(parse(big, &m) != 0);
     // Package manifests need all four required keys and a sane id/icon.
+    assert(parse("id=a\nname=A\nversion=1\nabi=1\ntype=gui\n", &m) == 0 && wiz_manifest_check_package(&m) == 0);
+    assert(parse("id=a\nname=A\nversion=1\nabi=1\ntype=console\n", &m) == 0 && wiz_manifest_check_package(&m) == 0);
+    assert(parse("id=a\nname=A\nversion=1\nabi=1\ntype=invalid\n", &m) == 0 && wiz_manifest_check_package(&m) == WIZ_E_MANIFEST);
     assert(parse("id=a\nname=A\nabi=1\n", &m) == 0 && wiz_manifest_check_package(&m) == WIZ_E_MANIFEST);
     assert(parse("id=a b\nname=A\nversion=1\nabi=1\n", &m) == 0 && wiz_manifest_check_package(&m) == WIZ_E_MANIFEST);
     assert(parse("id=a\nname=A\nversion=1\nabi=1\nicon=../x\n", &m) == 0 && wiz_manifest_check_package(&m) == WIZ_E_MANIFEST);
@@ -136,7 +140,7 @@ static void test_format() {
     const Case cases[] = {
         {"legacy.wiz",          0, 4, 0},
         {"no-manifest.wiz",     0, 1, WIZ_E_MANIFEST},
-        {"abi2.wiz",            0, 1, 0},
+        {"future-abi.wiz",      0, 1, 0},
         {"future-format.wiz",   WIZ_E_VERSION, 0, 0},
         {"dotdot.wiz",          0, WIZ_E_UNSAFE, 0},
         {"absolute.wiz",        0, WIZ_E_UNSAFE, 0},
@@ -159,7 +163,7 @@ static void test_format() {
         }
         std::printf(" ok\n");
     }
-    { Bytes d = load("abi2.wiz"); open_mem(&pkg, &mem, d); assert(wiz_read_manifest(&pkg, &m) == 0);
+    { Bytes d = load("future-abi.wiz"); open_mem(&pkg, &mem, d); assert(wiz_read_manifest(&pkg, &m) == 0);
       assert(wiz_manifest_check_package(&m) == WIZ_E_ABI); }
     { Bytes d = load("bad-id.wiz"); open_mem(&pkg, &mem, d); assert(wiz_read_manifest(&pkg, &m) == 0);
       assert(wiz_manifest_check_package(&m) == WIZ_E_MANIFEST); }
@@ -346,7 +350,7 @@ static void test_desktop() {
     resources::release(catalog);
 
     // A package that needs a newer WyzarOS ABI is hidden everywhere (never shown as a plain program).
-    files["/bin/future.wiz"] = load("abi2.wiz"); directories["/bin"].push_back({"future.wiz", false});
+    files["/bin/future.wiz"] = load("future-abi.wiz"); directories["/bin"].push_back({"future.wiz", false});
     text("/apps/futurist/app.manifest", "exec=/bin/future.wiz\n"); directories["/apps"].push_back({"futurist", true});
     catalog = resources::build(store, 24, 16, 24);
     assert(!find(catalog, "/bin/future.wiz"));

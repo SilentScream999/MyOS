@@ -61,6 +61,8 @@ options; header dependencies are tracked automatically.
   user-window surfaces/events. Both extensions currently contain WyzarOS ELFs.
 - Surface-backed desktop windows, damage tracking, taskbar, Start menu and
   CPU/SSE presentation. Terminal and compositor demos remain built-in fixtures.
+- Native File Explorer: folder navigation, file management, text previews and
+  double-click app launching. Open it from Start or `run /bin/explorer.wiz`.
 - App manifests and runtime PNG icons with CPU alpha blending, theme fallback
   and demand-driven caching; PNG/JPEG wallpapers and runtime TTF fonts.
 - Journaled ext4 root on USB, persistent apps/settings/files, atomic replacement,
@@ -84,6 +86,7 @@ console app; `run /bin/win_test.elf` demonstrates mapped GUI surfaces.
 | [ext4 internals](docs/EXT4.md) | Supported profile, capacity setup and write/recovery semantics |
 | [Applications](docs/APP_LOADING.md) | `.wiz`/`.elf`, manifests, launch and process lifecycle |
 | [App packages](docs/APP_PACKAGES.md) | Self-contained `.wiz` apps: icons, metadata, portable vs installed, `wiz` command |
+| [File Explorer](docs/EXPLORER.md) | Native file browser, file operations, previews and app launching |
 | [Images/icons](docs/IMAGES.md) | Runtime resources, formats, themes, caching and memory lifetime |
 | [Fonts](docs/FONTS.md) | Runtime TTF selection and limits |
 | [USB/input](docs/USB_INPUT.md) | HID, hubs, reset/probe rules and hardware caveats |

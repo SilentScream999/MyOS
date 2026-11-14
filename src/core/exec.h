@@ -176,4 +176,31 @@ static Task* execve_path(const char* path) {
     return t;
 }
 
+// Packages declare their subsystem; legacy executables default to console.
+static bool exec_is_gui(const char* path) {
+    file f{};if(vfs_open(path,0,&f)!=0)return false;
+    wiz_package pkg;bool gui=false;
+    if(wiz_open(&pkg,exec_wiz_read,&f,f.vn->size)==0){
+        auto* m=(wiz_manifest*)kmalloc(sizeof(wiz_manifest));auto* scratch=(wiz_u8*)kmalloc(WIZ_MAX_MANIFEST);
+        if(m&&scratch&&wiz_read_manifest_with(&pkg,m,scratch)==0&&wiz_manifest_check_package(m)==0)
+            gui=(m->seen&WIZ_KEY_TYPE)&&wiz_str_equal(m->type,"gui");
+        kfree(m);kfree(scratch);
+    }
+    vfs_close(&f);return gui;
+}
+static int64_t launch_program(const char* path,bool desktop,bool* gui) {
+    if(app_path_is_shell(path))return -1;
+    *gui=exec_is_gui(path);bool host=desktop&&!*gui;
+    Task* t=execve_path(host?"/share/system/console.elf":path);if(!t)return -1;
+    t->parent_pid=(desktop||*gui)?0:g_current_task?g_current_task->pid:0;
+    if(g_current_task)strcpy(t->cwd,g_current_task->cwd);
+    t->gui_app=desktop||*gui;
+    if(host){
+        auto* c=(AppConsole*)kmalloc(sizeof(AppConsole));if(!c){task_free(t);return -1;}
+        memset(c,0,sizeof(*c));c->refs=1;c->echo=true;t->console=c;t->console_host=true;
+        strcpy(t->launch_target,path);
+    }
+    if(!desktop&&!*gui&&t->parent_pid==g_terminal_shell_pid)g_terminal_foreground_pid=t->pid;
+    scheduler_add_task(t);return t->pid;
+}
 #endif // exec_h

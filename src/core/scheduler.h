@@ -61,6 +61,7 @@ static uint32_t g_tick_counter    = 0;         // added back for time-slice trac
 static pid_t g_terminal_shell_pid = 0;
 static pid_t g_terminal_foreground_pid = 0;
 static void (*g_task_exit_hook)(pid_t) = nullptr;
+static void (*g_stdio_exit_hook)(Task*) = nullptr;
 
 // Mark only user processes for interruption. Do not free resources from a key
 // IRQ or abandon a suspended kernel operation; cancellation happens at a safe
@@ -339,7 +340,7 @@ static void task_sleep_ms(uint64_t ms) {
 
 // Wait for one child, retaining completed children until status is collected.
 
-static int64_t task_wait_child(pid_t pid, uint64_t* exit_code) {
+static int64_t task_wait_child(pid_t pid, uint64_t* exit_code, bool nonblocking = false) {
     if (!g_current_task || !pid || pid == g_current_task->pid) return -1;
     uint64_t flags;
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
@@ -367,6 +368,10 @@ static int64_t task_wait_child(pid_t pid, uint64_t* exit_code) {
             __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
             return pid;
         }
+        if (nonblocking) {
+            __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
+            return 0; // A matching child exists but has not exited yet.
+        }
         // Interrupts remain disabled between testing exit and blocking, so an
         // exit cannot race the waiter into sleeping after its wakeup was sent.
         parent->wait_pid = pid;
@@ -381,6 +386,7 @@ static int64_t task_wait_child(pid_t pid, uint64_t* exit_code) {
 static void task_complete(Task* exiting, uint64_t code) {
     if (exiting && exiting->state != TaskState::DEAD) {
         if (g_task_exit_hook) g_task_exit_hook(exiting->pid);
+        if (g_stdio_exit_hook) g_stdio_exit_hook(exiting);
         if (g_terminal_foreground_pid == exiting->pid) g_terminal_foreground_pid = 0;
         exiting->exit_code = code;
         // Release descriptors now, even if the parent has not waited yet.

@@ -3,5 +3,6 @@ id=counter
 name=Counter
 version=1.0.0
 abi=1
+type=console
 description=Counts to five in the terminal, then exits.
 icon=counter

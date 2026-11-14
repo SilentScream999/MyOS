@@ -98,7 +98,7 @@ init.elf: user/init.o
 WIZ_ASSETS = tools/wiz_pack.py $(wildcard assets/apps/*/app.manifest) $(wildcard assets/apps/*/data/*) \
              $(wildcard assets/icons/hicolor/*/apps/*.png)
 PACKAGE_DIR := build/packages
-PACKAGES := $(addprefix $(PACKAGE_DIR)/,counter.wiz win_test.wiz bundle_demo.wiz)
+PACKAGES := $(addprefix $(PACKAGE_DIR)/,counter.wiz win_test.wiz bundle_demo.wiz explorer.wiz)
 $(PACKAGE_DIR)/%.wiz: %.elf $(WIZ_ASSETS)
 	mkdir -p $(@D)
 	$(if $(wildcard assets/apps/$*/app.manifest),python3 tools/wiz_pack.py pack --elf $< --manifest assets/apps/$*/app.manifest --icons assets/icons/hicolor $(if $(wildcard assets/apps/$*/data),--data assets/apps/$*/data,) -o $@,cp $< $@)
@@ -113,6 +113,18 @@ $(notdir $(PACKAGES)): %.wiz: $(PACKAGE_DIR)/%.wiz
 test-wiz:
 	python3 tests/run_wiz_tests.py
 .PHONY: test-wiz
+
+test-explorer:
+	python3 tests/run_explorer_tests.py
+.PHONY: test-explorer
+
+test-console:
+	mkdir -p .storage-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/console_session_test.cpp -o .storage-test/console-session-test
+	.storage-test/console-session-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/tty_idle_test.cpp -o .storage-test/tty-idle-test
+	.storage-test/tty-idle-test
+.PHONY: test-console
 
 user/counter.o: user/counter.c
 	$(CC) $(USER_CFLAGS) -I. -c $< -o $@
@@ -129,10 +141,23 @@ user/bundle_demo.o: user/bundle_demo.c user/wizlib.h src/core/wiz.h
 bundle_demo.elf: user/bundle_demo.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
+user/explorer.o: user/explorer.cpp user/native_ui.h user/wiz_cmd.h src/core/wiz.h src/core/app.h src/gui/ui_font.h src/gui/ui_font_data.h
+	$(CXX) $(USER_CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -I. -c $< -o $@
+
+explorer.elf: user/explorer.o
+	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
+
+user/console.o: user/console.cpp user/native_ui.h src/gui/font8x8_basic.h
+	$(CXX) $(USER_CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -I. -c $< -o $@
+
+build/console.elf: user/console.o
+	mkdir -p build
+	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
+
 win_test.elf: user/win_test.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
-initrd.tar: init.elf counter.elf win_test.elf $(PACKAGES) assets/fonts/selawik/LICENSE.txt assets/fonts/selawik/selawk.ttf $(wildcard assets/icons/hicolor/*/apps/*.png) third_party/stb/LICENSE Makefile
+initrd.tar: init.elf counter.elf win_test.elf build/console.elf $(PACKAGES) assets/fonts/selawik/LICENSE.txt assets/fonts/selawik/selawk.ttf $(wildcard assets/icons/hicolor/*/apps/*.png) third_party/stb/LICENSE Makefile
 	rm -rf initrd_root
 	mkdir -p initrd_root/bin
 	cp init.elf initrd_root/bin/
@@ -140,6 +165,9 @@ initrd.tar: init.elf counter.elf win_test.elf $(PACKAGES) assets/fonts/selawik/L
 	cp win_test.elf initrd_root/bin/
 	mkdir -p initrd_root/share/samples
 	cp $(PACKAGES) initrd_root/share/samples/
+	cp $(PACKAGE_DIR)/explorer.wiz initrd_root/bin/
+	mkdir -p initrd_root/share/system
+	cp build/console.elf initrd_root/share/system/
 	mkdir -p initrd_root/share/fonts
 	cp assets/fonts/selawik/LICENSE.txt initrd_root/share/fonts/selawik.txt
 	cp assets/fonts/selawik/selawk.ttf initrd_root/share/fonts/selawk.ttf
@@ -207,7 +235,7 @@ run: iso
 
 
 clean:
-	rm -rf iso_root initrd_root $(PACKAGE_DIR) $(OBJ) $(OBJ:.o=.d) $(EXT4_OBJ) $(EXT4_OBJ:.o=.d) user/init.o user/counter.o user/win_test.o user/bundle_demo.o wyzar wyzar.iso myos myos.iso init.elf counter.elf win_test.elf bundle_demo.elf counter.wiz win_test.wiz bundle_demo.wiz initrd.tar
+	rm -rf iso_root initrd_root $(PACKAGE_DIR) build/console.elf $(OBJ) $(OBJ:.o=.d) $(EXT4_OBJ) $(EXT4_OBJ:.o=.d) user/init.o user/counter.o user/win_test.o user/bundle_demo.o user/explorer.o user/console.o wyzar wyzar.iso myos myos.iso init.elf counter.elf win_test.elf bundle_demo.elf explorer.elf counter.wiz win_test.wiz bundle_demo.wiz initrd.tar
 
 # Refresh boot files and bundled system apps, preserving user files/settings.
 usb-image: all

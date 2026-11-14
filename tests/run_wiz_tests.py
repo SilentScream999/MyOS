@@ -122,7 +122,7 @@ def python_tests(tmp, alpha, blue):
                        ('dot-id', b'id=..\nname=A\nversion=1\nabi=1\n'),
                        ('missing-version', b'id=a\nname=A\nabi=1\n'),
                        ('abi-zero', b'id=a\nname=A\nversion=1\nabi=0\n'),
-                       ('abi-future', b'id=a\nname=A\nversion=1\nabi=2\n'),
+                       ('abi-future', ('id=a\nname=A\nversion=1\nabi=%d\n' % (wp.ABI+1)).encode()),
                        ('abi-text', b'id=a\nname=A\nversion=1\nabi=x\n'),
                        ('duplicate', b'id=a\nid=b\nname=A\nversion=1\nabi=1\n'),
                        ('empty-value', b'id=a\nname=\nversion=1\nabi=1\n'),
@@ -130,7 +130,8 @@ def python_tests(tmp, alpha, blue):
                        ('control-char', b'id=a\nname=A\x01\nversion=1\nabi=1\n'),
                        ('non-ascii', 'id=a\nname=\u00e9\nversion=1\nabi=1\n'.encode()),
                        ('long-name', b'id=a\nname=' + b'n' * 64 + b'\nversion=1\nabi=1\n'),
-                       ('bad-icon-name', b'id=a\nname=A\nversion=1\nabi=1\nicon=../up\n')):
+                       ('bad-icon-name', b'id=a\nname=A\nversion=1\nabi=1\nicon=../up\n'),
+                       ('bad-type', b'id=a\nname=A\nversion=1\nabi=1\ntype=invalid\n')):
         path = tmp / (name + '.manifest')
         path.write_bytes(text)
         expect_error(name, lambda path=path: run(manifest_path=path))
@@ -322,7 +323,7 @@ def wizlib_tests(tmp):
             ('data/big.bin', bytes((i * 7) & 255 for i in range(5000)))]
     (root / 'mnt/usb/demo.wiz').write_bytes(wp.assemble(elf, data))
     (root / 'mnt/usb/plain.wiz').write_bytes(elf)
-    (root / 'mnt/usb/future.wiz').write_bytes(wp.assemble(elf, [('app.manifest', b'id=f\nname=F\nversion=1\nabi=2\n')]))
+    (root / 'mnt/usb/future.wiz').write_bytes(wp.assemble(elf, [('app.manifest', ('id=f\nname=F\nversion=1\nabi=%d\n' % (wp.ABI+1)).encode())]))
     run = subprocess.run([str(binary), str(root), '/mnt/usb/demo.wiz', '/mnt/usb/plain.wiz', '/mnt/usb/future.wiz'],
                          capture_output=True, text=True)
     assert run.returncode == 0 and 'wizlib host test passed' in run.stdout, run.stdout + run.stderr
@@ -348,7 +349,7 @@ def write_fixtures(alpha, blue):
 
     good_manifest = ('app.manifest', GOOD_MANIFEST, '0')
     variant('no-manifest.wiz', [('icons/16.png', alpha, '0')])
-    variant('abi2.wiz', [('app.manifest', b'id=x\nname=X\nversion=1\nabi=2\n', '0')])
+    variant('future-abi.wiz', [('app.manifest', ('id=x\nname=X\nversion=1\nabi=%d\n' % (wp.ABI+1)).encode(), '0')])
     variant('future-format.wiz', [good_manifest], version=wp.FORMAT_VERSION + 1)
     variant('dotdot.wiz', [good_manifest, ('../evil', b'x', '0')])
     variant('absolute.wiz', [good_manifest, ('/etc/passwd', b'x', '0')])

@@ -40,6 +40,27 @@ static void process_exit_ui(pid_t pid) {
     }
 }
 
+static char desktop_launch_paths[8][256];
+static unsigned desktop_launch_head=0,desktop_launch_tail=0;
+static Task* desktop_launcher_task=nullptr;
+static bool desktop_queue_launch(const char* path) {
+    TtyIrqGuard guard;unsigned next=(desktop_launch_head+1)%8;
+    if(next==desktop_launch_tail||!path||strlen(path)>=256)return false;
+    strcpy(desktop_launch_paths[desktop_launch_head],path);desktop_launch_head=next;
+    if(desktop_launcher_task&&desktop_launcher_task->state==TaskState::BLOCKED)desktop_launcher_task->state=TaskState::READY;
+    return true;
+}
+static void desktop_launch_worker() {
+    for(;;){char path[256];
+        {TtyIrqGuard guard;
+            while(desktop_launch_head==desktop_launch_tail){g_current_task->state=TaskState::BLOCKED;g_current_task->wake_at_tick=0;
+                schedule();if(g_current_task->state==TaskState::BLOCKED)scheduler_idle_halt();}
+            strcpy(path,desktop_launch_paths[desktop_launch_tail]);desktop_launch_tail=(desktop_launch_tail+1)%8;
+        }
+        bool gui=false;if(launch_program(path,true,&gui)<0)print((char*)"[launcher] App launch failed.");
+    }
+}
+
 __attribute__((used, section(".limine_requests")))
 static volatile LIMINE_BASE_REVISION(4);
 
@@ -421,10 +442,8 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
                 wm_menu_close();
             } else if (menu_hit >= 0) {
                 // Launch the selected app (installed, pinned, or found in /bin or /home/Applications)
-                if (tty_queue_launch(g_resources_catalog->apps[menu_hit].app.exec)) {
-                    for (int i = 0; i < g_window_count; ++i)
-                        if (g_window_list[i] == g_win_terminal) { wm_raise_window(i); break; }
-                } else print((char*)"[launcher] Terminal busy; finish or interrupt its foreground program first.");
+                if (!desktop_queue_launch(g_resources_catalog->apps[menu_hit].app.exec))
+                    print((char*)"[launcher] Launch queue is full.");
                 wm_menu_close();
             } else if (g_menu_open) {
                 // Clicked header/padding or outside the panel: just dismiss it
@@ -853,6 +872,7 @@ extern "C" void kmain(void) {
 #endif
     wm_init();     // Initialize window manager and UI scaling first
     g_task_exit_hook = process_exit_ui;
+    g_stdio_exit_hook = console_release;
     wm_log_init(); // Then initialize the log buffer with the correct scaled dimensions
 #if BOOT_DIAGNOSTICS
     char ui_elapsed[32];
@@ -1070,6 +1090,8 @@ extern "C" void kmain(void) {
         g_resources_requested=false;
         wm_resources_reload();
         scheduler_add_task(task_create(wm_resource_worker,16));
+        desktop_launcher_task=task_create(desktop_launch_worker,16);
+        scheduler_add_task(desktop_launcher_task);
         if (!g_wallpaper) {
 #if BOOT_DIAGNOSTICS
             uint64_t fallback_started = rdtsc();

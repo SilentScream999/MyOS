@@ -62,6 +62,7 @@
 #include "tty.h"
 #include "acpi.h"
 #include "wm.h"
+#include "app_console.h"
 
 // ── MSR addresses ─────────────────────────────────────────────────────────────
 
@@ -116,6 +117,9 @@ static inline uint64_t rdmsr(uint32_t msr) {
 #define SYS_GETCWD  79u
 #define SYS_EXEPATH 210u   // path of the calling program (like /proc/self/exe)
 #define SYS_EXCHANGE 211u  // atomically swap two closed files in one directory
+#define SYS_TRYWAIT 212u   // nonblocking wait for one child; 0 means still running
+#define SYS_LAUNCH 213u    // subsystem-aware launch; desktop origin=1, shell origin=0
+#define SYS_CONSOLE 214u   // private console-host channel
 #define SYS_CHDIR   80u
 #define SYS_MKDIR   83u
 #define SYS_RMDIR   84u
@@ -222,6 +226,9 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf_va, uint64_t len) {
     if (len == 0) return 0;
     
     if (fd == 0) { // stdin
+        if(g_current_task->console){if(!buf_va||buf_va>=USERSPACE_END||len>USERSPACE_END-buf_va)return (uint64_t)-1;
+            return console_read((AppConsole*)g_current_task->console,(char*)buf_va,len);}
+        if(g_current_task->gui_app)return 0;
         if (g_current_task->pid==g_terminal_shell_pid) g_terminal_shell_ready=true;
         char tmp[128];
         size_t to_read = len > 128 ? 128 : len;
@@ -248,6 +255,11 @@ static uint64_t sys_write(uint64_t fd, uint64_t buf_va, uint64_t len) {
     if (len == 0) return 0;
     
     if (fd == 1 || fd == 2) {
+        if(g_current_task->console){
+            if(!buf_va||buf_va>=USERSPACE_END||len>USERSPACE_END-buf_va)return (uint64_t)-1;
+            console_output((AppConsole*)g_current_task->console,(const char*)buf_va,len);return len;
+        }
+        if(g_current_task->gui_app)return len;
         char* tmp = (char*)kmalloc(len + 1);
         if (!tmp) return (uint64_t)-1;
         
@@ -309,11 +321,14 @@ static uint64_t sys_shutdown() {
 }
 
 static uint64_t sys_scroll(int64_t delta) {
+    if(g_current_task&&(g_current_task->console||g_current_task->gui_app))return 0;
     term_scroll_view(delta);
     return 0;
 }
 
 static uint64_t sys_ttyraw(uint64_t raw) {
+    if(g_current_task&&g_current_task->console){((AppConsole*)g_current_task->console)->raw=raw!=0;return 0;}
+    if(g_current_task&&g_current_task->gui_app)return 0;
     tty_set_raw(raw != 0);
     return 0;
 }
@@ -414,6 +429,7 @@ static uint64_t sys_readdir(uint64_t path_va, uint64_t index, uint64_t name_out_
 }
 
 static Task* execve_path(const char* path);
+static int64_t launch_program(const char* path,bool desktop,bool* gui);
 
 static uint64_t sys_unlink(uint64_t path_va) {
     char path[256];
@@ -518,6 +534,9 @@ static uint64_t sys_spawn(uint64_t path_va) {
     t->parent_pid = g_current_task ? g_current_task->pid : 0;
     if (g_current_task) {
         strcpy(t->cwd, g_current_task->cwd);
+        {TtyIrqGuard guard;t->gui_app=g_current_task->gui_app;
+            t->console=g_current_task->console;
+            if(t->console){auto* c=(AppConsole*)t->console;++c->refs;if(g_current_task->console_host)c->foreground=t->pid;t->gui_app=false;}}
     }
     if (t->parent_pid == g_terminal_shell_pid) g_terminal_foreground_pid = t->pid;
     scheduler_add_task(t);
@@ -574,19 +593,31 @@ static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uin
         case SYS_UNLINK: return sys_unlink(a1);
         case SYS_SCROLL: return sys_scroll((int64_t)a1);
         case SYS_TTYRAW: return sys_ttyraw(a1);
-        case SYS_TTYECHO: return tty_set_echo(a1 != 0) ? 1 : 0;
-        case SYS_TTYFLUSH_INPUT: tty_discard_input(); return 0;
+        case SYS_TTYECHO:
+            if(g_current_task&&g_current_task->console){auto* c=(AppConsole*)g_current_task->console;bool old=c->echo;c->echo=a1!=0;return old;}
+            return g_current_task&&g_current_task->gui_app?0:tty_set_echo(a1 != 0) ? 1 : 0;
+        case SYS_TTYFLUSH_INPUT:
+            if(g_current_task&&g_current_task->console){auto* c=(AppConsole*)g_current_task->console;TtyIrqGuard guard;c->input_tail=c->input_head;c->line_len=0;}
+            else if(!g_current_task||!g_current_task->gui_app)tty_discard_input();return 0;
         case SYS_TTYTAKE_LAUNCH: return sys_take_launch(a1, a2);
         case SYS_SLEEP:  return sys_sleep(a1);
         case SYS_GETPID: return sys_getpid();
         case SYS_READDIR: return sys_readdir(a1, a2, a3, a4, a5);
         case SYS_SPAWN:   return sys_spawn(a1);
+        case SYS_LAUNCH: {
+            char path[256];if(a2>1||!get_user_path(a1,path,sizeof(path))||
+                (a3&&(a3>=USERSPACE_END||sizeof(uint64_t)>USERSPACE_END-a3)))return (uint64_t)-1;
+            bool gui=false;int64_t pid=launch_program(path,a2==1,&gui);
+            if(pid>0&&a3)*(uint64_t*)a3=gui?1:0;return pid;
+        }
+        case SYS_CONSOLE:return sys_console(a1,a2,a3);
         case SYS_EXIT:   sys_exit(a1);
+        case SYS_TRYWAIT:
         case SYS_WAITPID: {
             if (a1 > 0xffffffffULL || (a2 && (a2 >= USERSPACE_END || sizeof(uint64_t) > USERSPACE_END - a2))) return (uint64_t)-1;
             uint64_t code = 0;
-            int64_t pid = task_wait_child((pid_t)a1, &code);
-            if (pid >= 0 && a2) *(uint64_t*)a2 = code;
+            int64_t pid = task_wait_child((pid_t)a1, &code, nr == SYS_TRYWAIT);
+            if (pid > 0 && a2) *(uint64_t*)a2 = code;
             return (uint64_t)pid;
         }
         case SYS_GETCWD: return sys_getcwd(a1, a2);

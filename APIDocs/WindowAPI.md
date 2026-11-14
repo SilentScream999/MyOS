@@ -3,10 +3,11 @@
 Updated 2026-11-11. Mapped user surfaces, owner tracking, input events and exit
 cleanup are implemented. The remaining authorization/mapping limitations apply.
 
-The built `win_test.elf` exercises this API from ring 3. Terminal and Start-menu
-launches share a foreground session; Ctrl+C cancels the program even with its GUI
-focused, closes its windows and restores terminal focus/prompt. These paths were
-verified in QEMU. See [the handoff](../docs/AI_HANDOFF.md) for verification scope.
+The built `win_test.elf` exercises this API from ring 3. GUI packages declare
+`type=gui` and launch independently of the shell; console apps launched from the
+desktop get private terminal windows. Ctrl+C is routed by focus: terminal windows
+interrupt their own program, while GUI apps receive the chord as an input event.
+See [applications](../docs/APP_LOADING.md) for launch and process lifecycle.
 
 ## Calling convention
 

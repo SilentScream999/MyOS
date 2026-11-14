@@ -8,6 +8,7 @@ from pathlib import Path
 import math
 import struct
 import zlib
+import argparse
 
 ROOT = Path(__file__).resolve().parents[1] / 'assets/icons/hicolor'
 
@@ -30,13 +31,16 @@ def distance(x, y, line):
 def icon(name, size):
     colors = {'terminal': (59, 116, 195), 'application-default': (81, 116, 198),
               'visual-test': (39, 153, 151), 'rainbow': (143, 89, 191),
-              'boot-log': (76, 132, 159), 'counter': (194, 126, 47), 'win_test': (39, 153, 151)}
+              'boot-log': (76, 132, 159), 'counter': (194, 126, 47), 'win_test': (39, 153, 151),
+              'explorer': (91, 67, 132)}
     lines = {
         'terminal': [(19, 23, 28, 31), (28, 31, 19, 39), (34, 40, 45, 40)],
         'boot-log': [(22, 21, 42, 21), (22, 29, 42, 29), (22, 37, 42, 37), (22, 45, 34, 45)],
         'counter': [(23, 21, 23, 43), (32, 21, 32, 43), (20, 28, 44, 28), (20, 36, 44, 36)],
         'application-default': [(20, 21, 44, 21), (20, 21, 20, 43), (44, 21, 44, 43),
                                 (20, 43, 44, 43), (20, 27, 44, 27)],
+        'explorer': [(19, 25, 27, 25), (27, 25, 30, 29), (30, 29, 45, 29),
+                     (19, 25, 19, 43), (19, 43, 45, 43), (45, 29, 45, 43)],
     }
     pixels = bytearray()
     for py in range(size):
@@ -50,7 +54,18 @@ def icon(name, size):
                     if dx*dx+dy*dy > 9*9:
                         continue
                     color = colors[name]
-                    if name in ('visual-test', 'win_test'):
+                    if name == 'explorer':
+                        white = False
+                        # A connected, sloping tab above the front panel.
+                        if 19 <= x <= 45 and 24 <= y <= 43:
+                            color = (204, 156, 77)
+                        if 19 <= x <= 31 and 20 <= y < 26 and y >= 20 + max(0, x-27):
+                            color = (227, 181, 100)
+                        if 18 <= x <= 46 and 28 <= y <= 44:
+                            color = (239, 194, 117)
+                        if 19 <= x <= 45 and 28 <= y < 30:
+                            color = (255, 220, 153)
+                    elif name in ('visual-test', 'win_test'):
                         white = 19 <= x <= 45 and 19 <= y <= 45 and (int((x-19)/13)+int((y-19)/13)) % 2 == 0
                     elif name == 'rainbow':
                         white = False
@@ -70,10 +85,14 @@ def icon(name, size):
 
 
 def main():
+    names = ('terminal', 'application-default', 'visual-test', 'rainbow', 'boot-log', 'counter', 'win_test', 'explorer')
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--only', choices=names, help='Regenerate one icon family')
+    args = parser.parse_args()
     for size in (16, 24, 32, 48, 64, 128, 256):
         folder = ROOT / f'{size}x{size}/apps'
         folder.mkdir(parents=True, exist_ok=True)
-        for name in ('terminal', 'application-default', 'visual-test', 'rainbow', 'boot-log', 'counter', 'win_test'):
+        for name in ((args.only,) if args.only else names):
             (folder / f'{name}.png').write_bytes(icon(name, size))
 
 

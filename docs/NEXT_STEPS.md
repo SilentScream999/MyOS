@@ -54,11 +54,10 @@ Validate ELF tables/segments, honor permissions, enforce window ownership,
 validate user pointers and revoke mappings on teardown. Complete address-space
 cleanup and a shared userspace syscall/window library.
 
-Package Counter and future apps such as Notepad with their own manifest/icon
-assets. Add file transfer/management and a standalone image viewer. A versioned,
-self-contained `.wiz` package and package installer remain possible additions;
-current `.wiz` files are ordinary WyzarOS ELFs. See [APP_LOADING](APP_LOADING.md)
-and the [Window API](../APIDocs/WindowAPI.md).
+The `.wiz` package manager and first native File Explorer are implemented.
+Next app work includes Notepad, image viewing, recursive folder copying,
+cross-filesystem moves and trash/undo. See [Explorer](EXPLORER.md),
+[packages](APP_PACKAGES.md) and the [Window API](../APIDocs/WindowAPI.md).
 
 ## Desktop and display
 

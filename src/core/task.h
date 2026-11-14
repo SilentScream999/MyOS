@@ -111,6 +111,10 @@ struct Task {
     bool in_syscall;
     bool interrupt_requested;
     bool waiting_tty_input;
+    void* console;         // Private desktop-console channel; never the shell TTY.
+    bool gui_app;
+    bool console_host;
+    char launch_target[256];
 };
 
 // ── Global PID counter ─────────────────────────────────────────────────────────

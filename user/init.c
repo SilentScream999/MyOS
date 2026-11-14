@@ -143,6 +143,10 @@ static inline int64_t sys_waitpid(uint64_t pid, uint64_t* code) {
     __asm__ volatile("syscall" : "=a"(result) : "a"(61UL), "D"(pid), "S"(code) : "rcx", "r11", "memory");
     return result;
 }
+static inline int64_t sys_launch(const char* path,uint64_t* gui) {
+    int64_t result;
+    __asm__ volatile("syscall":"=a"(result):"a"(213UL),"D"(path),"S"(0UL),"d"(gui):"rcx","r11","memory");return result;
+}
 
 static inline void sys_reboot() {
     uint64_t result;
@@ -550,13 +554,15 @@ void _start() {
                 }
                 print("Spawning: "); print(prog); print("...\n");
                 sys_ttyecho(0); // child may run as soon as spawn returns
-                int64_t pid = sys_spawn(prog);
+                uint64_t gui=0;
+                int64_t pid = sys_launch(prog,&gui);
                 if (pid > 0) {
                     print("Successfully spawned process with PID ");
                     print_dec(pid);
                     print("\n");
                     uint64_t exit_code = 0;
-                    if (sys_waitpid(pid, &exit_code) < 0) {
+                    if(gui) { print("Opened GUI app; terminal ready.\n"); }
+                    else if (sys_waitpid(pid, &exit_code) < 0) {
                         print("Failed to wait for program.\n");
                     } else if (exit_code == 130) {
                         print("^C\n");

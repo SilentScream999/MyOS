@@ -59,18 +59,22 @@ Windows associate icons by owner executable path, independently of title.
 
 ## Launch and lifecycle
 
-`run <path>` accepts absolute or current-directory-relative paths. The shell
-spawns the task, waits for that exact child and restores input modes/prompt on
-completion. Start queues a path to the shell and uses this same foreground flow.
+`run <path>` accepts absolute or current-directory-relative paths. Console apps
+run as foreground children in the shell's TTY; GUI packages (`type=gui`) launch
+independently and immediately return the prompt. Legacy files default to console.
 
-There is one foreground app per shared TTY. Extra menu launches while busy are
-rejected. Child echo defaults off; apps can opt in. Unread child input is
-discarded before shell editing resumes.
+Start uses a dedicated worker independent of the shell. Start and Explorer launch
+GUI apps directly and console apps in a private terminal window. Each private
+console has isolated stdin, stdout/stderr, line editing, raw/echo modes and EOF.
+Its window remains after completion so output can be read; closing it cancels
+remaining programs attached to that channel. The helper is `/share/system/console.elf`.
+Console text uses the shell's unstretched 8x8 bitmap glyphs in 8x10 cells.
 
-Ctrl+C cancels the foreground task with status 130, including when its window
-has focus. Cancellation defers through in-progress syscalls, closes owned
-windows/descriptors and wakes the parent. This is not general signals or process
-groups. Window close buttons request `WIN_EVENT_CLOSE`; the app decides whether
+Ctrl+C in the main Terminal cancels its foreground console app with status 130.
+Ctrl+C in a private console cancels that console's program. GUI apps receive the
+key event themselves (Explorer uses it for Copy). Cancellation defers through
+in-progress syscalls and closes owned windows/descriptors. This is not general
+signals or process groups. Window close buttons request `WIN_EVENT_CLOSE`; the app decides whether
 to exit, destroy one window or ask to save. See [Window API](../APIDocs/WindowAPI.md).
 
 ## Boot and recovery
@@ -85,10 +89,10 @@ mounts remain valid. [Storage](PERSISTENT_STORAGE.md) defines the boot contract.
 - ELF program-header bounds, segment ranges/overlap, permissions/W^X and complete
   cleanup need hardening. A file-size cap does not validate ELF structure.
 - No dynamic linker, argument/environment passing, process groups or general
-  signals; a reusable userspace helper library is still needed.
+  signals; the small native helpers still need a general application SDK.
 - Window-ID authorization and user-pointer/mapping checks remain incomplete.
   Use trusted WyzarOS apps rather than treating this as secure isolation.
 - Terminal, Boot Log and compositor demos remain built into `wm_init`.
-- A versioned `.wiz` container/installer would be new formats/tools. Preserve
-  current ELF-based `.wiz`/`.elf` compatibility if introduced; neither is needed
-  for app-owned PNG assets.
+- File Explorer uses the shared native surface/syscall helpers in
+  `user/native_ui.h`. General argument passing, Unicode text and a full widget
+  toolkit remain future work. Package behavior is in [APP_PACKAGES](APP_PACKAGES.md).

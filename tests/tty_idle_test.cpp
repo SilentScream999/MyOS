@@ -12,6 +12,7 @@ struct Task {
     Task* next;
     uint64_t wake_at_tick=0;
     bool interrupt_requested=false,waiting_tty_input=false;
+    void* console=nullptr;
 };
 static Task *g_task_list,*g_current_task;
 static unsigned g_terminal_shell_pid=1,g_terminal_foreground_pid=0;

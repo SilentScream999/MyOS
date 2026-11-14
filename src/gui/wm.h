@@ -388,7 +388,8 @@ static void wm_resources_reload() {
                 if (resources::equal(win->executable,g_resources_catalog->apps[k].app.exec)) registered=true;
             for (unsigned k=0;k<g_resources_catalog->extra_count && k<resources::max_extra;++k)
                 if (resources::equal(win->executable,g_resources_catalog->extra[k].app.exec)) registered=true;
-            if (!registered) demand.system[4]=true;
+            if (resources::equal(win->executable,"/share/system/console.elf"))demand.system[0]=true;
+            else if (!registered) demand.system[4]=true;
         }
     }
     if (flags&(1u<<9)) __asm__ volatile("sti" ::: "memory");
@@ -430,6 +431,7 @@ static void wm_resource_worker() {
     }
 }
 static const resources::Icons& wm_window_icons(const Window* window) {
+    if(resources::equal(window->executable,"/share/system/console.elf"))return g_resources_catalog->system[0];
     if (window->is_system && window->type>=0 && window->type<4)
         return g_resources_catalog->system[window->type];
     for (unsigned i=0;i<g_resources_catalog->count;++i)
@@ -1387,13 +1389,14 @@ extern void term_write_string(char* s);
 static inline void wm_dispatch_key(char c, uint32_t scancode, bool is_down, uint32_t mods) {
     g_kbd_modifiers = mods;
     if (!is_down) return;
-    if ((mods & WIN_MOD_CTRL) && (c == 'c' || c == 'C' || c == 3)) {
+    Window* focused = wm_find_window(g_focused_win_id);
+    if (focused && focused->is_system && focused->type==WIN_TYPE_TERM &&
+        (mods & WIN_MOD_CTRL) && (c == 'c' || c == 'C' || c == 3)) {
         task_request_interrupt(g_terminal_foreground_pid);
         return; // consume the chord, including repeats after the process exits
     }
 
     // Focus-based routing
-    Window* focused = wm_find_window(g_focused_win_id);
     if (!focused) {
         // Nothing selected / Desktop has focus: don't route to any window
         return;

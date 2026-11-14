@@ -30,7 +30,7 @@ static void tty_wake_readers() {
     Task* task=g_task_list;
     if (!task) return;
     do {
-        if (task->waiting_tty_input && task->state==TaskState::BLOCKED) {
+        if (!task->console && task->waiting_tty_input && task->state==TaskState::BLOCKED) {
             task->waiting_tty_input=false;
             task->wake_at_tick=0;
             task->state=TaskState::READY;

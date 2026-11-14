@@ -3,5 +3,6 @@ id=bundle-demo
 name=Bundle Demo
 version=1.0.0
 abi=1
+type=console
 description=Shows how an app reads its own .wiz bundle and keeps data outside it.
 icon=counter

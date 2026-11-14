@@ -27,6 +27,20 @@ I/O, cache replacement/eviction and safe recovery-tree/module-page reclamation.
 QEMU covers default-VGA ISO boot, USB boot, RAM recovery, live icon/manifest
 replacement, menu/window resource lifetimes and failed-disk-shell fallback.
 
+## Native File Explorer
+
+```sh
+make test-explorer
+make test-console
+make iso PERSIST_DISK=.storage-test/explorer-seed.img ROOT_MIB=64
+python3 tests/qemu_explorer_test.py
+```
+
+Host tests cover the actual userspace file operations and input handling with
+ASan/UBSan. The QEMU test uses real pointer/keyboard events, validates `TRYWAIT`,
+Start launch, browsing, package launching, file dialogs and persistence, then
+checks the resulting ext4 filesystem. See [Explorer](EXPLORER.md) for limits.
+
 ## CPU usage and terminal wakeups
 
 ```sh
