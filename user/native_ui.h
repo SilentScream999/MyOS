@@ -131,4 +131,15 @@ struct NativeSurface {
         rect(x+7,y+12,12,2,accent);rect(x+7,y+17,12,2,accent);rect(x+7,y+22,8,2,accent);
     }
 };
+struct NativeWindowInfo { uint32_t width,height,pitch,reserved;uint64_t buffer; };
+static bool native_enable_resize(uint64_t win,int min_width,int min_height,NativeSurface& surface) {
+    uint64_t pixels=native_call(206,win,min_width,min_height);
+    if(!pixels||pixels==(uint64_t)-1)return false;
+    surface.pixels=(uint32_t*)pixels;return true;
+}
+static bool native_accept_resize(uint64_t win,NativeSurface& surface) {
+    uint64_t pixels=native_call(207,win);if(!pixels||pixels==(uint64_t)-1)return false;
+    NativeWindowInfo info{};if((int64_t)native_call(208,win,(uint64_t)&info)!=0)return false;
+    surface.pixels=(uint32_t*)info.buffer;surface.w=info.width;surface.h=info.height;return true;
+}
 #endif

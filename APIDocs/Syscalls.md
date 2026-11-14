@@ -29,7 +29,7 @@ for `rcx`/`r11` and memory effects. User-pointer validation remains incomplete.
 | 212 | `TRYWAIT` | Nonblocking exact-child wait: PID and optional exit-status pointer, returns child PID when collected, 0 while running, or -1 on error. Running/error results leave the status buffer untouched |
 | 213 | `LAUNCH` | Path, origin (0=shell, 1=desktop), optional GUI-kind output pointer. Returns PID or -1. GUI apps are detached; desktop console apps get a private terminal host |
 | 214 | `CONSOLE` | Console-host-only channel: action, buffer, size. Actions: 0=get target path, 1=drain output, 2=submit input, 3=EOF, 4=interrupt foreground program. Buffers limited to 4096 bytes |
-| 200–205 | Window operations | See [Window API](WindowAPI.md) |
+| 200–208 | Window operations, including native resizing (206–208, ABI 4) | See [Window API](WindowAPI.md) |
 
 Paths accept absolute and CWD-relative forms, `.` and `..`, with a current
 255-byte userspace limit. File metadata structures are in `src/fs/fileinfo.h`;

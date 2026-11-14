@@ -1,20 +1,33 @@
 #include "user/native_ui.h"
 #include "src/gui/font8x8_basic.h"
 // Match the shell: an unstretched 8x8 bitmap in an 8x10 character cell.
-constexpr int COLS=88,CELL_W=8,CELL_H=10,W=744,H=440,ROWS=(H-28-40)/CELL_H;
-static char cells[ROWS][COLS];static int col=0,row=0,escape=0;
+constexpr int CELL_W=8,CELL_H=10,MAX_COLS=480,MAX_ROWS=216;
+static int W=744,H=440,COLS=88,ROWS=(440-28-40)/CELL_H;
+static char cells[MAX_ROWS][MAX_COLS];static int col=0,row=0,escape=0;
+static char transcript[32768];static unsigned transcript_start=0,transcript_size=0;
 static bool changed=true,running=true;static uint64_t exit_code=0;
 static NativeSurface screen{};
-static void put(char ch) {
+static void terminal_char(char ch) {
     if(escape){if(ch=='['){escape=2;return;}if(ch>='@'&&ch<='~'){if(ch=='J'){for(auto& line:cells)for(char& c:line)c=0;row=col=0;}escape=0;}return;}
     if(ch==27){escape=1;return;}
     if(ch=='\r')col=0;
     else if(ch=='\n'){col=0;++row;}
     else if(ch=='\b'){if(col)--col;}
-    else if(ch=='\t'){int n=4-col%4;while(n--)put(' ');return;}
+    else if(ch=='\t'){int n=4-col%4;while(n--)terminal_char(' ');return;}
     else if((unsigned char)ch>=32){cells[row][col]=ch;if(++col==COLS){col=0;++row;}}
     if(row==ROWS){for(int y=1;y<ROWS;++y)for(int x=0;x<COLS;++x)cells[y-1][x]=cells[y][x];
         for(int x=0;x<COLS;++x)cells[ROWS-1][x]=0;row=ROWS-1;}
+    changed=true;
+}
+static void put(char ch) {
+    if(transcript_size==sizeof(transcript)){transcript_start=(transcript_start+1)%sizeof(transcript);--transcript_size;}
+    transcript[(transcript_start+transcript_size++)%sizeof(transcript)]=ch;terminal_char(ch);
+}
+static void layout_console(int width,int height) {
+    W=width;H=height;COLS=(W-24)/CELL_W;ROWS=(H-28-40)/CELL_H;
+    if(COLS>MAX_COLS)COLS=MAX_COLS;if(ROWS>MAX_ROWS)ROWS=MAX_ROWS;
+    for(auto& line:cells)for(char& c:line)c=0;col=row=escape=0;
+    for(unsigned i=0;i<transcript_size;++i)terminal_char(transcript[(transcript_start+i)%sizeof(transcript)]);
     changed=true;
 }
 static void render(uint64_t win) {
@@ -42,11 +55,13 @@ extern "C" void _start() {
     uint64_t win=native_call(200,(uint64_t)title,260,170,W,H);if(!win){native_call(60,1);for(;;){}}
     screen={(uint32_t*)native_call(203,win),W,H};
     if(!screen.pixels){native_call(60,1);for(;;){}}
+    native_enable_resize(win,360,220,screen);layout_console(W,H);
     int64_t child=native_call(59,(uint64_t)target);
     if(child<=0){running=false;exit_code=1;const char* error="Could not start this application.\n";while(*error)put(*error++);}
     for(;;){
         NativeEvent event{};while(native_call(205,win,(uint64_t)&event)){
             if(event.type==7){native_call(60,0);for(;;){}}
+            if(event.type==8){if(native_accept_resize(win,screen))layout_console(screen.w,screen.h);continue;}
             if(event.type==1&&event.key==1&&event.x>=W-100&&event.y<32){if(running)native_call(214,4);else{native_call(60,0);for(;;){}}}
             if(event.type==5&&running){
                 if((event.mods&1)&&(event.key=='c'||event.key=='C'||event.key==3))native_call(214,4);

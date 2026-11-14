@@ -134,6 +134,9 @@ static inline uint64_t rdmsr(uint32_t msr) {
 #define SYS_WIN_GET_BUFFER 203u
 #define SYS_WIN_DAMAGE     204u   // (win_id, x, y, w, h): part of the surface changed
 #define SYS_WIN_POLL_EVENT 205u
+#define SYS_WIN_RESIZABLE 206u
+#define SYS_WIN_ACCEPT_RESIZE 207u
+#define SYS_WIN_INFO 208u
 
 // ── string copying from user ──────────────────────────────────────────────────
 // For safety we should check if buf_va is within user limits.
@@ -637,6 +640,23 @@ static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uin
         case SYS_WIN_GET_BUFFER: return sys_win_get_buffer(a1);
         case SYS_WIN_DAMAGE: return sys_win_damage(a1, a2, a3, a4, a5);
         case SYS_WIN_POLL_EVENT: return sys_win_poll_event(a1, a2);
+        case SYS_WIN_RESIZABLE: {
+            Window* win=wm_find_window((int)a1);
+            if(a2>3840||a3>2160||!wm_enable_native_resize(win,(int)a2,(int)a3))return 0;
+            return win->user_va;
+        }
+        case SYS_WIN_ACCEPT_RESIZE: {
+            Window* win=wm_find_window((int)a1);
+            if(!win||!g_current_task||win->owner_pid!=g_current_task->pid||!win->native_resize)return 0;
+            TtyIrqGuard guard;win->canvas_width=win->w;win->canvas_height=win->h;win->buffer_pitch=win->w*4;
+            win->resize_pending=false;wm_discard_pointer_events(win);return win->user_va;
+        }
+        case SYS_WIN_INFO: {
+            Window* win=wm_find_window((int)a1);
+            if(!win||!g_current_task||win->owner_pid!=g_current_task->pid||!a2||a2>=USERSPACE_END||24>USERSPACE_END-a2)return (uint64_t)-1;
+            TtyIrqGuard guard;uint32_t* info=(uint32_t*)a2;info[0]=win->canvas_width;info[1]=win->canvas_height;info[2]=win->buffer_pitch;info[3]=0;
+            *(uint64_t*)(a2+16)=win->user_va;return 0;
+        }
         
         default:         return (uint64_t)-1;
     }

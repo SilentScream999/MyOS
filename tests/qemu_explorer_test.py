@@ -6,6 +6,7 @@ Build with make iso PERSIST_DISK=.storage-test/explorer-seed.img ROOT_MIB=64.
 from pathlib import Path
 import re
 import shutil
+import socket
 import struct
 import subprocess
 import time
@@ -51,6 +52,7 @@ def main():
     subprocess.run(['clang++','-std=c++20','-I.',str(layout),'-o',str(binary)],cwd=ROOT,check=True)
     apps_offset,stride,exec_offset=map(int,subprocess.check_output([str(binary)]).split())
     q=smoke.Qemu(resolution=(1280,800))
+    q.sock.setsockopt(socket.IPPROTO_TCP,socket.TCP_NODELAY,1)
     def memory(addr,n):
         path=OUT/'explorer-memory.bin';q.command('stop')
         try:
@@ -75,6 +77,13 @@ def main():
         move(x,y);q.monitor('mouse_button 1');time.sleep(.07);q.monitor('mouse_button 0');time.sleep(.2)
     def double(x,y):click(x,y);click(x,y);time.sleep(.4)
     def client(x,y):click(130+x,100+y)
+    def drag(title,edge,dx,dy):
+        focus(title);_,(x,y,w,h)=windows()[title];th=scalar('g_title_h')
+        sx=x+2 if 'l' in edge else x+w-2 if 'r' in edge else x+w//2
+        sy=y-th+2 if 't' in edge else y+h-2 if 'b' in edge else y+h//2
+        move(sx,sy);q.monitor('mouse_button 1');time.sleep(.1);move(sx+dx,sy+dy)
+        q.monitor('mouse_button 0');time.sleep(.5)
+        return windows()[title][1]
     def go(path):
         client(300,26);q.type(path+'\n',pause=.4)
     def terminal():
@@ -83,8 +92,28 @@ def main():
     def capture(label):
         q.command('screendump',{'filename':str(OUT/(label+'.ppm'))});save_png(OUT/(label+'.ppm'),OUT/(label+'.png'))
     def focus(title):
+        pointer,_=windows()[title]
+        if scalar('g_focused_win_id')==int.from_bytes(memory(pointer,4),'little'):return
         index=list(windows()).index(title);width=scalar('g_wbtn_w');gap=800*4//1080
         click(6+scalar('g_sb_w')+800*10//1080+index*(width+gap)+width//2,780)
+    def control(title,which):
+        focus(title);_,(x,y,w,h)=windows()[title];th=scalar('g_title_h');pad=max(2,th//10);bw=th+8
+        click(x+w-pad-(which+1)*bw-which*2+bw//2,y-th+th//2);time.sleep(.3)
+    def window_controls(title):
+        focus(title);pointer,original=windows()[title]
+        count=len(windows());identity=int.from_bytes(memory(pointer,4),'little')
+        control(title,2)
+        assert scalar('g_focused_win_id')!=identity,(title,'minimize retained focus')
+        assert len(windows())==count,(title,'minimize destroyed window')
+        click(original[0]+original[2]//2,original[1]+original[3]//2)
+        assert scalar('g_focused_win_id')!=identity,(title,'minimized window still receives clicks')
+        capture('minimized-'+title.split()[0].lower())
+        focus(title);assert windows()[title][1]==original,(title,'minimize changed bounds')
+        control(title,1)
+        expected=(0,scalar('g_title_h'),1280,800-scalar('g_title_h')-scalar('g_taskbar_h'))
+        assert windows()[title][1]==expected,(title,windows()[title][1],expected)
+        capture('maximized-'+title.split()[0].lower())
+        control(title,1);assert windows()[title][1]==original,(title,'restore changed bounds')
     font_source=(ROOT/'src/gui/font8x8_basic.h').read_text()
     glyphs=[]
     for body in re.findall(r'\{([^{}]+)\}',font_source):
@@ -97,7 +126,7 @@ def main():
         data=memory(buffer,width*height*4);pixels=memoryview(data).cast('I');lines=[]
         for row in range((height-28-40)//10):
             line=''
-            for col in range(88):
+            for col in range((width-24)//8):
                 glyph=bytes(sum((1<<x) if pixels[(40+row*10+y)*width+12+col*8+x]==0xffffffff else 0 for x in range(8)) for y in range(8))
                 line+=font_lookup.get(glyph,'?')
             lines.append(line.rstrip())
@@ -130,6 +159,42 @@ def main():
         assert terminal().rstrip().endswith('wyzar:/>'),terminal()
         capture('explorer-home')
         print('Start-menu launch and initial render passed',flush=True)
+        original=windows()['File Explorer'][1]
+        grown=drag('File Explorer','rb',100,70);assert grown[2:]==(960,630),grown
+        pointer,_=windows()['File Explorer'];assert struct.unpack_from('<I',memory(pointer,384),352)[0]==960*4
+        capture('explorer-resize-large')
+        shrunk=drag('File Explorer','rb',-700,-500);assert shrunk[2:]==(600,360),shrunk
+        capture('explorer-resize-small')
+        restored=drag('File Explorer','rb',260,200);assert restored==original,restored
+        corner=drag('File Explorer','lt',32,24);assert corner==(162,124,828,536),corner
+        restored=drag('File Explorer','lt',-32,-24);assert restored==original,restored
+        window_controls('File Explorer')
+        # An active taskbar button toggles minimization without closing the app.
+        pointer,_=windows()['File Explorer'];identity=int.from_bytes(memory(pointer,4),'little')
+        index=list(windows()).index('File Explorer');gap=800*4//1080
+        click(6+scalar('g_sb_w')+800*10//1080+index*(scalar('g_wbtn_w')+gap)+scalar('g_wbtn_w')//2,780)
+        assert scalar('g_focused_win_id')!=identity
+        focus('File Explorer');assert windows()['File Explorer'][1]==original
+        # A title-bar double-click uses the same maximize/restore path.
+        for maximized in (True,False):
+            _,(x,y,w,h)=windows()['File Explorer'];move(x+100,y-scalar('g_title_h')//2)
+            for _ in range(2):
+                q.monitor('mouse_button 1');time.sleep(.04);q.monitor('mouse_button 0');time.sleep(.06)
+            time.sleep(.4)
+            actual=windows()['File Explorer'][1]
+            assert actual[2]==1280 if maximized else actual==original,actual
+        _,(x,y,w,h)=windows()['File Explorer']
+        for label,mx,my in [('horizontal',x+2,y+h//2),('diagonal-up',x+2,y+h-2),('diagonal-down',x+w-2,y+h-2)]:
+            move(mx,my);time.sleep(.2);capture('cursor-'+label)
+        # Every built-in window supports resizing at native font/pixel sizes.
+        for title in ('Terminal','Boot Log','Visual Test','Rainbow Animation'):
+            window_controls(title)
+            before=windows()[title][1];after=drag(title,'l',32,0)
+            assert after[2]<before[2],(title,before,after)
+            pointer,_=windows()[title];assert struct.unpack_from('<I',memory(pointer,384),352)[0]==after[2]*4
+        focus('Terminal');q.type('write /home/resize-ok.txt resized\n',pause=.3)
+        focus('File Explorer')
+        print('All built-in windows and Explorer resize, minimize and maximize/restore correctly',flush=True)
         # Home: Applications, archive, projects, readme.txt (folders first).
         double(130+265,100+138+3*34+16);capture('explorer-preview');q.type('\n',pause=.2)
         client(214,77);q.type('created\n',pause=.3) # New folder dialog, initial name selected.
@@ -143,6 +208,11 @@ def main():
         assert 'Console - bundle_demo.wiz' in windows(),windows()
         assert 'This is run number 1' in console_text('Console - bundle_demo.wiz'),console_text('Console - bundle_demo.wiz')
         assert 'This is run number 1' not in terminal(),terminal()
+        size=drag('Console - bundle_demo.wiz','rb',100,70);assert size[2:]==(844,510),size
+        assert 'This is run number 1' in console_text('Console - bundle_demo.wiz')
+        capture('console-resize-large')
+        window_controls('Console - bundle_demo.wiz')
+        assert 'This is run number 1' in console_text('Console - bundle_demo.wiz')
         focus('File Explorer')
         client(670,77);capture('explorer-package-install');q.type('\n',pause=.2)
         client(260,138+34+16);client(730,77);q.type('\n',pause=.2) # pin counter.wiz
@@ -164,6 +234,16 @@ def main():
         # A GUI child must not block Explorer; close it and keep browsing.
         double(130+265,100+138+3*34+16);time.sleep(.5) # win_test.wiz
         child=windows().get('Wyzar Desktop Demo');assert child,windows()
+        window_controls('Wyzar Desktop Demo')
+        old_pitch=struct.unpack_from('<I',memory(child[0],384),352)[0]
+        size=drag('Wyzar Desktop Demo','rb',100,60);assert size[2:]==(580,380),size
+        pointer,_=windows()['Wyzar Desktop Demo'];assert struct.unpack_from('<I',memory(pointer,384),352)[0]==old_pitch
+        q.type('r',pause=.1);click(size[0]+size[2]*3//4,size[1]+size[3]*3//5)
+        buffer=struct.unpack_from('<Q',memory(pointer,384),344)[0]
+        pixel=memory(buffer+(192*480+360)*4,4)
+        assert int.from_bytes(pixel,'little')==0xffff3333,pixel
+        capture('legacy-window-resize')
+        child=windows()['Wyzar Desktop Demo']
         _,(x,y,w,h)=child;title_h=scalar('g_title_h');click(x+w-title_h//2,y-title_h//2);time.sleep(.5)
         assert 'Wyzar Desktop Demo' not in windows(),windows()
         go('/home/created');client(260,155);client(607,77);q.type('\n',pause=.3)
@@ -197,6 +277,7 @@ def main():
     assert read('/home/.local/share/bundle-demo/runs.txt')==b'1'
     assert read('/apps/bundle-demo/bundle-demo.wiz')==(ROOT/'build/packages/bundle_demo.wiz').read_bytes()
     assert b'kind=pinned' in read('/apps/counter/app.manifest')
+    assert read('/home/resize-ok.txt')==b'resized'
     print('Explorer QEMU disk verification and filesystem checker passed',flush=True)
 
 if __name__=='__main__':main()

@@ -16,6 +16,8 @@
 #include "ui_font.h"
 #include "truetype.h"
 #include "resources.h"
+#include "window_resize.h"
+#include "window_decorations.h"
 
 void* image_allocate(uint64_t size) { return kmalloc(size); }
 void image_deallocate(void* pointer) { kfree(pointer); }
@@ -129,6 +131,7 @@ static char* hud_put_ms1(char* sp, uint64_t ticks) {
 #define WIN_EVENT_KEY_DOWN     5u
 #define WIN_EVENT_KEY_UP       6u
 #define WIN_EVENT_CLOSE        7u
+#define WIN_EVENT_RESIZE       8u
 
 struct WinEvent {
     uint32_t type;    // WIN_EVENT_*
@@ -168,6 +171,14 @@ struct Window {
     WinEvent event_queue[WIN_EVENT_QUEUE_SIZE];
     uint32_t event_head;
     uint32_t event_tail;
+    int32_t canvas_width,canvas_height,min_w,min_h;
+    bool native_resize,resize_pending;
+    unsigned resize_edges;
+    int32_t ghost_w,ghost_h,resize_mouse_x,resize_mouse_y;
+    ResizeRect resize_original;
+    Window* retired_next;
+    bool minimized,maximized;
+    ResizeRect restore_rect;
 };
 
 #define USER_WIN_BASE   0x0000600000000000ULL
@@ -187,6 +198,7 @@ static uint32_t g_kbd_modifiers = 0;
 
 static inline bool wm_win_push_event(Window* win, const WinEvent& ev) {
     if (!win) return false;
+    TtyIrqGuard guard;
     uint32_t next_head = (win->event_head + 1) % WIN_EVENT_QUEUE_SIZE;
     if (next_head == win->event_tail) {
         win->event_tail = (win->event_tail + 1) % WIN_EVENT_QUEUE_SIZE;
@@ -198,16 +210,33 @@ static inline bool wm_win_push_event(Window* win, const WinEvent& ev) {
 
 static inline bool wm_win_pop_event(Window* win, WinEvent* out_ev) {
     if (!win || !out_ev) return false;
+    TtyIrqGuard guard;
     if (win->close_pending) {
         win->close_pending = false;
         *out_ev = {};
         out_ev->type = WIN_EVENT_CLOSE;
         return true;
     }
+    if(win->resize_pending){win->resize_pending=false;*out_ev={};out_ev->type=WIN_EVENT_RESIZE;
+        out_ev->x=win->w;out_ev->y=win->h;return true;}
     if (win->event_head == win->event_tail) return false;
     *out_ev = win->event_queue[win->event_tail];
     win->event_tail = (win->event_tail + 1) % WIN_EVENT_QUEUE_SIZE;
     return true;
+}
+
+// Pointer events use the old canvas coordinates. Keep keyboard input when
+// changing the canvas, but discard pointer events that no longer match it.
+static inline void wm_discard_pointer_events(Window* win) {
+    TtyIrqGuard guard;
+    uint32_t write=win->event_tail;
+    for(uint32_t read=win->event_tail;read!=win->event_head;read=(read+1)%WIN_EVENT_QUEUE_SIZE){
+        const WinEvent ev=win->event_queue[read];
+        if(ev.type==WIN_EVENT_KEY_DOWN||ev.type==WIN_EVENT_KEY_UP){
+            win->event_queue[write]=ev;write=(write+1)%WIN_EVENT_QUEUE_SIZE;
+        }
+    }
+    win->event_head=write;
 }
 
 static uint32_t g_title_h = 28;
@@ -228,6 +257,11 @@ static uint32_t g_pad     = 2;
 // the client is: damage is converted to a screen dirty-rect and every window is composed the same way.
 static inline void wm_surface_damage(Window* win, int32_t x1, int32_t y1, int32_t x2, int32_t y2) {
     if (!win || !win->visible || !fb) return;
+    if(win->canvas_width&&win->canvas_height&&(win->canvas_width!=win->w||win->canvas_height!=win->h)){
+        x1=(int64_t)x1*win->w/win->canvas_width;y1=(int64_t)y1*win->h/win->canvas_height;
+        x2=((int64_t)x2*win->w+win->canvas_width-1)/win->canvas_width;
+        y2=((int64_t)y2*win->h+win->canvas_height-1)/win->canvas_height;
+    }
     int32_t sx1, sy1, sx2, sy2;
     if (!surface_damage_to_screen(win->x, win->y, win->w, win->h, x1, y1, x2, y2,
                                   (int32_t)fb->width, (int32_t)fb->height, &sx1, &sy1, &sx2, &sy2)) return;
@@ -707,7 +741,7 @@ static uint32_t* g_log_win_backbuffer = nullptr;
 static int32_t  log_last_rendered_scroll = -1;
 
 static inline void wm_get_win_rect(Window* win, WinRect* r) {
-    r->visible = win->visible;
+    r->visible = win->visible && !win->minimized;
     r->x1 = win->x;
     r->y1 = win->y - (int32_t)g_title_h;
     r->x2 = win->x + (int32_t)win->w;
@@ -969,11 +1003,10 @@ static inline void wm_clock_damage() {
     g_needs_refresh = true;
 }
 
-static inline void wm_draw_window_chrome(int32_t x, int32_t y, int32_t w, int32_t h, const char* title, bool closable, int32_t min_y, int32_t max_y, bool focused = false, const Image* icon = nullptr) {
+static inline void wm_draw_window_chrome(int32_t x, int32_t y, int32_t w, int32_t h, const char* title, bool closable, int32_t min_y, int32_t max_y, bool focused = false, const Image* icon = nullptr,bool maximized=false) {
     if (!g_master_backbuffer) return;
-    // Title bar background: active blue accent if focused, muted dark grey if inactive
-    uint32_t bar_clr  = focused ? 0xFF2A4268 : 0xFF22242B;
-    uint32_t bar_line = focused ? 0xFF4A6898 : 0xFF2D3039;
+    uint32_t bar_clr  = focused ? 0xFF352A49 : 0xFF25232E;
+    uint32_t bar_line = focused ? 0xFF77608F : 0xFF3D374A;
     for (int32_t ty = y; ty < y + (int32_t)g_title_h; ty++) {
         if (ty < 0 || (uint32_t)ty >= fb->height) continue;
         if (ty < min_y || ty > max_y) continue; // Respect dirty rect
@@ -995,32 +1028,27 @@ static inline void wm_draw_window_chrome(int32_t x, int32_t y, int32_t w, int32_
                      x,min_y,x+w-(int32_t)g_title_h,max_y+1);
         text_x=x+12+icon->width;
     }
-    int32_t title_space=w-(int32_t)g_title_h-(text_x-x)-14;
+    auto first_control=window_control_rect(x,y,w,g_title_h,WINDOW_MINIMIZE);
+    int32_t title_space=first_control.x-text_x-10;
     if (title_space>0 && text_y + (int32_t)char_h >= min_y && text_y <= max_y)
         wm_draw_string(text_x, text_y, title, text_clr, g_font_scale_100, title_space);
     
-    // Close button (Scaled with title bar)
-    int32_t btn_pad = (int32_t)(4 * g_title_h) / 42;
-    if (btn_pad < 2) btn_pad = 2;
-    int32_t btn_h = (int32_t)g_title_h - btn_pad * 2;
-    int32_t btn_w = btn_h;
-    int32_t btn_x = x + w - btn_w - btn_pad;
-    int32_t btn_y = y + btn_pad;
-
-    uint32_t btn_clr = closable ? 0xFFFF0000 : 0xFF555555;
-    for (int32_t by = btn_y; by < btn_y + btn_h; by++) {
-        if (by < 0 || (uint32_t)by >= fb->height) continue;
-        if (by < min_y || by > max_y) continue;
-        uint32_t* row = (uint32_t*)(g_master_backbuffer + (uint64_t)by * fb->pitch);
-        int32_t s_x = btn_x; if (s_x < 0) s_x = 0;
-        int32_t e_x = btn_x + btn_w; if (e_x > (int32_t)fb->width) e_x = fb->width;
-        if (e_x > s_x) memset_32(row + s_x, btn_clr, e_x - s_x);
+    for(int control=0;control<3;++control){
+        auto r=window_control_rect(x,y,w,g_title_h,control);
+        bool disabled=control==WINDOW_CLOSE&&!closable;
+        bool hover=!disabled&&g_mouse_x>=r.x&&g_mouse_x<r.x+r.w&&g_mouse_y>=r.y&&g_mouse_y<r.y+r.h;
+        uint32_t background=hover?(control==WINDOW_CLOSE?0xFF9A405D:0xFF665078):bar_clr;
+        uint32_t ink=disabled?0xFF625C6D:hover?0xFFFFFFFF:focused?0xFFE9D7B0:0xFFADA2BD;
+        for(int py=r.y;py<r.y+r.h;++py){
+            if(py<0||py>=(int)fb->height||py<min_y||py>max_y)continue;
+            auto* pixels=(uint32_t*)(g_master_backbuffer+(uint64_t)py*fb->pitch);
+            for(int px=r.x;px<r.x+r.w;++px){
+                if(px<0||px>=(int)fb->width)continue;
+                bool corner=(px==r.x||px==r.x+r.w-1)&&(py==r.y||py==r.y+r.h-1);
+                pixels[px]=window_control_ink(control,maximized,px-(r.x+r.w/2),py-(r.y+r.h/2))?ink:corner?bar_clr:background;
+            }
+        }
     }
-    // Centered 'X' in button
-    int32_t x_off = (btn_w - wm_text_width("X", g_font_scale_100)) / 2;
-    int32_t y_off = (btn_h - (int32_t)char_h) / 2;
-    if (btn_y + y_off <= max_y && btn_y + y_off + (int32_t)char_h >= min_y)
-        wm_draw_char(btn_x + x_off, btn_y + y_off, 'X', 0xFFFFFFFF, g_font_scale_100);
 }
 
 // =============================================================================
@@ -1221,22 +1249,35 @@ static inline void wm_draw_rainbow_content(uint32_t* row, int32_t rw, uint32_t b
     }
 }
 
-// Draw the cursor directly to VRAM. Does NOT modify master_backbuffer.
-static inline void vram_draw_cursor(int32_t mx, int32_t my, uint8_t mb) {
-    if (!fb) return;
-    for (int cr = 0; cr < CURSOR_H; cr++) {
-        int32_t sy = my + cr;
-        if (sy < 0 || (uint32_t)sy >= fb->height) continue;
-        uint32_t* row = (uint32_t*)((uint8_t*)fb->address + (uint64_t)sy * fb->pitch);
-        for (int x = 0; x < CURSOR_W; x++) {
-            int32_t sx = mx + x;
-            if (sx < 0 || (uint32_t)sx >= fb->width) continue;
-            uint8_t p = g_cursor_bitmap[cr][x];
-            if (!p) continue;
-            row[sx] = (p == 2)
-                ? ((mb & 1) ? 0xFFFF0000 : (mb & 2) ? 0xFF00FFFF : 0xFF000000)
-                : 0xFFFFFFFF;
+// Both compositor presentation and the direct VRAM overlay use this sprite.
+// Resize cursors are centered on the actual edge/corner, unlike the arrow's tip.
+constexpr int CURSOR_SPRITE_SIZE=32,CURSOR_SPRITE_ORIGIN=12;
+static unsigned wm_cursor_edges(int mx,int my) {
+    for(int i=0;i<g_window_count;++i)if(g_window_list[i]->resize_edges)return g_window_list[i]->resize_edges;
+    for(int s=g_window_count-1;s>=0;--s){Window* win=g_window_list[g_window_order[s]];
+        if(!win||!win->visible||win->minimized)continue;
+        if(mx>=win->x&&mx<win->x+win->w&&my>=win->y-(int)g_title_h&&my<win->y+win->h){
+            if(win->maximized||window_control_hit(win->x,win->y-g_title_h,win->w,g_title_h,mx,my)>=0)return 0;
+            return resize_hit({win->x,win->y,win->w,win->h},g_title_h,mx,my);
         }
+    }
+    return 0;
+}
+static uint32_t wm_cursor_color(unsigned edges,int x,int y,uint8_t buttons) {
+    if(edges){unsigned pixel=resize_cursor_pixel(edges,x,y);
+        return pixel==2?0xFFF8F3FF:pixel==1?0xFF17121E:0;}
+    if(x<0||x>=CURSOR_W||y<0||y>=CURSOR_H)return 0;
+    unsigned pixel=g_cursor_bitmap[y][x];
+    return pixel==1?0xFFFFFFFF:pixel==2?((buttons&1)?0xFFFF0000:(buttons&2)?0xFF00FFFF:0xFF000000):0;
+}
+static inline void vram_draw_cursor(int32_t mx,int32_t my,uint8_t buttons) {
+    if(!fb)return;
+    unsigned edges=wm_cursor_edges(mx,my);
+    for(int y=0;y<CURSOR_SPRITE_SIZE;++y)for(int x=0;x<CURSOR_SPRITE_SIZE;++x){
+        int rx=x-CURSOR_SPRITE_ORIGIN,ry=y-CURSOR_SPRITE_ORIGIN;
+        int sx=mx+rx,sy=my+ry;if(sx<0||sy<0||sx>=(int)fb->width||sy>=(int)fb->height)continue;
+        uint32_t color=wm_cursor_color(edges,rx,ry,buttons);
+        if(color)((uint32_t*)((uint8_t*)fb->address+(uint64_t)sy*fb->pitch))[sx]=color;
     }
 }
 
@@ -1246,7 +1287,7 @@ static inline int wm_find_top_window(int32_t mx, int32_t my) {
     for (int s = g_window_count - 1; s >= 0; s--) {
         int idx = g_window_order[s];
         Window* win = g_window_list[idx];
-        if (!win || !win->visible) continue;
+        if (!win || !win->visible || win->minimized) continue;
         WinRect r; wm_get_win_rect(win, &r);
         if (mx >= r.x1 && mx < r.x2 && my >= r.y1 && my < r.y2) return idx;
     }
@@ -1256,7 +1297,7 @@ static inline int wm_find_top_window(int32_t mx, int32_t my) {
 static inline void wm_raise_window(int idx) {
     if (idx < 0 || idx >= g_window_count) return;
     Window* win = g_window_list[idx];
-    if (win) g_focused_win_id = win->id;
+    if (win) { win->minimized=false;g_focused_win_id = win->id; }
     int old_pos = -1;
     for (int i = 0; i < g_window_count; i++) if (g_window_order[i] == idx) old_pos = i;
     if (old_pos != -1 && old_pos < g_window_count - 1) {
@@ -1277,20 +1318,24 @@ static inline bool wm_is_in_title(int idx, int32_t mx, int32_t my) {
     return (mx >= r.x1 && mx < r.x2 && my >= r.y1 && my < r.y1 + (int32_t)g_title_h);
 }
 
+static inline void wm_minimize_window(int idx) {
+    if(idx<0||idx>=g_window_count)return;
+    Window* win=g_window_list[idx];win->minimized=true;
+    win->ghost_dragging=false;win->resize_edges=0;
+    if(g_focused_win_id==win->id){
+        g_focused_win_id=-1;
+        for(int s=g_window_count-1;s>=0;--s){auto* other=g_window_list[g_window_order[s]];
+            if(other&&other->visible&&!other->minimized){g_focused_win_id=other->id;break;}}
+    }
+    g_dirty_min_x=0;g_dirty_min_y=0;g_dirty_max_x=fb->width-1;g_dirty_max_y=fb->height-1;g_needs_refresh=true;
+}
+
 static inline bool wm_is_in_close(int idx, int32_t mx, int32_t my) {
     if (idx < 0 || idx >= g_window_count) return false;
     Window* win = g_window_list[idx];
     WinRect r; wm_get_win_rect(win, &r);
     
-    int32_t w = r.x2 - r.x1;
-    int32_t btn_pad = (int32_t)(4 * g_title_h) / 42;
-    if (btn_pad < 2) btn_pad = 2;
-    int32_t btn_h = (int32_t)g_title_h - btn_pad * 2;
-    int32_t btn_w = btn_h;
-    int32_t btn_x = r.x1 + w - btn_w - btn_pad;
-    int32_t btn_y = r.y1 + btn_pad;
-    
-    return (mx >= btn_x && mx < btn_x + btn_w && my >= btn_y && my < btn_y + btn_h);
+    return window_control_hit(win->x,win->y-g_title_h,win->w,g_title_h,mx,my)==WINDOW_CLOSE;
 }
 
 static inline void wm_close_window(int idx) {
@@ -1310,7 +1355,7 @@ static inline void wm_close_window(int idx) {
         for (int s = g_window_count - 1; s >= 0; s--) {
             int o_idx = g_window_order[s];
             Window* w = g_window_list[o_idx];
-            if (w && w->visible) {
+            if (w && w->visible && !w->minimized) {
                 g_focused_win_id = w->id;
                 break;
             }
@@ -1349,6 +1394,8 @@ static inline Window* wm_create_window(const char* title, int32_t x, int32_t y, 
     
     uint64_t buf_bytes = (uint64_t)w * h * 4;
     uint64_t pages = (buf_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    win->canvas_width=w;win->canvas_height=h;win->min_w=160;win->min_h=100;
+    if(is_system){win->native_resize=true;win->min_w=320;win->min_h=150;}
     win->buffer_pages = pages;
     
     if (!is_system) {
@@ -1362,8 +1409,10 @@ static inline Window* wm_create_window(const char* title, int32_t x, int32_t y, 
         win->buffer = (uint32_t*)(HHDM + phys);
     } else {
         win->buffer_phys = 0;
-        win->buffer = (uint32_t*)kmalloc(buf_bytes);
-        if (win->buffer) memset(win->buffer, 0, buf_bytes);
+        // System renderers retain this backing pointer across resizing.
+        uint64_t capacity=(uint64_t)(fb->width>(uint32_t)w?fb->width:w)*(fb->height>(uint32_t)h?fb->height:h)*4;
+        win->buffer = (uint32_t*)kmalloc(capacity);
+        if (win->buffer) memset(win->buffer, 0, capacity);
     }
     win->buffer_pitch = w * 4;
     
@@ -1385,6 +1434,86 @@ static inline Window* wm_find_window(int id) {
 
 extern void tty_input(char c);
 extern void term_write_string(char* s);
+
+struct RetiredWindowSurface { uint64_t physical,pages; };
+static RetiredWindowSurface g_retired_surfaces[64];
+static unsigned g_retired_surface_count=0;
+static Window* g_retired_windows=nullptr;
+// Run only at the compositor's frame boundary: a preempted frame may still
+// have a pointer into the previous surface, even on a single-core machine.
+static void wm_collect_retired_surfaces() {
+    TtyIrqGuard guard;
+    for(unsigned i=0;i<g_retired_surface_count;++i)
+        for(uint64_t p=0;p<g_retired_surfaces[i].pages;++p)free_phys_page(g_retired_surfaces[i].physical+p*PAGE_SIZE);
+    g_retired_surface_count=0;
+    while(g_retired_windows){Window* win=g_retired_windows;g_retired_windows=win->retired_next;
+        if(win->buffer_phys){for(uint64_t p=0;p<win->buffer_pages;++p)free_phys_page(win->buffer_phys+p*PAGE_SIZE);}
+        else kfree(win->buffer);kfree(win);}
+}
+static bool wm_enable_native_resize(Window* win,int minw,int minh) {
+    if(!win||win->is_system||!g_current_task||win->owner_pid!=g_current_task->pid||minw<32||minh<32||
+       minw>(int)fb->width||minh>(int)(fb->height-g_title_h-g_taskbar_h))return false;
+    uint64_t width=fb->width>3840?3840:fb->width,height=fb->height>2160?2160:fb->height;
+    if(width<(uint64_t)win->canvas_width)width=win->canvas_width;if(height<(uint64_t)win->canvas_height)height=win->canvas_height;
+    uint64_t pages=(width*height*4+PAGE_SIZE-1)/PAGE_SIZE;
+    if(pages>win->buffer_pages){
+        if(g_retired_surface_count==64)return false;
+        uint64_t physical=alloc_phys_pages(pages);if(!physical)return false;
+        auto* pixels=(uint32_t*)(HHDM+physical);memset(pixels,0,pages*PAGE_SIZE);
+        memcpy(pixels,win->buffer,(uint64_t)win->canvas_width*win->canvas_height*4);
+        TtyIrqGuard guard;
+        if(g_retired_surface_count==64){for(uint64_t p=0;p<pages;++p)free_phys_page(physical+p*PAGE_SIZE);return false;}
+        for(uint64_t p=0;p<pages;++p){uint64_t va=win->user_va+p*PAGE_SIZE;
+            map_page_in(g_current_task->cr3,va,physical+p*PAGE_SIZE,PRESENT|WRITABLE|USER);
+            __asm__ volatile("invlpg (%0)"::"r"(va):"memory");}
+        g_retired_surfaces[g_retired_surface_count++]={win->buffer_phys,win->buffer_pages};
+        win->buffer_phys=physical;win->buffer_pages=pages;win->buffer=pixels;
+    }
+    win->native_resize=true;win->min_w=minw;win->min_h=minh;return true;
+}
+static void wm_commit_resize(Window* win) {
+    win->x=win->ghost_x;win->y=win->ghost_y;win->w=win->ghost_w;win->h=win->ghost_h;
+    if(win->is_system){
+        if(!win->maximized&&(win->type==WIN_TYPE_TERM||win->type==WIN_TYPE_LOG)){
+            int width=win->w/8*8,height=win->h/10*10;
+            if(win->resize_edges&RESIZE_LEFT)win->x+=win->w-width;
+            if(win->resize_edges&RESIZE_TOP)win->y+=win->h-height;
+            win->w=width;win->h=height;
+        }
+        win->canvas_width=win->w;win->canvas_height=win->h;win->buffer_pitch=win->w*4;
+        memset(win->buffer,0,(uint64_t)win->w*win->h*4);
+        if(win->type==WIN_TYPE_TERM){g_term_ox=win->x;g_term_oy=win->y;
+            g_term_stride_pixels=win->w;g_term_max_cols=win->w/8;g_term_max_rows=win->h/10;
+            if(g_term_max_cols>TERM_MATRIX_COLS)g_term_max_cols=TERM_MATRIX_COLS;
+            if(g_term_scrolled_rows+g_term_max_rows>TERM_MATRIX_ROWS)g_term_scrolled_rows=TERM_MATRIX_ROWS-g_term_max_rows;
+            if(term_x>=g_term_max_cols)term_x=g_term_max_cols-1;if(term_y>=g_term_max_rows)term_y=g_term_max_rows-1;
+            term_sync_backbuffer();term_dirty_all();}
+        else if(win->type==WIN_TYPE_LOG){g_log_win_cols=win->w/8;g_log_rows_visible=win->h/10;
+            if(g_log_rows_visible>LOG_WIN_LINES)g_log_rows_visible=LOG_WIN_LINES;
+            g_log_stride=win->w;g_log_win_backbuffer=win->buffer;log_last_rendered_scroll=-1;wm_log_render_to_buffer();}
+        else if(win->type==WIN_TYPE_TEST)checker_render_surface(win->buffer,win->w,win->h,win->buffer_pitch);
+    }else if(win->native_resize){wm_discard_pointer_events(win);win->resize_pending=true;}
+    win->resize_edges=0;win->chrome_drawn=false;
+    g_dirty_min_x=0;g_dirty_min_y=0;g_dirty_max_x=fb->width-1;g_dirty_max_y=fb->height-1;g_needs_refresh=true;
+}
+static void wm_toggle_maximize(Window* win) {
+    if(!win)return;
+    ResizeRect target;
+    if(win->maximized){target=win->restore_rect;win->maximized=false;}
+    else {
+        win->restore_rect={win->x,win->y,win->w,win->h};win->maximized=true;
+        int width=fb->width>3840?3840:fb->width;
+        int height=(int)fb->height-g_title_h-g_taskbar_h;if(height>2160)height=2160;
+        target={0,(int)g_title_h,width,height};
+    }
+    win->ghost_dragging=false;win->resize_edges=0;
+    win->ghost_x=target.x;win->ghost_y=target.y;win->ghost_w=target.w;win->ghost_h=target.h;
+    wm_commit_resize(win);
+}
+static void wm_event_coordinates(Window* win,int x,int y,WinEvent* event) {
+    event->x=(int64_t)(x-win->x)*win->canvas_width/win->w;
+    event->y=(int64_t)(y-win->y)*win->canvas_height/win->h;
+}
 
 static inline void wm_dispatch_key(char c, uint32_t scancode, bool is_down, uint32_t mods) {
     g_kbd_modifiers = mods;
@@ -1428,7 +1557,7 @@ static inline void wm_dispatch_key(char c, uint32_t scancode, bool is_down, uint
 // its animation; ghost outlines are overlays and must not count as occluders.
 static inline void wm_visible_client(Window* win, VisibleRegion* region) {
     region->count = 0;
-    if (!win || !win->visible || !win->buffer || !fb) return;
+    if (!win || !win->visible || win->minimized || !win->buffer || !fb) return;
     int32_t width = (int32_t)fb->width;
     int32_t height = fb->height > g_taskbar_h ? (int32_t)(fb->height-g_taskbar_h) : 0;
     VisibleRect client = visibility_clip(win->x,win->y,win->w,win->h,0,width,height);
@@ -1438,7 +1567,7 @@ static inline void wm_visible_client(Window* win, VisibleRegion* region) {
     for (int s = 0; s < g_window_count; ++s) {
         Window* other = g_window_list[g_window_order[s]];
         if (other == win) { above = true; continue; }
-        if (!above || !other || !other->visible || !other->buffer) continue;
+        if (!above || !other || !other->visible || other->minimized || !other->buffer) continue;
         VisibleRect cover = visibility_clip(other->x,other->y,other->w,other->h,
                                              (int32_t)g_title_h,width,height);
         if (!visibility_subtract(region,cover)) {
@@ -1480,12 +1609,13 @@ static inline void wm_test_render(Window* win) {
 }
 
 static inline void wm_destroy_window(int id) {
+    TtyIrqGuard guard;
     if (g_focused_win_id == id) {
         g_focused_win_id = -1;
         for (int s = g_window_count - 1; s >= 0; s--) {
             int o_idx = g_window_order[s];
             Window* w = g_window_list[o_idx];
-            if (w && w->visible && w->id != id) {
+            if (w && w->visible && !w->minimized && w->id != id) {
                 g_focused_win_id = w->id;
                 break;
             }
@@ -1502,16 +1632,9 @@ static inline void wm_destroy_window(int id) {
     if (idx == -1) return;
     
     Window* win = g_window_list[idx];
-    if (win->buffer) {
-        if (!win->is_system && win->buffer_phys) {
-            for (uint64_t p = 0; p < win->buffer_pages; p++) {
-                free_phys_page(win->buffer_phys + p * PAGE_SIZE);
-            }
-        } else {
-            kfree(win->buffer);
-        }
-    }
-    kfree(win);
+    // A compositor frame may have been preempted while holding this window.
+    // Retire both metadata and backing until that frame has finished.
+    win->visible=false;win->retired_next=g_retired_windows;g_retired_windows=win;
     g_window_list[idx] = nullptr;
     
     for (int i = idx; i < g_window_count - 1; i++) g_window_list[i] = g_window_list[i+1];
@@ -1559,16 +1682,17 @@ static inline void wm_overlay_update_unlocked(int32_t new_cx, int32_t new_cy, ui
     if (!fb || !g_master_backbuffer) return;
 
     // Erase old cursor from VRAM
-    vram_restore_rect(ov_cx - 1, ov_cy - 1,
-                      ov_cx + CURSOR_W + 1, ov_cy + CURSOR_H + 1);
+    vram_restore_rect(ov_cx - CURSOR_SPRITE_ORIGIN, ov_cy - CURSOR_SPRITE_ORIGIN,
+                      ov_cx + CURSOR_SPRITE_SIZE-CURSOR_SPRITE_ORIGIN, ov_cy + CURSOR_SPRITE_SIZE-CURSOR_SPRITE_ORIGIN);
 
     for (int i = 0; i < g_window_count; i++) {
         Window* win = g_window_list[i];
         if (!win) continue;
         
         int32_t nfx = 0, nfy = 0, nfw = 0, nfh = 0;
-        bool dn = win->ghost_dragging;
+        bool dn = win->ghost_dragging || win->resize_edges;
         if (dn) wm_get_win_rect_from_pos(win, win->ghost_x, win->ghost_y, &nfx, &nfy, &nfw, &nfh);
+        if(win->resize_edges){nfw=win->ghost_w;nfh=win->ghost_h+(int32_t)g_title_h;}
         
         vram_transition_outline(win->last_ghost_fx, win->last_ghost_fy, win->last_ghost_fw, win->last_ghost_fh, win->last_ghost_active,
                                 nfx,     nfy,     nfw,     nfh,     dn);
@@ -1716,10 +1840,11 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
     // antialiasing twice onto rows whose backgrounds were not recomposed.
     g_ui_clip_left = 0; g_ui_clip_top = min_y;
     g_ui_clip_right = fb->width; g_ui_clip_bottom = max_y + 1;
-    WinRect rects[MAX_WINDOWS];
-    for (int i = 0; i < g_window_count; i++) {
-        if (g_window_list[i]) wm_get_win_rect(g_window_list[i], &rects[i]);
-    }
+    WinRect rects[MAX_WINDOWS];Window* frame_windows[MAX_WINDOWS];int frame_order[MAX_WINDOWS],frame_count;
+    struct Source { uint32_t* pixels;int w,h;uint32_t pitch; } sources[MAX_WINDOWS];
+    {TtyIrqGuard guard;frame_count=g_window_count;
+        for(int i=0;i<frame_count;++i){auto* win=g_window_list[i];frame_windows[i]=win;frame_order[i]=g_window_order[i];
+            wm_get_win_rect(win,&rects[i]);sources[i]={win->buffer,win->canvas_width,win->canvas_height,win->buffer_pitch};}}
     
     // Metrics reset (B/W/r/L are updated DURING the frame, V is from last)
     g_time_bg_ticks   = 0;
@@ -1744,8 +1869,8 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         Span spans[MAX_WINDOWS];
         int num_spans = 0;
         
-        for (int i = 0; i < g_window_count; i++) {
-            if (g_window_list[i] && rects[i].visible && (int32_t)y >= rects[i].y1 && (int32_t)y < rects[i].y2) {
+        for (int i = 0; i < frame_count; i++) {
+            if (frame_windows[i] && rects[i].visible && (int32_t)y >= rects[i].y1 && (int32_t)y < rects[i].y2) {
                 // Intersects this scanline
                 int32_t sx1 = rects[i].x1; if (sx1 < (int32_t)min_x) sx1 = min_x;
                 int32_t sx2 = rects[i].x2; if (sx2 > (int32_t)max_x + 1) sx2 = max_x + 1;
@@ -1811,11 +1936,12 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
     g_time_bg_ticks = t1 - t0;
 
     // Stage 2: Windows in stack order
-    for (int s = 0; s < g_window_count; s++) {
-        int idx = g_window_order[s];
-        Window* win = g_window_list[idx];
-        if (!win || !win->visible) continue;
+    for (int s = 0; s < frame_count; s++) {
+        int idx = frame_order[s];
+        Window* win = frame_windows[idx];
+        if (!win || !rects[idx].visible) continue;
         WinRect r = rects[idx];
+        Source source_surface=sources[idx];int display_w=r.x2-r.x1,display_h=r.y2-r.y1-g_title_h;
 
         int32_t dr1 = (r.y1 > (int32_t)min_y) ? r.y1 : (int32_t)min_y;
         int32_t dr2 = (r.y2 < (int32_t)max_y) ? r.y2 : (int32_t)max_y;
@@ -1824,8 +1950,8 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         if (dr1 >= dr2) continue;
 
         // Unified surface compositor: every window (system or user) is backed by its surface buffer
-        wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, win->closable, min_y, max_y, win->id == g_focused_win_id, &wm_window_icons(win).title);
-        if (win->buffer) {
+        wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, win->closable, min_y, max_y, win->id == g_focused_win_id, &wm_window_icons(win).title,win->maximized);
+        if (source_surface.pixels) {
             for (int32_t y = dr1; y < dr2; y++) {
                 if (y < r.y1 + (int32_t)g_title_h) continue;
                 uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
@@ -1835,7 +1961,17 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                 if (wx + ww > (int32_t)fb->width) ww = (int32_t)fb->width - wx;
                 if (ww > 0) {
                     uint32_t src_off = (r.x1 < 0) ? (uint32_t)(-r.x1) : 0;
-                    memcpy_vram_sse_headless(drow + wx, (uint32_t*)((uint8_t*)win->buffer + (uint64_t)ry * win->buffer_pitch) + src_off, ww * 4);
+                    if(source_surface.w==display_w&&source_surface.h==display_h)
+                        memcpy_vram_sse_headless(drow + wx, (uint32_t*)((uint8_t*)source_surface.pixels + (uint64_t)ry * source_surface.pitch) + src_off, ww * 4);
+                    else {
+                        uint32_t sy=(uint64_t)ry*source_surface.h/display_h;
+                        auto* source=(uint32_t*)((uint8_t*)source_surface.pixels+(uint64_t)sy*source_surface.pitch);
+                        for(int32_t px=0;px<ww;++px)drow[wx+px]=source[(uint64_t)(src_off+px)*source_surface.w/display_w];
+                    }
+                    int from_bottom=r.y2-1-y;
+                    if(!win->maximized&&from_bottom>=1&&from_bottom<12)for(int right=1;right<12;++right)
+                        if(right+from_bottom==6||right+from_bottom==10||right+from_bottom==14){int px=r.x2-1-right;
+                            if(px>=wx&&px<wx+ww)drow[px]=0xff81728f;}
                 }
             }
         }
@@ -1977,13 +2113,22 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         for (int idx = 0; idx < g_window_count; idx++) {
             Window* win = g_window_list[idx];
             if (!win || !win->visible) continue;
-            bool active = (win->id == g_focused_win_id);
+            bool active = !win->minimized&&(win->id == g_focused_win_id);
 
             uint32_t top_c  = active ? 0xFF3d4d80 : 0xFF23283d;
             uint32_t bot_c  = active ? 0xFF28366a : 0xFF181c30;
             uint32_t edge_c = active ? 0xFF5568b0 : 0xFF2c3258;
 
             draw_btn(cur_x, sb_y, g_wbtn_w, sb_h, top_c, bot_c, edge_c, active);
+
+            if(win->minimized){
+                int py=sb_y+sb_h-4;
+                if(py>=(int)min_y&&py<=(int)max_y&&py>=0&&py<(int)fb->height){
+                    auto* pixels=(uint32_t*)(g_master_backbuffer+(uint64_t)py*fb->pitch);
+                    for(int px=cur_x+g_wbtn_w/2-8;px<cur_x+(int)g_wbtn_w/2+8;++px)
+                        if(px>=0&&px<(int)fb->width)pixels[px]=0xFF9C87BB;
+                }
+            }
 
             if (active) {
                 int32_t bar_y = sb_y;
@@ -2013,8 +2158,12 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         }
     }
 
+    // Keep diagnostic overlays off maximized applications and their controls.
+    bool show_desktop_stats=true;
+    for(int i=0;i<frame_count;++i)
+        if(rects[i].visible&&frame_windows[i]->maximized){show_desktop_stats=false;break;}
     // Stage 2.6: RAM display (top-right)
-    {
+    if(show_desktop_stats){
         uint64_t total_mb = get_total_ram_count() / (1024 * 1024);
         uint64_t mapped_mb = get_mapped_ram_count() / (1024 * 1024);
         char m_str[16];
@@ -2054,7 +2203,7 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
     }
 
     // Stage 2.7: CPU display (below RAM)
-    {
+    if(show_desktop_stats){
         // ── Task Count measurement ──────────────────────────────────────────
         static uint32_t g_task_count = 0;
         static uint64_t last_count_tick = 0;
@@ -2319,23 +2468,16 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
     // We save the affected pixels first so we can restore backbuffer after.
     int32_t ccx = g_mouse_x, ccy = g_mouse_y;
     uint8_t cmb = g_mouse_buttons;
-    static uint32_t cursor_save_buf[CURSOR_H * CURSOR_W];
-    uint32_t pitch32 = ptch / 4;
-    for (int cr = 0; cr < CURSOR_H; cr++) {
-        int32_t sy = ccy + cr;
-        if (sy < 0 || (uint32_t)sy >= fb->height) {
-            for (int x = 0; x < CURSOR_W; x++) cursor_save_buf[cr * CURSOR_W + x] = 0;
-            continue;
-        }
-        uint32_t* bbrow = (uint32_t*)(g_master_backbuffer + (uint64_t)sy * ptch);
-        for (int x = 0; x < CURSOR_W; x++) {
-            int32_t sx = ccx + x;
-            if (sx < 0 || (uint32_t)sx >= fb->width) { cursor_save_buf[cr * CURSOR_W + x] = 0; continue; }
-            cursor_save_buf[cr * CURSOR_W + x] = bbrow[sx]; // save
-            uint8_t p = g_cursor_bitmap[cr][x];
-            if (p) bbrow[sx] = (p == 2)
-                ? ((cmb & 1) ? 0xFFFF0000 : (cmb & 2) ? 0xFF00FFFF : 0xFF000000)
-                : 0xFFFFFFFF; // stamp
+    static uint32_t cursor_save_buf[CURSOR_SPRITE_SIZE * CURSOR_SPRITE_SIZE];
+    unsigned cursor_edges=wm_cursor_edges(ccx,ccy);
+    for(int y=0;y<CURSOR_SPRITE_SIZE;++y){
+        int sy=ccy+y-CURSOR_SPRITE_ORIGIN;if(sy<0||sy>=(int)fb->height)continue;
+        auto* pixels=(uint32_t*)(g_master_backbuffer+(uint64_t)sy*ptch);
+        for(int x=0;x<CURSOR_SPRITE_SIZE;++x){
+            int sx=ccx+x-CURSOR_SPRITE_ORIGIN;if(sx<0||sx>=(int)fb->width)continue;
+            cursor_save_buf[y*CURSOR_SPRITE_SIZE+x]=pixels[sx];
+            uint32_t color=wm_cursor_color(cursor_edges,x-CURSOR_SPRITE_ORIGIN,y-CURSOR_SPRITE_ORIGIN,cmb);
+            if(color)pixels[sx]=color;
         }
     }
 
@@ -2368,14 +2510,12 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
 
     // ── Restore backbuffer cursor pixels ────────────────────────────────────
     // (master_backbuffer does not own cursor pixels; VRAM does)
-    for (int cr = 0; cr < CURSOR_H; cr++) {
-        int32_t sy = ccy + cr;
-        if (sy < 0 || (uint32_t)sy >= fb->height) continue;
-        uint32_t* bbrow = (uint32_t*)(g_master_backbuffer + (uint64_t)sy * ptch);
-        for (int x = 0; x < CURSOR_W; x++) {
-            int32_t sx = ccx + x;
-            if (sx < 0 || (uint32_t)sx >= fb->width) continue;
-            if (g_cursor_bitmap[cr][x]) bbrow[sx] = cursor_save_buf[cr * CURSOR_W + x];
+    for(int y=0;y<CURSOR_SPRITE_SIZE;++y){
+        int sy=ccy+y-CURSOR_SPRITE_ORIGIN;if(sy<0||sy>=(int)fb->height)continue;
+        auto* pixels=(uint32_t*)(g_master_backbuffer+(uint64_t)sy*ptch);
+        for(int x=0;x<CURSOR_SPRITE_SIZE;++x){
+            int sx=ccx+x-CURSOR_SPRITE_ORIGIN;
+            if(sx>=0&&sx<(int)fb->width)pixels[sx]=cursor_save_buf[y*CURSOR_SPRITE_SIZE+x];
         }
     }
 

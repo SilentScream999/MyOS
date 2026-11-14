@@ -93,5 +93,11 @@ int main(int argc,char** argv) {
     std::vector<uint32_t> pixels(WIDTH*HEIGHT);surface={pixels.data(),WIDTH,HEIGHT};render();assert(presents==1);
     std::ofstream image(argv[2],std::ios::binary);image<<"P6\n"<<WIDTH<<" "<<HEIGHT<<"\n255\n";
     for(uint32_t p:pixels){char rgb[]={(char)(p>>16),(char)(p>>8),(char)p};image.write(rgb,3);}
+    for(auto size: {std::pair{600,360},std::pair{1200,720},std::pair{860,560}}){
+        layout(size.first,size.second);pixels.assign(WIDTH*HEIGHT,0);surface={pixels.data(),WIDTH,HEIGHT};
+        for(int i=4;i<14;++i)assert(buttons[i].x>=SIDE&&buttons[i].x+buttons[i].w<=WIDTH-16);
+        assert(VISIBLE>0&&LIST_TOP+VISIBLE*ROW<=HEIGHT-36);render();
+        begin_dialog(NEW_FOLDER);render();dialog=NONE;
+    }
     puts("Explorer navigation, sorting, dialogs, copy failure, moves, detached launch, limits and rendering passed");
 }

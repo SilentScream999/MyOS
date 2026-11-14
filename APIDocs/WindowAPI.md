@@ -1,6 +1,6 @@
 # WyzarOS Window Management API
 
-Updated 2026-11-11. Mapped user surfaces, owner tracking, input events and exit
+Updated 2026-11-14. Mapped user surfaces, resizing, owner tracking, input events and exit
 cleanup are implemented. The remaining authorization/mapping limitations apply.
 
 The built `win_test.elf` exercises this API from ring 3. GUI packages declare
@@ -24,7 +24,50 @@ General calls are listed in [Syscalls](Syscalls.md).
 | 202 | `SYS_WIN_DESTROY` | `id` | `0` | Removes the window from the z-stack and frees it. |
 | 203 | `SYS_WIN_GET_BUFFER` | `id` | surface pointer, or `0` | User windows return their mapped user address (`USER_WIN_BASE + id * USER_WIN_STRIDE`). Window-ID authorization remains incomplete. |
 | 204 | `SYS_WIN_DAMAGE` | `id`, `x`, `y`, `w`, `h` | `0`, or `-1` for an unknown id or out-of-range values | Reports a partial update (surface-relative pixels). Cheaper than `SYNC` for small changes. The compositor tracks up to 8 rects per frame. |
-| 205 | `SYS_WIN_POLL_EVENT` | `id`, `WinEvent*` | `1` for an event, otherwise `0` | Returns a pending close request first, otherwise pops a nonblocking input event from the window's 64-slot queue. |
+| 205 | `SYS_WIN_POLL_EVENT` | `id`, `WinEvent*` | `1` for an event, otherwise `0` | Returns close first, then a pending resize, then input from the window's 64-slot queue. |
+| 206 | `SYS_WIN_RESIZABLE` | `id`, `min_width`, `min_height` | surface pointer, or `0` on failure | ABI 4. Owner-only opt-in to native resize events; reserves backing for desktop-sized surfaces. Minimums must fit the current desktop. Call before drawing. |
+| 207 | `SYS_WIN_ACCEPT_RESIZE` | `id` | surface pointer, or `0` on failure | ABI 4. Owner-only; adopts the latest client dimensions and pitch. Redraw the whole surface afterwards. |
+| 208 | `SYS_WIN_INFO` | `id`, `WindowInfo*` | `0`, or `-1` | ABI 4. Owner-only; returns the current drawing surface dimensions, pitch and user pointer. |
+
+## Resizing
+
+All windows have shared title-bar controls: minimize, maximize/restore and close.
+Minimize keeps the application running and its taskbar button available; clicking
+that button restores and focuses it. Clicking an active taskbar button minimizes
+the window. Maximization fills the desktop above the taskbar; restoring returns
+to the saved bounds. Double-clicking the title bar also toggles maximization.
+Maximized windows must be restored before moving or dragging their resize edges.
+The Terminal's close control is disabled; its minimize and maximize controls work.
+Close continues to send event 7 to applications rather than terminating them.
+
+Drag any window edge or corner. The outline previews its new bounds; releasing
+the mouse commits the resize. Minimum sizes and desktop bounds are enforced.
+Explorer, private consoles and built-in windows redraw at their new dimensions,
+keeping text and icons at their normal size. Explorer wraps its toolbar; private
+consoles reflow retained output. The main Terminal retains its character grid.
+
+Existing apps remain resizable through compositor scaling of their original
+surface. Pointer coordinates and damage rectangles are transformed accordingly;
+their surface dimensions and pitch stay unchanged. For a responsive layout,
+declare package `abi=4`, call 206 once and handle `WIN_EVENT_RESIZE` (type `8`).
+Its `x` and `y` fields report the latest client width and height. Resize requests
+coalesce separately from the input queue and cannot displace a close request.
+
+On a resize event, call 207, then 208, update your layout and redraw before
+calling `WIN_SYNC`. The mapped user pointer remains stable. Until acceptance,
+the compositor scales the previous canvas. Queued pointer events using old
+coordinates are discarded when dimensions change; keyboard input is retained.
+The new pitch is `width * 4`; do not keep drawing with the original row width.
+
+```c
+struct WindowInfo {
+    uint32_t width, height, pitch, reserved;
+    uint64_t buffer;
+}; // 24 bytes
+```
+
+`user/native_ui.h` supplies `native_enable_resize` and `native_accept_resize`
+helpers. See `user/explorer.cpp` and `user/console.cpp` for complete clients.
 
 ## Surface format
 

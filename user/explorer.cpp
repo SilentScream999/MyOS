@@ -12,7 +12,8 @@ static void print(const char* s) {
 static void print_dec(uint64_t n) { char b[24]; native_number(n,b); print(b); }
 #include "user/wiz_cmd.h"
 
-constexpr int WIDTH=860, HEIGHT=560, SIDE=164, LIST_TOP=138, ROW=34, VISIBLE=11;
+constexpr int SIDE=164,ROW=34;
+static int WIDTH=860,HEIGHT=560,LIST_TOP=138,VISIBLE=11,place_step=43;
 constexpr uint32_t BG=0xff1a1925, PANEL=0xff222131, LINE=0xff39334b,
     INK=0xffeeebf8, MUTED=0xffa49bb6, BLUE=0xffc9b5ff;
 struct ExplorerEntry { char name[256]; uint64_t size,type; };
@@ -187,12 +188,21 @@ static void file_size(uint64_t n,char* out) {
     native_number(n,out);wz_append(out,32,unit);
 }
 struct Button { int x,y,w,h;const char* label; };
-static const Button buttons[]={
+static Button buttons[]={
     {12,12,32,30,"<"},{48,12,32,30,">"},{84,12,32,30,"^"},{120,12,80,30,"Refresh"},
     {176,62,84,30,"New folder"},{266,62,72,30,"New file"},{344,62,60,30,"Rename"},
     {410,62,52,30,"Copy"},{468,62,46,30,"Cut"},{520,62,52,30,"Paste"},
     {578,62,58,30,"Delete"},{642,62,60,30,"Install"},{708,62,48,30,"Pin"},{762,62,80,30,"Hidden"}
 };
+static void layout(int width,int height) {
+    WIDTH=width;HEIGHT=height;int x=SIDE+12,y=62;
+    for(int i=4;i<14;++i){if(x+buttons[i].w>WIDTH-16){x=SIDE+12;y+=38;}
+        buttons[i].x=x;buttons[i].y=y;x+=buttons[i].w+6;}
+    LIST_TOP=y+76;VISIBLE=(HEIGHT-36-LIST_TOP)/ROW;if(VISIBLE<1)VISIBLE=1;
+    place_step=(HEIGHT-36-105-34)/5;if(place_step>43)place_step=43;
+    int maximum=entry_count-VISIBLE;if(maximum<0)maximum=0;
+    if(scroll_row>maximum)scroll_row=maximum;hovered_button=-1;dirty=true;
+}
 static bool hit(int x,int y,int rx,int ry,int w,int h){return x>=rx&&x<rx+w&&y>=ry&&y<ry+h;}
 static bool button_enabled(int id) {
     if(id==0)return history_at>0;if(id==1)return history_at+1<history_count;
@@ -249,16 +259,17 @@ static void render() {
     surface.rect(0,0,WIDTH,HEIGHT,BG);surface.rect(0,0,WIDTH,52,PANEL);
     surface.rect(0,52,SIDE,HEIGHT-52,PANEL);surface.rect(SIDE,52,1,HEIGHT-52,LINE);
     for(int i=0;i<14;++i)draw_button(buttons[i],i==13&&show_hidden,i);
-    surface.rounded(204,12,638,30,6,address_edit?0xff58416f:0xff15131e);
-    surface.text(216,18,address,INK,830);
+    surface.rounded(204,12,WIDTH-222,30,6,address_edit?0xff58416f:0xff15131e);
+    surface.text(216,18,address,INK,WIDTH-30);
     surface.text(16,72,"PLACES",MUTED,150,12);
     const char* labels[]={"Home","Applications","App samples","Installed apps","System","Devices"};
     const char* paths[]={"/home","/home/Applications","/share/samples","/apps","/","/mnt"};
-    for(int i=0;i<6;++i){int y=105+i*43;if(wiz_str_equal(current_dir,paths[i]))surface.rounded(8,y-4,148,36,5,0xff3b2d50);
+    for(int i=0;i<6;++i){int y=105+i*place_step;if(wiz_str_equal(current_dir,paths[i]))surface.rounded(8,y-4,148,36,5,0xff3b2d50);
         surface.folder(17,y,20);surface.text(46,y+4,labels[i],INK,155);}
-    surface.text(17,410,"WyzarOS",MUTED,155,16);surface.text(17,436,"File Explorer",MUTED,155,12);
-    surface.rect(SIDE,105,WIDTH-SIDE,32,PANEL);surface.text(216,112,"Name",MUTED,600,12);
-    surface.text(627,112,"Type",MUTED,750,12);surface.text(770,112,"Size",MUTED,840,12);
+    if(HEIGHT>=520){surface.text(17,HEIGHT-150,"WyzarOS",MUTED,155,16);surface.text(17,HEIGHT-124,"File Explorer",MUTED,155,12);}
+    int type_x=WIDTH-233,size_x=WIDTH-90,header=LIST_TOP-33;
+    surface.rect(SIDE,header,WIDTH-SIDE,32,PANEL);surface.text(216,header+7,"Name",MUTED,type_x-17,12);
+    surface.text(type_x,header+7,"Type",MUTED,size_x-20,12);surface.text(size_x,header+7,"Size",MUTED,WIDTH-20,12);
     for(int row=0;row<VISIBLE;++row) {
         int index=scroll_row+row;if(index>=entry_count)break;int y=LIST_TOP+row*ROW;
         auto& e=entries[index];if(index==selected){surface.rounded(SIDE+7,y,WIDTH-SIDE-20,ROW,5,0xff3c2f51);surface.rect(SIDE+8,y+6,2,ROW-12,0xffc8a4ed);}
@@ -266,29 +277,30 @@ static void render() {
         if(e.type==2)surface.folder(180,y+2,28);
         else if(wiz_name_is_package(e.name))surface.wizard(179,y+1,30);
         else surface.document(180,y+2,app_name_supported(e.name)?0xff9a82db:0xff8598b5);
-        surface.text(216,y+8,e.name,INK,610);
+        surface.text(216,y+8,e.name,INK,type_x-17);
         const char* type=e.type==2?"Folder":wiz_name_is_package(e.name)?"Wyzar app":app_name_supported(e.name)?"Program":"File";
-        surface.text(627,y+8,type,MUTED,750,12);
-        if(e.type!=2){char size[32];file_size(e.size,size);surface.text(770,y+8,size,MUTED,842,12);}
+        surface.text(type_x,y+8,type,MUTED,size_x-20,12);
+        if(e.type!=2){char size[32];file_size(e.size,size);surface.text(size_x,y+8,size,MUTED,WIDTH-18,12);}
     }
     if(entry_count==0)surface.centered_text(SIDE,LIST_TOP,WIDTH-SIDE,HEIGHT-36-LIST_TOP,
         listing_error?"This folder could not be read.":"This folder is empty.",MUTED,16);
     if(entry_count>VISIBLE){int track=VISIBLE*ROW,thumb=track*VISIBLE/entry_count;if(thumb<20)thumb=20;
-        surface.rect(850,LIST_TOP,4,track,LINE);surface.rect(850,LIST_TOP+(track-thumb)*scroll_row/(entry_count-VISIBLE),4,thumb,0xff6486b2);}
+        surface.rect(WIDTH-10,LIST_TOP,4,track,LINE);surface.rect(WIDTH-10,LIST_TOP+(track-thumb)*scroll_row/(entry_count-VISIBLE),4,thumb,0xff6486b2);}
     surface.rect(0,HEIGHT-36,WIDTH,36,PANEL);surface.text(14,HEIGHT-25,status_line,MUTED,WIDTH-12,12);
     if(dialog!=NONE) {
-        bool reading=dialog==PREVIEW||dialog==PACKAGE_RESULT;int top=reading?98:176,height=reading?380:202;
-        surface.rect(193,top+5,480,height,0xff0c1019);surface.rect(188,top,480,height,0xff283449);
+        bool reading=dialog==PREVIEW||dialog==PACKAGE_RESULT;int height=reading?380:202;if(height>HEIGHT-40)height=HEIGHT-40;
+        int top=(HEIGHT-height)/2,left=(WIDTH-480)/2;
+        surface.rect(left+5,top+5,480,height,0xff0c1019);surface.rect(left,top,480,height,0xff283449);
         const char* title=dialog==NEW_FOLDER?"Create folder":dialog==NEW_FILE?"Create file":dialog==RENAME?"Rename item":
             dialog==DELETE_ITEM?"Delete this item?":dialog==PREVIEW?dialog_target:"Package manager";
-        surface.text(210,top+16,title,INK,646,18);
-        if(reading)multiline(dialog_text,210,top+55,434,13);
-        else if(dialog==DELETE_ITEM){multiline(dialog_target,210,top+54,434,2);surface.text(210,top+104,"Files and empty folders only. This cannot be undone.",MUTED,646,12);}
-        else {surface.rect(208,top+57,438,34,0xff111925);surface.text(218,top+65,edit_text,BLUE,638);}
+        surface.text(left+22,top+16,title,INK,left+458,18);
+        if(reading)multiline(dialog_text,left+22,top+55,434,(height-110)/20);
+        else if(dialog==DELETE_ITEM){multiline(dialog_target,left+22,top+54,434,2);surface.text(left+22,top+104,"Files and empty folders only. This cannot be undone.",MUTED,left+458,12);}
+        else {surface.rect(left+20,top+57,438,34,0xff111925);surface.text(left+30,top+65,edit_text,BLUE,left+450);}
         int bottom=top+height-44;
-        draw_button({reading?560:454,bottom,90,30,reading?"Close":"Cancel"});
-        if(!reading)draw_button({554,bottom,92,30,dialog==DELETE_ITEM?"Delete":"Save"},true);
-        if(!reading)surface.text(210,top+height-74,status_line,MUTED,645,12);
+        draw_button({left+(reading?372:266),bottom,90,30,reading?"Close":"Cancel"});
+        if(!reading)draw_button({left+366,bottom,92,30,dialog==DELETE_ITEM?"Delete":"Save"},true);
+        if(!reading)surface.text(left+22,top+height-74,status_line,MUTED,left+457,12);
     }
     native_call(201,window_id);dirty=false;
 }
@@ -307,6 +319,7 @@ static void edit_key(char* buffer,unsigned capacity,uint32_t key) {
     dirty=true;
 }
 static void handle_event(const NativeEvent& event) {
+    if(event.type==8){if(native_accept_resize(window_id,surface))layout(surface.w,surface.h);return;}
     if(event.type==3){int next=-1;if(dialog==NONE)for(int i=0;i<14;++i)
             if(hit(event.x,event.y,buttons[i].x,buttons[i].y,buttons[i].w,buttons[i].h)){next=i;break;}
         if(next!=hovered_button){hovered_button=next;dirty=true;}return;}
@@ -329,13 +342,14 @@ static void handle_event(const NativeEvent& event) {
     } else if(event.type==4&&dialog==NONE){scroll_row-=event.delta*3;if(scroll_row<0)scroll_row=0;
         int max=entry_count-VISIBLE;if(max<0)max=0;if(scroll_row>max)scroll_row=max;dirty=true;}
     else if(event.type==1&&event.key==1){int x=event.x,y=event.y;
-        if(dialog!=NONE){bool reading=dialog==PREVIEW||dialog==PACKAGE_RESULT;int top=reading?98:176,h=reading?380:202;
-            if(hit(x,y,reading?560:454,top+h-44,90,30)){dialog=NONE;dirty=true;}
-            else if(!reading&&hit(x,y,554,top+h-44,92,30))commit_dialog();return;}
-        if(hit(x,y,204,12,638,30)){address_edit=true;edit_replace=true;dirty=true;return;}
+        if(dialog!=NONE){bool reading=dialog==PREVIEW||dialog==PACKAGE_RESULT;int h=reading?380:202;if(h>HEIGHT-40)h=HEIGHT-40;
+            int top=(HEIGHT-h)/2,left=(WIDTH-480)/2;
+            if(hit(x,y,left+(reading?372:266),top+h-44,90,30)){dialog=NONE;dirty=true;}
+            else if(!reading&&hit(x,y,left+366,top+h-44,92,30))commit_dialog();return;}
+        if(hit(x,y,204,12,WIDTH-222,30)){address_edit=true;edit_replace=true;dirty=true;return;}
         for(int i=0;i<14;++i)if(hit(x,y,buttons[i].x,buttons[i].y,buttons[i].w,buttons[i].h)){if(button_enabled(i))button_action(i);return;}
         const char* paths[]={"/home","/home/Applications","/share/samples","/apps","/","/mnt"};
-        for(int i=0;i<6;++i)if(hit(x,y,8,101+i*43,148,36)){navigate(paths[i]);return;}
+        for(int i=0;i<6;++i)if(hit(x,y,8,101+i*place_step,148,36)){navigate(paths[i]);return;}
         address_edit=false;
         if(hit(x,y,SIDE,LIST_TOP,WIDTH-SIDE,VISIBLE*ROW)){int index=scroll_row+(y-LIST_TOP)/ROW;
             if(index<entry_count){bool twice=last_click==index&&frame-last_click_frame<=30;selected=index;
@@ -350,6 +364,7 @@ extern "C" void _start() {
     if(!window_id){native_call(60,1);for(;;){}}
     surface={(uint32_t*)native_call(203,window_id),WIDTH,HEIGHT};
     if(!surface.pixels){native_call(60,1);for(;;){}}
+    native_enable_resize(window_id,600,360,surface);layout(WIDTH,HEIGHT);
     if(!navigate("/home"))navigate("/");
     for(;;){NativeEvent event{};unsigned processed=0;
         while(processed++<64&&native_call(205,window_id,(uint64_t)&event)){

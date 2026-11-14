@@ -22,6 +22,11 @@ extern int32_t g_term_ox;        // terminal window X offset
 extern int32_t g_term_oy;        // terminal window Y offset
 extern uint32_t g_term_max_cols;  // terminal character width
 extern uint32_t g_term_max_rows;  // terminal row height
+// The shell grid can be narrower than a maximized surface on large desktops.
+static uint32_t g_term_stride_pixels=0;
+static inline uint32_t term_surface_stride() {
+    return g_term_stride_pixels?g_term_stride_pixels:g_term_max_cols?g_term_max_cols*8:fb?fb->pitch/4:800;
+}
 extern volatile bool g_needs_refresh;
 extern DamageList g_damage;     // separate dirty rects (see damage.h); the g_dirty_* box still exists for legacy writers
 
@@ -110,7 +115,7 @@ static inline void putp(uint32_t rx, uint32_t ry, uint32_t argb) {
         return;
     }
     uint32_t *base = (uint32_t *)g_backbuffer;
-    uint32_t pitch32 = g_term_max_cols ? (g_term_max_cols * 8) : (fb ? fb->pitch / 4 : 800);
+    uint32_t pitch32 = term_surface_stride();
     base[ry * pitch32 + rx] = argb;
 }
 
@@ -124,7 +129,7 @@ static inline void fill_screen_fast(uint32_t argb) {
         }
         return;
     }
-    uint32_t pitch32 = g_term_max_cols ? (g_term_max_cols * 8) : (fb ? fb->pitch / 4 : 800);
+    uint32_t pitch32 = term_surface_stride();
     uint64_t count = (uint64_t)g_term_max_rows * 10 * pitch32;
     uint32_t clr = (argb == 0) ? 0xFF0A0A14 : argb;
     uint32_t* base = (uint32_t*)g_backbuffer;
@@ -149,7 +154,7 @@ static void draw_char(int x, int y, char c, uint32_t color) {
         return;
     }
     
-    uint32_t pitch32 = g_term_max_cols ? (g_term_max_cols * 8) : (fb ? fb->pitch / 4 : 800);
+    uint32_t pitch32 = term_surface_stride();
     uint32_t term_w_px = g_term_max_cols * 8;
     uint32_t term_h_px = g_term_max_rows * 10;
     if ((uint32_t)(x + 8) > term_w_px || (uint32_t)(y + 8) > term_h_px) return;

@@ -376,8 +376,7 @@ extern "C" void mouse_process_scroll(int8_t scroll_dy) {
         } else {
             WinEvent ev;
             ev.type = WIN_EVENT_MOUSE_SCROLL;
-            ev.x = mx - win->x;
-            ev.y = my - win->y;
+            wm_event_coordinates(win,mx,my,&ev);
             ev.key = 0;
             ev.mods = g_kbd_modifiers;
             ev.delta = scroll_dy;
@@ -407,6 +406,18 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
     if (g_mouse_y < 0) g_mouse_y = 0;
     if (g_mouse_y >= (int32_t)fb->height) g_mouse_y = fb->height - 1;
 
+    // Repaint only when the pointer enters or leaves a title-bar control.
+    static int hover_window=-1,hover_control=WINDOW_NO_CONTROL;
+    int hover_index=wm_find_top_window(g_mouse_x,g_mouse_y);
+    Window* hover=hover_index>=0?g_window_list[hover_index]:nullptr;
+    int control=hover?window_control_hit(hover->x,hover->y-g_title_h,hover->w,g_title_h,g_mouse_x,g_mouse_y):WINDOW_NO_CONTROL;
+    int hover_id=control>=0?hover->id:-1;
+    if(hover_id!=hover_window||control!=hover_control){
+        wm_damage_window_full(wm_find_window(hover_window));
+        if(control>=0)wm_damage_window_full(hover);
+        hover_window=hover_id;hover_control=control;
+    }
+
     // Start menu hover highlight follows the pointer
     if (g_menu_open && (dx != 0 || dy != 0)) wm_menu_hover_dirty();
 
@@ -428,7 +439,8 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
                     Window* win = g_window_list[i];
                     if (!win || !win->visible) continue;
                     if (mx >= cur_x && mx < cur_x + (int32_t)g_wbtn_w) {
-                        wm_raise_window(i);
+                        if(win->id==g_focused_win_id&&!win->minimized)wm_minimize_window(i);
+                        else wm_raise_window(i);
                         break;
                     }
                     cur_x += g_wbtn_w + WBTN_GAP;
@@ -455,17 +467,28 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
                 Window* win = g_window_list[idx];
                 if (wm_is_in_close(idx, mx, my)) {
                     wm_close_window(idx);
+                } else if(window_control_hit(win->x,win->y-g_title_h,win->w,g_title_h,mx,my)==WINDOW_MINIMIZE) {
+                    wm_minimize_window(idx);
+                } else if(window_control_hit(win->x,win->y-g_title_h,win->w,g_title_h,mx,my)==WINDOW_MAXIMIZE) {
+                    wm_toggle_maximize(win);
+                } else if(unsigned edges=win->maximized?0:resize_hit({win->x,win->y,win->w,win->h},g_title_h,mx,my)) {
+                    win->resize_edges=edges;win->resize_original={win->x,win->y,win->w,win->h};
+                    win->resize_mouse_x=mx;win->resize_mouse_y=my;
+                    win->ghost_x=win->x;win->ghost_y=win->y;win->ghost_w=win->w;win->ghost_h=win->h;
                 } else if (wm_is_in_title(idx, mx, my)) {
-                    win->ghost_dragging = true;
-                    win->ghost_x = win->x;
-                    win->ghost_y = win->y;
-                    win->drag_off_x = mx - win->x;
-                    win->drag_off_y = my - win->y;
-                } else {
+                    static uint64_t last_title_click=0;static int last_title_id=-1,last_title_x=0,last_title_y=0;
+                    uint64_t now=rdtsc();int tx=mx-last_title_x,ty=my-last_title_y;
+                    if(last_title_id==win->id&&now-last_title_click<_usb_tsc_hz()*4/10&&tx>=-5&&tx<=5&&ty>=-5&&ty<=5){
+                        wm_toggle_maximize(win);last_title_id=-1;
+                    }else {
+                        last_title_click=now;last_title_id=win->id;last_title_x=mx;last_title_y=my;
+                        if(!win->maximized){win->ghost_dragging=true;win->ghost_x=win->x;win->ghost_y=win->y;
+                            win->drag_off_x=mx-win->x;win->drag_off_y=my-win->y;}
+                    }
+                } else if(!wm_is_in_title(idx,mx,my)) {
                     WinEvent ev;
                     ev.type = WIN_EVENT_MOUSE_DOWN;
-                    ev.x = mx - win->x;
-                    ev.y = my - win->y;
+                    wm_event_coordinates(win,mx,my,&ev);
                     ev.key = 1; // Left button
                     ev.mods = g_kbd_modifiers;
                     ev.delta = 0;
@@ -489,12 +512,20 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
             win->ghost_x = g_mouse_x - win->drag_off_x;
             win->ghost_y = g_mouse_y - win->drag_off_y;
         }
+        if(win&&win->resize_edges){
+            int maxw=fb->width>3840?3840:fb->width;
+            int maxh=(int)fb->height-g_title_h-g_taskbar_h;if(maxh>2160)maxh=2160;
+            ResizeRect r=resize_rect(win->resize_original,win->resize_edges,g_mouse_x-win->resize_mouse_x,g_mouse_y-win->resize_mouse_y,
+                win->min_w,win->min_h,maxw,maxh,g_title_h);
+            win->ghost_x=r.x;win->ghost_y=r.y;win->ghost_w=r.w;win->ghost_h=r.h;
+        }
     }
 
     if (mouse_release) {
         bool dragged = false;
         for (int i = 0; i < g_window_count; i++) {
             Window* win = g_window_list[i];
+            if(win&&win->resize_edges){wm_commit_resize(win);dragged=true;}
             if (win && win->ghost_dragging) {
                 win->x = win->ghost_x;
                 win->y = win->ghost_y;
@@ -517,8 +548,7 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
                 if (!wm_is_in_title(idx, mx, my) && !wm_is_in_close(idx, mx, my)) {
                     WinEvent ev;
                     ev.type = WIN_EVENT_MOUSE_UP;
-                    ev.x = mx - win->x;
-                    ev.y = my - win->y;
+                    wm_event_coordinates(win,mx,my,&ev);
                     ev.key = 1;
                     ev.mods = g_kbd_modifiers;
                     ev.delta = 0;
@@ -527,6 +557,11 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
             }
         }
     }
+    if(dx||dy){int idx=wm_find_top_window(g_mouse_x,g_mouse_y);
+        if(idx>=0){Window* win=g_window_list[idx];
+            if(!win->is_system&&!win->ghost_dragging&&!win->resize_edges&&!wm_is_in_title(idx,g_mouse_x,g_mouse_y)){
+                WinEvent ev{};ev.type=WIN_EVENT_MOUSE_MOVE;wm_event_coordinates(win,g_mouse_x,g_mouse_y,&ev);
+                ev.mods=g_kbd_modifiers;wm_win_push_event(win,ev);}}}
 }
 
 void compositor_thread_main() {
@@ -582,6 +617,7 @@ void compositor_thread_main() {
     static uint64_t last_clock_tick   = 0;
 
     while (true) {
+        wm_collect_retired_surfaces();
         uint64_t frame_interval = (tsc_hz / 60);
         target_tsc += frame_interval;
 
@@ -592,7 +628,7 @@ void compositor_thread_main() {
         Window* rain_win = nullptr;
         VisibleRegion rain_region{};
         for (int i = 0; i < g_window_count; i++) {
-            if (g_window_list[i] && g_window_list[i]->visible && g_window_list[i]->type == WIN_TYPE_RAIN) {
+            if (g_window_list[i] && g_window_list[i]->visible && !g_window_list[i]->minimized && g_window_list[i]->type == WIN_TYPE_RAIN) {
                 rain_win = g_window_list[i];
                 rain_scroll += 4;
                 wm_visible_client(rain_win, &rain_region);

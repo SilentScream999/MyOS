@@ -55,7 +55,7 @@ static void term_clear_screen() {
     wm_dirty_chrome();
     g_term_view_offset = 0;
     if (g_backbuffer) {
-        uint32_t pitch32 = g_term_max_cols * 8;
+        uint32_t pitch32 = term_surface_stride();
         memset_32(g_backbuffer, 0xFF0A0A14, (uint64_t)g_term_max_rows * 10 * pitch32);
     }
     // Clear matrix
@@ -74,7 +74,7 @@ static void term_clear_screen() {
 // Redraw the entire pixel backbuffer from the matrix based on view_offset
 static void term_sync_backbuffer() {
     if (!g_backbuffer) return;
-    uint32_t pitch32 = g_term_max_cols * 8;
+    uint32_t pitch32 = term_surface_stride();
     uint32_t* base = (uint32_t*)g_backbuffer;
 
     // Determine viewport start in matrix
@@ -125,7 +125,7 @@ static void term_scroll() {
     
     // Pixel scroll (Delta)
     if (g_backbuffer && g_term_view_offset == 0) {
-        uint32_t pitch32 = g_term_max_cols * 8;
+        uint32_t pitch32 = term_surface_stride();
         uint32_t window_height_px = (g_term_max_rows - 1) * 10;
         uint32_t ww_px = g_term_max_cols * 8;
         
@@ -162,7 +162,7 @@ static void term_erase_cursor() {
     uint32_t cx = term_x * 8;
     uint32_t cy = term_y * 10;
     uint32_t* base = (uint32_t*)g_backbuffer;
-    uint32_t pitch32 = g_term_max_cols * 8;
+    uint32_t pitch32 = term_surface_stride();
     for (int r = 8; r < 10; r++) {
         uint32_t* row_base = base + (cy + r) * pitch32 + cx;
         for (int col = 0; col < 8; col++) row_base[col] = 0xFF0A0A14;
@@ -251,7 +251,7 @@ static void term_putchar(char c) {
             uint32_t cx = term_x * 8;
             uint32_t cy = term_y * 10;
             uint32_t* base = (uint32_t*)g_backbuffer;
-            uint32_t pitch32 = g_term_max_cols * 8;
+            uint32_t pitch32 = term_surface_stride();
             const uint8_t* glyph = font8x8_basic[(uint8_t)c];
             
             // Draw character with solid background to prevent ghosting
@@ -282,7 +282,7 @@ static void term_render_cursor() {
     uint32_t cx = term_x * 8;
     uint32_t cy = term_y * 10;
     uint32_t* base = (uint32_t*)g_backbuffer;
-    uint32_t pitch32 = g_term_max_cols * 8;
+    uint32_t pitch32 = term_surface_stride();
 
     for (int r = 8; r < 10; r++) {
         uint32_t* row_base = base + (cy + r) * pitch32 + cx;

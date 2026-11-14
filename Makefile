@@ -124,7 +124,15 @@ test-console:
 	.storage-test/console-session-test
 	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/tty_idle_test.cpp -o .storage-test/tty-idle-test
 	.storage-test/tty-idle-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. tests/console_render_test.cpp -o .storage-test/console-render-test
+	.storage-test/console-render-test
 .PHONY: test-console
+
+test-resize:
+	mkdir -p .storage-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/window_resize_test.cpp -o .storage-test/window-resize-test
+	.storage-test/window-resize-test
+.PHONY: test-resize
 
 user/counter.o: user/counter.c
 	$(CC) $(USER_CFLAGS) -I. -c $< -o $@

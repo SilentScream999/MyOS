@@ -24,7 +24,7 @@ from pathlib import Path
 
 FOOTER_SIZE = 40
 FORMAT_VERSION = 2
-ABI = 3
+ABI = 4
 ICON_SIZES = (16, 24, 32, 48, 64, 128, 256, 512)
 MAX_MANIFEST = 4096
 MAX_ICON = 4 * 1024 * 1024
