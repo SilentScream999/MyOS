@@ -117,6 +117,26 @@ int main(int argc,char** argv){
     browser.saving=true;assert(browser.submit()==NativeFileDialog::ACCEPT&&!strcmp(browser.result,"/home/missing.txt"));
     char resolved[256];assert(NativeFileDialog::absolute("/home/projects","../../mnt/./",resolved)&&!strcmp(resolved,"/mnt"));
     assert(!NativeFileDialog::absolute("/",std::string(256,'x').c_str(),resolved));browser.hide();
+    // Full paths in the address field reveal and select files, without opening
+    // them until the user confirms. Relative and quoted paths work too.
+    assert(browser.show(false,"/home/"));
+    browser.event({5,0,0,'l',1,0},3);
+    assert(native_clipboard_set("/home/projects/draft.txt",native_length("/home/projects/draft.txt")));
+    browser.event({5,0,0,'v',1,0},3);assert(browser.event({5,0,0,'\n',0,0},3)==NativeFileDialog::WAIT);
+    assert(!strcmp(browser.directory,"/home/projects")&&!strcmp(browser.filename,"draft.txt"));
+    assert(browser.selected>=0&&!strcmp(browser.entries[browser.selected].name,"draft.txt"));
+    assert(browser.submit()==NativeFileDialog::ACCEPT&&!strcmp(browser.result,"/home/projects/draft.txt"));
+    browser.text_only=true;browser.focus=NativeFileDialog::ADDRESS;native_copy(browser.address,256,"\"notes.md\"");
+    assert(browser.submit()==NativeFileDialog::WAIT&&browser.selected>=0&&!strcmp(browser.entries[browser.selected].name,"notes.md"));
+    browser.focus=NativeFileDialog::ADDRESS;native_copy(browser.address,256,"/home/.hidden.txt");
+    assert(browser.submit()==NativeFileDialog::WAIT&&browser.selected>=0&&!strcmp(browser.filename,".hidden.txt"));
+    files["/root note.txt"]="root";browser.focus=NativeFileDialog::ADDRESS;native_copy(browser.address,256,"\"/root note.txt\"");
+    assert(browser.submit()==NativeFileDialog::WAIT&&!strcmp(browser.directory,"/")&&!strcmp(browser.filename,"root note.txt"));
+    browser.focus=NativeFileDialog::ADDRESS;native_copy(browser.address,256,"/missing/nothing.txt");
+    assert(browser.submit()==NativeFileDialog::WAIT&&!strcmp(browser.directory,"/"));
+    browser.saving=true;native_copy(browser.address,256,"/home/projects/new name.txt");
+    assert(browser.submit()==NativeFileDialog::WAIT&&!strcmp(browser.directory,"/home/projects")&&!strcmp(browser.filename,"new name.txt"));
+    assert(browser.submit()==NativeFileDialog::ACCEPT&&!strcmp(browser.result,"/home/projects/new name.txt"));browser.hide();
     assert(text_clipboard.set("/home/projects/draft.txt",native_length("/home/projects/draft.txt"))==0);
     assert(browser.show(false,"/home/"));browser.event({5,0,0,'v',1,0},3);
     assert(!strcmp(browser.filename,"/home/projects/draft.txt")&&browser.submit()==NativeFileDialog::ACCEPT);browser.hide();
@@ -135,6 +155,7 @@ int main(int argc,char** argv){
     // A path copied by another app replaces the current selection as text.
     assert(native_clipboard_set("/home/name with spaces.txt",native_length("/home/name with spaces.txt")));caret=anchor=length;
     key_event('v',1);assert(std::string(text,length).ends_with("/home/name with spaces.txt"));
+    handle_event({1,20,EDIT_TOP+5,1,0,0});assert(caret==0&&anchor==0);
     for(auto size: {std::pair{480,300},std::pair{760,520},std::pair{1200,720}}){
         pixels.assign(size.first*size.second,0);surface={pixels.data(),size.first,size.second};
         for(int i=NORMAL;i<=ABOUT;++i){modal=(Modal)i;render();}modal=NORMAL;
@@ -143,7 +164,8 @@ int main(int argc,char** argv){
     for(auto size: {std::pair{560,360},std::pair{1000,680}}){std::vector<uint32_t> dialog_pixels(size.first*size.second);
         browser.canvas={dialog_pixels.data(),size.first,size.second};browser.bound_scroll();browser.render();}
     browser.hide();
-    pixels.assign(760*520,0);surface={pixels.data(),760,520};render();
+    pixels.assign(760*520,0);surface={pixels.data(),760,520};
+    native_copy(path,sizeof(path),"/home/projects/notes.txt");note("Saved.");modified=false;render();
     if(argc>1){image(argv[1],surface);menu=0;render();image(std::string(argv[1])+"-file-menu.ppm",surface);menu=-1;
         assert(browser.show(false,"/home/projects/"));browser.render();image(std::string(argv[1])+"-open.ppm",browser.canvas);browser.hide();
         assert(browser.show(true,"/home/Untitled.txt"));browser.render();image(std::string(argv[1])+"-save-as.ppm",browser.canvas);browser.hide();}

@@ -19,10 +19,11 @@ struct NativeFileDialog {
         if(x>='A'&&x<='Z')x+=32;if(y>='A'&&y<='Z')y+=32;if(x!=y)return x<y?-1:1;}return *a?1:*b?-1:0;}
     static bool hit(int x,int y,int rx,int ry,int w,int h){return x>=rx&&x<rx+w&&y>=ry&&y<ry+h;}
     static bool absolute(const char* base,const char* value,char* output){
-        char raw[512];unsigned used=0;
+        char raw[512];unsigned used=0,n=native_length(value);
+        if(n>=2&&value[0]=='"'&&value[n-1]=='"'){++value;n-=2;}
         if(value[0]!='/'){unsigned n=native_length(base);if(n+1>=sizeof(raw))return false;
             memcpy(raw,base,n);used=n;if(used&&raw[used-1]!='/')raw[used++]='/';}
-        unsigned n=native_length(value);if(used+n>=sizeof(raw))return false;memcpy(raw+used,value,n+1);
+        if(used+n>=sizeof(raw))return false;memcpy(raw+used,value,n);raw[used+n]=0;
         unsigned at=0;output[at++]='/';const char* p=raw;
         while(*p){while(*p=='/')++p;const char* part=p;while(*p&&*p!='/')++p;unsigned len=(unsigned)(p-part);
             if(!len||(len==1&&part[0]=='.'))continue;
@@ -34,7 +35,7 @@ struct NativeFileDialog {
     void tell(const char* text){native_copy(message,sizeof(message),text);dirty=true;}
     int visible()const{int n=(canvas.h-206)/30;return n>0?n:1;}
     void bound_scroll(){int maximum=count-visible();if(maximum<0)maximum=0;if(scroll<0)scroll=0;if(scroll>maximum)scroll=maximum;}
-    bool navigate(const char* value){
+    bool navigate(const char* value,const char* reveal=nullptr){
         char target[256];file_info info{};
         if(!absolute(directory,value,target)){tell("The folder path is too long or invalid.");return false;}
         if(sys_stat(target,&info)!=0||info.type!=2){tell("Cannot open that folder. Check the path and storage.");return false;}
@@ -42,8 +43,9 @@ struct NativeFileDialog {
         count=0;selected=-1;scroll=0;last_click=-1;truncated=false;bool failed=false;uint64_t i=0;
         for(;i<8192;++i){char name[256];uint64_t size,type;
             int64_t rc=sys_readdir(directory,i,name,&size,&type);if(rc<=0){failed=rc<0;break;}
-            if(name[0]=='.')continue;
-            if(text_only&&type!=2){const char* ext=name;for(const char* p=name;*p;++p)if(*p=='.')ext=p;if(compare(ext,".txt"))continue;}
+            bool explicit_file=reveal&&equal(name,reveal);
+            if(name[0]=='.'&&!explicit_file)continue;
+            if(text_only&&type!=2&&!explicit_file){const char* ext=name;for(const char* p=name;*p;++p)if(*p=='.')ext=p;if(compare(ext,".txt"))continue;}
             if(count==512){truncated=true;break;}
             Entry value{};native_copy(value.name,256,name);value.size=size;value.type=type;
             int at=count++;while(at&&((type==2&&entries[at-1].type!=2)||
@@ -70,8 +72,28 @@ struct NativeFileDialog {
     void select(int index){if(index<0||index>=count)return;selected=index;
         if(entries[index].type!=2)native_copy(filename,256,entries[index].name);
         if(index<scroll)scroll=index;if(index>=scroll+visible())scroll=index-visible()+1;dirty=true;}
+    void resolve_address(){
+        char target[256];file_info info{};
+        if(!absolute(directory,address,target)){tell("The path is too long or invalid.");return;}
+        int64_t rc=sys_stat(target,&info);
+        if(rc==0&&info.type==2){if(navigate(target)){focus=LIST;replace_input=true;}return;}
+        if((rc!=0&&!saving)||(rc==0&&info.type!=1)){tell("That file or folder does not exist.");return;}
+        char parent[256],leaf[256];native_copy(parent,256,target);
+        unsigned split=native_length(parent);while(split&&parent[split-1]!='/')--split;
+        native_copy(leaf,256,parent+split);parent[split>1?split-1:1]=0;
+        if(!leaf[0]||!navigate(parent,leaf))return;
+        native_copy(filename,256,leaf);replace_input=true;
+        if(rc==0){
+            for(int i=0;i<count;++i)if(equal(entries[i].name,leaf)){select(i);focus=LIST;tell("File selected. Choose Open or Save to continue.");return;}
+            // An explicit path remains selectable even beyond the listing cap.
+            if(count==512)--count;
+            Entry entry{};native_copy(entry.name,256,leaf);entry.type=1;entry.size=info.size;
+            entries[count++]=entry;select(count-1);focus=LIST;
+        }else focus=NAME;
+        tell(saving?"Destination selected. Choose Save to continue.":"File selected. Choose Open to continue.");
+    }
     Result submit(){
-        if(focus==ADDRESS){if(navigate(address)){focus=LIST;replace_input=true;}return WAIT;}
+        if(focus==ADDRESS){resolve_address();return WAIT;}
         if(focus==LIST&&selected>=0&&entries[selected].type==2){navigate(entries[selected].name);return WAIT;}
         if(!filename[0]){tell("Choose a file name first.");return WAIT;}
         if(!absolute(directory,filename,result)){tell("The file path is too long or invalid.");return WAIT;}

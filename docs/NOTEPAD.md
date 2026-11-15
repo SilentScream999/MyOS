@@ -9,11 +9,15 @@ Open, Save, Save As and Exit; Edit contains Undo, Cut, Copy, Paste, Delete and
 Select All. Unavailable editing actions are dimmed. View toggles the status bar;
 Help shows About. Click a menu or use Alt+F/E/V/H, arrows, Enter and Escape.
 Ctrl+N, Ctrl+O, Ctrl+S and Ctrl+Shift+S remain available.
+The filename and unsaved indicator share the menu row; the full path appears
+in the existing status bar when space allows. Long paths shorten from the left
+to keep the filename visible. The document starts directly below the menus.
 
 Open and Save As open a separate Explorer-style file browser. Use the Home,
 Applications, System and Devices sidebar, double-click folders or select one
 and press Enter, and select files from the list. Up and Alt+Up navigate to the
-parent folder; Ctrl+L edits the folder address. The mouse wheel scrolls the list.
+parent folder; Ctrl+L edits the folder address. Paste a full file path there and
+press Enter to reveal and select that file, then choose Open or Save. The mouse wheel scrolls the list.
 Click File name to type a new save name, including spaces. All files and Text
 files filters control the listing, and Tab moves between filename, list and
 address fields. Lists are bounded to 512 visible entries and report truncation.

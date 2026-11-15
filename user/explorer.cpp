@@ -291,7 +291,7 @@ static void render() {
     const char* labels[]={"Home","Applications","App samples","Installed apps","System","Devices"};
     const char* paths[]={"/home","/home/Applications","/share/samples","/apps","/","/mnt"};
     for(int i=0;i<6;++i){int y=105+i*place_step;if(wiz_str_equal(current_dir,paths[i]))surface.rounded(8,y-4,148,36,5,0xff3b2d50);
-        surface.folder(17,y,20);surface.text(46,y+4,labels[i],INK,155);}
+        surface.folder(17,y+4+(ui_font_for_pixels(14)->height-20)/2,20);surface.text(46,y+4,labels[i],INK,155);}
     if(HEIGHT>=520){surface.text(17,HEIGHT-150,"WyzarOS",MUTED,155,16);surface.text(17,HEIGHT-124,"File Explorer",MUTED,155,12);}
     int type_x=WIDTH-233,size_x=WIDTH-90,header=LIST_TOP-33;
     surface.rect(SIDE,header,WIDTH-SIDE,32,PANEL);surface.text(216,header+7,"Name",MUTED,type_x-17,12);
@@ -300,7 +300,7 @@ static void render() {
         int index=scroll_row+row;if(index>=entry_count)break;int y=LIST_TOP+row*ROW;
         auto& e=entries[index];if(index==selected){surface.rounded(SIDE+7,y,WIDTH-SIDE-20,ROW,5,0xff3c2f51);surface.rect(SIDE+8,y+6,2,ROW-12,0xffc8a4ed);}
         else if(row%2)surface.rect(SIDE+7,y,WIDTH-SIDE-20,ROW,0xff201d2d);
-        if(e.type==2)surface.folder(180,y+2,28);
+        if(e.type==2)surface.folder(180,y+8+(ui_font_for_pixels(14)->height-28)/2,28);
         else if(wiz_name_is_package(e.name))surface.wizard(179,y+1,30);
         else surface.document(180,y+2,app_name_supported(e.name)?0xff9a82db:0xff8598b5);
         surface.text(216,y+8,e.name,INK,type_x-17);

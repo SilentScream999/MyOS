@@ -6,6 +6,11 @@ it does not depend on Notepad or a running/installed Explorer process. Include
 the header and declare a static `NativeFileDialog` (its bounded listing is too
 large for a small stack). Packages using it must declare `abi=7` or later.
 Ctrl+V pastes shared clipboard text into filename and folder address fields.
+The address field also accepts full file paths: press Enter to navigate to the
+parent folder and highlight the file, then Open/Save to confirm. Relative and
+double-quoted paths work, including spaces. Explicit paths can reveal files
+hidden by the active filter. In Save As, a new file path selects its existing
+parent folder and fills in the new filename. Missing paths leave the browser open.
 
 Call `dialog.show(false, "/home/")` to open a file, or
 `dialog.show(true, "/home/Untitled.txt")` to choose a save destination. The

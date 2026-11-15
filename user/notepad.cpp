@@ -17,12 +17,13 @@ static NativeFileDialog picker;
 static int menu=-1,menu_item=0;
 static bool show_status=true;
 static unsigned frame=0;
+constexpr int EDIT_TOP=44;
 static void note(const char* s){native_copy(message,sizeof(message),s);dirty=true;}
 static unsigned low(){return caret<anchor?caret:anchor;}
 static unsigned high(){return caret>anchor?caret:anchor;}
 static unsigned line_start(unsigned at){while(at&&text[at-1]!='\n')--at;return at;}
 static unsigned line_end(unsigned at){while(at<length&&text[at]!='\n')++at;return at;}
-static int rows(){int n=(surface.h-(show_status?112:84))/20;return n>0?n:1;}
+static int rows(){int n=(surface.h-EDIT_TOP-(show_status?28:0))/20;return n>0?n:1;}
 static int columns(){int n=(surface.w-44)/9;return n>0?n:1;}
 static void reveal(){
     int row=0;for(unsigned i=0;i<caret;++i)if(text[i]=='\n')++row;
@@ -126,20 +127,35 @@ static void render_menu(){
         if(menu==2&&show_status)surface.text(x+8,45+i*30,"*",0xffc9b5ff,x+23,12);
     }
 }
+static void fit_tail(const char* value,char* output,int width){
+    const UiFont* font=ui_font_for_pixels(12);
+    if(ui_text_width(font,value)<=width){native_copy(output,260,value);return;}
+    int dots=ui_text_width(font,"...");while(*value&&ui_text_width(font,value)+dots>width)++value;
+    output[0]=output[1]=output[2]='.';native_copy(output+3,257,value);
+}
 static void render(){
-    surface.rect(0,0,surface.w,surface.h,0xff1a1925);surface.rect(0,0,surface.w,78,0xff222131);
-    surface.text(16,52,modified?"*":"",0xffe9bd70);surface.text(30,52,path[0]?path:"Untitled",0xffeeebf8,surface.w-16);
+    surface.rect(0,0,surface.w,surface.h,0xff1a1925);surface.rect(0,0,surface.w,34,0xff222131);
+    const char* name=path[0]?path:"Untitled";for(const char* p=name;*p;++p)if(*p=='/')name=p+1;
+    char caption[260];fit_tail(name,caption,surface.w-280);
+    int caption_width=ui_text_width(ui_font_for_pixels(12),caption);
+    surface.text(surface.w-16-caption_width,9,caption,0xffb9aecb,surface.w-16,12);
+    if(modified)surface.text(surface.w-30-caption_width,9,"*",0xffe9bd70,surface.w-16,12);
     unsigned start=0;int row=0;while(start<length&&row<top_line)if(text[start++]=='\n')++row;
     for(int r=0;r<rows();++r){unsigned end=line_end(start);
         for(unsigned i=start;i<=end;++i){int col=(int)(i-start)-left_column;if(col<0||col>=columns())continue;
-            int x=20+col*9,y=88+r*20;
+            int x=20+col*9,y=EDIT_TOP+r*20;
             if(i>=low()&&i<high())surface.rect(x,y,9,20,0xff574274);
             if(i<end){char glyph[2]={text[i]=='\t'||text[i]=='\r'?' ':text[i],0};surface.text(x,y+2,glyph,0xffeeebf8,x+9,12);}
             if(i==caret&&modal==NORMAL)surface.rect(x,y,1,19,0xffe9bd70);
         }
         if(end==length)break;start=end+1;
     }
-    if(show_status){surface.rect(0,surface.h-28,surface.w,28,0xff222131);surface.text(12,surface.h-22,message,0xffb9aecb,surface.w-12,12);}
+    if(show_status){surface.rect(0,surface.h-28,surface.w,28,0xff222131);
+        surface.text(12,surface.h-22,message,0xffb9aecb,surface.w-12,12);
+        int start=ui_text_width(ui_font_for_pixels(12),message)+36,available=surface.w-start-16;
+        if(path[0]&&available>160){char location[260];fit_tail(path,location,available);
+            int width=ui_text_width(ui_font_for_pixels(12),location);
+            surface.text(surface.w-16-width,surface.h-22,location,0xff968ba8,surface.w-16,12);}}
     render_menu();
     if(modal==UNSAVED||modal==OVERWRITE||modal==ABOUT){int x=(surface.w-440)/2,y=(surface.h-174)/2;
         surface.rounded(x,y,440,174,8,0xff393047);
@@ -228,7 +244,7 @@ static void handle_event(const NativeEvent& e){
     if(e.y>=2&&e.y<30&&e.x>=4&&e.x<228){int next=(e.x-4)/56;menu=menu==next?-1:next;menu_item=0;dirty=true;return;}
     if(menu>=0){int x=4+menu*56;if(hit(e.x,e.y,x,38,270,menu_count()*30)){menu_item=(e.y-38)/30;menu_execute();}
         else {menu=-1;dirty=true;}return;}
-    if(e.y>=88&&e.y<88+rows()*20){int row=top_line+(e.y-88)/20,col=left_column+(e.x>20?(e.x-20)/9:0);unsigned at=0;
+    if(e.y>=EDIT_TOP&&e.y<EDIT_TOP+rows()*20){int row=top_line+(e.y-EDIT_TOP)/20,col=left_column+(e.x>20?(e.x-20)/9:0);unsigned at=0;
         while(at<length&&row)if(text[at++]=='\n')--row;
         unsigned end=line_end(at);caret=at+(unsigned)col;if(caret>end)caret=end;if(!(e.mods&2))anchor=caret;reveal();}
 }
