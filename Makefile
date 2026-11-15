@@ -98,7 +98,7 @@ init.elf: user/init.o
 WIZ_ASSETS = tools/wiz_pack.py $(wildcard assets/apps/*/app.manifest) $(wildcard assets/apps/*/data/*) \
              $(wildcard assets/icons/hicolor/*/apps/*.png)
 PACKAGE_DIR := build/packages
-PACKAGES := $(addprefix $(PACKAGE_DIR)/,counter.wiz win_test.wiz bundle_demo.wiz explorer.wiz)
+PACKAGES := $(addprefix $(PACKAGE_DIR)/,counter.wiz win_test.wiz bundle_demo.wiz explorer.wiz notepad.wiz)
 $(PACKAGE_DIR)/%.wiz: %.elf $(WIZ_ASSETS)
 	mkdir -p $(@D)
 	$(if $(wildcard assets/apps/$*/app.manifest),python3 tools/wiz_pack.py pack --elf $< --manifest assets/apps/$*/app.manifest --icons assets/icons/hicolor $(if $(wildcard assets/apps/$*/data),--data assets/apps/$*/data,) -o $@,cp $< $@)
@@ -117,6 +117,10 @@ test-wiz:
 test-explorer:
 	python3 tests/run_explorer_tests.py
 .PHONY: test-explorer
+
+test-notepad:
+	python3 tests/run_notepad_tests.py
+.PHONY: test-notepad
 
 test-console:
 	mkdir -p .storage-test
@@ -157,6 +161,12 @@ user/explorer.o: user/explorer.cpp user/native_ui.h user/wiz_cmd.h src/core/wiz.
 explorer.elf: user/explorer.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
+user/notepad.o: user/notepad.cpp user/native_ui.h user/native_file_dialog.h src/fs/fileinfo.h src/gui/ui_font.h src/gui/ui_font_data.h
+	$(CXX) $(USER_CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -I. -c $< -o $@
+
+notepad.elf: user/notepad.o
+	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
+
 user/console.o: user/console.cpp user/native_ui.h src/gui/font8x8_basic.h
 	$(CXX) $(USER_CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -I. -c $< -o $@
 
@@ -176,6 +186,7 @@ initrd.tar: init.elf counter.elf win_test.elf build/console.elf $(PACKAGES) asse
 	mkdir -p initrd_root/share/samples
 	cp $(PACKAGES) initrd_root/share/samples/
 	cp $(PACKAGE_DIR)/explorer.wiz initrd_root/bin/
+	cp $(PACKAGE_DIR)/notepad.wiz initrd_root/bin/
 	mkdir -p initrd_root/share/system
 	cp build/console.elf initrd_root/share/system/
 	mkdir -p initrd_root/share/fonts
@@ -245,7 +256,7 @@ run: iso
 
 
 clean:
-	rm -rf iso_root initrd_root $(PACKAGE_DIR) build/console.elf $(OBJ) $(OBJ:.o=.d) $(EXT4_OBJ) $(EXT4_OBJ:.o=.d) user/init.o user/counter.o user/win_test.o user/bundle_demo.o user/explorer.o user/console.o wyzar wyzar.iso myos myos.iso init.elf counter.elf win_test.elf bundle_demo.elf explorer.elf counter.wiz win_test.wiz bundle_demo.wiz initrd.tar
+	rm -rf iso_root initrd_root $(PACKAGE_DIR) build/console.elf $(OBJ) $(OBJ:.o=.d) $(EXT4_OBJ) $(EXT4_OBJ:.o=.d) user/init.o user/counter.o user/win_test.o user/bundle_demo.o user/explorer.o user/notepad.o user/console.o wyzar wyzar.iso myos myos.iso init.elf counter.elf win_test.elf bundle_demo.elf explorer.elf notepad.elf counter.wiz win_test.wiz bundle_demo.wiz initrd.tar
 
 # Refresh boot files and bundled system apps, preserving user files/settings.
 usb-image: all

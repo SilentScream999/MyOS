@@ -28,12 +28,62 @@ def distance(x, y, line):
     return math.hypot(x-ax-t*dx, y-ay-t*dy)
 
 
+def inside(x, y, points):
+    odd = False
+    for (ax, ay), (bx, by) in zip(points, points[1:] + points[:1]):
+        if (ay > y) != (by > y) and x < ax + (bx-ax)*(y-ay)/(by-ay):
+            odd = not odd
+    return odd
+
+
+def desktop_symbol(name, x, y):
+    """Full-size folder/paper silhouettes, without a padded background tile."""
+    color = None
+    if name == 'explorer':
+        if inside(x, y, [(4, 13), (7, 9), (25, 9), (31, 16), (57, 16), (60, 20), (59, 54), (5, 54)]):
+            color = (209, 140, 35)
+        if inside(x, y, [(7, 13), (24, 13), (30, 20), (56, 20), (56, 48), (7, 48)]):
+            color = (255, 215, 115)
+        if 11 <= x <= 55 and 22 <= y <= 36:
+            color = (79, 158, 219)
+        if 14 <= x <= 55 and 26 <= y <= 38:
+            color = (236, 245, 253)
+        if inside(x, y, [(3, 29), (61, 29), (57, 55), (7, 55)]):
+            t = (y-29)/26
+            color = (255-round(t*15), 205-round(t*31), 85-round(t*36))
+        if inside(x, y, [(3, 29), (61, 29), (60.5, 31), (3.5, 31)]):
+            color = (255, 229, 155)
+        if inside(x, y, [(7, 53), (57.3, 53), (57, 55), (7, 55)]):
+            color = (220, 151, 36)
+    else:
+        if 9 <= x <= 55 and 6 <= y <= 59:
+            color = (33, 102, 163)
+        if 13 <= x <= 54 and 5 <= y <= 56:
+            color = (222, 235, 247)
+        if 17 <= x <= 53 and 6 <= y <= 55:
+            color = (248, 251, 255)
+        if 13 <= x <= 54 and 5 <= y <= 16:
+            color = (100, 182, 238) if y < 8 else (62, 155, 222)
+        if 13 <= x <= 16 and 16 < y <= 56:
+            color = (169, 211, 242)
+        if 21 <= x <= 48 and any(abs(y-row) < .75 for row in (24, 31, 38, 45)):
+            color = (127, 169, 197)
+        for ring in (17, 25, 33, 41, 49):
+            if distance(x, y, (ring, 3, ring, 11)) < 1.3:
+                color = (54, 86, 112)
+            if distance(x, y, (ring-.4, 3, ring-.4, 10)) < .45:
+                color = (205, 225, 242)
+    return color
+
+
 def icon(name, size):
     colors = {'terminal': (59, 116, 195), 'application-default': (81, 116, 198),
               'visual-test': (39, 153, 151), 'rainbow': (143, 89, 191),
               'boot-log': (76, 132, 159), 'counter': (194, 126, 47), 'win_test': (39, 153, 151),
-              'explorer': (91, 67, 132)}
+              'explorer': (91, 67, 132), 'notepad': (76, 115, 146)}
     lines = {
+        'notepad': [(21, 18, 43, 18), (43, 18, 43, 46), (43, 46, 21, 46),
+                    (21, 46, 21, 18), (26, 26, 38, 26), (26, 33, 38, 33), (26, 40, 34, 40)],
         'terminal': [(19, 23, 28, 31), (28, 31, 19, 39), (34, 40, 45, 40)],
         'boot-log': [(22, 21, 42, 21), (22, 29, 42, 29), (22, 37, 42, 37), (22, 45, 34, 45)],
         'counter': [(23, 21, 23, 43), (32, 21, 32, 43), (20, 28, 44, 28), (20, 36, 44, 36)],
@@ -49,6 +99,12 @@ def icon(name, size):
             for sy in range(4):
                 for sx in range(4):
                     x, y = (px+(sx+.5)/4)*64/size, (py+(sy+.5)/4)*64/size
+                    if name in ('explorer', 'notepad'):
+                        color = desktop_symbol(name, x, y)
+                        if color is not None:
+                            for i in range(3): sums[i] += color[i]
+                            sums[3] += 255
+                        continue
                     # Rounded tile, with a transparent margin for every theme.
                     dx, dy = max(abs(x-32)-17, 0), max(abs(y-32)-17, 0)
                     if dx*dx+dy*dy > 9*9:
@@ -85,7 +141,7 @@ def icon(name, size):
 
 
 def main():
-    names = ('terminal', 'application-default', 'visual-test', 'rainbow', 'boot-log', 'counter', 'win_test', 'explorer')
+    names = ('terminal', 'application-default', 'visual-test', 'rainbow', 'boot-log', 'counter', 'win_test', 'explorer', 'notepad')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--only', choices=names, help='Regenerate one icon family')
     args = parser.parse_args()

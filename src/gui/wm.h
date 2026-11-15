@@ -123,6 +123,11 @@ static char* hud_put_ms1(char* sp, uint64_t ticks) {
 #define WIN_MOD_SHIFT (1u << 1)
 #define WIN_MOD_ALT   (1u << 2)
 #define WIN_MOD_GUI   (1u << 3)
+#define WIN_KEY_HOME   0x1100u
+#define WIN_KEY_END    0x1101u
+#define WIN_KEY_DELETE 0x1102u
+#define WIN_ROLE_APP 0u
+#define WIN_ROLE_FILE_DIALOG 1u
 
 #define WIN_EVENT_NONE         0u
 #define WIN_EVENT_MOUSE_DOWN   1u
@@ -181,6 +186,7 @@ struct Window {
     Window* retired_next;
     bool minimized,maximized;
     ResizeRect restore_rect;
+    uint32_t role; // Semantic window role; ownership/executable remain those of the caller.
 };
 
 #define USER_WIN_BASE   0x0000600000000000ULL
@@ -416,7 +422,8 @@ static void wm_resources_reload() {
     for (int i=0;i<g_window_count;++i) {
         const Window* win=g_window_list[i];
         if (!win || !win->visible) continue;
-        if (win->is_system && win->type>=0 && win->type<4) demand.system[win->type]=true;
+        if (!win->is_system && win->role==WIN_ROLE_FILE_DIALOG) demand.system[resources::file_dialog_icon]=true;
+        else if (win->is_system && win->type>=0 && win->type<4) demand.system[win->type]=true;
         else if (!win->is_system && demand.window_count<32) {
             resources::copy(demand.executables[demand.window_count++],256,win->executable);
             bool registered=false;
@@ -467,6 +474,7 @@ static void wm_resource_worker() {
     }
 }
 static const resources::Icons& wm_window_icons(const Window* window) {
+    if(!window->is_system&&window->role==WIN_ROLE_FILE_DIALOG)return g_resources_catalog->system[resources::file_dialog_icon];
     if(resources::equal(window->executable,"/share/system/console.elf"))return g_resources_catalog->system[0];
     if (window->is_system && window->type>=0 && window->type<4)
         return g_resources_catalog->system[window->type];
@@ -1452,7 +1460,9 @@ static inline void wm_dispatch_key(char c, uint32_t scancode, bool is_down, uint
     ev.type = WIN_EVENT_KEY_DOWN;
     ev.x = 0;
     ev.y = 0;
-    ev.key = c ? (uint32_t)(uint8_t)c : scancode;
+    // Non-text HID usages must not masquerade as printable ASCII in editors.
+    ev.key = c ? (uint32_t)(uint8_t)c : scancode==0x4a?WIN_KEY_HOME:
+        scancode==0x4d?WIN_KEY_END:scancode==0x4c?WIN_KEY_DELETE:0x2000u+scancode;
     ev.mods = mods;
     ev.delta = 0;
     wm_win_push_event(focused, ev);

@@ -40,6 +40,8 @@ static int64_t sys_readdir(const char* p,uint64_t i,char* n,uint64_t* s,uint64_t
     return native_call(40,(uint64_t)p,i,(uint64_t)n,(uint64_t)s,(uint64_t)t);
 }
 static unsigned native_length(const char* s) { unsigned n=0; while(s[n]) ++n; return n; }
+static bool native_clipboard_set(const char* text,unsigned length){return (int64_t)native_call(217,0,(uint64_t)text,length)==0;}
+static int64_t native_clipboard_get(char* text,unsigned capacity){return (int64_t)native_call(217,1,(uint64_t)text,capacity);}
 static bool native_copy(char* d,unsigned cap,const char* s) {
     unsigned n=native_length(s); if(n>=cap) return false;
     for(unsigned i=0;i<=n;++i) d[i]=s[i]; return true;

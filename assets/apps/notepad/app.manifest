@@ -1,0 +1,7 @@
+id=notepad
+name=Notepad
+version=1.0.0
+abi=7
+type=gui
+icon=notepad
+description=Edit text documents with atomic saving and unsaved-change protection.

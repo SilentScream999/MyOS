@@ -28,6 +28,21 @@ General calls are listed in [Syscalls](Syscalls.md).
 | 206 | `SYS_WIN_RESIZABLE` | `id`, `min_width`, `min_height` | surface pointer, or `0` on failure | ABI 4. Owner-only opt-in to native resize events; reserves backing for desktop-sized surfaces. Minimums must fit the current desktop. Call before drawing. |
 | 207 | `SYS_WIN_ACCEPT_RESIZE` | `id` | surface pointer, or `0` on failure | ABI 4. Owner-only; adopts the latest client dimensions and pitch. Redraw the whole surface afterwards. |
 | 208 | `SYS_WIN_INFO` | `id`, `WindowInfo*` | `0`, or `-1` | ABI 4. Owner-only; returns the current drawing surface dimensions, pitch and user pointer. |
+| 209 | `SYS_WIN_ROLE` | `id`, `role` | `0`, or `-1` | ABI 6. Owner-only; 0=ordinary app window, 1=common file dialog. File dialogs use the Explorer theme icon in the title bar and taskbar, independent of the caller. Other role values and system windows are refused. |
+
+Native apps can reuse `user/native_file_dialog.h` for Open and Save As windows.
+It sets the common file-dialog role automatically. See [common file dialogs](../docs/FILE_DIALOGS.md).
+
+## Input keys and buttons
+
+Mouse down/up `key` values are button bits: 1=left, 2=right, 4=middle.
+Native clients receive right/middle transitions in their client area; right
+click also focuses the window without beginning a drag.
+Keyboard events contain ASCII text, or arrows at `0x1041` through `0x1044`
+(Up, Down, Right, Left). Home, End and Delete use `0x1100`, `0x1101`,
+`0x1102` on USB and PS/2 keyboards. Other non-text keys use `0x2000` plus
+the device scancode, so they cannot accidentally insert ASCII text.
+Modifier bits are Ctrl=1, Shift=2, Alt=4, GUI=8.
 
 ## Resizing
 

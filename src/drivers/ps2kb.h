@@ -93,6 +93,13 @@ void ps2kb_irq_handler() {
     // Ignore other key release events (scancode > 0x80)
     if (scancode & 0x80) return;
 
+    if(was_e0&&(scancode==0x47||scancode==0x4f||scancode==0x53)){
+        Window* focused=wm_find_window(g_focused_win_id);
+        if(focused&&!focused->is_system){WinEvent ev{};ev.type=WIN_EVENT_KEY_DOWN;ev.mods=mods;
+            ev.key=scancode==0x47?WIN_KEY_HOME:scancode==0x4f?WIN_KEY_END:WIN_KEY_DELETE;
+            wm_win_push_event(focused,ev);}return;
+    }
+
     if (scancode < (uint8_t)sizeof(ps2_set1_map)) {
         char c = ps2_shift_held ? ps2_set1_shift_map[scancode] : ps2_set1_map[scancode];
         wm_dispatch_key(c, scancode, true, mods);

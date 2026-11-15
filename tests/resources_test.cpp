@@ -1,3 +1,6 @@
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -113,5 +116,17 @@ int main(int argc,char** argv) {
     text("/etc/icons.cfg","../../bad\n");
     demand={}; demand.system[0]=true;
     catalog=resources::build(store,24,16,24,demand); assert(catalog && catalog->system[0].title.pixels); resources::release(catalog);
+    // Common dialogs use the Explorer theme icon without depending on the
+    // calling app or an installed /bin/explorer.wiz executable.
+    files["/share/icons/hicolor/32x32/apps/explorer.png"]=blue;
+    demand={};demand.system[resources::file_dialog_icon]=true;
+    catalog=resources::build(store,24,16,24,demand);
+    assert(catalog&&catalog->system[resources::file_dialog_icon].title.pixels);
+    assert(catalog->system[resources::file_dialog_icon].title.pixels[0]==0xff0000ff);
+    assert(catalog->system[resources::file_dialog_icon].task.pixels[0]==0xff0000ff);
+    reads.clear();decodes=store.decodes;
+    auto* dialog_again=resources::build(store,24,16,24,demand,catalog);
+    assert(dialog_again&&reads.empty()&&store.decodes==decodes);
+    resources::release(dialog_again);resources::release(catalog);
     store.clear(); assert(live==0);
 }

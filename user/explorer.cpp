@@ -24,7 +24,7 @@ static char history[32][256]; static int history_count=0, history_at=-1;
 static char clipboard[256]; static bool clipboard_cut=false;
 static char status_line[192]="Double-click a folder or app to open it.";
 static char edit_text[256], dialog_target[256], dialog_text[4097];
-enum Dialog { NONE, NEW_FOLDER, RENAME, DELETE_ITEM, PREVIEW, PACKAGE_RESULT, NEW_FILE };
+enum Dialog { NONE, NEW_FOLDER, RENAME, DELETE_ITEM, PREVIEW, PACKAGE_RESULT, NEW_FILE, OPEN_WITH };
 static Dialog dialog=NONE;
 static bool address_edit=false, edit_replace=false;
 static char address[256]="/home";
@@ -32,6 +32,9 @@ static uint64_t window_id=0, frame=0, last_click_frame=0;
 static int last_click=-1;
 static int hovered_button=-1;
 static NativeSurface surface{};
+static bool context_open=false;
+static int context_x=0,context_y=0;
+constexpr int CONTEXT_ITEMS=7,CONTEXT_HEIGHT=CONTEXT_ITEMS*31+14;
 
 static void status(const char* text) { native_copy(status_line,sizeof(status_line),text); dirty=true; }
 static int compare(const char* a,const char* b) {
@@ -46,6 +49,7 @@ static bool selected_path(char* path) {
     return selected>=0&&selected<entry_count&&join_path(current_dir,entries[selected].name,path);
 }
 static void load_directory() {
+    context_open=false;
     entry_count=0;selected=-1;scroll_row=0;last_click=-1;listing_truncated=false;listing_error=false;
     char name[256]; uint64_t size,type;
     // Bound work even on broken drivers or directories full of hidden files.
@@ -94,6 +98,13 @@ static void select_row(int index) {
     last_click=-1;dirty=true;
     if(wiz_name_is_package(entries[selected].name))status("Double-click runs this app. Install adds it to Start; Pin keeps it in this location.");
 }
+static void open_with_notepad();
+static bool text_document(const char* name) {
+    const char* extension=name;for(const char* p=name;*p;++p)if(*p=='.')extension=p;
+    const char* supported[]={".txt",".md",".log",".cfg",".ini",".json",".csv",".c",".cpp",".h"};
+    for(const char* candidate:supported)if(compare(extension,candidate)==0)return true;
+    return false;
+}
 static void open_selected() {
     char path[256];if(!selected_path(path))return;
     if(entries[selected].type==2) { navigate(path);return; }
@@ -102,6 +113,7 @@ static void open_selected() {
         if(pid<=0){status("Could not launch this app. Its package may be invalid or unsupported.");return;}
         status("App opened independently. Console apps use their own terminal.");return;
     }
+    if(text_document(path)){open_with_notepad();return;}
     uint64_t fd=sys_open(path,0);if(fd==(uint64_t)-1){status("Cannot read that file.");return;}
     uint64_t n=sys_read(fd,dialog_text,sizeof(dialog_text)-1);sys_close(fd);
     if(n>=sizeof(dialog_text)){status("File read failed.");return;}
@@ -109,6 +121,16 @@ static void open_selected() {
     if(binary)native_copy(dialog_text,sizeof(dialog_text),"This file has binary content. A viewer for this file type is not installed.");
     else dialog_text[n]=0;
     native_copy(dialog_target,sizeof(dialog_target),entries[selected].name);dialog=PREVIEW;dirty=true;
+}
+static void open_with_notepad() {
+    char path[256];if(!selected_path(path)||entries[selected].type!=1)return;
+    int64_t pid=native_call(216,(uint64_t)"/bin/notepad.wiz",(uint64_t)path);
+    if(pid<=0){status("Could not open Notepad. Check that /bin/notepad.wiz is available.");return;}
+    dialog=NONE;status("File opened in Notepad.");
+}
+static void choose_open_with() {
+    if(selected<0||entries[selected].type!=1)return;
+    dialog=OPEN_WITH;address_edit=false;dirty=true;
 }
 static void begin_dialog(Dialog kind) {
     if((kind==RENAME||kind==DELETE_ITEM)&&!selected_path(dialog_target))return;
@@ -144,6 +166,10 @@ static void commit_dialog() {
 static void copy_selection(bool cut) {
     if(!selected_path(clipboard))return;
     clipboard_cut=cut;status(cut?"Ready to move. Open a destination folder, then Paste.":"Ready to copy. Open a destination folder, then Paste.");
+}
+static void copy_as_path(){
+    char path[256];if(!selected_path(path))return;
+    status(native_clipboard_set(path,native_length(path))?"Path copied. Paste it with Ctrl+V.":"Could not copy the path.");
 }
 static void paste_selection() {
     if(!clipboard[0]){status("Copy or cut an item first.");return;}
@@ -287,7 +313,21 @@ static void render() {
     if(entry_count>VISIBLE){int track=VISIBLE*ROW,thumb=track*VISIBLE/entry_count;if(thumb<20)thumb=20;
         surface.rect(WIDTH-10,LIST_TOP,4,track,LINE);surface.rect(WIDTH-10,LIST_TOP+(track-thumb)*scroll_row/(entry_count-VISIBLE),4,thumb,0xff6486b2);}
     surface.rect(0,HEIGHT-36,WIDTH,36,PANEL);surface.text(14,HEIGHT-25,status_line,MUTED,WIDTH-12,12);
-    if(dialog!=NONE) {
+    if(context_open) {
+        const char* labels[]={"Open","Open with...","Copy","Cut","Copy as path","Rename","Delete"};
+        surface.rounded(context_x+3,context_y+3,180,CONTEXT_HEIGHT,6,0xff0c1019);
+        surface.rounded(context_x,context_y,180,CONTEXT_HEIGHT,6,0xff332a42);
+        for(int i=0;i<CONTEXT_ITEMS;++i)surface.text(context_x+14,context_y+12+i*31,labels[i],
+            i==1&&entries[selected].type!=1?MUTED:INK,context_x+172);
+    }
+    if(dialog==OPEN_WITH) {
+        int left=(WIDTH-480)/2,top=(HEIGHT-202)/2;
+        surface.rounded(left,top,480,202,8,0xff332a42);
+        surface.text(left+22,top+18,"Open with",INK,left+458,18);
+        surface.text(left+22,top+52,entries[selected].name,MUTED,left+458);
+        draw_button({left+22,top+88,436,38,"Notepad - edit text files"},true);
+        draw_button({left+366,top+158,92,30,"Cancel"});
+    } else if(dialog!=NONE) {
         bool reading=dialog==PREVIEW||dialog==PACKAGE_RESULT;int height=reading?380:202;if(height>HEIGHT-40)height=HEIGHT-40;
         int top=(HEIGHT-height)/2,left=(WIDTH-480)/2;
         surface.rect(left+5,top+5,480,height,0xff0c1019);surface.rect(left,top,480,height,0xff283449);
@@ -318,18 +358,31 @@ static void edit_key(char* buffer,unsigned capacity,uint32_t key) {
     else if(key>=32&&key<=126){if(edit_replace){n=0;buffer[0]=0;}if(n+1<capacity){buffer[n]=(char)key;buffer[n+1]=0;}edit_replace=false;}
     dirty=true;
 }
+static void paste_text(char* buffer,unsigned capacity){
+    char value[256];int64_t n=native_clipboard_get(value,sizeof(value));
+    if(n<0){status("Clipboard text is too long or unavailable.");return;}
+    for(int64_t i=0;i<n;++i)if((unsigned char)value[i]<32){status("Paste a single path or name.");return;}
+    unsigned at=edit_replace?0:native_length(buffer);
+    if(at+(unsigned)n>=capacity){status("The pasted text is too long.");return;}
+    memcpy(buffer+at,value,(unsigned)n+1);edit_replace=false;dirty=true;
+}
 static void handle_event(const NativeEvent& event) {
-    if(event.type==8){if(native_accept_resize(window_id,surface))layout(surface.w,surface.h);return;}
+    if(event.type==8){context_open=false;if(native_accept_resize(window_id,surface))layout(surface.w,surface.h);return;}
     if(event.type==3){int next=-1;if(dialog==NONE)for(int i=0;i<14;++i)
             if(hit(event.x,event.y,buttons[i].x,buttons[i].y,buttons[i].w,buttons[i].h)){next=i;break;}
         if(next!=hovered_button){hovered_button=next;dirty=true;}return;}
     if(event.type==5) {
         uint32_t key=event.key;
+        if(context_open){context_open=false;dirty=true;if(key==27)return;}
+        if(dialog==OPEN_WITH){if(key==27){dialog=NONE;dirty=true;}else if(key=='\n'||key=='\r')open_with_notepad();return;}
         if(dialog!=NONE){if(key==27){dialog=NONE;dirty=true;}else if(key=='\n'||key=='\r')commit_dialog();
-            else if(dialog==NEW_FOLDER||dialog==NEW_FILE||dialog==RENAME)edit_key(edit_text,sizeof(edit_text),key);return;}
+            else if(dialog==NEW_FOLDER||dialog==NEW_FILE||dialog==RENAME){
+                if((event.mods&1)&&(key=='v'||key=='V'))paste_text(edit_text,sizeof(edit_text));else edit_key(edit_text,sizeof(edit_text),key);}return;}
         if(address_edit){if(key==27){address_edit=false;native_copy(address,sizeof(address),current_dir);dirty=true;}
-            else if(key=='\n'||key=='\r')navigate(address);else edit_key(address,sizeof(address),key);return;}
-        if((event.mods&1)&&(key=='c'||key=='C'))copy_selection(false);
+            else if(key=='\n'||key=='\r')navigate(address);else if((event.mods&1)&&(key=='v'||key=='V'))paste_text(address,sizeof(address));
+            else edit_key(address,sizeof(address),key);return;}
+        if((event.mods&3)==3&&(key=='c'||key=='C'))copy_as_path();
+        else if((event.mods&1)&&(key=='c'||key=='C'))copy_selection(false);
         else if((event.mods&1)&&(key=='x'||key=='X'))copy_selection(true);
         else if((event.mods&1)&&(key=='v'||key=='V'))paste_selection();
         else if((event.mods&1)&&(key=='l'||key=='L')){address_edit=true;edit_replace=true;dirty=true;}
@@ -339,9 +392,24 @@ static void handle_event(const NativeEvent& event) {
         else if(key==0x1042)select_row(selected<0?0:selected+1);
         else if(key=='\n'||key=='\r')open_selected();
         else if(key==8||key==127)navigate("..");
-    } else if(event.type==4&&dialog==NONE){scroll_row-=event.delta*3;if(scroll_row<0)scroll_row=0;
+    } else if(event.type==1&&event.key==2&&dialog==NONE){
+        context_open=false;address_edit=false;last_click=-1;
+        if(hit(event.x,event.y,SIDE,LIST_TOP,WIDTH-SIDE,VISIBLE*ROW)){
+            int index=scroll_row+(event.y-LIST_TOP)/ROW;
+            if(index<entry_count){selected=index;context_open=true;context_x=event.x;context_y=event.y;
+                if(context_x+180>WIDTH)context_x=WIDTH-180;if(context_y+CONTEXT_HEIGHT>HEIGHT-36)context_y=HEIGHT-36-CONTEXT_HEIGHT;}}
+        dirty=true;return;
+    } else if(event.type==4&&dialog==NONE){context_open=false;scroll_row-=event.delta*3;if(scroll_row<0)scroll_row=0;
         int max=entry_count-VISIBLE;if(max<0)max=0;if(scroll_row>max)scroll_row=max;dirty=true;}
     else if(event.type==1&&event.key==1){int x=event.x,y=event.y;
+        if(context_open){context_open=false;dirty=true;
+            if(hit(x,y,context_x,context_y+6,180,CONTEXT_ITEMS*31)){int action=(y-context_y-6)/31;
+                if(action==0)open_selected();else if(action==1)choose_open_with();else if(action==2)copy_selection(false);
+                else if(action==3)copy_selection(true);else if(action==4)copy_as_path();else if(action==5)begin_dialog(RENAME);else if(action==6)begin_dialog(DELETE_ITEM);}
+            return;}
+        if(dialog==OPEN_WITH){int left=(WIDTH-480)/2,top=(HEIGHT-202)/2;
+            if(hit(x,y,left+22,top+88,436,38))open_with_notepad();
+            else if(hit(x,y,left+366,top+158,92,30)){dialog=NONE;dirty=true;}return;}
         if(dialog!=NONE){bool reading=dialog==PREVIEW||dialog==PACKAGE_RESULT;int h=reading?380:202;if(h>HEIGHT-40)h=HEIGHT-40;
             int top=(HEIGHT-h)/2,left=(WIDTH-480)/2;
             if(hit(x,y,left+(reading?372:266),top+h-44,90,30)){dialog=NONE;dirty=true;}

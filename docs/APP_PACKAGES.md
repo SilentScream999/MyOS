@@ -91,9 +91,12 @@ Unknown keys are ignored, so newer packages stay readable on older systems.
 A package with a higher `abi` than the OS provides is **refused by the loader and
 hidden from Start**, rather than starting and crashing.
 
-The current OS supports ABI 4 (native window resize events and surface dimensions).
-ABI 3 added independent desktop launches and private console sessions. ABI 1, 2
-and 3 packages remain supported; File Explorer requires ABI 4. Older windowed
+The current OS supports ABI 7 (shared desktop text clipboard).
+ABI 6 added common file-dialog window identity.
+ABI 5 added document launch paths and Open with.
+ABI 4 added native window resizing; ABI 3 added independent desktop launches and
+private console sessions. ABI 1 through 6 packages remain supported; File Explorer
+and Notepad require ABI 7. Older windowed
 apps can still be resized through compositor scaling.
 
 Use `type=gui` for windowed apps or `type=console` for terminal programs. An

@@ -508,6 +508,18 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
         }
     }
 
+    // Secondary buttons go to native clients without starting title/resize drags.
+    for(unsigned button=2;button<=4;button<<=1){
+        if((g_mouse_buttons&button)==(g_mouse_prev_buttons&button)||g_menu_open)continue;
+        int idx=wm_find_top_window(g_mouse_x,g_mouse_y);
+        if(idx<0)continue;Window* win=g_window_list[idx];
+        if(win->is_system||g_mouse_y<win->y||g_mouse_y>=win->y+win->h)continue;
+        if(g_mouse_buttons&button)wm_raise_window(idx);
+        WinEvent ev{};ev.type=(g_mouse_buttons&button)?WIN_EVENT_MOUSE_DOWN:WIN_EVENT_MOUSE_UP;
+        wm_event_coordinates(win,g_mouse_x,g_mouse_y,&ev);ev.key=button;ev.mods=g_kbd_modifiers;
+        wm_win_push_event(win,ev);
+    }
+
     // 3. Restore a maximized title drag, then update the drag/resize outline.
     for (int i = 0; i < g_window_count; i++) {
         Window* win = g_window_list[i];

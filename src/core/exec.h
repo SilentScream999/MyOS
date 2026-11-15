@@ -188,12 +188,14 @@ static bool exec_is_gui(const char* path) {
     }
     vfs_close(&f);return gui;
 }
-static int64_t launch_program(const char* path,bool desktop,bool* gui) {
+static int64_t launch_program(const char* path,bool desktop,bool* gui,const char* document) {
     if(app_path_is_shell(path))return -1;
     *gui=exec_is_gui(path);bool host=desktop&&!*gui;
+    if(document&&*document&&!*gui)return -1; // Document handlers currently require a GUI package.
     Task* t=execve_path(host?"/share/system/console.elf":path);if(!t)return -1;
     t->parent_pid=(desktop||*gui)?0:g_current_task?g_current_task->pid:0;
     if(g_current_task)strcpy(t->cwd,g_current_task->cwd);
+    if(document)strcpy(t->document_path,document);
     t->gui_app=desktop||*gui;
     if(host){
         auto* c=(AppConsole*)kmalloc(sizeof(AppConsole));if(!c){task_free(t);return -1;}

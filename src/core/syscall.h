@@ -120,6 +120,11 @@ static inline uint64_t rdmsr(uint32_t msr) {
 #define SYS_TRYWAIT 212u   // nonblocking wait for one child; 0 means still running
 #define SYS_LAUNCH 213u    // subsystem-aware launch; desktop origin=1, shell origin=0
 #define SYS_CONSOLE 214u   // private console-host channel
+#define SYS_DOCUMENT_PATH 215u // copy the optional launch document path
+#define SYS_OPEN_WITH 216u // desktop GUI launch: app path, document path
+#define SYS_TEXT_CLIPBOARD 217u // action 0=set bytes, 1=get NUL-terminated text
+#include "text_clipboard.h"
+static TextClipboard g_text_clipboard;
 #define SYS_CHDIR   80u
 #define SYS_MKDIR   83u
 #define SYS_RMDIR   84u
@@ -137,6 +142,7 @@ static inline uint64_t rdmsr(uint32_t msr) {
 #define SYS_WIN_RESIZABLE 206u
 #define SYS_WIN_ACCEPT_RESIZE 207u
 #define SYS_WIN_INFO 208u
+#define SYS_WIN_ROLE 209u // (owned window, role): 0=app, 1=common file dialog
 
 // ── string copying from user ──────────────────────────────────────────────────
 // For safety we should check if buf_va is within user limits.
@@ -432,7 +438,7 @@ static uint64_t sys_readdir(uint64_t path_va, uint64_t index, uint64_t name_out_
 }
 
 static Task* execve_path(const char* path);
-static int64_t launch_program(const char* path,bool desktop,bool* gui);
+static int64_t launch_program(const char* path,bool desktop,bool* gui,const char* document=nullptr);
 
 static uint64_t sys_unlink(uint64_t path_va) {
     char path[256];
@@ -614,6 +620,23 @@ static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uin
             if(pid>0&&a3)*(uint64_t*)a3=gui?1:0;return pid;
         }
         case SYS_CONSOLE:return sys_console(a1,a2,a3);
+        case SYS_OPEN_WITH: {
+            char app[256],document[256];
+            if(!get_user_path(a1,app,sizeof(app))||!get_user_path(a2,document,sizeof(document)))return (uint64_t)-1;
+            bool gui=false;return launch_program(app,true,&gui,document);
+        }
+        case SYS_TEXT_CLIPBOARD: {
+            if(a1>1||!a2||a2>=USERSPACE_END||a3>USERSPACE_END-a2||
+                (a1==0&&a3>TextClipboard::capacity))return (uint64_t)-1;
+            TtyIrqGuard guard;
+            return a1==0?g_text_clipboard.set((const char*)a2,a3):g_text_clipboard.get((char*)a2,a3);
+        }
+        case SYS_DOCUMENT_PATH: {
+            if(!g_current_task||!a1||a1>=USERSPACE_END)return (uint64_t)-1;
+            const char* path=g_current_task->document_path;uint64_t len=strlen(path);
+            if(a2<len+1||len+1>USERSPACE_END-a1)return (uint64_t)-1;
+            copy_string_to_user(a1,path,len+1);return len;
+        }
         case SYS_EXIT:   sys_exit(a1);
         case SYS_TRYWAIT:
         case SYS_WAITPID: {
@@ -650,6 +673,13 @@ static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uin
             if(!win||!g_current_task||win->owner_pid!=g_current_task->pid||!win->native_resize)return 0;
             TtyIrqGuard guard;win->canvas_width=win->w;win->canvas_height=win->h;win->buffer_pitch=win->w*4;
             win->resize_pending=false;wm_discard_pointer_events(win);return win->user_va;
+        }
+        case SYS_WIN_ROLE: {
+            Window* win=wm_find_window((int)a1);
+            if(!win||!g_current_task||win->is_system||win->owner_pid!=g_current_task->pid||a2>WIN_ROLE_FILE_DIALOG)return (uint64_t)-1;
+            TtyIrqGuard guard;win->role=(uint32_t)a2;win->chrome_drawn=false;
+            ++g_resource_demand_generation;g_resources_requested=true;
+            wm_damage_window_full(win);g_needs_refresh=true;return 0;
         }
         case SYS_WIN_INFO: {
             Window* win=wm_find_window((int)a1);

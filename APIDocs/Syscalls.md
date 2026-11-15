@@ -29,7 +29,11 @@ for `rcx`/`r11` and memory effects. User-pointer validation remains incomplete.
 | 212 | `TRYWAIT` | Nonblocking exact-child wait: PID and optional exit-status pointer, returns child PID when collected, 0 while running, or -1 on error. Running/error results leave the status buffer untouched |
 | 213 | `LAUNCH` | Path, origin (0=shell, 1=desktop), optional GUI-kind output pointer. Returns PID or -1. GUI apps are detached; desktop console apps get a private terminal host |
 | 214 | `CONSOLE` | Console-host-only channel: action, buffer, size. Actions: 0=get target path, 1=drain output, 2=submit input, 3=EOF, 4=interrupt foreground program. Buffers limited to 4096 bytes |
+| 215 | `DOCUMENT_PATH` | Buffer, capacity; copy the caller's launch document path including NUL. Returns byte length, zero for a normal launch, or -1 for an invalid/short buffer |
+| 216 | `OPEN_WITH` | App path, document path; launch a detached GUI package with a private copy of the resolved document path. Returns PID or -1; console handlers are refused |
+| 217 | `TEXT_CLIPBOARD` | ABI 7. Action, buffer, size: action 0 sets up to 65536 text bytes (without NUL), returns 0; action 1 copies text including NUL into the supplied capacity and returns its byte length. Errors return -1 and preserve clipboard/output. Shared between native apps, memory-only; embedded NUL is refused |
 | 200–208 | Window operations, including native resizing (206–208, ABI 4) | See [Window API](WindowAPI.md) |
+| 209 | `WIN_ROLE` | Owned window ID, role (0=app, 1=common file dialog); returns 0 or -1. ABI 6; gives common dialogs the Explorer icon without changing ownership |
 
 Paths accept absolute and CWD-relative forms, `.` and `..`, with a current
 255-byte userspace limit. File metadata structures are in `src/fs/fileinfo.h`;

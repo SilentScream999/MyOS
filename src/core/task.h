@@ -115,6 +115,7 @@ struct Task {
     bool gui_app;
     bool console_host;
     char launch_target[256];
+    char document_path[256]; // Optional document supplied by desktop Open with.
 };
 
 // ── Global PID counter ─────────────────────────────────────────────────────────

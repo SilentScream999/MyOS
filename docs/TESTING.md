@@ -31,6 +31,7 @@ replacement, menu/window resource lifetimes and failed-disk-shell fallback.
 
 ```sh
 make test-explorer
+make test-notepad
 make test-console
 make iso PERSIST_DISK=.storage-test/explorer-seed.img ROOT_MIB=64
 python3 tests/qemu_explorer_test.py
@@ -40,6 +41,11 @@ Host tests cover the actual userspace file operations and input handling with
 ASan/UBSan. The QEMU test uses real pointer/keyboard events, validates `TRYWAIT`,
 Start launch, browsing, package launching, file dialogs and persistence, then
 checks the resulting ext4 filesystem. See [Explorer](EXPLORER.md) for limits.
+The Notepad host suite also covers menu input, browser navigation and filtering,
+new-name saves, cancellation, overwrite prompts and failed reads/saves. Its
+captures include the File menu and separate Open/Save As browser windows. The
+Explorer QEMU suite opens these menus/browser windows and closes them without
+changing the fixture document.
 
 ## CPU usage and terminal wakeups
 

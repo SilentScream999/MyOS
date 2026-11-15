@@ -17,6 +17,7 @@ target is a GPU-composited desktop with installable applications.
 | Desktop | Surface-backed windows, damage tracking, taskbar, Start, CPU presentation | [Display roadmap](GPU_DESKTOP_ROADMAP.md) |
 | App resources | Portable `.wiz` packages, verified install/pin/remove, metadata/icons, `/apps` and `/bin` discovery | [Packages](APP_PACKAGES.md) |
 | File Explorer | Native userspace browser, file operations, text previews and app launching | [Explorer](EXPLORER.md) |
+| Notepad | Native text editing, atomic saving, unsaved prompts and Explorer Open with | [Notepad](NOTEPAD.md) |
 | Images | PNG/JPEG wallpapers; lazy PNG icons, alpha, themes and bounded caching | [Images](IMAGES.md) |
 | Fonts | Runtime TTF selection with built-in fallback; printable ASCII UI | [Fonts](FONTS.md) |
 | Storage | Journaled ext4 USB root, persistent apps/settings/files, atomic saves, automatic capacity setup | [ext4](EXT4.md) |

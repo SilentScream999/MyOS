@@ -63,6 +63,8 @@ options; header dependencies are tracked automatically.
   CPU/SSE presentation. Terminal and compositor demos remain built-in fixtures.
 - Native File Explorer: folder navigation, file management, text previews and
   double-click app launching. Open it from Start or `run /bin/explorer.wiz`.
+- Native Notepad: text editing, Save/Save As and unsaved-change prompts. Explorer
+  opens text documents in it and offers a right-click Open with menu.
 - App manifests and runtime PNG icons with CPU alpha blending, theme fallback
   and demand-driven caching; PNG/JPEG wallpapers and runtime TTF fonts.
 - Journaled ext4 root on USB, persistent apps/settings/files, atomic replacement,
@@ -87,6 +89,8 @@ console app; `run /bin/win_test.elf` demonstrates mapped GUI surfaces.
 | [Applications](docs/APP_LOADING.md) | `.wiz`/`.elf`, manifests, launch and process lifecycle |
 | [App packages](docs/APP_PACKAGES.md) | Self-contained `.wiz` apps: icons, metadata, portable vs installed, `wiz` command |
 | [File Explorer](docs/EXPLORER.md) | Native file browser, file operations, previews and app launching |
+| [Notepad](docs/NOTEPAD.md) | Text editor, saving, shortcuts and Open with |
+| [Common file dialogs](docs/FILE_DIALOGS.md) | Reusable Open/Save As browser for native apps |
 | [Images/icons](docs/IMAGES.md) | Runtime resources, formats, themes, caching and memory lifetime |
 | [Fonts](docs/FONTS.md) | Runtime TTF selection and limits |
 | [USB/input](docs/USB_INPUT.md) | HID, hubs, reset/probe rules and hardware caveats |

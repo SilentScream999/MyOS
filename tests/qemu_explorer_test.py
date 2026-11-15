@@ -196,7 +196,17 @@ def main():
         focus('File Explorer')
         print('All built-in windows and Explorer resize, minimize and maximize/restore correctly',flush=True)
         # Home: Applications, archive, projects, readme.txt (folders first).
-        double(130+265,100+138+3*34+16);capture('explorer-preview');q.type('\n',pause=.2)
+        double(130+265,100+138+3*34+16);assert 'Notepad' in windows(),windows()
+        capture('explorer-notepad')
+        _,(nx,ny,_,_)=windows()['Notepad']
+        click(nx+25,ny+15);capture('notepad-file-menu')
+        click(nx+60,ny+83);assert 'Open' in windows(),windows()
+        capture('notepad-open-browser');control('Open',0);assert 'Open' not in windows()
+        focus('Notepad');q.monitor('sendkey ctrl-shift-s 40');time.sleep(.5)
+        assert 'Save As' in windows(),windows()
+        capture('notepad-save-browser');control('Save As',0);assert 'Save As' not in windows()
+        control('Notepad',0);assert 'Notepad' not in windows()
+        focus('File Explorer')
         client(214,77);q.type('created\n',pause=.3) # New folder dialog, initial name selected.
         go('/home/created');client(300,77);q.type('scratch.txt\n',pause=.3)
         client(260,155);client(374,77);q.type('renamed.txt\n',pause=.3)

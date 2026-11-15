@@ -43,7 +43,7 @@ typedef unsigned long long wiz_u64;
 
 #define WIZ_FOOTER_SIZE    40u
 #define WIZ_FORMAT_VERSION 2u
-#define WIZ_ABI            4u          // ABI 4 adds native window resizing
+#define WIZ_ABI            7u          // ABI 7 adds the shared text clipboard
 #define WIZ_MAX_MANIFEST   4096u
 #define WIZ_MAX_ICON       (4u * 1024u * 1024u)
 #define WIZ_MAX_ENTRIES    512u

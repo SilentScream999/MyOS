@@ -221,15 +221,16 @@ struct Store {
 struct Icons { Image menu, title, task; };
 struct Entry { App app; Icons icons; };
 constexpr unsigned max_extra = 4;
+constexpr unsigned system_icon_count = 6, file_dialog_icon = 5;
 // `apps` is the Start menu. `extra` holds portable packages that are running
 // from somewhere else (USB stick, Downloads): they are not in the menu but
 // their windows still get the package's own name and icons.
 struct Catalog { unsigned count; Entry apps[max_apps]; unsigned extra_count; Entry extra[max_extra];
-                 Icons system[5]; char theme[64]; };
+                 Icons system[system_icon_count]; char theme[64]; };
 struct Demand {
     unsigned menu_rows, window_count;
     char executables[32][256];
-    bool system[5];
+    bool system[system_icon_count];
     bool has_window(const char* executable) const {
         for (unsigned i=0;i<window_count && i<32;++i)
             if (equal(executables[i],executable)) return true;
@@ -364,8 +365,8 @@ static Catalog* build(Store& store, uint32_t menu, uint32_t title, uint32_t task
                    previous ? &previous->icons : nullptr,&entry.app);
         ++catalog->extra_count;
     }
-    const char* system[]={"terminal","visual-test","rainbow","boot-log","application-default"};
-    for (unsigned i=0;i<5;++i)
+    const char* system[]={"terminal","visual-test","rainbow","boot-log","application-default","explorer"};
+    for (unsigned i=0;i<system_icon_count;++i)
         load_icons(store,theme,system[i],catalog->system[i],menu,title,task,false,demand.system[i],
                     known ? &known->system[i] : nullptr);
     return catalog;
