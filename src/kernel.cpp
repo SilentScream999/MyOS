@@ -683,6 +683,9 @@ void compositor_thread_main() {
             if (rtc_poll()) wm_clock_damage();
         }
 
+        Window* cursor_window=wm_find_window(g_focused_win_id);
+        term_cursor_tick(now_refresh/(tsc_hz/1000),tty_raw_mode&&g_term_view_offset==0&&
+            cursor_window&&cursor_window->visible&&!cursor_window->minimized&&cursor_window->is_system&&cursor_window->type==WIN_TYPE_TERM);
         if (g_needs_refresh) {
             g_needs_refresh  = false;
 

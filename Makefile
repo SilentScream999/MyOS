@@ -84,7 +84,7 @@ USER_CFLAGS = -O0 -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
               -mno-red-zone -target x86_64-elf -fno-builtin \
               -fno-unwind-tables -fno-asynchronous-unwind-tables
 
-user/init.o: user/init.c user/wiz_cmd.h src/core/wiz.h src/core/app.h src/fs/fileinfo.h
+user/init.o: user/init.c user/shell_line.h user/wiz_cmd.h src/core/wiz.h src/core/app.h src/fs/fileinfo.h
 	$(CC) $(USER_CFLAGS) -I. -c $< -o $@
 
 init.elf: user/init.o
@@ -122,6 +122,14 @@ test-notepad:
 	python3 tests/run_notepad_tests.py
 .PHONY: test-notepad
 
+test-text-input:
+	mkdir -p .storage-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. tests/text_input_test.cpp -o .storage-test/text-input-test
+	.storage-test/text-input-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. -Isrc/gui tests/terminal_input_test.cpp -o .storage-test/terminal-input-test
+	.storage-test/terminal-input-test
+.PHONY: test-text-input
+
 test-console:
 	mkdir -p .storage-test
 	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/console_session_test.cpp -o .storage-test/console-session-test
@@ -155,13 +163,13 @@ user/bundle_demo.o: user/bundle_demo.c user/wizlib.h src/core/wiz.h
 bundle_demo.elf: user/bundle_demo.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
-user/explorer.o: user/explorer.cpp user/native_ui.h user/wiz_cmd.h src/core/wiz.h src/core/app.h src/gui/ui_font.h src/gui/ui_font_data.h
+user/explorer.o: user/explorer.cpp user/native_ui.h user/native_text.h user/wiz_cmd.h src/core/wiz.h src/core/app.h src/gui/ui_font.h src/gui/ui_font_data.h
 	$(CXX) $(USER_CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -I. -c $< -o $@
 
 explorer.elf: user/explorer.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
-user/notepad.o: user/notepad.cpp user/native_ui.h user/native_file_dialog.h src/fs/fileinfo.h src/gui/ui_font.h src/gui/ui_font_data.h
+user/notepad.o: user/notepad.cpp user/native_ui.h user/native_text.h user/native_file_dialog.h src/fs/fileinfo.h src/gui/ui_font.h src/gui/ui_font_data.h
 	$(CXX) $(USER_CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -I. -c $< -o $@
 
 notepad.elf: user/notepad.o

@@ -17,6 +17,8 @@ static int32_t  g_term_view_offset = 0;   // 0 = live, -1 = one line back
 static uint32_t term_x = 0;
 static uint32_t term_y = 0;
 static uint32_t term_color = 0xFFFFFFFF; // White
+static bool term_cursor_enabled=false,term_cursor_visible=false;
+static uint64_t term_cursor_epoch=0,term_cursor_now=0;
 
 static bool term_escape = false;
 static bool term_escape_bracket = false;
@@ -159,6 +161,7 @@ static void term_scroll_view(int delta) {
 
 // Erase the cursor from the backbuffer (call before drawing a character)
 static void term_erase_cursor() {
+    if(!g_backbuffer||term_x>=g_term_max_cols||term_y>=g_term_max_rows)return;
     uint32_t cx = term_x * 8;
     uint32_t cy = term_y * 10;
     uint32_t* base = (uint32_t*)g_backbuffer;
@@ -192,6 +195,13 @@ static void term_putchar(char c) {
             } else if (c == 'H') {
                 term_x = 0;
                 term_y = 0;
+            } else if(c=='C'||c=='D') {
+                unsigned count=0;for(int i=0;i<term_escape_len;++i){if(term_escape_buf[i]<'0'||term_escape_buf[i]>'9')break;
+                    count=count*10+(term_escape_buf[i]-'0');if(count>TERM_MATRIX_ROWS*TERM_MATRIX_COLS){count=TERM_MATRIX_ROWS*TERM_MATRIX_COLS;break;}}
+                if(!count)count=1;
+                unsigned at=term_y*term_width+term_x,limit=term_height*term_width-1;
+                if(c=='D')at=count>at?0:at-count;else at=count>limit-at?limit:at+count;
+                term_x=at%term_width;term_y=at/term_width;
             } else if (c == 'm') {
                 if (term_escape_len == 0 || (term_escape_buf[0] == '0')) {
                     term_color = 0xFFFFFFFF;
@@ -199,13 +209,16 @@ static void term_putchar(char c) {
                     term_color = 0xFF00FF00;
                 }
             } else if (c == 'K') {
-                for (uint32_t tx = term_x; tx < term_width; tx++) {
+                uint32_t begin=term_escape_len&&term_escape_buf[0]=='2'?0:term_x;
+                for (uint32_t tx = begin; tx < term_width; tx++) {
+                    g_term_matrix[g_term_scrolled_rows+term_y][tx].c=0;
                     for (int r = 0; r < 10; r++) {
                         for (int col = 0; col < 8; col++) {
                             putp(tx * 8 + col, term_y * 10 + r, 0xFF0A0A14);
                         }
                     }
                 }
+                term_dirty_all();
             }
             term_escape = false;
             term_escape_bracket = false;
@@ -218,7 +231,7 @@ static void term_putchar(char c) {
         return;
     }
 
-    if (c == '\e') {
+    if (c == '\x1b') {
         term_escape = true;
         term_escape_bracket = false;
         return;
@@ -232,6 +245,7 @@ static void term_putchar(char c) {
     } else if (c == '\b') {
         if (term_x > 0) {
             term_x--;
+            g_term_matrix[g_term_scrolled_rows+term_y][term_x].c=0;
             for (int r = 0; r < 10; r++) {
                 for (int col = 0; col < 8; col++) {
                     putp(term_x * 8 + col, term_y * 10 + r, 0xFF0A0A14);
@@ -279,6 +293,8 @@ static void term_putchar(char c) {
 // Draw the cursor into the backbuffer so term_flip() includes it naturally.
 // This eliminates flicker caused by VRAM-direct writes being overwritten by flip.
 static void term_render_cursor() {
+    if(!term_cursor_enabled||!term_cursor_visible||g_term_view_offset||!g_backbuffer||
+       term_x>=g_term_max_cols||term_y>=g_term_max_rows)return;
     uint32_t cx = term_x * 8;
     uint32_t cy = term_y * 10;
     uint32_t* base = (uint32_t*)g_backbuffer;
@@ -289,6 +305,17 @@ static void term_render_cursor() {
         for (int col = 0; col < 8; col++) row_base[col] = term_color;
     }
     term_dirty_rect(cx + g_term_ox, cy + g_term_oy + 8, cx + g_term_ox + 8, cy + g_term_oy + 10);
+}
+
+// Called by the compositor even when there is no output. Only the two cursor
+// scanlines are damaged on a blink; output restarts the visible half-period.
+static void term_cursor_tick(uint64_t milliseconds,bool active) {
+    term_cursor_now=milliseconds;
+    if(active&&!term_cursor_enabled)term_cursor_epoch=milliseconds;
+    bool visible=active&&((milliseconds-term_cursor_epoch)/500%2==0);
+    bool changed=visible!=term_cursor_visible||active!=term_cursor_enabled;
+    term_cursor_enabled=active;term_cursor_visible=visible;
+    if(changed){term_erase_cursor();term_render_cursor();g_needs_refresh=true;}
 }
 
 static void term_write(const char* data, size_t size) {
@@ -320,6 +347,7 @@ static void term_process_ring_buffer() {
     }
 
     if (moved) {
+        term_cursor_epoch=term_cursor_now;term_cursor_visible=term_cursor_enabled;
         term_render_cursor();
         term_dirty_all(); // efficient batch update
         g_needs_refresh = true;

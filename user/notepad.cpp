@@ -1,6 +1,7 @@
 // Native text editor. Files stay in memory until an atomic VFS replacement succeeds.
 #include "user/native_ui.h"
 #include "user/native_file_dialog.h"
+#include "user/native_text.h"
 constexpr unsigned CAP=65536;
 static char text[CAP+1], staging[CAP+1], undo_text[CAP+1], clip[CAP+1];
 static unsigned length=0,caret=0,anchor=0,undo_length=0,undo_caret=0;
@@ -17,6 +18,7 @@ static NativeFileDialog picker;
 static int menu=-1,menu_item=0;
 static bool show_status=true;
 static unsigned frame=0;
+static NativeTextCursor text_cursor;
 constexpr int EDIT_TOP=44;
 static void note(const char* s){native_copy(message,sizeof(message),s);dirty=true;}
 static unsigned low(){return caret<anchor?caret:anchor;}
@@ -146,7 +148,7 @@ static void render(){
             int x=20+col*9,y=EDIT_TOP+r*20;
             if(i>=low()&&i<high())surface.rect(x,y,9,20,0xff574274);
             if(i<end){char glyph[2]={text[i]=='\t'||text[i]=='\r'?' ':text[i],0};surface.text(x,y+2,glyph,0xffeeebf8,x+9,12);}
-            if(i==caret&&modal==NORMAL)surface.rect(x,y,1,19,0xffe9bd70);
+            if(i==caret&&modal==NORMAL&&menu<0)text_cursor.draw(surface,x,y,19);
         }
         if(end==length)break;start=end+1;
     }
@@ -179,6 +181,7 @@ static void picker_event(const NativeEvent& event){
     else if(result==NativeFileDialog::ACCEPT){native_copy(field,sizeof(field),picker.result);submit_path();}
 }
 static void key_event(uint32_t key,uint32_t mods){
+    text_cursor.reset(frame);dirty=true;
     bool ctrl=mods&1,shift=mods&2;
     if(modal==NORMAL&&(mods&4)){
         if(key=='f'||key=='F')menu=0;else if(key=='e'||key=='E')menu=1;else if(key=='v'||key=='V')menu=2;else if(key=='h'||key=='H')menu=3;
@@ -246,7 +249,7 @@ static void handle_event(const NativeEvent& e){
         else {menu=-1;dirty=true;}return;}
     if(e.y>=EDIT_TOP&&e.y<EDIT_TOP+rows()*20){int row=top_line+(e.y-EDIT_TOP)/20,col=left_column+(e.x>20?(e.x-20)/9:0);unsigned at=0;
         while(at<length&&row)if(text[at++]=='\n')--row;
-        unsigned end=line_end(at);caret=at+(unsigned)col;if(caret>end)caret=end;if(!(e.mods&2))anchor=caret;reveal();}
+        unsigned end=line_end(at);caret=at+(unsigned)col;if(caret>end)caret=end;if(!(e.mods&2))anchor=caret;text_cursor.reset(frame);reveal();}
 }
 #ifndef NATIVE_HOST_TEST
 extern "C" void _start(){
@@ -258,6 +261,8 @@ extern "C" void _start(){
     char document[256]{};if((int64_t)native_call(215,(uint64_t)document,sizeof(document))>0)load(document);
     while(!exiting){NativeEvent e{};unsigned n=0;while(n++<64&&native_call(205,window_id,(uint64_t)&e))handle_event(e);
         if(picker.window){n=0;while(n++<64&&picker.window&&native_call(205,picker.window,(uint64_t)&e))picker_event(e);}
+        if(text_cursor.animate(surface,window_id,frame,modal==NORMAL&&menu<0,dirty))dirty=true;
+        if(picker.window)picker.tick(frame);
         if(dirty)render();if(picker.window&&picker.dirty)picker.render();++frame;native_call(35,16);}
     native_call(60,0);for(;;){}
 }

@@ -164,11 +164,7 @@ static size_t tty_write(const char* buf, size_t count) {
         term_dirty_all();
     }
     term_write(buf, count);  // writes chars, flips backbuffer → VRAM
-    // Only draw cursor when shell owns the keyboard (raw/interactive mode).
-    // During boot prints and command output, no cursor should appear.
-    if (tty_raw_mode) {
-        term_render_cursor();
-    }
+    // The compositor owns cursor blinking and paints after queued output drains.
     return count;
 }
 

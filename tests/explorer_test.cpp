@@ -20,6 +20,7 @@ namespace fs=std::filesystem;
 static fs::path sandbox;
 static bool write_failure=false;
 static unsigned spawned=0,presents=0;
+static unsigned partial_presents=0;
 static std::string opened_document,opened_app;
 static bool launch_failure=false;
 static std::string resolve(uint64_t value) { return sandbox.string()+(const char*)value; }
@@ -61,6 +62,7 @@ static uint64_t native_call(uint64_t n,uint64_t a,uint64_t b,uint64_t c,uint64_t
     case 87:return unlink(resolve(a).c_str());
     case 138:{std::ofstream out(resolve(a),std::ios::binary);out.write((const char*)b,c);return out?0:-1;}
     case 201:++presents;return 0;
+    case 204:assert(d==1&&e<=64&&b<(uint64_t)surface.w&&c+e<=(uint64_t)surface.h);++partial_presents;return 0;
     default:return -1;
     }
 }
@@ -142,5 +144,21 @@ int main(int argc,char** argv) {
         assert(VISIBLE>0&&LIST_TOP+VISIBLE*ROW<=HEIGHT-36);render();
         begin_dialog(NEW_FOLDER);render();dialog=NONE;
     }
+    address_edit=true;edit_replace=true;native_copy(address,sizeof(address),"abcd");
+    handle_event({5,0,0,0x1044,0,0});handle_event({5,0,0,0x1043,0,0});
+    handle_event({5,0,0,'X',0,0});assert(!strcmp(address,"aXbcd"));
+    handle_event({5,0,0,8,0,0});assert(!strcmp(address,"abcd"));
+    handle_event({5,0,0,'a',1,0});handle_event({5,0,0,'Z',0,0});assert(!strcmp(address,"Z"));
+    // Clicking the address bar and leaving it idle must not redraw Explorer
+    // on each caret blink. The live loop uses the same render_frame function.
+    frame=100;handle_event({1,220,24,1,0,0});render_frame();
+    unsigned full_before=presents,partial_before=partial_presents;auto visible_pixels=pixels;
+    for(frame=101;frame<=160;++frame)render_frame();
+    assert(!dirty&&presents==full_before&&partial_presents==partial_before+2);
+    assert(pixels==visible_pixels);
+    handle_event({5,0,0,27,0,0});render_frame();
+    full_before=presents;partial_before=partial_presents;
+    for(;frame<221;++frame)render_frame();
+    assert(presents==full_before&&partial_presents==partial_before);
     puts("Explorer navigation, sorting, dialogs, copy failure, moves, detached launch, limits and rendering passed");
 }

@@ -2,6 +2,7 @@ typedef unsigned long uint64_t;
 typedef long          int64_t;
 #include "src/fs/fileinfo.h"
 #include "src/core/app.h"
+#include "user/shell_line.h"
 
 // Minimal syscall wrappers
 static inline uint64_t sys_read(uint64_t fd, char* buf, uint64_t len) {
@@ -286,17 +287,26 @@ static int is_known_command(const char* buf, int len) {
 }
 
 // Redraw the current input line in-place with color feedback
-static void redraw_line(const char* buf, int len) {
+static int displayed_length=0,displayed_cursor=0;
+static void move_cursor(int count,char direction){
+    char sequence[3]={'\x1b','[',direction};
+    while(count-->0)sys_write(1,sequence,3);
+}
+static void redraw_line(const char* buf, int len, int cursor) {
+    // Move back over the prompt too, including when the command wraps.
+    move_cursor(displayed_cursor+strlen(current_dir)+8,'D');
     if (is_known_command(buf, len)) {
-        print("\r\x1b[32mwyzar:");   // green
+        print("\x1b[32mwyzar:");   // green
     } else {
-        print("\r\x1b[0mwyzar:");    // default white
+        print("\x1b[0mwyzar:");    // default white
     }
     print(current_dir);
     print("> \x1b[0m");
     sys_write(1, buf, len);
-    // Erase any leftover characters to the right
-    print("\x1b[K");
+    int erased=displayed_length>len?displayed_length-len:0;
+    for(int i=0;i<erased;++i)print(" ");
+    move_cursor(len+erased-cursor,'D');
+    displayed_length=len;displayed_cursor=cursor;
 }
 
 // `wiz`: inspect, install, pin and remove .wiz application packages.
@@ -313,6 +323,7 @@ void _start() {
 
     char buf[128];
     int pos = 0;
+    int cursor = 0;
 
     while(1) {
         update_cwd();
@@ -322,6 +333,7 @@ void _start() {
         print(current_dir);
         print("> ");     // tty_raw_mode=1 -> cursor appears here
         pos = 0;
+        cursor=0;buf[0]=0;displayed_length=displayed_cursor=0;
         history_index = -1;
 
         while (1) {
@@ -332,22 +344,21 @@ void _start() {
                 buf[0] = 'r'; buf[1] = 'u'; buf[2] = 'n'; buf[3] = ' ';
                 if (sys_take_launch(buf + 4, sizeof(buf) - 4) <= 0) continue;
                 pos = strlen(buf);
-                sys_ttyraw(0);
-                print("\r\x1b[2Kwyzar:"); print(current_dir); print("> "); print(buf); print("\n");
+                redraw_line(buf,pos,pos);sys_ttyraw(0);print("\n");
                 break;
             }
 
             if (n == 0 || n == (uint64_t)-1) continue;
 
             if (c == '\n' || c == '\r') {
+                move_cursor(pos-cursor,'C');
                 sys_ttyraw(0);   // leave raw mode before command output
                 buf[pos] = '\0';
                 print("\x1b[0m\n");  // reset color, newline
                 break;
             } else if (c == '\b' || c == 127) {
-                if (pos > 0) {
-                    pos--;
-                    redraw_line(buf, pos);
+                if (shell_line_backspace(buf,&pos,&cursor)) {
+                    redraw_line(buf, pos, cursor);
                 }
             } else if (c == '\x1b') {
                 // Arrow key escape sequence: read next two bytes (still in raw mode)
@@ -361,7 +372,7 @@ void _start() {
                                 while (history[history_index][pos]) {
                                     buf[pos] = history[history_index][pos]; pos++;
                                 }
-                                redraw_line(buf, pos);
+                                buf[pos]=0;cursor=pos;redraw_line(buf, pos, cursor);
                             }
                         } else if (seq[1] == 'B') { // Down arrow
                             if (history_index >= 0) {
@@ -372,14 +383,14 @@ void _start() {
                                         buf[pos] = history[history_index][pos]; pos++;
                                     }
                                 }
-                                redraw_line(buf, pos);
+                                buf[pos]=0;cursor=pos;redraw_line(buf, pos, cursor);
                             }
-                        }
+                        } else if(seq[1]=='D'&&cursor>0){--cursor;move_cursor(1,'D');displayed_cursor=cursor;}
+                        else if(seq[1]=='C'&&cursor<pos){++cursor;move_cursor(1,'C');displayed_cursor=cursor;}
                     }
                 }
-            } else if (pos < 127) {
-                buf[pos++] = c;
-                redraw_line(buf, pos);
+            } else if (shell_line_insert(buf,sizeof(buf),&pos,&cursor,c)) {
+                redraw_line(buf, pos, cursor);
             }
         }
 

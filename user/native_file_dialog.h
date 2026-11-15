@@ -1,12 +1,14 @@
 #ifndef WYZAR_NATIVE_FILE_DIALOG_H
 #define WYZAR_NATIVE_FILE_DIALOG_H
 #include "native_ui.h"
+#include "native_text.h"
 
 // Explorer-style common file picker. The owning app processes its events while
 // suspending document input; filesystem work happens outside the renderer.
 struct NativeFileDialog {
     struct Entry { char name[256];uint64_t size,type; } entries[512];
     NativeSurface canvas{};
+    NativeTextInput name_input,address_input;
     uint64_t window=0;
     char directory[256]="/home",address[256],filename[256],result[256],message[192];
     int count=0,selected=-1,scroll=0,last_click=-1;
@@ -103,12 +105,17 @@ struct NativeFileDialog {
         return ACCEPT;
     }
     void draw_button(int x,int y,int w,const char* label){canvas.rounded(x,y,w,30,5,0xff403451);canvas.centered_text(x,y,w,30,label,0xffeeebf8,12);}
+    void tick(unsigned frame){
+        if(name_input.cursor.animate(canvas,window,frame,focus==NAME,dirty))dirty=true;
+        if(address_input.cursor.animate(canvas,window,frame,focus==ADDRESS,dirty))dirty=true;
+    }
     void render(){
         int w=canvas.w,h=canvas.h;if(!canvas.pixels)return;
         canvas.rect(0,0,w,h,0xff1a1925);canvas.rect(0,0,w,58,0xff222131);
         draw_button(12,14,36,"Up");draw_button(56,14,64,"Refresh");
         canvas.rounded(132,14,w-148,30,4,focus==ADDRESS?0xff443454:0xff14121e);
-        canvas.text(142,21,address,0xffeeebf8,w-28,12);
+        if(focus==ADDRESS)address_input.draw(canvas,142,21,w-28,address,replace_input,12);
+        else canvas.text(142,21,address,0xffeeebf8,w-28,12);
         canvas.rect(0,58,140,h-58,0xff222131);canvas.text(16,76,"PLACES",0xffa49bb6,132,12);
         const char* places[]={"Home","Applications","System","Devices"};
         for(int i=0;i<4;++i){canvas.folder(12,104+i*40,24);canvas.text(43,109+i*40,places[i],0xffeeebf8,134,12);}
@@ -123,13 +130,15 @@ struct NativeFileDialog {
             canvas.rect(w-8,96,3,track,0xff39334b);canvas.rect(w-8,96+(track-thumb)*scroll/(count-visible()),3,thumb,0xffa58bc5);}
         canvas.rect(140,h-106,w-140,106,0xff222131);canvas.text(154,h-94,"File name:",0xffeeebf8,236,12);
         canvas.rounded(240,h-100,w-256,30,4,focus==NAME?0xff443454:0xff14121e);
-        canvas.text(250,h-93,filename,0xffeeebf8,w-26,12);
+        if(focus==NAME)name_input.draw(canvas,250,h-93,w-26,filename,replace_input,12);
+        else canvas.text(250,h-93,filename,0xffeeebf8,w-26,12);
         draw_button(154,h-58,180,text_only?"Text files (*.txt)":"All files (*.*)");
         draw_button(w-200,h-58,86,saving?"Save":"Open");draw_button(w-102,h-58,86,"Cancel");
         canvas.text(152,h-20,message,0xffb9aecb,w-12,12);
         native_call(201,window);dirty=false;
     }
     Result event(const NativeEvent& e,unsigned frame){
+        if(e.type==5||e.type==1){name_input.cursor.reset(frame);address_input.cursor.reset(frame);dirty=true;}
         if(e.type==7)return CANCEL;
         if(e.type==8){if(native_accept_resize(window,canvas)){bound_scroll();dirty=true;}return WAIT;}
         if(e.type==5){uint32_t key=e.key;
@@ -139,17 +148,17 @@ struct NativeFileDialog {
             if(key=='\t'){focus=focus==NAME?LIST:focus==LIST?ADDRESS:NAME;replace_input=true;dirty=true;return WAIT;}
             if(key=='\n'||key=='\r')return submit();
             if(focus==LIST){if(key==0x1041)select(selected<0?0:selected-1);else if(key==0x1042)select(selected+1);else if(key==8)navigate("..");return WAIT;}
-            char* buffer=focus==NAME?filename:address;unsigned n=native_length(buffer);
+            char* buffer=focus==NAME?filename:address;
+            NativeTextInput& input=focus==NAME?name_input:address_input;
             if((e.mods&1)&&(key=='v'||key=='V')){
                 char pasted[256];int64_t size=native_clipboard_get(pasted,sizeof(pasted));
                 if(size<0){tell("Clipboard text is too long or unavailable.");return WAIT;}
                 for(int64_t i=0;i<size;++i)if((unsigned char)pasted[i]<32){tell("Paste a single file or folder path.");return WAIT;}
-                if(replace_input)n=0;if(n+(unsigned)size>=256){tell("The pasted path is too long.");return WAIT;}
-                memcpy(buffer+n,pasted,(unsigned)size+1);replace_input=false;dirty=true;return WAIT;
+                if(!input.insert(buffer,256,pasted,(unsigned)size,replace_input,frame))tell("The pasted path is too long.");
+                dirty=true;return WAIT;
             }
             if((e.mods&1)&&(key=='a'||key=='A')){replace_input=true;dirty=true;return WAIT;}
-            if(key==8||key==127){if(replace_input)buffer[0]=0;else if(n)buffer[n-1]=0;replace_input=false;}
-            else if(!(e.mods&1)&&key>=32&&key<=126){if(replace_input)n=0;if(n+1<256){buffer[n]=(char)key;buffer[n+1]=0;}replace_input=false;}
+            if(!(e.mods&1))input.key(buffer,256,key,replace_input,frame);
             dirty=true;return WAIT;
         }
         if(e.type==4){scroll-=e.delta*3;bound_scroll();dirty=true;return WAIT;}

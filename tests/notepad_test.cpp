@@ -161,6 +161,12 @@ int main(int argc,char** argv){
         for(int i=NORMAL;i<=ABOUT;++i){modal=(Modal)i;render();}modal=NORMAL;
         for(int i=0;i<4;++i){menu=i;menu_item=0;render();}menu=-1;}
     assert(browser.show(false,"/home/"));assert(window_roles[browser.window]==1);
+    native_copy(browser.filename,256,"abcd");browser.focus=NativeFileDialog::NAME;browser.replace_input=true;
+    browser.event({5,0,0,0x1044,0,0},100);browser.event({5,0,0,0x1043,0,0},101);
+    browser.event({5,0,0,'X',0,0},102);assert(!strcmp(browser.filename,"aXbcd"));
+    browser.event({5,0,0,8,0,0},103);assert(!strcmp(browser.filename,"abcd"));
+    browser.tick(133);assert(!browser.name_input.cursor.visible);
+    browser.event({5,0,0,0x1101,0,0},134);assert(browser.name_input.cursor.visible);
     for(auto size: {std::pair{560,360},std::pair{1000,680}}){std::vector<uint32_t> dialog_pixels(size.first*size.second);
         browser.canvas={dialog_pixels.data(),size.first,size.second};browser.bound_scroll();browser.render();}
     browser.hide();
