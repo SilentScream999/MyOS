@@ -117,6 +117,7 @@ inspection, pinning, removal, purge and preservation of saved app data.
 | `python3 tests/qemu_storage_api_test.py` | Actual save/file syscalls and cleanup |
 | `python3 tests/qemu_storage_async_test.py` | Input/timer/desktop progress during a missing disk completion |
 | `python3 tests/qemu_power_action_test.py` | Shutdown/restart with connected and unplugged boot storage |
+| `python3 tests/qemu_power_action_test.py --menu` | Start menu power buttons, screenshots, clean filesystem shutdown and saved-data checks with connected/unplugged storage |
 
 ## USB and fonts
 

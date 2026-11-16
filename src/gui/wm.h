@@ -19,6 +19,7 @@
 #include "window_resize.h"
 #include "window_decorations.h"
 #include "window_overlay.h"
+#include "power_icons.h"
 
 void* image_allocate(uint64_t size) { return kmalloc(size); }
 void image_deallocate(void* pointer) { kfree(pointer); }
@@ -318,18 +319,29 @@ static uint32_t g_wbtn_w = 124;
 // ── Start Menu (taskbar popup) ────────────────────────────────
 #define g_menu_app_count ((int)g_resources_catalog->count)
 static bool  g_menu_open = false;
+// Action IDs never overlap catalog indices.
+static constexpr int MENU_RESTART = -2, MENU_SHUTDOWN = -3;
+static inline int32_t wm_menu_scale(int32_t value, int32_t minimum) {
+    int32_t scaled = (int32_t)(fb->height * value / 1080);
+    return scaled < minimum ? minimum : scaled;
+}
+static inline int32_t wm_menu_header() { return wm_menu_scale(56, 44); }
+static inline int32_t wm_menu_footer() { return wm_menu_scale(64, 52); }
+static inline int32_t wm_menu_row() { return wm_menu_scale(38, 26); }
+static inline int32_t wm_menu_pad() { return wm_menu_scale(14, 10); }
 
 // Panel geometry (scaled like the rest of the UI). The app list starts below the header.
 static inline void wm_menu_geom(int32_t* px, int32_t* py, int32_t* pw, int32_t* ph) {
     uint32_t sn = fb->height, sd = 1080;
-    int32_t w     = (int32_t)((sn * 340) / sd); if (w < 250) w = 250;
-    int32_t hdr_h = (int32_t)((sn * 36)  / sd); if (hdr_h < 24) hdr_h = 24;
-    int32_t row_h = (int32_t)((sn * 38)  / sd); if (row_h < 26) row_h = 26;
-    int32_t pad   = (int32_t)((sn * 10)  / sd); if (pad < 6) pad = 6;
+    int32_t w = wm_menu_scale(380, 290);
+    if (w > (int32_t)fb->width - 12) w = (int32_t)fb->width - 12;
+    int32_t hdr_h = wm_menu_header(), row_h = wm_menu_row(), pad = wm_menu_pad();
 
     int rows = g_menu_app_count > 0 ? g_menu_app_count : 1;
-    int32_t h = hdr_h + rows * row_h + pad * 2;
+    int32_t h = hdr_h + rows * row_h + pad * 2 + wm_menu_footer();
     int32_t max_h = (int32_t)((sn * 740) / sd);
+    int32_t available = (int32_t)fb->height - (int32_t)g_taskbar_h - 12;
+    if (max_h > available) max_h = available;
     if (h > max_h) h = max_h;
 
     int32_t x = 6; // aligned with the Start button
@@ -347,13 +359,18 @@ static inline int wm_menu_hit_test(int32_t mx, int32_t my, bool* in_panel = null
     if (in_panel) *in_panel = inside;
     if (!inside) return -1;
 
-    uint32_t sn = fb->height, sd = 1080;
-    int32_t hdr_h = (int32_t)((sn * 36) / sd); if (hdr_h < 24) hdr_h = 24;
-    int32_t row_h = (int32_t)((sn * 38) / sd); if (row_h < 26) row_h = 26;
-    int32_t pad   = (int32_t)((sn * 10) / sd); if (pad < 6) pad = 6;
+    int32_t hdr_h = wm_menu_header(), row_h = wm_menu_row(), pad = wm_menu_pad();
+    int32_t footer_top = py + ph - wm_menu_footer();
+    if (my >= footer_top + pad && my < py + ph - pad) {
+        int32_t button_w = (pw - pad * 3) / 2;
+        if (mx >= px + pad && mx < px + pad + button_w) return MENU_RESTART;
+        if (mx >= px + pad * 2 + button_w && mx < px + pw - pad) return MENU_SHUTDOWN;
+    }
+    if (mx < px + pad || mx >= px + pw - pad) return -1;
 
     int32_t list_top = py + hdr_h + pad;
-    if (my < list_top || my >= list_top + g_menu_app_count * row_h) return -1;
+    int32_t visible_rows = (footer_top - pad - list_top) / row_h;
+    if (my < list_top || my >= list_top + visible_rows * row_h) return -1;
     int idx = (my - list_top) / row_h;
     if (idx < 0 || idx >= g_menu_app_count) return -1;
     return idx;
@@ -414,9 +431,8 @@ static void wm_resources_reload() {
     generation=g_resource_demand_generation;
     refresh=g_resources_refresh; g_resources_refresh=false;
     if (g_menu_open) {
-        int32_t header=fb->height*36/1080; if (header<24) header=24;
-        int32_t pad=fb->height*10/1080; if (pad<6) pad=6;
-        int32_t room=(int32_t)(fb->height*740/1080)-header-pad*2;
+        int32_t header=wm_menu_header(), pad=wm_menu_pad();
+        int32_t room=(int32_t)(fb->height*740/1080)-header-pad*2-wm_menu_footer();
         if (room>0) demand.menu_rows=(room+row-1)/row;
     }
     for (int i=0;i<g_window_count;++i) {
@@ -1875,6 +1891,44 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         }
     }
 
+    // ── Shared shell control: taskbar and Start menu ─────────────────────────────
+    // top_c/bot_c are the gradient endpoints; edge_c is the 1px border;
+    // shine=true draws a bright highlight row on top (glass effect).
+    auto draw_btn = [&](int32_t bx, int32_t by, int32_t bw, int32_t bh,
+                        uint32_t top_c, uint32_t bot_c,
+                        uint32_t edge_c, bool shine) {
+        for (int32_t y = by; y < by + bh; y++) {
+            if (y < (int32_t)min_y || y > (int32_t)max_y) continue;
+            if (y < 0 || (uint32_t)y >= fb->height) continue;
+            uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
+            uint32_t t = (uint32_t)(y - by) * 255 / (bh > 1 ? (uint32_t)(bh - 1) : 1u);
+            uint8_t rr  = (uint8_t)(((top_c>>16)&0xFF) + (int32_t)(((int32_t)((bot_c>>16)&0xFF)-(int32_t)((top_c>>16)&0xFF))*(int32_t)t/255));
+            uint8_t gg  = (uint8_t)(((top_c>> 8)&0xFF) + (int32_t)(((int32_t)((bot_c>> 8)&0xFF)-(int32_t)((top_c>> 8)&0xFF))*(int32_t)t/255));
+            uint8_t bb  = (uint8_t)(((top_c    )&0xFF) + (int32_t)(((int32_t)((bot_c    )&0xFF)-(int32_t)((top_c    )&0xFF))*(int32_t)t/255));
+            uint32_t row_clr = 0xFF000000 | ((uint32_t)rr<<16) | ((uint32_t)gg<<8) | bb;
+            if (shine && y == by) row_clr = 0xFFAABBEE;  // top shine row
+
+            int32_t sx = bx < 0 ? 0 : bx;
+            int32_t ex = bx + bw; if (ex > (int32_t)fb->width) ex = (int32_t)fb->width;
+            if (ex > sx) memset_32(drow + sx, row_clr, (uint32_t)(ex - sx));
+
+            // Left/right 1px edges
+            if (bx >= 0 && (uint32_t)bx < fb->width)           drow[bx]       = edge_c;
+            if (bx+bw-1 >= 0 && (uint32_t)(bx+bw-1) < fb->width) drow[bx+bw-1] = edge_c;
+        }
+        // Top / bottom edge lines
+        for (int32_t px = bx; px < bx + bw; px++) {
+            if (px < 0 || (uint32_t)px >= fb->width) continue;
+            auto edge_px = [&](int32_t ey, uint32_t ec) {
+                if (ey < (int32_t)min_y || ey > (int32_t)max_y) return;
+                if (ey < 0 || (uint32_t)ey >= fb->height) return;
+                ((uint32_t*)(g_master_backbuffer + (uint64_t)ey * fb->pitch))[px] = ec;
+            };
+            edge_px(by,        edge_c);
+            edge_px(by + bh - 1, 0xFF101828);
+        }
+    };
+
     // Stage 2.5: Task Bar — Modern dark glass style
     int32_t tb_y = (int32_t)fb->height - (int32_t)g_taskbar_h;
     int32_t tbr1 = (tb_y > (int32_t)min_y) ? tb_y : (int32_t)min_y;
@@ -1898,49 +1952,6 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
             }
             memset_32(drow, clr, fb->width);
         }
-
-        // ── Helper: gradient-filled button rect ─────────────────────────────
-        // top_c/bot_c are the gradient endpoints; edge_c is the 1px border;
-        // shine=true draws a bright highlight row on top (glass effect).
-        auto draw_btn = [&](int32_t bx, int32_t by, int32_t bw, int32_t bh,
-                            uint32_t top_c, uint32_t bot_c,
-                            uint32_t edge_c, bool shine) {
-            for (int32_t y = by; y < by + bh; y++) {
-                if (y < (int32_t)min_y || y > (int32_t)max_y) continue;
-                if (y < 0 || (uint32_t)y >= fb->height) continue;
-                uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
-                uint32_t t = (uint32_t)(y - by) * 255 / (bh > 1 ? (uint32_t)(bh - 1) : 1u);
-                // Lerp each channel
-                auto lerp8 = [](uint32_t a, uint32_t b, uint32_t t) -> uint8_t {
-                    return (uint8_t)((int32_t)(a >> 16 & 0xFF) +
-                        ((int32_t)(b >> 16 & 0xFF) - (int32_t)(a >> 16 & 0xFF)) * (int32_t)t / 255);
-                };
-                uint8_t rr  = (uint8_t)(((top_c>>16)&0xFF) + (int32_t)(((int32_t)((bot_c>>16)&0xFF)-(int32_t)((top_c>>16)&0xFF))*(int32_t)t/255));
-                uint8_t gg  = (uint8_t)(((top_c>> 8)&0xFF) + (int32_t)(((int32_t)((bot_c>> 8)&0xFF)-(int32_t)((top_c>> 8)&0xFF))*(int32_t)t/255));
-                uint8_t bb  = (uint8_t)(((top_c    )&0xFF) + (int32_t)(((int32_t)((bot_c    )&0xFF)-(int32_t)((top_c    )&0xFF))*(int32_t)t/255));
-                uint32_t row_clr = 0xFF000000 | ((uint32_t)rr<<16) | ((uint32_t)gg<<8) | bb;
-                if (shine && y == by) row_clr = 0xFFAABBEE;  // top shine row
-
-                int32_t sx = bx < 0 ? 0 : bx;
-                int32_t ex = bx + bw; if (ex > (int32_t)fb->width) ex = (int32_t)fb->width;
-                if (ex > sx) memset_32(drow + sx, row_clr, (uint32_t)(ex - sx));
-
-                // Left/right 1px edges
-                if (bx >= 0 && (uint32_t)bx < fb->width)           drow[bx]       = edge_c;
-                if (bx+bw-1 >= 0 && (uint32_t)(bx+bw-1) < fb->width) drow[bx+bw-1] = edge_c;
-            }
-            // Top / bottom edge lines
-            for (int32_t px = bx; px < bx + bw; px++) {
-                if (px < 0 || (uint32_t)px >= fb->width) continue;
-                auto edge_px = [&](int32_t ey, uint32_t ec) {
-                    if (ey < (int32_t)min_y || ey > (int32_t)max_y) return;
-                    if (ey < 0 || (uint32_t)ey >= fb->height) return;
-                    ((uint32_t*)(g_master_backbuffer + (uint64_t)ey * fb->pitch))[px] = ec;
-                };
-                edge_px(by,        edge_c);
-                edge_px(by + bh - 1, 0xFF101828);
-            }
-        };
 
         // ── Start button ─────────────────────────────────────────────────────
         const int32_t PAD = 5;
@@ -2234,113 +2245,85 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
     if (g_menu_open && fb) {
         int32_t px, py, pw, ph;
         wm_menu_geom(&px, &py, &pw, &ph);
-
-        uint32_t sn = fb->height, sd = 1080;
-        int32_t hdr_h = (int32_t)((sn * 36) / sd); if (hdr_h < 24) hdr_h = 24;
-        int32_t row_h = (int32_t)((sn * 38) / sd); if (row_h < 26) row_h = 26;
-        int32_t pad   = (int32_t)((sn * 10) / sd); if (pad < 6) pad = 6;
-
-        // Hover index comes straight from the live cursor position — no state to keep in sync.
-        int hover = wm_menu_hit_test(g_mouse_x, g_mouse_y);
-
-        uint32_t char_h = wm_text_height(g_font_scale_100);
-
-        // ── Panel body: dark navy glass, same family as the taskbar
-        for (int32_t y = py; y < py + ph; y++) {
-            if (y < (int32_t)min_y || y > (int32_t)max_y) continue;
-            if (y < 0 || (uint32_t)y >= fb->height) continue;
-            uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
-
-            int32_t rel = y - py;
-            uint32_t bgc;
-            if (rel == 0) {
-                bgc = 0xFF6A76A8; // top shelf highlight, matches the taskbar's bright edge
-            } else if (rel < hdr_h) {
-                uint32_t t = (uint32_t)(rel - 1) * 255 / (hdr_h > 2 ? (uint32_t)(hdr_h - 2) : 1u);
-                int32_t rr = (int32_t)0x2E + ((int32_t)0x23 - (int32_t)0x2E) * (int32_t)t / 255;
-                int32_t gg = (int32_t)0x46 + ((int32_t)0x2F - (int32_t)0x46) * (int32_t)t / 255;
-                int32_t bb = (int32_t)0x70 + ((int32_t)0x52 - (int32_t)0x70) * (int32_t)t / 255;
-                bgc = 0xFF000000 | ((uint32_t)rr << 16) | ((uint32_t)gg << 8) | (uint32_t)bb;
-            } else if (rel == hdr_h) {
-                bgc = 0xFF0D1120; // separator line under the header
-            } else {
-                bgc = 0xFF161B2C; // body
+        int32_t pad=wm_menu_pad(), header=wm_menu_header(), row_h=wm_menu_row();
+        int32_t footer_top=py+ph-wm_menu_footer(), list_top=py+header+pad;
+        int32_t char_h=(int32_t)wm_text_height(g_font_scale_100);
+        int hover=wm_menu_hit_test(g_mouse_x,g_mouse_y);
+        // Every primitive respects the current damage band and framebuffer bounds.
+        auto rect=[&](int32_t x,int32_t y,int32_t w,int32_t h,uint32_t color,int radius=0) {
+            for(int32_t yy=y;yy<y+h;++yy) {
+                if(yy<(int32_t)min_y||yy>(int32_t)max_y||yy<0||yy>=(int32_t)fb->height)continue;
+                int inset=0,edge=yy-y<h/2?yy-y:y+h-1-yy;
+                if(edge<radius)inset=radius-edge;
+                int32_t left=x+inset,right=x+w-inset;
+                if(left<0)left=0;if(right>(int32_t)fb->width)right=fb->width;
+                if(right>left)memset_32((uint32_t*)(g_master_backbuffer+(uint64_t)yy*fb->pitch)+left,color,right-left);
             }
+        };
+        auto text=[&](int32_t x,int32_t y,const char* label,uint32_t color,int32_t width) {
+            if(y>=py&&y+char_h<=py+ph&&y+char_h>(int32_t)min_y&&y<=(int32_t)max_y)
+                wm_draw_string(x,y,label,color,g_font_scale_100,width);
+        };
+        // Use the taskbar's navy surfaces, borders, and active-control gradient.
+        draw_btn(px,py,pw,ph,0xFF23283D,0xFF181C30,0xFF303560,false);
+        draw_btn(px+1,py+1,pw-2,header,0xFF3D4D80,0xFF28366A,0xFF5568B0,true);
+        int32_t section_y=py+(header-char_h)/2;
+        text(px+pad+8,section_y,"All apps",0xFFEEEEFF,pw-pad*2-8);
+        char count[16];to_str((uint64_t)g_menu_app_count,count);
+        int32_t count_w=wm_text_width(count,g_font_scale_100);
+        text(px+pw-pad-8-count_w,section_y,count,0xFFB9C5EE,count_w);
 
-            int32_t sx = px < 0 ? 0 : px;
-            int32_t ex = px + pw; if (ex > (int32_t)fb->width) ex = (int32_t)fb->width;
-            if (ex > sx) memset_32(drow + sx, bgc, (uint32_t)(ex - sx));
-        }
-
-        // ── Header text: "START" left, app count right
-        {
-            int32_t hy = py + (hdr_h - (int32_t)char_h) / 2;
-            if (hy + (int32_t)char_h >= (int32_t)min_y && hy <= (int32_t)max_y) {
-                wm_draw_string((uint32_t)(px + pad), (uint32_t)hy, "START", 0xFFFFFFFF, g_font_scale_100);
-                char cnt[16];
-                to_str((uint64_t)g_menu_app_count, cnt);
-                wm_draw_string((uint32_t)(px + pw - pad - wm_text_width(cnt, g_font_scale_100)), (uint32_t)hy, cnt, 0xFF9FB0D8, g_font_scale_100);
-            }
-        }
-
-        // ── App list: icon + name per row, hover highlight like an active taskbar button
-        int32_t list_top = py + hdr_h + pad;
-        for (int i = 0; i < g_menu_app_count; i++) {
-            int32_t ry = list_top + i * row_h;
-            if (ry >= py + ph - pad) break; // clipped by the height cap
-
-            bool hov = (i == hover);
-
-            if (hov) {
-                for (int32_t y = ry; y < ry + row_h; y++) {
-                    if (y < (int32_t)min_y || y > (int32_t)max_y) continue;
-                    if (y < 0 || (uint32_t)y >= fb->height) continue;
-                    uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
-                    uint32_t t = (uint32_t)(y - ry) * 255 / (row_h > 1 ? (uint32_t)(row_h - 1) : 1u);
-                    int32_t rr = (int32_t)0x3D + ((int32_t)0x28 - (int32_t)0x3D) * (int32_t)t / 255;
-                    int32_t gg = (int32_t)0x4D + ((int32_t)0x36 - (int32_t)0x4D) * (int32_t)t / 255;
-                    int32_t bb = (int32_t)0x80 + ((int32_t)0x6A - (int32_t)0x80) * (int32_t)t / 255;
-                    uint32_t c = 0xFF000000 | ((uint32_t)rr << 16) | ((uint32_t)gg << 8) | (uint32_t)bb;
-                    int32_t sx = px + pad < 0 ? 0 : px + pad;
-                    int32_t ex = px + pw - pad; if (ex > (int32_t)fb->width) ex = (int32_t)fb->width;
-                    if (ex > sx) memset_32(drow + sx, c, (uint32_t)(ex - sx));
-                }
-            }
-
+        for(int i=0;i<g_menu_app_count;++i) {
+            int32_t ry=list_top+i*row_h;
+            if(ry+row_h>footer_top-pad)break;
             const auto& entry=g_resources_catalog->apps[i];
-            uint32_t hash = 0;
-            for (const char* q = entry.app.id; *q; q++) hash = hash * 31u + (uint8_t)*q;
-            uint32_t icon_c = g_rainbow_lut[hash % 360];
-            int32_t isz = wm_icon_size(row_h-10,14,128);
-            int32_t ix = px + pad, iy = ry + (row_h - isz) / 2;
-            if (entry.icons.menu.pixels) {
+            bool hov=hover==i;
+            if(hov)draw_btn(px+pad,ry,pw-pad*2,row_h-3,
+                            0xFF3D4D80,0xFF28366A,0xFF5568B0,false);
+            int32_t isz=wm_icon_size(row_h-10,14,128);
+            int32_t ix=px+pad+8,iy=ry+(row_h-3-isz)/2;
+            if(entry.icons.menu.pixels) {
                 const Image& icon=entry.icons.menu;
                 wm_draw_icon(icon,ix+(isz-(int32_t)icon.width)/2,iy+(isz-(int32_t)icon.height)/2,
                              px+pad,min_y,px+pw-pad,max_y+1);
-            } else for (int32_t y = iy; y < iy + isz; y++) {
-                if (y < (int32_t)min_y || y > (int32_t)max_y) continue;
-                if (y < 0 || (uint32_t)y >= fb->height) continue;
-                uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
-                int32_t sx = ix < 0 ? 0 : ix;
-                int32_t ex = ix + isz; if (ex > (int32_t)fb->width) ex = (int32_t)fb->width;
-                if (ex > sx) memset_32(drow + sx, icon_c, (uint32_t)(ex - sx));
+            } else {
+                uint32_t hash=0;for(const char* q=entry.app.id;*q;++q)hash=hash*31u+(uint8_t)*q;
+                rect(ix,iy,isz,isz,g_rainbow_lut[hash%360],3);
             }
-
-            uint32_t txt_clr = hov ? 0xFFFFFFFF : 0xFFE4E8F5;
-            if (!entry.app.available) txt_clr = 0xFF6A7088; // pinned app whose file/drive is missing
-            int32_t ty = ry + (row_h - (int32_t)char_h) / 2;
-            if (ty + (int32_t)char_h >= (int32_t)min_y && ty <= (int32_t)max_y)
-                wm_draw_string((uint32_t)(ix + isz + 8), (uint32_t)ty, entry.app.name, txt_clr, g_font_scale_100, px + pw - pad - (ix + isz + 8));
+            int32_t ty=ry+(row_h-3-char_h)/2;
+            text(ix+isz+10,ty,entry.app.name,entry.app.available?0xFFE6E8FF:0xFF8888AA,
+                 pw-pad*2-isz-26);
         }
+        if(!g_menu_app_count)
+            text(px+pad+8,list_top+(row_h-char_h)/2,"No installed apps",0xFF9FA6CC,pw-pad*2-16);
 
-        // Empty state
-        if (g_menu_app_count == 0 && list_top < py + ph - pad) {
-            int32_t ty = list_top + (row_h - (int32_t)char_h) / 2;
-            if (ty + (int32_t)char_h >= (int32_t)min_y && ty <= (int32_t)max_y)
-                wm_draw_string((uint32_t)(px + pad), (uint32_t)ty, "No installed apps", 0xFF8890A8, g_font_scale_100);
+        draw_btn(px+1,footer_top,pw-2,wm_menu_footer()-1,
+                 0xFF252A42,0xFF1A1F35,0xFF303560,false);
+        int32_t button_w=(pw-pad*3)/2,button_h=wm_menu_footer()-pad*2;
+        for(int i=0;i<2;++i) {
+            int action=i?MENU_SHUTDOWN:MENU_RESTART;
+            int32_t bx=px+pad+i*(button_w+pad),by=footer_top+pad;
+            bool hov=hover==action;
+            draw_btn(bx,by,button_w,button_h,
+                     hov?0xFF3D4D80:0xFF23283D,hov?0xFF28366A:0xFF181C30,
+                     hov?0xFF5568B0:0xFF2C3258,hov);
+            int32_t icon_size=wm_menu_scale(20,16),ix=bx+10,iy=by+(button_h-icon_size)/2;
+            for(int y=0;y<icon_size;++y)for(int x=0;x<icon_size;++x) {
+                int yy=iy+y,xx=ix+x;
+                if(yy<(int32_t)min_y||yy>(int32_t)max_y||yy<0||yy>=(int32_t)fb->height||
+                   xx<0||xx>=(int32_t)fb->width)continue;
+                unsigned alpha=power_icon_coverage(i!=0,x,y,icon_size);
+                if(!alpha)continue;
+                uint32_t* pixel=(uint32_t*)(g_master_backbuffer+(uint64_t)yy*fb->pitch)+xx;
+                uint32_t color=0xFF000000;
+                for(unsigned shift=0;shift<24;shift+=8)
+                    color|=(((((*pixel>>shift)&255)*(16-alpha)+0xEE*alpha+8)/16)<<shift);
+                *pixel=color;
+            }
+            int32_t label_x=ix+icon_size+6;
+            text(label_x,by+(button_h-char_h)/2,i?"Shut down":"Restart",0xFFE6E8FF,bx+button_w-label_x-6);
         }
     }
-
     t2 = rdtsc_val();
     g_time_win_ticks = t2 - t1;
 

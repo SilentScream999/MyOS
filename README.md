@@ -61,6 +61,8 @@ options; header dependencies are tracked automatically.
   user-window surfaces/events. Both extensions currently contain WyzarOS ELFs.
 - Surface-backed desktop windows, damage tracking, taskbar, Start menu and
   CPU/SSE presentation. Terminal and compositor demos remain built-in fixtures.
+- Start uses the taskbar's navy gradients and bordered controls, with an All apps
+  header and Restart / Shut down buttons that flush storage before the power action.
 - Native File Explorer: folder navigation, file management, text previews and
   double-click app launching. Open it from Start or `run /bin/explorer.wiz`.
 - Native Notepad: text editing, Save/Save As and unsaved-change prompts. Explorer

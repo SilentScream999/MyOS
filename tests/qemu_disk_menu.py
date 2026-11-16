@@ -59,8 +59,8 @@ def check(storage):
         expected = {'/bin/COUNTER.ELF', '/bin/WIN_TEST.ELF'} if storage else {'/bin/counter.elf', '/bin/win_test.elf'}
         assert set(paths) == expected, paths
         index = next(i for i, name in enumerate(names) if name.lower() == 'counter')
-        hdr, row, pad = max(24, 768*36//1080), max(26, 768*38//1080), max(6, 768*10//1080)
-        top = 768 - scalar('g_taskbar_h') - (hdr + count*row + pad*2) - 768*4//1080
+        hdr, row, pad = max(44, 768*56//1080), max(26, 768*38//1080), max(10, 768*14//1080)
+        top = 768 - scalar('g_taskbar_h') - min(hdr + max(1,count)*row + pad*2 + max(52,768*64//1080),768*740//1080) - 768*4//1080
         click(80, top + hdr + pad + index*row + row//2)
         time.sleep(4)
         data = memory('g_term_matrix', 640000)[::8]

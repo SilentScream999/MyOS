@@ -178,8 +178,8 @@ int main(){ printf("%zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu",sizeof(resource
                 # Launch the manifest-backed entry through the actual menu.
                 before_windows=struct.unpack('<I',memory(address('g_window_count'),4))[0]
                 bar=struct.unpack('<I',memory(address('g_taskbar_h'),4))[0]
-                row=max(26,768*38//1080); header=max(24,768*36//1080); pad=max(6,768*10//1080)
-                panel_y=768-bar-(header+count*row+pad*2)-768*4//1080
+                row=max(26,768*38//1080); header=max(44,768*56//1080); pad=max(10,768*14//1080)
+                panel_y=768-bar-min(header+max(1,count)*row+pad*2+max(52,768*64//1080),768*740//1080)-768*4//1080
                 target_y=panel_y+header+pad+row//2
                 move(20,target_y)
                 q.monitor('mouse_button 1'); time.sleep(.2); q.monitor('mouse_button 0')

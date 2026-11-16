@@ -43,6 +43,12 @@ static void process_exit_ui(pid_t pid) {
 static char desktop_launch_paths[8][256];
 static unsigned desktop_launch_head=0,desktop_launch_tail=0;
 static Task* desktop_launcher_task=nullptr;
+static int desktop_power_action=0;
+static void desktop_queue_power(int action) {
+    TtyIrqGuard guard;
+    desktop_power_action=action;
+    if(desktop_launcher_task&&desktop_launcher_task->state==TaskState::BLOCKED)desktop_launcher_task->state=TaskState::READY;
+}
 static bool desktop_queue_launch(const char* path) {
     TtyIrqGuard guard;unsigned next=(desktop_launch_head+1)%8;
     if(next==desktop_launch_tail||!path||strlen(path)>=256)return false;
@@ -51,12 +57,16 @@ static bool desktop_queue_launch(const char* path) {
     return true;
 }
 static void desktop_launch_worker() {
-    for(;;){char path[256];
+    for(;;){char path[256];int power=0;
         {TtyIrqGuard guard;
-            while(desktop_launch_head==desktop_launch_tail){g_current_task->state=TaskState::BLOCKED;g_current_task->wake_at_tick=0;
+            while(desktop_launch_head==desktop_launch_tail&&!desktop_power_action){g_current_task->state=TaskState::BLOCKED;g_current_task->wake_at_tick=0;
                 schedule();if(g_current_task->state==TaskState::BLOCKED)scheduler_idle_halt();}
-            strcpy(path,desktop_launch_paths[desktop_launch_tail]);desktop_launch_tail=(desktop_launch_tail+1)%8;
+            power=desktop_power_action;desktop_power_action=0;
+            if(!power){strcpy(path,desktop_launch_paths[desktop_launch_tail]);desktop_launch_tail=(desktop_launch_tail+1)%8;}
         }
+        // Filesystem shutdown may sleep; never run it in the pointer handler.
+        if(power==MENU_SHUTDOWN){sys_shutdown();continue;}
+        if(power==MENU_RESTART){storage_prepare_poweroff();hardware_reset();continue;}
         bool gui=false;if(launch_program(path,true,&gui)<0)print((char*)"[launcher] App launch failed.");
     }
 }
@@ -447,8 +457,12 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
                 }
             }
         } else {
-            int menu_hit = wm_menu_hit_test(mx, my);
-            if (menu_hit >= 0 && !g_resources_catalog->apps[menu_hit].app.available) {
+            bool in_menu=false;
+            int menu_hit = wm_menu_hit_test(mx, my, &in_menu);
+            if(menu_hit==MENU_RESTART||menu_hit==MENU_SHUTDOWN) {
+                wm_menu_close();
+                desktop_queue_power(menu_hit);
+            } else if (menu_hit >= 0 && !g_resources_catalog->apps[menu_hit].app.available) {
                 // Pinned app whose file or drive is missing: nothing to launch.
                 print((char*)"[launcher] That app is unavailable (its file or drive is missing).");
                 wm_menu_close();
@@ -458,8 +472,7 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
                     print((char*)"[launcher] Launch queue is full.");
                 wm_menu_close();
             } else if (g_menu_open) {
-                // Clicked header/padding or outside the panel: just dismiss it
-                wm_menu_close();
+                if(!in_menu)wm_menu_close();
             } else {
             int idx = wm_find_top_window(mx, my);
             if (idx != -1) {

@@ -152,8 +152,8 @@ def main():
         data=memory(catalog+apps_offset,count*stride)
         paths=[data[i*stride+exec_offset:i*stride+exec_offset+256].split(b'\0')[0].decode() for i in range(count)]
         index=paths.index('/bin/explorer.wiz')
-        hdr=max(24,800*36//1080);row=max(26,800*38//1080);pad=max(6,800*10//1080)
-        top=800-scalar('g_taskbar_h')-(hdr+count*row+2*pad)-800*4//1080
+        hdr=max(44,800*56//1080);row=max(26,800*38//1080);pad=max(10,800*14//1080)
+        top=800-scalar('g_taskbar_h')-min(hdr+max(1,count)*row+2*pad+max(52,800*64//1080),800*740//1080)-800*4//1080
         click(80,top+hdr+pad+index*row+row//2);time.sleep(1)
         assert 'File Explorer' in windows(),windows()
         assert terminal().rstrip().endswith('wyzar:/>'),terminal()
