@@ -51,11 +51,11 @@ reboot, handles date rollover and gives new file timestamps a defined UTC basis.
 ## Applications and API hardening
 
 Validate ELF tables/segments, honor permissions, enforce window ownership,
-validate user pointers and revoke mappings on teardown. Complete address-space
-cleanup and a shared userspace syscall/window library.
+validate user pointers and revoke live window mappings on teardown. Harden
+loader failure cleanup and add a shared userspace syscall/window library.
 
 The `.wiz` package manager, native File Explorer and Notepad are implemented.
-Next app work includes Unicode text, terminal clipboard integration, file associations, image viewing, recursive folder copying,
+Next app work includes Unicode text, terminal clipboard integration, configurable file associations, recursive folder copying,
 cross-filesystem moves and trash/undo. See [Explorer](EXPLORER.md),
 [packages](APP_PACKAGES.md) and the [Window API](../APIDocs/WindowAPI.md).
 

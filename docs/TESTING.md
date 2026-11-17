@@ -1,8 +1,45 @@
 # Verification guide
 
-Updated 2026-11-11. Run commands from the repository root in WSL/Linux.
+Updated 2026-11-17. Run commands from the repository root in WSL/Linux.
 Use current build artifacts, clang sanitizers, QEMU, OVMF and e2fsprogs as needed.
 Build/setup instructions are in [README](../README.md).
+
+## Image Viewer and retained Start icons
+
+```sh
+make test-image-viewer test-explorer test-user-memory
+python3 tests/run_image_tests.py
+make iso PERSIST_DISK=.storage-test/viewer-seed.img ROOT_MIB=64
+python3 tests/qemu_image_viewer_test.py
+```
+
+For interrupt/syscall register preservation, also run:
+
+```sh
+python3 tests/qemu_simd_test.py
+```
+
+The native probe keeps distinct patterns in XMM0-15, nondefault MXCSR and live
+x87 values across blocking syscalls and timer-driven preemption. It reproduced
+failures on both paths before entry stubs saved/restored the extended state.
+The viewer guest suite also checks solid bands in its plus button and the
+shared file-picker text field after repeated repaints, avoiding text/corner
+pixels that legitimately differ from the background.
+It checks visible Up/Refresh icons in both Explorer and the native picker,
+then clicks Refresh and Up to confirm they keep/reload the listing and navigate
+to its parent. The host picker test starts from zeroed instance storage to
+reproduce native startup without global C++ constructors.
+
+Host sanitizer tests cover PNG/JPEG loads, failed-load preservation, zoom/pan,
+partial reads, arena reuse, Explorer image associations and reference-counted
+menu icon lifetimes without reads or pixel copies on visibility changes.
+The QEMU test boots a disposable copy of the seed and exercises Explorer image
+launch, PNG/JPEG display, actual size, invalid-image handling, file dialogs,
+maximize/resize, rapid Start reopening and three repeated open/close cycles
+that must return physical RAM to within 256 KiB of the warmed baseline. The
+ownership-walk sanitizer test checks that borrowed window pages and shared
+kernel mappings survive while private tables and loader-owned pages are freed
+exactly once. Captures stay in `.storage-test/`.
 
 Run QEMU suites sequentially: the shared harness uses fixed QMP/debug ports.
 Keep physical-device tests separate from emulator results. Fixture scripts can

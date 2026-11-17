@@ -67,6 +67,8 @@ options; header dependencies are tracked automatically.
   double-click app launching. Open it from Start or `run /bin/explorer.wiz`.
 - Native Notepad: text editing, Save/Save As and unsaved-change prompts. Explorer
   opens text documents in it and offers a right-click Open with menu.
+- Native Image Viewer: PNG/JPEG, checkerboard transparency, fit/actual size,
+  zoom and pan. Open from Start or double-click an image in Explorer.
 - Native Task Manager: a 60-second Core 0 CPU graph, collapsible Programs,
   Background processes and Kernel / System sections, CPU sorting within each,
   PID and scheduler state. Open with Ctrl+Shift+Esc, from Start, or
@@ -98,6 +100,7 @@ console app; `run /bin/win_test.elf` demonstrates mapped GUI surfaces.
 | [App packages](docs/APP_PACKAGES.md) | Self-contained `.wiz` apps: icons, metadata, portable vs installed, `wiz` command |
 | [File Explorer](docs/EXPLORER.md) | Native file browser, file operations, previews and app launching |
 | [Notepad](docs/NOTEPAD.md) | Text editor, saving, shortcuts and Open with |
+| [Image Viewer](docs/IMAGE_VIEWER.md) | PNG/JPEG viewing, zoom, pan and memory limits |
 | [Common file dialogs](docs/FILE_DIALOGS.md) | Reusable Open/Save As browser for native apps |
 | [Images/icons](docs/IMAGES.md) | Runtime resources, formats, themes, caching and memory lifetime |
 | [Fonts](docs/FONTS.md) | Runtime TTF selection and limits |
@@ -106,8 +109,8 @@ console app; `run /bin/win_test.elf` demonstrates mapped GUI surfaces.
 | [Syscalls](APIDocs/Syscalls.md) / [Window API](APIDocs/WindowAPI.md) | Native application interfaces |
 | [Testing](docs/TESTING.md) | Host/QEMU commands and hardware verification scope |
 
-Key gaps: ELF/user-pointer/window-ownership hardening, complete process memory
-cleanup, runtime timezone/DST, safe eject/reconnect, internal-drive installation,
+Key gaps: ELF/user-pointer/window-ownership hardening, loader failure cleanup,
+runtime timezone/DST, safe eject/reconnect, internal-drive installation,
 translucent client windows and hardware page flipping. PNG/font alpha already
 works; general window surfaces are still composed opaque.
 

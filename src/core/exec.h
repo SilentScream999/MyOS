@@ -64,7 +64,7 @@ static Task* execve_memory(const uint8_t* elf_data) {
             for (uint64_t p = start_page; p < end_page; p += PAGE_SIZE) {
                 uint64_t phys = alloc_phys_page();
                 // 0x04 = USER bit, 0x02 = WRITABLE bit
-                map_page(p, phys, 0x04 | 0x02);
+                map_page(p, phys, 0x04 | 0x02 | USER_PAGE_OWNED);
                 
                 // Zero the newly allocated page
                 for (int j = 0; j < (int)PAGE_SIZE; j++) ((uint8_t*)p)[j] = 0;
@@ -85,7 +85,7 @@ static Task* execve_memory(const uint8_t* elf_data) {
     
     for (uint64_t p = user_stack_bottom; p < user_stack_top; p += PAGE_SIZE) {
         uint64_t phys = alloc_phys_page();
-        map_page(p, phys, 0x04 | 0x02);
+        map_page(p, phys, 0x04 | 0x02 | USER_PAGE_OWNED);
     }
     
     // Restore the kernel's original address space

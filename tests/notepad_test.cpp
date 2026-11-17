@@ -102,8 +102,20 @@ int main(int argc,char** argv){
     // selects existing files, and returns a path for a new save name.
     files["/home/projects/draft.txt"]="draft";files["/home/projects/notes.md"]="notes";files["/home/.hidden.txt"]="hidden";
     NativeFileDialog browser;
+    // Native _start does not run static constructors: reproduce its zeroed
+    // picker storage rather than relying on the hosted constructor above.
+    memset(&browser,0,sizeof(browser));
     fail_role=true;assert(!browser.show(false,"/home/")&&!browser.window&&windows.empty());fail_role=false;
     assert(browser.show(false,"/home/"));assert(window_roles[browser.window]==1);assert(browser.entries[0].type==2);
+    browser.render();
+    for(const auto& nav:browser.navigation){
+        unsigned ink=0;for(int y=nav.y+6;y<nav.y+nav.h-6;++y)for(int x=nav.x+6;x<nav.x+nav.w-6;++x)
+            if((browser.canvas.pixels[y*browser.canvas.w+x]&0xffffff)>0xb0b0b0)++ink;
+        assert(ink>10); // Both icons must actually be drawn from zeroed storage.
+    }
+    browser.event({1,30,28,1,0,0},0);assert(!strcmp(browser.directory,"/"));
+    browser.event({1,74,28,1,0,0},0);assert(!strcmp(browser.directory,"/"));
+    assert(browser.navigate("/home"));
     auto choose=[&](const char* name){for(int i=0;i<browser.count;++i)if(!strcmp(browser.entries[i].name,name)){browser.select(i);browser.focus=NativeFileDialog::LIST;return;}assert(false);};
     choose("projects");int project_row=browser.selected;browser.last_click=-1;
     assert(browser.event({1,200,106+project_row*30,1,0,0},1)==NativeFileDialog::WAIT);

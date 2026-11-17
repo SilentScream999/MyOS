@@ -10,7 +10,7 @@
 //   • A private kernel stack (allocated from the heap).
 //   • A saved RSP — the only CPU state the context switcher needs to restore
 //     callee-saved registers and resume execution.
-//   • A CR3 slot — physical address of the task's PML4.  0 = inherit current
+//   • A CR3 slot — physical address of the task's PML4.  0 = use the kernel
 //     address space (all kernel tasks share the boot PML4).
 //   • A state field used by the scheduler (READY / RUNNING / BLOCKED / DEAD).
 //   • An intrusive `next` pointer for the scheduler's circular run-queue.
@@ -84,7 +84,7 @@ struct Task {
 
     // ── Virtual memory ────────────────────────────────────────────────────────
     // Physical address of this task's PML4.
-    // 0 = no CR3 switch on context swap (task shares the current address space).
+    // 0 = use the scheduler's kernel address space on context swap.
     // For user tasks: set this to the value returned by create_user_page_table().
     uint64_t cr3;
 
@@ -119,6 +119,7 @@ struct Task {
     bool console_host;
     char launch_target[256];
     char document_path[256]; // Optional document supplied by desktop Open with.
+    bool owns_address_space; // Private user PML4; kernel tasks never own theirs.
 };
 
 // ── Global PID counter ─────────────────────────────────────────────────────────
@@ -249,6 +250,7 @@ static Task* task_create_user(void (*entry)(), uint64_t cr3_phys,
                                uint32_t stack_pages = 0) {
     Task* t = task_create(entry, stack_pages);
     t->cr3  = cr3_phys;
+    t->owns_address_space = true;
     return t;
 }
 
@@ -266,6 +268,10 @@ static void task_free(Task* t) {
         }
     }
 
+    if (t->owns_address_space && t->cr3) {
+        destroy_user_page_table(t->cr3);
+        t->cr3=0;
+    }
     if (t->stack_size > 0 && t->stack_base)
         kfree(t->stack_base);
     kfree(t);

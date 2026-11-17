@@ -20,6 +20,7 @@ target is a GPU-composited desktop with installable applications.
 | Notepad | Native text editing, atomic saving, unsaved prompts and Explorer Open with | [Notepad](NOTEPAD.md) |
 | Task Manager | Core 0 CPU history, grouped programs/background/kernel tasks and opt-in Kernel / Input breakdown (ABI 10) | [Syscalls](../APIDocs/Syscalls.md) |
 | Images | PNG/JPEG wallpapers; lazy PNG icons, alpha, themes and bounded caching | [Images](IMAGES.md) |
+| Image Viewer | Native PNG/JPEG app, Explorer association, fit/zoom/pan, bounded userspace arena | [Viewer](IMAGE_VIEWER.md) |
 | Fonts | Runtime TTF selection with built-in fallback; printable ASCII UI | [Fonts](FONTS.md) |
 | Storage | Journaled ext4 USB root, persistent apps/settings/files, atomic saves, automatic capacity setup | [ext4](EXT4.md) |
 | Input | xHCI HID, USB hubs, descriptor-based pointers, PS/2 keyboard/Synaptics | [USB/input](USB_INPUT.md) |
@@ -59,6 +60,11 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
   exposed; the visibility calculation assumes today's opaque client windows.
 - Kernel string helpers are local definitions, not a hosted C runtime.
   Compiler-generated libc calls and the ext4/codec shim need deliberate linkage.
+- Interrupt and syscall entry preserve x87/SSE state in aligned stack frames
+  before calling C++. Kernel entry uses default floating-point controls; exit
+  restores the interrupted controls/registers. Keep this ahead of C handlers:
+  optimized UI drawing and the compositor both use XMM registers. AVX is not
+  enabled; enabling it requires broader extended-state preservation.
 - Do not remove USB protocol fixes as speculative workarounds. Preserve bounded
   reset/probe handling and exact transfer-completion ownership.
 - Headers are dependency-tracked; compiler-option changes require `make clean`.
@@ -67,7 +73,8 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
 ## Known limitations
 
 - ELF validation, segment permissions/W^X, user-pointer checks, window-ID
-  authorization and full address-space cleanup remain incomplete. The app API
+  authorization and malformed-ELF/failure cleanup remain incomplete. Normal
+  user-task reap releases loader-owned pages and private page tables. The app API
   is for trusted programs, not a finished security boundary.
 - One foreground application per shared terminal; no process groups, general
   signals, argument/environment passing or dynamic linking.
@@ -76,8 +83,8 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
 - Safe eject/reconnect, stable boot-volume identity, GPT, internal-drive drivers
   and installation remain pending. Permissions, links and UTC file timestamps
   also need defined semantics.
-- Runtime timezone/DST configuration, file-transfer UI and a standalone image
-  viewer are absent. Icon themes implement the native subset in [IMAGES](IMAGES.md).
+- Runtime timezone/DST configuration and file-transfer UI are absent. Icon
+  themes implement the native subset in [IMAGES](IMAGES.md).
 - A failing device can delay sibling HID discovery during synchronous
   enumeration. Surface/ZM3310 wireless stutter is not confirmed resolved.
 - Some generated binaries/images are tracked. `.gitignore` does not untrack

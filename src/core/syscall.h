@@ -1,5 +1,6 @@
 #ifndef syscall_h
 #define syscall_h
+#include "fp_context.h"
 
 // ── syscall.h ─────────────────────────────────────────────────────────────────
 //
@@ -716,6 +717,11 @@ static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uin
             Window* win=wm_find_window((int)a1);
             if(!win||!g_current_task||win->is_system||win->owner_pid!=g_current_task->pid||a2>WIN_ROLE_FILE_DIALOG)return (uint64_t)-1;
             TtyIrqGuard guard;win->role=(uint32_t)a2;win->chrome_drawn=false;
+            // A foreground app's common dialog must receive keyboard input
+            // immediately. Background apps must not steal another app's focus.
+            Window* focused=wm_find_window(g_focused_win_id);
+            if(a2==WIN_ROLE_FILE_DIALOG&&focused&&!focused->is_system&&focused->owner_pid==win->owner_pid)
+                for(int i=0;i<g_window_count;++i)if(g_window_list[i]==win){wm_raise_window(i);break;}
             ++g_resource_demand_generation;g_resources_requested=true;
             wm_damage_window_full(win);g_needs_refresh=true;return 0;
         }
@@ -739,6 +745,7 @@ static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uin
 // We must save/restore: RCX, R11 (clobbered by SYSCALL/SYSRET),
 // and callee-saved regs: RBP, RBX, R12-R15.
 // RAX carries the return value; RDI/RSI/RDX are argument registers.
+// Entry also saves x87, MXCSR and XMM0-15 on the private kernel stack before C++.
 
 // ── syscall_entry (Pure Assembly) ─────────────────────────────────────────────
 //
@@ -785,6 +792,10 @@ __asm__ (
     // Fifteen pushes = 120 bytes; another 8 bytes aligns the C call.
     "subq $8, %rsp\n"
 
+    // Inline syscall wrappers keep SSE registers live. Preserve the complete
+    // x87/SSE state before C++ can use it or interrupts can switch tasks.
+    FP_ENTRY_SAVE("%rsp")
+
     // 6. Re-enable interrupts: we are securely on this task's private kernel stack.
     "sti\n"
 
@@ -803,6 +814,7 @@ __asm__ (
     "cli\n"
 
     // 9. Remove 16-byte alignment padding.
+    FP_ENTRY_RESTORE("%rsp")
     "addq $8, %rsp\n"
 
     // 10. Restore user register state from the private stack.

@@ -11,6 +11,7 @@ extern void image_deallocate(void*);
 struct alignas(16) ImageAllocation {
     uint64_t size; bool charged;
     ImageAllocation *previous, *next;
+    unsigned references = 1;
 };
 static uint64_t decode_used, decode_budget;
 static bool decoding;
@@ -35,6 +36,7 @@ static void* decoder_alloc(size_t size) {
 static void decoder_free(void* pointer) {
     if (!pointer) return;
     auto* allocation = (ImageAllocation*)pointer - 1;
+    if (--allocation->references) return;
     decoder_uncharge(allocation);
     image_deallocate(allocation);
 }
@@ -126,6 +128,11 @@ bool image_decode(const uint8_t* bytes, uint64_t size, Image* out, uint64_t max_
 void image_free(Image* image) {
     if (image) { decoder_free(image->pixels); *image = {}; }
 }
+bool image_share(const Image& source, Image* out) {
+    if (!source.pixels || !out || out->pixels) return false;
+    ++((ImageAllocation*)source.pixels-1)->references;
+    *out=source; return true;
+}
 uint32_t image_over(uint32_t background, uint32_t foreground) {
     uint32_t alpha = foreground >> 24;
     if (!alpha) return background;
@@ -144,7 +151,7 @@ bool image_resize(const Image& source, uint32_t width, uint32_t height, Image* o
     uint64_t size = (uint64_t)width * height * 4;
     auto* allocation = (ImageAllocation*)image_allocate(sizeof(ImageAllocation) + size);
     if (!allocation) return false;
-    *allocation = {size, false};
+    *allocation = {size, false, nullptr, nullptr};
     auto* pixels = (uint32_t*)(allocation + 1);
     // Bilinear sampling at pixel centers, in premultiplied space.
     for (uint32_t y = 0; y < height; ++y) {

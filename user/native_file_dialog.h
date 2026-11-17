@@ -2,6 +2,7 @@
 #define WYZAR_NATIVE_FILE_DIALOG_H
 #include "native_ui.h"
 #include "native_text.h"
+#include "native_controls.h"
 
 // Explorer-style common file picker. The owning app processes its events while
 // suspending document input; filesystem work happens outside the renderer.
@@ -13,6 +14,11 @@ struct NativeFileDialog {
     char directory[256]="/home",address[256],filename[256],result[256],message[192];
     int count=0,selected=-1,scroll=0,last_click=-1;
     unsigned last_frame=0;
+    int hovered_navigation=-1;
+    // Apps enter at _start without running global C++ constructors. Keep
+    // geometry/artwork in constant storage, independent of picker startup.
+    static constexpr NativeToolbarButton navigation[2]={{12,14,36,30,NativeIcon::Up,nullptr,"Up one level (Alt+Up)"},
+        {56,14,36,30,NativeIcon::Refresh,nullptr,"Refresh folder (Ctrl+R)"}};
     enum Focus { LIST, NAME, ADDRESS } focus=NAME;
     bool saving=false,replace_input=true,dirty=true,text_only=false,truncated=false;
     enum Result { WAIT, ACCEPT, CANCEL };
@@ -56,6 +62,7 @@ struct NativeFileDialog {
         tell(failed?"Folder read failed. Try another folder or refresh.":truncated?"Showing the first 512 items.":"Select a file or browse to another folder.");return true;
     }
     bool show(bool save,const char* initial){
+        hovered_navigation=-1;
         saving=save;focus=NAME;replace_input=true;text_only=false;filename[0]=0;
         char initial_dir[256];native_copy(initial_dir,256,initial&&initial[0]?initial:"/home/");
         unsigned end=native_length(initial_dir);while(end&&initial_dir[end-1]!='/')--end;
@@ -112,19 +119,22 @@ struct NativeFileDialog {
     void render(){
         int w=canvas.w,h=canvas.h;if(!canvas.pixels)return;
         canvas.rect(0,0,w,h,0xff1a1925);canvas.rect(0,0,w,58,0xff222131);
-        draw_button(12,14,36,"Up");draw_button(56,14,64,"Refresh");
-        canvas.rounded(132,14,w-148,30,4,focus==ADDRESS?0xff443454:0xff14121e);
-        if(focus==ADDRESS)address_input.draw(canvas,142,21,w-28,address,replace_input,12);
-        else canvas.text(142,21,address,0xffeeebf8,w-28,12);
+        navigation[0].draw(canvas,!equal(directory,"/"),hovered_navigation==0);
+        navigation[1].draw(canvas,true,hovered_navigation==1);
+        canvas.rounded(104,14,w-120,30,4,focus==ADDRESS?0xff443454:0xff14121e);
+        if(focus==ADDRESS)address_input.draw(canvas,114,21,w-28,address,replace_input,12);
+        else canvas.text(114,21,address,0xffeeebf8,w-28,12);
         canvas.rect(0,58,140,h-58,0xff222131);canvas.text(16,76,"PLACES",0xffa49bb6,132,12);
         const char* places[]={"Home","Applications","System","Devices"};
         for(int i=0;i<4;++i){canvas.folder(12,104+i*40,24);canvas.text(43,109+i*40,places[i],0xffeeebf8,134,12);}
         canvas.rect(148,66,w-164,26,0xff222131);canvas.text(184,71,"Name",0xffa49bb6,w-150,12);canvas.text(w-130,71,"Type",0xffa49bb6,w-20,12);
         for(int row=0;row<visible();++row){int index=scroll+row;if(index>=count)break;int y=96+row*30;
             if(index==selected)canvas.rounded(148,y,w-164,30,4,0xff443454);
-            if(entries[index].type==2)canvas.folder(154,y+2,26);else canvas.document(154,y+1);
+            bool image=entries[index].type!=2&&native_image_file(entries[index].name);
+            if(entries[index].type==2)canvas.folder(154,y+2,26);
+            else if(image)canvas.image_file(154,y+1);else canvas.document(154,y+1);
             canvas.text(188,y+7,entries[index].name,0xffeeebf8,w-142,12);
-            canvas.text(w-130,y+7,entries[index].type==2?"Folder":"File",0xffa49bb6,w-20,12);}
+            canvas.text(w-130,y+7,entries[index].type==2?"Folder":image?"Image":"File",0xffa49bb6,w-20,12);}
         if(!count)canvas.text(178,112,"No files in this folder.",0xffa49bb6,w-20,12);
         if(count>visible()){int track=visible()*30,thumb=track*visible()/count;if(thumb<16)thumb=16;
             canvas.rect(w-8,96,3,track,0xff39334b);canvas.rect(w-8,96+(track-thumb)*scroll/(count-visible()),3,thumb,0xffa58bc5);}
@@ -134,16 +144,20 @@ struct NativeFileDialog {
         else canvas.text(250,h-93,filename,0xffeeebf8,w-26,12);
         draw_button(154,h-58,180,text_only?"Text files (*.txt)":"All files (*.*)");
         draw_button(w-200,h-58,86,saving?"Save":"Open");draw_button(w-102,h-58,86,"Cancel");
-        canvas.text(152,h-20,message,0xffb9aecb,w-12,12);
+        canvas.text(152,h-20,hovered_navigation>=0?navigation[hovered_navigation].hint:message,0xffb9aecb,w-12,12);
         native_call(201,window);dirty=false;
     }
     Result event(const NativeEvent& e,unsigned frame){
+        if(e.type==3){int next=-1;for(int i=0;i<2;++i)if(navigation[i].hit(e.x,e.y))next=i;
+            if(next==0&&equal(directory,"/"))next=-1;
+            if(next!=hovered_navigation){hovered_navigation=next;dirty=true;}return WAIT;}
         if(e.type==5||e.type==1){name_input.cursor.reset(frame);address_input.cursor.reset(frame);dirty=true;}
         if(e.type==7)return CANCEL;
         if(e.type==8){if(native_accept_resize(window,canvas)){bound_scroll();dirty=true;}return WAIT;}
         if(e.type==5){uint32_t key=e.key;
             if(key==27)return CANCEL;
             if((e.mods&1)&&(key=='l'||key=='L')){focus=ADDRESS;replace_input=true;dirty=true;return WAIT;}
+            if((e.mods&1)&&(key=='r'||key=='R')){navigate(directory);return WAIT;}
             if((e.mods&4)&&key==0x1041){navigate("..");return WAIT;}
             if(key=='\t'){focus=focus==NAME?LIST:focus==LIST?ADDRESS:NAME;replace_input=true;dirty=true;return WAIT;}
             if(key=='\n'||key=='\r')return submit();
@@ -167,9 +181,9 @@ struct NativeFileDialog {
         if(hit(x,y,w-102,h-58,86,30))return CANCEL;
         if(hit(x,y,w-200,h-58,86,30))return submit();
         if(hit(x,y,154,h-58,180,30)){text_only=!text_only;navigate(directory);return WAIT;}
-        if(hit(x,y,12,14,36,30)){navigate("..");return WAIT;}
-        if(hit(x,y,56,14,64,30)){navigate(directory);return WAIT;}
-        if(hit(x,y,132,14,w-148,30)){focus=ADDRESS;replace_input=true;dirty=true;return WAIT;}
+        if(navigation[0].hit(x,y)){if(!equal(directory,"/"))navigate("..");return WAIT;}
+        if(navigation[1].hit(x,y)){navigate(directory);return WAIT;}
+        if(hit(x,y,104,14,w-120,30)){focus=ADDRESS;replace_input=true;dirty=true;return WAIT;}
         if(hit(x,y,240,h-100,w-256,30)){focus=NAME;replace_input=true;dirty=true;return WAIT;}
         const char* places[]={"/home","/home/Applications","/","/mnt"};
         for(int i=0;i<4;++i)if(hit(x,y,8,100+i*40,126,36)){navigate(places[i]);return WAIT;}

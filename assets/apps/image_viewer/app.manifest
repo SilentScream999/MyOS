@@ -1,0 +1,7 @@
+id=image_viewer
+name=Image Viewer
+version=1.0.0
+abi=7
+type=gui
+icon=image_viewer
+description=View PNG and JPEG images with fit, zoom and pan controls.

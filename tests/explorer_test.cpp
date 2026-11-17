@@ -113,6 +113,11 @@ int main(int argc,char** argv) {
     choose_open_with();launch_failure=true;handle_event({5,0,0,'\n',0,0});assert(dialog==OPEN_WITH);launch_failure=false;
     handle_event({5,0,0,27,0,0});assert(dialog==NONE);
     choose("destination");choose_open_with();assert(dialog==NONE);
+    put("/home/photo.PNG","fixture");load_directory();choose("photo.PNG");open_selected();
+    assert(dialog==NONE&&opened_document=="/home/photo.PNG"&&opened_app=="/bin/image_viewer.wiz");
+    choose_open_with();launch_failure=true;handle_event({5,0,0,'\n',0,0});assert(dialog==OPEN_WITH);launch_failure=false;
+    handle_event({5,0,0,'i',0,0});assert(dialog==NONE&&opened_app=="/bin/image_viewer.wiz");
+    assert(image_document("photo.JPEG")&&image_document("photo.jpg")&&!image_document("photo.png.txt"));
     // Path text is shared independently of file-copy state, including spaces.
     choose("zeta.txt");copy_selection(false);std::string file_copy=clipboard;
     handle_event({1,250,LIST_TOP+selected*ROW+8,2,0,0});assert(context_open);

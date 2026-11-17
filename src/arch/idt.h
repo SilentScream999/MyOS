@@ -49,6 +49,7 @@
 
 #include <stdint.h>
 #include "helpers.h"   // print(), to_hex(), hcf()
+#include "fp_context.h"
 
 // ── Gate descriptor ───────────────────────────────────────────────────────────
 struct IDTEntry {
@@ -259,7 +260,13 @@ void isr_common_stub() {
         // Align rsp to 16 bytes (System V ABI requirement before any call).
         "andq $-16, %%rsp\n\t"
 
+        // C++ and the compositor use SSE. Save it before any C handler runs,
+        // including a timer handler that schedules a different task.
+        FP_ENTRY_SAVE("%%rsp")
+
         "callq exception_dispatch\n\t"
+
+        FP_ENTRY_RESTORE("%%rsp")
 
         // ── Restore rsp and registers ─────────────────────────────────────────
         "movq %%rbx, %%rsp\n\t"

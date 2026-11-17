@@ -77,6 +77,14 @@ in-progress syscalls and closes owned windows/descriptors. This is not general
 signals or process groups. Window close buttons request `WIN_EVENT_CLOSE`; the app decides whether
 to exit, destroy one window or ask to save. See [Window API](../APIDocs/WindowAPI.md).
 
+On reap, a user task returns its loader-owned ELF/stack pages and private
+lower-half page tables to the physical allocator. This includes application BSS
+arenas. Shared kernel mappings and borrowed window-surface pages are excluded;
+the compositor separately releases retired surfaces. Kernel threads switch to
+the kernel CR3 instead of retaining a user address space. Reaping never destroys
+the current task or active CR3. Detached GUI tasks are reaped automatically;
+foreground children retain their task record until the parent collects exit.
+
 ## Boot and recovery
 
 Boot normally starts the disk shell after root validation. Missing/invalid
@@ -86,8 +94,8 @@ mounts remain valid. [Storage](PERSISTENT_STORAGE.md) defines the boot contract.
 
 ## Remaining work
 
-- ELF program-header bounds, segment ranges/overlap, permissions/W^X and complete
-  cleanup need hardening. A file-size cap does not validate ELF structure.
+- ELF program-header bounds, segment ranges/overlap, permissions/W^X and loader
+  failure cleanup need hardening. A file-size cap does not validate ELF structure.
 - No dynamic linker, argument/environment passing, process groups or general
   signals; the small native helpers still need a general application SDK.
 - Window-ID authorization and user-pointer/mapping checks remain incomplete.

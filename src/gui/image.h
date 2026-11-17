@@ -12,6 +12,8 @@ constexpr uint64_t IMAGE_MAX_PIXELS = 16ull * 1024 * 1024;
 bool image_decode(const uint8_t* bytes, uint64_t size, Image* out,
                   uint64_t max_pixels = IMAGE_MAX_PIXELS);
 void image_free(Image* image);
+// Share immutable pixels between resource snapshots; each owner calls image_free.
+bool image_share(const Image& source, Image* out);
 bool image_resize(const Image& source, uint32_t width, uint32_t height, Image* out);
 // Source-over onto an opaque desktop target. Alpha is already in source RGB.
 uint32_t image_over(uint32_t background, uint32_t foreground);

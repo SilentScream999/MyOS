@@ -36,6 +36,7 @@
 #include "structures.h"
 #include "helpers.h"
 #include <stdint.h>
+#include "user_address_space.h"
 
 extern "C" {
     #include "limine.h"
@@ -468,6 +469,17 @@ uint64_t create_user_page_table() {
     // Entries 0–255 remain zero: clean user address space.
 
     return new_phys;
+}
+
+// The caller has stopped the task and disabled interrupts. Never release the
+// active CR3, kernel-half mappings, or externally owned window surfaces.
+static void destroy_user_page_table(uint64_t physical) {
+    uint64_t flags;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    release_user_address_space(physical,
+        [](uint64_t page){return (volatile uint64_t*)(HHDM+page);},
+        [](uint64_t page){free_phys_page(page);});
+    if(flags&(1u<<9))__asm__ volatile("sti" ::: "memory");
 }
 
 // switch_to_cr3 — activate an address space by writing CR3.

@@ -40,6 +40,19 @@ static int64_t sys_readdir(const char* p,uint64_t i,char* n,uint64_t* s,uint64_t
     return native_call(40,(uint64_t)p,i,(uint64_t)n,(uint64_t)s,(uint64_t)t);
 }
 static unsigned native_length(const char* s) { unsigned n=0; while(s[n]) ++n; return n; }
+static bool native_image_file(const char* name) {
+    const char* extension=nullptr;
+    for(const char* p=name;*p;++p){if(*p=='/')extension=nullptr;else if(*p=='.')extension=p;}
+    if(!extension)return false;
+    const char* supported[]={".png",".jpg",".jpeg"};
+    for(const char* candidate:supported){
+        const char* p=extension;const char* q=candidate;
+        bool matches=true;
+        while(*p&&*q){unsigned c=(unsigned char)*p++;if(c>='A'&&c<='Z')c+=32;if(c!=(unsigned char)*q++){matches=false;break;}}
+        if(matches&&!*p&&!*q)return true;
+    }
+    return false;
+}
 static bool native_clipboard_set(const char* text,unsigned length){return (int64_t)native_call(217,0,(uint64_t)text,length)==0;}
 static int64_t native_clipboard_get(char* text,unsigned capacity){return (int64_t)native_call(217,1,(uint64_t)text,capacity);}
 static bool native_copy(char* d,unsigned cap,const char* s) {
@@ -131,6 +144,16 @@ struct NativeSurface {
     void document(int x,int y,uint32_t accent=0xff8598b5) {
         rect(x+4,y+2,19,25,0xffd9e1ed);rect(x+17,y+2,6,6,0xff9eacc1);
         rect(x+7,y+12,12,2,accent);rect(x+7,y+17,12,2,accent);rect(x+7,y+22,8,2,accent);
+    }
+    void image_file(int x,int y,int size=28) {
+        static const Point frame[]={{2,4},{30,4},{30,28},{2,28}};
+        static const Point sky[]={{4,6},{28,6},{28,26},{4,26}};
+        static const Point far[]={{4,24},{13,12},{23,26},{4,26}};
+        static const Point near[]={{13,26},{23,16},{28,22},{28,26}};
+        static const Point sun[]={{23,8},{25,9},{26,11},{25,13},{23,14},{21,13},{20,11},{21,9}};
+        polygon(x,y,size,frame,0xffd2dbee);polygon(x,y,size,sky,0xff699fd1);
+        polygon(x,y,size,sun,0xffffde8c);polygon(x,y,size,far,0xffd2ebe9);
+        polygon(x,y,size,near,0xff63a08d);
     }
 };
 struct NativeWindowInfo { uint32_t width,height,pitch,reserved;uint64_t buffer; };

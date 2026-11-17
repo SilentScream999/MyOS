@@ -1,5 +1,15 @@
 # File Explorer
 
+Back, Forward, Up and Refresh share the file picker's bordered icon-button
+renderer. Refresh uses the Start menu's restart symbol; disabled navigation is
+dimmed, hover shows its label, and the compact row leaves more room for the path.
+
+PNG/JPG/JPEG files open in the native [Image Viewer](IMAGE_VIEWER.md) on
+double-click. Open with offers both Notepad and Image Viewer; Enter selects the
+default for the file extension, and I selects Image Viewer explicitly.
+These files use a landscape picture icon and an Image type label in Explorer
+and the shared file picker; extensions are recognized without regard to case.
+
 File Explorer is a native userspace `.wiz` app, available from Start or with:
 
 ```text

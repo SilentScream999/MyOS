@@ -30,6 +30,7 @@ static resources::Catalog* g_resources_catalog = &g_empty_catalog;
 static volatile bool g_resources_requested = true;
 static volatile bool g_resources_refresh = true;
 static uint64_t g_resource_demand_generation = 0;
+static uint64_t g_resource_refresh_ticks = 0;
 static unsigned g_resource_readers = 0;
 // Publication waits for readers to finish. Readers never wait or touch disk.
 struct ResourceRead {
@@ -404,7 +405,12 @@ static inline void wm_menu_dirty_rect() {
 
 static inline void wm_menu_open() {
     g_menu_open = true;
-    wm_menu_refresh();
+    // Rapid reopenings reuse the complete snapshot. Refresh at the next open
+    // after five seconds, preserving discovery of externally replaced assets.
+    uint64_t now=rdtsc_val();
+    if (!g_resource_refresh_ticks || !tsc_hz || now-g_resource_refresh_ticks>=tsc_hz*5)
+        wm_menu_refresh();
+    else { ++g_resource_demand_generation; g_resources_requested=true; }
     wm_menu_dirty_rect();
 }
 
@@ -475,6 +481,7 @@ static void wm_resources_reload() {
         if (!__atomic_load_n(&g_resource_readers,__ATOMIC_ACQUIRE)) {
             if (g_menu_open) wm_menu_dirty_rect();
             previous=g_resources_catalog; g_resources_catalog=next;
+            if (refresh) g_resource_refresh_ticks=rdtsc_val();
             wm_dirty_add(0,fb->width-1,0,fb->height-1); g_needs_refresh=true;
             if (flags&(1u<<9)) __asm__ volatile("sti" ::: "memory");
             break;

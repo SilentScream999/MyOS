@@ -55,6 +55,19 @@ def desktop_symbol(name, x, y):
             color = (255, 229, 155)
         if inside(x, y, [(7, 53), (57.3, 53), (57, 55), (7, 55)]):
             color = (220, 151, 36)
+    elif name == 'image_viewer':
+        if 5 <= x <= 59 and 10 <= y <= 55:
+            color = (210, 219, 238)
+        if 8 <= x <= 56 and 13 <= y <= 51:
+            color = (44, 73, 116)
+        if 12 <= x <= 52 and 17 <= y <= 47:
+            color = (105, 168, 210)
+            if math.hypot(x-42, y-25) <= 5:
+                color = (255, 222, 140)
+            if inside(x, y, [(12, 43), (24, 26), (38, 47), (12, 47)]):
+                color = (210, 235, 233)
+            if inside(x, y, [(25, 47), (40, 32), (52, 43), (52, 47)]):
+                color = (99, 160, 141)
     elif name == 'task_manager':
         if inside(x, y, [(7, 9), (58, 9), (61, 12), (61, 48), (58, 51), (7, 51), (4, 48), (4, 12)]):
             color = (38, 70, 101)
@@ -122,7 +135,7 @@ def icon(name, size):
             for sy in range(4):
                 for sx in range(4):
                     x, y = (px+(sx+.5)/4)*64/size, (py+(sy+.5)/4)*64/size
-                    if name in ('explorer', 'notepad', 'task_manager'):
+                    if name in ('explorer', 'notepad', 'task_manager', 'image_viewer'):
                         color = desktop_symbol(name, x, y)
                         if color is not None:
                             for i in range(3): sums[i] += color[i]
@@ -164,7 +177,7 @@ def icon(name, size):
 
 
 def main():
-    names = ('terminal', 'application-default', 'visual-test', 'rainbow', 'boot-log', 'counter', 'win_test', 'explorer', 'notepad', 'task_manager')
+    names = ('terminal', 'application-default', 'visual-test', 'rainbow', 'boot-log', 'counter', 'win_test', 'explorer', 'notepad', 'task_manager', 'image_viewer')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--only', choices=names, help='Regenerate one icon family')
     args = parser.parse_args()

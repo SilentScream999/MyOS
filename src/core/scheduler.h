@@ -163,7 +163,9 @@ extern volatile uint64_t g_tick_count;
 // function body is exactly what we write in the asm block.
 //
 // Callee-saved registers (SysV AMD64 ABI): rbp, rbx, r12, r13, r14, r15.
-// Saving these is sufficient to make the old task resumable.
+// C callers spill caller-saved XMM registers around this ordinary call. The
+// interrupt/syscall entry stubs separately save interrupted x87/SSE state on
+// this task's stack before entering C++, so that state resumes with the task.
 
 __attribute__((naked))
 static void switch_context(uint64_t* old_rsp_out, uint64_t new_rsp, uint64_t new_cr3) {
@@ -243,6 +245,7 @@ static void scheduler_reap_dead() {
     while (cur != g_task_list) {
         Task* nxt = cur->next;
         if (cur != g_current_task && cur->state == TaskState::DEAD &&
+            (!cur->owns_address_space || cur->cr3!=(read_cr3()&PTE_ADDR_MASK)) &&
             (cur->parent_pid == 0 || cur->exit_collected)) {
             prev->next = nxt;
             task_free(cur);
@@ -254,6 +257,7 @@ static void scheduler_reap_dead() {
 
     // Check the head node itself (never remove if it is the current task).
     if (g_task_list != g_current_task &&
+        (!g_task_list->owns_address_space || g_task_list->cr3!=(read_cr3()&PTE_ADDR_MASK)) &&
         g_task_list->state == TaskState::DEAD &&
         (g_task_list->parent_pid == 0 || g_task_list->exit_collected) &&
         g_task_list->next  != g_task_list) {
@@ -350,7 +354,8 @@ switch_now:
     }
     g_tss.rsp[0] = g_current_kstack_top;
 
-    switch_context(&old->saved_rsp, next->saved_rsp, next->cr3);
+    // Kernel threads must not inherit a user CR3 that the reaper may release.
+    switch_context(&old->saved_rsp, next->saved_rsp, next->cr3 ? next->cr3 : g_kernel_cr3);
     
     // Execution resumes here when the old task is scheduled back in.
     // Restore the exactly matching interrupt state we had before yielding.

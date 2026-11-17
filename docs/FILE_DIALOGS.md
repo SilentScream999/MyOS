@@ -6,6 +6,11 @@ it does not depend on Notepad or a running/installed Explorer process. Include
 the header and declare a static `NativeFileDialog` (its bounded listing is too
 large for a small stack). Packages using it must declare `abi=7` or later.
 Ctrl+V pastes shared clipboard text into filename and folder address fields.
+The compact Up and Refresh toolbar buttons use icons and the Explorer border
+style. Refresh shares Start's restart artwork. Hover shows a status hint;
+Alt+Up goes to the parent, Ctrl+R refreshes, and Up is dimmed at the root.
+Toolbar definitions are static constexpr data so the controls also work in
+native apps that enter through `_start` without running global C++ constructors.
 The address field also accepts full file paths: press Enter to navigate to the
 parent folder and highlight the file, then Open/Save to confirm. Relative and
 double-quoted paths work, including spaces. Explicit paths can reveal files
@@ -33,7 +38,9 @@ Suspend document input while the picker is open. The caller owns its window,
 handles events and retains its ordinary process/cleanup behavior.
 
 The shared browser automatically sets `WIN_ROLE_FILE_DIALOG` through syscall
-209. The window manager uses the system `explorer` theme icon for its title bar
+209. If the app currently owns keyboard focus, assigning this role raises and
+focuses the dialog immediately. A background app does not steal focus.
+The window manager uses the system `explorer` theme icon for its title bar
 and taskbar, regardless of the calling app's executable or package icon. Ordinary
 windows keep their app icon. Resources are loaded by the existing background
 worker and cached; renderers do no filesystem work. Ownership and the executable

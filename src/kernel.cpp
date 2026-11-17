@@ -816,7 +816,7 @@ extern "C" void kmain(void) {
     {
         uint64_t cr0;
         __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
-        cr0 &= ~(1ULL << 2); // Clear EM (Emulation)
+        cr0 &= ~((1ULL << 2) | (1ULL << 3)); // Clear EM and TS (eager x87/SSE use)
         cr0 |= (1ULL << 1);  // Set MP (Monitor Coprocessor)
         __asm__ volatile("mov %0, %%cr0" :: "r"(cr0) : "memory");
 
@@ -825,6 +825,8 @@ extern "C" void kmain(void) {
         cr4 |= (1ULL << 9);  // Set OSFXSR (FXSAVE/FXRSTOR support)
         cr4 |= (1ULL << 10); // Set OSXMMEXCPT (SIMD exception support)
         __asm__ volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
+        uint32_t mxcsr=0x1f80;
+        __asm__ volatile("fninit; ldmxcsr %0" :: "m"(mxcsr) : "memory");
     }
 
 	if (!boot_framebuffer || !boot_framebuffer->address || boot_framebuffer->bpp != 32 ||

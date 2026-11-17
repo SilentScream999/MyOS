@@ -91,11 +91,18 @@ inheritance, symbolic recoloring, SVG or ICO decoding.
 ## Loading, caching and release
 
 Discovery reads metadata without opening application PNGs. Opening Start asks a
-worker to refresh app/theme metadata and load only displayed rows. Visible app
+worker to refresh app/theme metadata and load only displayed rows, at most once
+per five seconds (measured since the last successful full refresh). Rapid
+reopenings reuse the catalog without disk access. Changes are picked up on an
+opening after that interval; there is no continuous polling. Visible app
 windows request title/taskbar icons independently of Start; system windows
 request their own icons. The old complete catalog remains visible while work runs.
 
-Closing a menu/window releases its scaled icon buffers in the next snapshot.
+Closing Start retains previously displayed menu icons, bounded by the 16-app
+catalog and 128-pixel maximum menu size (at most 1 MiB of pixels). Immutable
+scaled pixels are reference-counted across snapshots, so visibility changes
+neither copy nor resize them. A full refresh replaces these retained variants.
+Closing a window releases its title/taskbar variants in the next snapshot.
 Visibility-only changes reuse metadata and existing pixels without disk scans.
 Obsolete in-flight demand is discarded before publication. The renderer never
 performs file access or decoding, and old snapshots are released only after
@@ -145,6 +152,7 @@ stb_image handles baseline/progressive JPEG subject to its format limitations.
 
 Scratch allocations have a per-request budget and are reclaimed on failure.
 Concurrent decodes fail cleanly instead of spinning; the desktop uses one worker.
-Color management, EXIF orientation, image saving and a standalone image viewer
-are not implemented. [TESTING](TESTING.md) lists host/QEMU resource and recovery
+Color management, EXIF orientation and image saving are not implemented. The
+native [Image Viewer](IMAGE_VIEWER.md) reuses this codec with its own memory limits.
+[TESTING](TESTING.md) lists host/QEMU resource and recovery
 checks; physical performance still needs measurement.

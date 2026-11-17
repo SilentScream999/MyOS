@@ -93,9 +93,17 @@ int main(int argc,char** argv) {
     reads.clear(); decodes=store.decodes;
     demand.menu_rows=0;
     auto* hidden=resources::build(store,24,16,24,demand,shown);
-    assert(hidden && !hidden->apps[0].icons.menu.pixels);
+    assert(hidden && hidden->apps[0].icons.menu.pixels==shown->apps[0].icons.menu.pixels);
     assert(hidden->system[0].title.pixels && reads.empty() && store.decodes==decodes);
-    resources::release(hidden); resources::release(shown);
+    // Closing and reopening keeps shared pixels alive after the old snapshot
+    // is freed, with no reads, decode, resize or new pixel allocation.
+    resources::release(shown);
+    demand.menu_rows=1;reads.clear();
+    auto* reopened=resources::build(store,24,16,24,demand,hidden);
+    assert(reopened&&reads.empty()&&reopened->apps[0].icons.menu.pixels==hidden->apps[0].icons.menu.pixels);
+    resources::release(hidden);
+    assert(reopened->apps[0].icons.menu.pixels[0]);
+    resources::release(reopened);
     demand={}; demand.window_count=1;
     resources::copy(demand.executables[0],256,"/bin/counter.wiz");
     auto* running=resources::build(store,24,16,24,demand,catalog);

@@ -96,11 +96,11 @@ def install_ext4_file(volume, root, create=False, sectors=EXT4_SECTORS):
         if (root / 'build/console.elf').exists():
             put('share/system/console.elf', (root / 'build/console.elf').read_bytes())
         # Sample packages: run them in place or `wiz install` them (docs/APP_PACKAGES.md).
-        for package in ('counter.wiz', 'win_test.wiz', 'bundle_demo.wiz', 'explorer.wiz', 'notepad.wiz', 'task_manager.wiz'):
+        for package in ('counter.wiz', 'win_test.wiz', 'bundle_demo.wiz', 'explorer.wiz', 'notepad.wiz', 'task_manager.wiz', 'image_viewer.wiz'):
             source = root / 'build' / 'packages' / package
             if source.exists():
                 put('share/samples/' + package, source.read_bytes())
-                if package in ('explorer.wiz', 'notepad.wiz', 'task_manager.wiz'):
+                if package in ('explorer.wiz', 'notepad.wiz', 'task_manager.wiz', 'image_viewer.wiz'):
                     put('bin/' + package, source.read_bytes())
         put('etc/root.cfg', b'WYZARROOT1\n')
         put('etc/desktop.cfg', b'/share/wall.raw\n', True)

@@ -102,7 +102,7 @@ init.elf: user/init.o
 WIZ_ASSETS = tools/wiz_pack.py $(wildcard assets/apps/*/app.manifest) $(wildcard assets/apps/*/data/*) \
              $(wildcard assets/icons/hicolor/*/apps/*.png)
 PACKAGE_DIR := build/packages
-PACKAGES := $(addprefix $(PACKAGE_DIR)/,counter.wiz win_test.wiz bundle_demo.wiz explorer.wiz notepad.wiz task_manager.wiz)
+PACKAGES := $(addprefix $(PACKAGE_DIR)/,counter.wiz win_test.wiz bundle_demo.wiz explorer.wiz notepad.wiz task_manager.wiz image_viewer.wiz)
 $(PACKAGE_DIR)/%.wiz: %.elf $(WIZ_ASSETS)
 	mkdir -p $(@D)
 	$(if $(wildcard assets/apps/$*/app.manifest),python3 tools/wiz_pack.py pack --elf $< --manifest assets/apps/$*/app.manifest --icons assets/icons/hicolor $(if $(wildcard assets/apps/$*/data),--data assets/apps/$*/data,) -o $@,cp $< $@)
@@ -173,13 +173,13 @@ user/bundle_demo.o: user/bundle_demo.c user/wizlib.h src/core/wiz.h
 bundle_demo.elf: user/bundle_demo.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
-user/explorer.o: user/explorer.cpp user/native_ui.h user/native_text.h user/wiz_cmd.h src/core/wiz.h src/core/app.h src/gui/ui_font.h src/gui/ui_font_data.h
+user/explorer.o: user/explorer.cpp user/native_ui.h user/native_text.h user/native_controls.h src/gui/power_icons.h user/wiz_cmd.h src/core/wiz.h src/core/app.h src/gui/ui_font.h src/gui/ui_font_data.h
 	$(CXX) $(USER_CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -I. -c $< -o $@
 
 explorer.elf: user/explorer.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
-user/notepad.o: user/notepad.cpp user/native_ui.h user/native_text.h user/native_file_dialog.h src/fs/fileinfo.h src/gui/ui_font.h src/gui/ui_font_data.h
+user/notepad.o: user/notepad.cpp user/native_ui.h user/native_text.h user/native_file_dialog.h user/native_controls.h src/gui/power_icons.h src/fs/fileinfo.h src/gui/ui_font.h src/gui/ui_font_data.h
 	$(CXX) $(USER_CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -I. -c $< -o $@
 
 user/task_manager.o: user/task_manager.cpp user/task_usage.h user/native_ui.h src/core/process_info.h src/gui/ui_font.h src/gui/ui_font_data.h
@@ -190,6 +190,25 @@ task_manager.elf: user/task_manager.o
 
 notepad.elf: user/notepad.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
+
+user/image_viewer.o: user/image_viewer.cpp user/native_ui.h user/native_file_dialog.h user/native_text.h user/native_controls.h src/gui/power_icons.h src/gui/image.h src/gui/ui_font.h src/gui/ui_font_data.h
+	$(CXX) $(USER_CFLAGS) -O2 -std=c++20 -fno-exceptions -fno-rtti -I. -c $< -o $@
+
+user/image_codec.o: src/gui/image.cpp src/gui/image.h third_party/stb/stb_image.h user/codec_libc/string.h user/codec_libc/stdlib.h
+	$(CXX) $(USER_CFLAGS) -O2 -std=c++20 -fno-exceptions -fno-rtti -Iuser/codec_libc -c $< -o $@
+
+image_viewer.elf: user/image_viewer.o user/image_codec.o
+	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $^
+
+test-image-viewer:
+	python3 tests/run_image_viewer_tests.py
+.PHONY: test-image-viewer
+
+test-user-memory:
+	mkdir -p .storage-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/user_address_space_test.cpp -o .storage-test/user-address-space-test
+	.storage-test/user-address-space-test
+.PHONY: test-user-memory
 
 user/console.o: user/console.cpp user/native_ui.h src/gui/font8x8_basic.h
 	$(CXX) $(USER_CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -I. -c $< -o $@
@@ -212,6 +231,7 @@ initrd.tar: init.elf counter.elf win_test.elf build/console.elf $(PACKAGES) asse
 	cp $(PACKAGE_DIR)/explorer.wiz initrd_root/bin/
 	cp $(PACKAGE_DIR)/notepad.wiz initrd_root/bin/
 	cp $(PACKAGE_DIR)/task_manager.wiz initrd_root/bin/
+	cp $(PACKAGE_DIR)/image_viewer.wiz initrd_root/bin/
 	mkdir -p initrd_root/share/system
 	cp build/console.elf initrd_root/share/system/
 	mkdir -p initrd_root/share/fonts
@@ -281,6 +301,7 @@ run: iso
 
 
 clean:
+	rm -f user/image_viewer.o user/image_codec.o image_viewer.elf image_viewer.wiz
 	rm -rf iso_root initrd_root $(PACKAGE_DIR) build/console.elf $(OBJ) $(OBJ:.o=.d) $(EXT4_OBJ) $(EXT4_OBJ:.o=.d) user/init.o user/counter.o user/win_test.o user/bundle_demo.o user/explorer.o user/notepad.o user/task_manager.o user/console.o wyzar wyzar.iso myos myos.iso init.elf counter.elf win_test.elf bundle_demo.elf explorer.elf notepad.elf task_manager.elf counter.wiz win_test.wiz bundle_demo.wiz initrd.tar
 
 # Refresh boot files and bundled system apps, preserving user files/settings.

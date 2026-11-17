@@ -242,7 +242,9 @@ def main():
         focus('File Explorer');go('/share/samples')
         print('Private console input/output, shell independence and scoped Ctrl+C passed',flush=True)
         # A GUI child must not block Explorer; close it and keep browsing.
-        double(130+265,100+138+3*34+16);time.sleep(.5) # win_test.wiz
+        # Locate the sample by name: adding bundled apps changes sorted rows.
+        samples=sorted(p.name for p in (ROOT/'initrd_root/share/samples').glob('*.wiz'))
+        double(130+265,100+138+samples.index('win_test.wiz')*34+16);time.sleep(.5)
         child=windows().get('Wyzar Desktop Demo');assert child,windows()
         window_controls('Wyzar Desktop Demo')
         old_pitch=struct.unpack_from('<I',memory(child[0],384),352)[0]

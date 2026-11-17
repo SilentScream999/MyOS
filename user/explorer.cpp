@@ -2,6 +2,7 @@
 // and input code through NATIVE_HOST_TEST; no host GUI toolkit is involved.
 #include "user/native_ui.h"
 #include "user/native_text.h"
+#include "user/native_controls.h"
 #include "src/core/app.h"
 static char current_dir[256]="/home";
 static char operation_log[2048];
@@ -101,6 +102,10 @@ static void select_row(int index) {
     if(wiz_name_is_package(entries[selected].name))status("Double-click runs this app. Install adds it to Start; Pin keeps it in this location.");
 }
 static void open_with_notepad();
+static void open_with_viewer();
+static bool image_document(const char* name) {
+    return native_image_file(name);
+}
 static bool text_document(const char* name) {
     const char* extension=name;for(const char* p=name;*p;++p)if(*p=='.')extension=p;
     const char* supported[]={".txt",".md",".log",".cfg",".ini",".json",".csv",".c",".cpp",".h"};
@@ -116,6 +121,7 @@ static void open_selected() {
         status("App opened independently. Console apps use their own terminal.");return;
     }
     if(text_document(path)){open_with_notepad();return;}
+    if(image_document(path)){open_with_viewer();return;}
     uint64_t fd=sys_open(path,0);if(fd==(uint64_t)-1){status("Cannot read that file.");return;}
     uint64_t n=sys_read(fd,dialog_text,sizeof(dialog_text)-1);sys_close(fd);
     if(n>=sizeof(dialog_text)){status("File read failed.");return;}
@@ -133,6 +139,12 @@ static void open_with_notepad() {
 static void choose_open_with() {
     if(selected<0||entries[selected].type!=1)return;
     dialog=OPEN_WITH;address_edit=false;dirty=true;
+}
+static void open_with_viewer() {
+    char path[256];if(!selected_path(path)||entries[selected].type!=1)return;
+    int64_t pid=native_call(216,(uint64_t)"/bin/image_viewer.wiz",(uint64_t)path);
+    if(pid<=0){status("Could not open Image Viewer. Check /bin/image_viewer.wiz.");return;}
+    dialog=NONE;status("File opened in Image Viewer.");
 }
 static void begin_dialog(Dialog kind) {
     if((kind==RENAME||kind==DELETE_ITEM)&&!selected_path(dialog_target))return;
@@ -217,7 +229,7 @@ static void file_size(uint64_t n,char* out) {
 }
 struct Button { int x,y,w,h;const char* label; };
 static Button buttons[]={
-    {12,12,32,30,"<"},{48,12,32,30,">"},{84,12,32,30,"^"},{120,12,80,30,"Refresh"},
+    {12,12,32,30,"Back"},{48,12,32,30,"Forward"},{84,12,32,30,"Up"},{120,12,32,30,"Refresh"},
     {176,62,84,30,"New folder"},{266,62,72,30,"New file"},{344,62,60,30,"Rename"},
     {410,62,52,30,"Copy"},{468,62,46,30,"Cut"},{520,62,52,30,"Paste"},
     {578,62,58,30,"Delete"},{642,62,60,30,"Install"},{708,62,48,30,"Pin"},{762,62,80,30,"Hidden"}
@@ -241,11 +253,7 @@ static bool button_enabled(int id) {
 }
 static void button_symbol(int id,int x,int y,uint32_t color) {
     auto line=[&](int a,int b,int c,int d){surface.line(x+a,y+b,x+c,y+d,color);};
-    if(id<3){if(id==2){line(3,7,7,3);line(7,3,11,7);line(7,3,7,12);}
-        else {int a=id==0?9:5,b=id==0?5:9;line(a,3,b,7);line(b,7,a,11);}}
-    else if(id==3){line(4,3,10,3);line(10,3,12,6);line(12,6,12,9);line(12,9,9,12);
-        line(9,12,4,12);line(4,12,2,9);line(2,9,2,6);line(2,6,4,3);line(12,2,12,6);line(9,6,12,6);}
-    else if(id==4){line(1,4,5,4);line(5,4,7,6);line(7,6,13,6);line(1,4,1,12);line(1,12,13,12);line(13,6,13,12);
+    if(id==4){line(1,4,5,4);line(5,4,7,6);line(7,6,13,6);line(1,4,1,12);line(1,12,13,12);line(13,6,13,12);
         line(7,8,7,11);line(5,10,9,10);}
     else if(id==5){line(3,2,9,2);line(9,2,12,5);line(12,5,12,13);line(12,13,3,13);line(3,13,3,2);}
     else if(id==6){line(3,11,10,4);line(4,12,11,5);line(3,11,2,13);line(2,13,4,12);}
@@ -259,13 +267,16 @@ static void button_symbol(int id,int x,int y,uint32_t color) {
 }
 static void draw_button(const Button& b,bool active=false,int id=-1) {
     bool enabled=id<0||button_enabled(id),hover=enabled&&id>=0&&hovered_button==id;
+    if(id>=0&&id<4){
+        NativeIcon icon=id==0?NativeIcon::Back:id==1?NativeIcon::Forward:id==2?NativeIcon::Up:NativeIcon::Refresh;
+        NativeToolbarButton{b.x,b.y,b.w,b.h,icon,nullptr,b.label}.draw(surface,enabled,hover,active);return;
+    }
     uint32_t edge=active?0xff9971cb:hover?0xff87729f:0xff41394f;
     uint32_t fill=active?0xff44315f:hover?0xff3b304e:0xff2c273b;
     uint32_t ink=enabled?(active?0xffe3c9ff:INK):0xff756d85;
     if(id==10&&hover){edge=0xffa8667c;fill=0xff4a2c3d;ink=0xffffc1d2;}
     surface.rounded(b.x,b.y,b.w,b.h,6,edge);
     surface.rounded(b.x+1,b.y+1,b.w-2,b.h-2,5,fill);
-    if(id>=0&&id<3){button_symbol(id,b.x+8,b.y+7,ink);return;}
     int label_width=ui_text_width(ui_font_for_pixels(12),b.label);
     bool symbol=id>=0&&label_width+25<=b.w;
     int start=b.x+(b.w-label_width-(symbol?18:0))/2;
@@ -287,9 +298,9 @@ static void render() {
     surface.rect(0,0,WIDTH,HEIGHT,BG);surface.rect(0,0,WIDTH,52,PANEL);
     surface.rect(0,52,SIDE,HEIGHT-52,PANEL);surface.rect(SIDE,52,1,HEIGHT-52,LINE);
     for(int i=0;i<14;++i)draw_button(buttons[i],i==13&&show_hidden,i);
-    surface.rounded(204,12,WIDTH-222,30,6,address_edit?0xff58416f:0xff15131e);
-    if(address_edit)address_input.draw(surface,216,18,WIDTH-30,address,edit_replace,14,INK);
-    else surface.text(216,18,address,INK,WIDTH-30);
+    surface.rounded(156,12,WIDTH-174,30,6,address_edit?0xff58416f:0xff15131e);
+    if(address_edit)address_input.draw(surface,168,18,WIDTH-30,address,edit_replace,14,INK);
+    else surface.text(168,18,address,INK,WIDTH-30);
     surface.text(16,72,"PLACES",MUTED,150,12);
     const char* labels[]={"Home","Applications","App samples","Installed apps","System","Devices"};
     const char* paths[]={"/home","/home/Applications","/share/samples","/apps","/","/mnt"};
@@ -308,9 +319,10 @@ static void render() {
         else if(row%2)surface.rect(SIDE+7,y,WIDTH-SIDE-20,ROW,0xff201d2d);
         if(e.type==2)surface.folder(180,y+8+(ui_font_for_pixels(14)->height-28)/2,28);
         else if(wiz_name_is_package(e.name))surface.wizard(179,y+1,30);
+        else if(image_document(e.name))surface.image_file(180,y+2);
         else surface.document(180,y+2,app_name_supported(e.name)?0xff9a82db:0xff8598b5);
         surface.text(216,y+8,e.name,INK,type_x-17);
-        const char* type=e.type==2?"Folder":wiz_name_is_package(e.name)?"Wyzar app":app_name_supported(e.name)?"Program":"File";
+        const char* type=e.type==2?"Folder":wiz_name_is_package(e.name)?"Wyzar app":app_name_supported(e.name)?"Program":image_document(e.name)?"Image":"File";
         surface.text(type_x,y+8,type,MUTED,size_x-20,12);
         if(e.type!=2){char size[32];file_size(e.size,size);surface.text(size_x,y+8,size,MUTED,WIDTH-18,12);}
     }
@@ -318,7 +330,8 @@ static void render() {
         listing_error?"This folder could not be read.":"This folder is empty.",MUTED,16);
     if(entry_count>VISIBLE){int track=VISIBLE*ROW,thumb=track*VISIBLE/entry_count;if(thumb<20)thumb=20;
         surface.rect(WIDTH-10,LIST_TOP,4,track,LINE);surface.rect(WIDTH-10,LIST_TOP+(track-thumb)*scroll_row/(entry_count-VISIBLE),4,thumb,0xff6486b2);}
-    surface.rect(0,HEIGHT-36,WIDTH,36,PANEL);surface.text(14,HEIGHT-25,status_line,MUTED,WIDTH-12,12);
+    surface.rect(0,HEIGHT-36,WIDTH,36,PANEL);surface.text(14,HEIGHT-25,
+        hovered_button>=0&&hovered_button<4?buttons[hovered_button].label:status_line,MUTED,WIDTH-12,12);
     if(context_open) {
         const char* labels[]={"Open","Open with...","Copy","Cut","Copy as path","Rename","Delete"};
         surface.rounded(context_x+3,context_y+3,180,CONTEXT_HEIGHT,6,0xff0c1019);
@@ -332,6 +345,7 @@ static void render() {
         surface.text(left+22,top+18,"Open with",INK,left+458,18);
         surface.text(left+22,top+52,entries[selected].name,MUTED,left+458);
         draw_button({left+22,top+88,436,38,"Notepad - edit text files"},true);
+        draw_button({left+22,top+128,436,28,"Image Viewer - PNG / JPEG (press I)"},true);
         draw_button({left+366,top+158,92,30,"Cancel"});
     } else if(dialog!=NONE) {
         bool reading=dialog==PREVIEW||dialog==PACKAGE_RESULT;int height=reading?380:202;if(height>HEIGHT-40)height=HEIGHT-40;
@@ -379,7 +393,7 @@ static void handle_event(const NativeEvent& event) {
     if(event.type==5) {
         uint32_t key=event.key;
         if(context_open){context_open=false;dirty=true;if(key==27)return;}
-        if(dialog==OPEN_WITH){if(key==27){dialog=NONE;dirty=true;}else if(key=='\n'||key=='\r')open_with_notepad();return;}
+        if(dialog==OPEN_WITH){if(key==27){dialog=NONE;dirty=true;}else if(key=='i'||key=='I')open_with_viewer();else if(key=='\n'||key=='\r'){if(image_document(entries[selected].name))open_with_viewer();else open_with_notepad();}return;}
         if(dialog!=NONE){if(key==27){dialog=NONE;dirty=true;}else if(key=='\n'||key=='\r')commit_dialog();
             else if(dialog==NEW_FOLDER||dialog==NEW_FILE||dialog==RENAME){
                 if((event.mods&1)&&(key=='v'||key=='V'))paste_text(edit_text,sizeof(edit_text));else edit_key(edit_text,sizeof(edit_text),key,event.mods);}return;}
@@ -414,12 +428,13 @@ static void handle_event(const NativeEvent& event) {
             return;}
         if(dialog==OPEN_WITH){int left=(WIDTH-480)/2,top=(HEIGHT-202)/2;
             if(hit(x,y,left+22,top+88,436,38))open_with_notepad();
+            else if(hit(x,y,left+22,top+128,436,28))open_with_viewer();
             else if(hit(x,y,left+366,top+158,92,30)){dialog=NONE;dirty=true;}return;}
         if(dialog!=NONE){bool reading=dialog==PREVIEW||dialog==PACKAGE_RESULT;int h=reading?380:202;if(h>HEIGHT-40)h=HEIGHT-40;
             int top=(HEIGHT-h)/2,left=(WIDTH-480)/2;
             if(hit(x,y,left+(reading?372:266),top+h-44,90,30)){dialog=NONE;dirty=true;}
             else if(!reading&&hit(x,y,left+366,top+h-44,92,30))commit_dialog();return;}
-        if(hit(x,y,204,12,WIDTH-222,30)){address_edit=true;edit_replace=true;dirty=true;return;}
+        if(hit(x,y,156,12,WIDTH-174,30)){address_edit=true;edit_replace=true;dirty=true;return;}
         for(int i=0;i<14;++i)if(hit(x,y,buttons[i].x,buttons[i].y,buttons[i].w,buttons[i].h)){if(button_enabled(i))button_action(i);return;}
         const char* paths[]={"/home","/home/Applications","/share/samples","/apps","/","/mnt"};
         for(int i=0;i<6;++i)if(hit(x,y,8,101+i*place_step,148,36)){navigate(paths[i]);return;}

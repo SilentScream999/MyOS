@@ -250,10 +250,13 @@ static void load_icons(Store& store, const char* theme, const char* name, Icons&
                        bool menu_visible, bool window_visible, const Icons* cached = nullptr,
                        const App* app = nullptr) {
     auto variant=[&](uint32_t size, Image& out, const Image* previous) {
-        if (previous && previous->pixels) image_resize(*previous,previous->width,previous->height,&out);
+        if (previous && previous->pixels &&
+            (previous->width==size || previous->height==size)) image_share(*previous,&out);
         else store.icon(theme,name,size,&out,app);
     };
-    if (menu_visible) variant(menu,out.menu,cached ? &cached->menu : nullptr);
+    // Keep previously demanded Start icons warm while the menu is closed.
+    // At most max_apps small menu images survive; title/task icons stay lazy.
+    if (menu_visible || (cached && cached->menu.pixels)) variant(menu,out.menu,cached ? &cached->menu : nullptr);
     if (window_visible) {
         variant(title,out.title,cached ? &cached->title : nullptr);
         variant(task,out.task,cached ? &cached->task : nullptr);
