@@ -36,7 +36,7 @@ CXXFLAGS = $(CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -mno-red-zone -DGPU_BR
 LDFLAGS=-nostdlib -z max-page-size=0x1000
 
 SRC=src/kernel.cpp
-OBJ=$(SRC:.cpp=.o) src/gui/image.o
+OBJ=$(SRC:.cpp=.o) src/gui/image.o src/gui/overlay_renderer.o
 include src/fs/ext4_config_flags.mk
 EXT4_OBJ = $(EXT4_SRC:.c=.o) src/fs/ext4_libc.o
 CXXFLAGS += $(EXT4_CONFIG) $(EXT4_INC) -Isrc/fs/ext4_libc
@@ -57,6 +57,10 @@ $(EXT4_OBJ): %.o: %.c
 # per-pixel codec paths even when the rest of the kernel is a debug build.
 src/gui/image.o: src/gui/image.cpp src/gui/image.h third_party/stb/stb_image.h
 	$(CXX) -Isrc/fs/ext4_libc $(CXXFLAGS) -O2 -MMD -MP -c $< -o $@
+
+# Keep the per-span overlay compositor optimized independently of kernel OPT.
+src/gui/overlay_renderer.o: src/gui/overlay_renderer.cpp src/gui/overlay_renderer.h src/gui/window_overlay.h src/core/string.h
+	$(CXX) $(CXXFLAGS) -O2 -MMD -MP -c $< -o $@
 
 -include $(EXT4_OBJ:.o=.d)
 
@@ -98,7 +102,7 @@ init.elf: user/init.o
 WIZ_ASSETS = tools/wiz_pack.py $(wildcard assets/apps/*/app.manifest) $(wildcard assets/apps/*/data/*) \
              $(wildcard assets/icons/hicolor/*/apps/*.png)
 PACKAGE_DIR := build/packages
-PACKAGES := $(addprefix $(PACKAGE_DIR)/,counter.wiz win_test.wiz bundle_demo.wiz explorer.wiz notepad.wiz)
+PACKAGES := $(addprefix $(PACKAGE_DIR)/,counter.wiz win_test.wiz bundle_demo.wiz explorer.wiz notepad.wiz task_manager.wiz)
 $(PACKAGE_DIR)/%.wiz: %.elf $(WIZ_ASSETS)
 	mkdir -p $(@D)
 	$(if $(wildcard assets/apps/$*/app.manifest),python3 tools/wiz_pack.py pack --elf $< --manifest assets/apps/$*/app.manifest --icons assets/icons/hicolor $(if $(wildcard assets/apps/$*/data),--data assets/apps/$*/data,) -o $@,cp $< $@)
@@ -122,6 +126,12 @@ test-notepad:
 	python3 tests/run_notepad_tests.py
 .PHONY: test-notepad
 
+test-task-manager:
+	mkdir -p .storage-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. tests/task_manager_test.cpp -o .storage-test/task-manager-test
+	.storage-test/task-manager-test .storage-test/task-manager.ppm
+.PHONY: test-task-manager
+
 test-text-input:
 	mkdir -p .storage-test
 	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. tests/text_input_test.cpp -o .storage-test/text-input-test
@@ -144,7 +154,7 @@ test-resize:
 	mkdir -p .storage-test
 	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/window_resize_test.cpp -o .storage-test/window-resize-test
 	.storage-test/window-resize-test
-	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/window_overlay_test.cpp -o .storage-test/window-overlay-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/window_overlay_test.cpp src/gui/overlay_renderer.cpp -o .storage-test/window-overlay-test
 	.storage-test/window-overlay-test
 .PHONY: test-resize
 
@@ -172,6 +182,12 @@ explorer.elf: user/explorer.o
 user/notepad.o: user/notepad.cpp user/native_ui.h user/native_text.h user/native_file_dialog.h src/fs/fileinfo.h src/gui/ui_font.h src/gui/ui_font_data.h
 	$(CXX) $(USER_CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -I. -c $< -o $@
 
+user/task_manager.o: user/task_manager.cpp user/task_usage.h user/native_ui.h src/core/process_info.h src/gui/ui_font.h src/gui/ui_font_data.h
+	$(CXX) $(USER_CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -I. -c $< -o $@
+
+task_manager.elf: user/task_manager.o
+	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
+
 notepad.elf: user/notepad.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
@@ -195,6 +211,7 @@ initrd.tar: init.elf counter.elf win_test.elf build/console.elf $(PACKAGES) asse
 	cp $(PACKAGES) initrd_root/share/samples/
 	cp $(PACKAGE_DIR)/explorer.wiz initrd_root/bin/
 	cp $(PACKAGE_DIR)/notepad.wiz initrd_root/bin/
+	cp $(PACKAGE_DIR)/task_manager.wiz initrd_root/bin/
 	mkdir -p initrd_root/share/system
 	cp build/console.elf initrd_root/share/system/
 	mkdir -p initrd_root/share/fonts
@@ -264,7 +281,7 @@ run: iso
 
 
 clean:
-	rm -rf iso_root initrd_root $(PACKAGE_DIR) build/console.elf $(OBJ) $(OBJ:.o=.d) $(EXT4_OBJ) $(EXT4_OBJ:.o=.d) user/init.o user/counter.o user/win_test.o user/bundle_demo.o user/explorer.o user/notepad.o user/console.o wyzar wyzar.iso myos myos.iso init.elf counter.elf win_test.elf bundle_demo.elf explorer.elf notepad.elf counter.wiz win_test.wiz bundle_demo.wiz initrd.tar
+	rm -rf iso_root initrd_root $(PACKAGE_DIR) build/console.elf $(OBJ) $(OBJ:.o=.d) $(EXT4_OBJ) $(EXT4_OBJ:.o=.d) user/init.o user/counter.o user/win_test.o user/bundle_demo.o user/explorer.o user/notepad.o user/task_manager.o user/console.o wyzar wyzar.iso myos myos.iso init.elf counter.elf win_test.elf bundle_demo.elf explorer.elf notepad.elf task_manager.elf counter.wiz win_test.wiz bundle_demo.wiz initrd.tar
 
 # Refresh boot files and bundled system apps, preserving user files/settings.
 usb-image: all

@@ -27,6 +27,10 @@ static bool ps2_shift_held = false;
 static bool ps2_ctrl_held  = false;
 static bool ps2_alt_held   = false;
 static bool ps2_e0_prefix  = false;
+static bool ps2_escape_held = false;
+static uint32_t ps2_modifiers() {
+    return (ps2_ctrl_held?WIN_MOD_CTRL:0)|(ps2_shift_held?WIN_MOD_SHIFT:0)|(ps2_alt_held?WIN_MOD_ALT:0);
+}
 
 // ── IRQ1 Handler ─────────────────────────────────────────────────────────────
 void ps2kb_irq_handler() {
@@ -45,20 +49,18 @@ void ps2kb_irq_handler() {
     ps2_e0_prefix = false;
 
     // Shift Key tracking (Set 1: 0x2A, 0x36)
-    if (scancode == 0x2A || scancode == 0x36) { ps2_shift_held = true; return; }
-    if (scancode == 0xAA || scancode == 0xB6) { ps2_shift_held = false; return; }
+    if (scancode == 0x2A || scancode == 0x36) { ps2_shift_held = true;g_kbd_modifiers=ps2_modifiers();return; }
+    if (scancode == 0xAA || scancode == 0xB6) { ps2_shift_held = false;g_kbd_modifiers=ps2_modifiers();return; }
 
     // Ctrl Key tracking (Set 1: 0x1D)
-    if (scancode == 0x1D) { ps2_ctrl_held = true; return; }
-    if (scancode == 0x9D) { ps2_ctrl_held = false; return; }
+    if (scancode == 0x1D) { ps2_ctrl_held = true;g_kbd_modifiers=ps2_modifiers();return; }
+    if (scancode == 0x9D) { ps2_ctrl_held = false;g_kbd_modifiers=ps2_modifiers();return; }
 
     // Alt Key tracking (Set 1: 0x38, E0 0x38 for right alt)
-    if (scancode == 0x38) { ps2_alt_held = true; return; }
-    if (scancode == 0xB8) { ps2_alt_held = false; return; }
+    if (scancode == 0x38) { ps2_alt_held = true;g_kbd_modifiers=ps2_modifiers();return; }
+    if (scancode == 0xB8) { ps2_alt_held = false;g_kbd_modifiers=ps2_modifiers();return; }
 
-    uint32_t mods = (ps2_ctrl_held ? WIN_MOD_CTRL : 0) |
-                    (ps2_shift_held ? WIN_MOD_SHIFT : 0) |
-                    (ps2_alt_held ? WIN_MOD_ALT : 0);
+    uint32_t mods = ps2_modifiers();
     g_kbd_modifiers = mods;
 
     // Arrow Keys (Set 1 scancodes: 0x48=Up, 0x50=Down, 0x4B=Left, 0x4D=Right)
@@ -91,7 +93,7 @@ void ps2kb_irq_handler() {
     }
 
     // Ignore other key release events (scancode > 0x80)
-    if (scancode & 0x80) return;
+    if (scancode & 0x80) {if(scancode==0x81)ps2_escape_held=false;return;}
 
     if(was_e0&&(scancode==0x47||scancode==0x4f||scancode==0x53)){
         Window* focused=wm_find_window(g_focused_win_id);
@@ -102,7 +104,9 @@ void ps2kb_irq_handler() {
 
     if (scancode < (uint8_t)sizeof(ps2_set1_map)) {
         char c = ps2_shift_held ? ps2_set1_shift_map[scancode] : ps2_set1_map[scancode];
-        wm_dispatch_key(c, scancode, true, mods);
+        bool repeat=scancode==1&&ps2_escape_held;
+        if(scancode==1)ps2_escape_held=true;
+        wm_dispatch_key(c, scancode, true, mods,repeat);
     }
 }
 

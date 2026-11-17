@@ -91,7 +91,8 @@ Unknown keys are ignored, so newer packages stay readable on older systems.
 A package with a higher `abi` than the OS provides is **refused by the loader and
 hidden from Start**, rather than starting and crashing.
 
-The current OS supports ABI 7 (shared desktop text clipboard).
+The current OS supports ABI 10 (timestamped process categories). Task Manager
+requires ABI 10; older packages retain their existing requirements.
 ABI 6 added common file-dialog window identity.
 ABI 5 added document launch paths and Open with.
 ABI 4 added native window resizing; ABI 3 added independent desktop launches and

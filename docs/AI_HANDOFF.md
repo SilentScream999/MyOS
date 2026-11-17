@@ -18,6 +18,7 @@ target is a GPU-composited desktop with installable applications.
 | App resources | Portable `.wiz` packages, verified install/pin/remove, metadata/icons, `/apps` and `/bin` discovery | [Packages](APP_PACKAGES.md) |
 | File Explorer | Native userspace browser, file operations, text previews and app launching | [Explorer](EXPLORER.md) |
 | Notepad | Native text editing, atomic saving, unsaved prompts and Explorer Open with | [Notepad](NOTEPAD.md) |
+| Task Manager | Core 0 CPU history, grouped programs/background/kernel tasks and opt-in Kernel / Input breakdown (ABI 10) | [Syscalls](../APIDocs/Syscalls.md) |
 | Images | PNG/JPEG wallpapers; lazy PNG icons, alpha, themes and bounded caching | [Images](IMAGES.md) |
 | Fonts | Runtime TTF selection with built-in fallback; printable ASCII UI | [Fonts](FONTS.md) |
 | Storage | Journaled ext4 USB root, persistent apps/settings/files, atomic saves, automatic capacity setup | [ext4](EXT4.md) |
@@ -35,8 +36,9 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
 
 ## Decisions and implementation constraints
 
-- Keep `GPU=0` and kernel `OPT=-O0` as defaults. The image codec has its own
-  optimized rule. Test kernel-wide optimization changes separately.
+- Keep `GPU=0` and kernel `OPT=-O0` as defaults. The image codec and isolated
+  overlay pixel renderer have their own optimized rules. Test kernel-wide
+  optimization changes separately.
 - QEMU does not emulate our Intel Gen9 GPU. Keep CPU fallbacks and bounded
   hardware waits; record what was actually tested on physical hardware.
 - Apps are files plus metadata. Do not add new applications permanently to

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real TTY sleep/wakeup, menu launch, cancellation and CPU accounting in QEMU."""
+"""Real TTY sleep/wakeup, private desktop launch and CPU accounting in QEMU."""
 from pathlib import Path
 import re
 import struct
@@ -53,12 +53,13 @@ static long call(u64 n,u64 a,u64 b,u64 c) { long r;
         layout.write_text('#include <cstdio>\n#include <cstddef>\n#include <cstdint>\n'
             '#include "src/gui/resources.h"\n#include "limine.h"\n'
             f'#define MAX_FDS {max_fds}\nstruct file; enum class TaskState:uint8_t;\n'+task+
-            '\nint main(){printf("%zu %zu %zu %zu %zu %zu %zu %zu %zu %zu",sizeof(Task),offsetof(Task,state),offsetof(Task,next),offsetof(Task,waiting_tty_input),offsetof(Task,wait_pid),offsetof(resources::Catalog,apps),sizeof(resources::Entry),offsetof(resources::App,exec),offsetof(limine_framebuffer,height),offsetof(Task,wake_at_tick));}\n')
+            '\nint main(){printf("%zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu",sizeof(Task),offsetof(Task,state),offsetof(Task,next),offsetof(Task,waiting_tty_input),offsetof(Task,wait_pid),offsetof(resources::Catalog,apps),sizeof(resources::Entry),offsetof(resources::App,exec),offsetof(limine_framebuffer,height),offsetof(Task,wake_at_tick),offsetof(Task,executable));}\n')
         binary=work/'layout'
         subprocess.run(['clang++','-std=c++20','-I',str(ROOT),str(layout),'-o',str(binary)],check=True)
-        size,state,next_offset,waiting,wait_pid,apps,entry_size,exec_offset,height_offset,wake=map(int,subprocess.check_output([str(binary)],text=True).split())
+        size,state,next_offset,waiting,wait_pid,apps,entry_size,exec_offset,height_offset,wake,executable=map(int,subprocess.check_output([str(binary)],text=True).split())
         smoke.IMAGE=image; smoke.BOOT_ISO=True
-        q=smoke.Qemu(extra_args=('-no-shutdown',))
+        # Leave enough visible Start rows for the larger bundled app catalog.
+        q=smoke.Qemu(resolution=(1280,1080),extra_args=('-no-shutdown',))
         try:
             def memory(address,count):
                 out=smoke.OUT/'cpu-idle-state.bin'
@@ -144,7 +145,8 @@ static long call(u64 n,u64 a,u64 b,u64 c) { long r;
                 diagnostics)
             q.monitor('sendkey ctrl-c'); wait_for(at_prompt,'Busy cancellation did not restore prompt')
 
-            # A sleeping prompt must also wake for a real Start-menu request.
+            # Start launches a private desktop console; the shared shell must
+            # remain asleep instead of acquiring its foreground process.
             fb=value('fb'); height=int.from_bytes(memory(fb+height_offset,8),'little')
             def move(x,y):
                 for _ in range(60):
@@ -164,11 +166,21 @@ static long call(u64 n,u64 a,u64 b,u64 c) { long r;
             panel_height=min(header+max(1,count)*row+pad*2+max(52,height*64//1080),height*740//1080)
             panel_y=max(0,height-value('g_taskbar_h',4)-panel_height-height*4//1080)
             move(20,panel_y+header+pad+index*row+row//2); click()
-            wait_for(lambda:value('g_terminal_foreground_pid',4)!=0,'Menu request did not wake sleeping shell')
-            q.monitor('sendkey ctrl-c'); wait_for(at_prompt,'Menu app cancellation did not restore sleeping prompt')
+            def desktop_counter_running():
+                head=value('g_task_list');pointer=head
+                for _ in range(128):
+                    data=memory(pointer,size)
+                    if data[executable:executable+256].split(b'\0')[0]==b'/bin/counter.elf' and data[state]!=3:return True
+                    pointer=struct.unpack_from('<Q',data,next_offset)[0]
+                    if pointer==head:break
+                return False
+            wait_for(desktop_counter_running,'Menu request did not launch Counter in a private desktop console')
+            assert at_prompt(),'Desktop launch disturbed the sleeping shared shell'
+            wait_for(lambda:not desktop_counter_running(),'Desktop Counter did not exit')
+            assert at_prompt()
             q.capture('cpu-idle-passed')
             print(f'HUD CPU samples: prompt {baseline}; Counter {during}; returned prompt {after}; busy loop {busy}',flush=True)
-            print('QEMU passed: blocked prompt, Counter, canonical input, read cancellation, busy accounting and Start wakeup.',flush=True)
+            print('QEMU passed: blocked prompt, Counter, canonical input, read cancellation, busy accounting and private Start launch.',flush=True)
         finally: q.close()
 
 

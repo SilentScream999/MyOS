@@ -37,7 +37,7 @@ def inside(x, y, points):
 
 
 def desktop_symbol(name, x, y):
-    """Full-size folder/paper silhouettes, without a padded background tile."""
+    """Full-size desktop silhouettes, without a padded background tile."""
     color = None
     if name == 'explorer':
         if inside(x, y, [(4, 13), (7, 9), (25, 9), (31, 16), (57, 16), (60, 20), (59, 54), (5, 54)]):
@@ -55,6 +55,29 @@ def desktop_symbol(name, x, y):
             color = (255, 229, 155)
         if inside(x, y, [(7, 53), (57.3, 53), (57, 55), (7, 55)]):
             color = (220, 151, 36)
+    elif name == 'task_manager':
+        if inside(x, y, [(7, 9), (58, 9), (61, 12), (61, 48), (58, 51), (7, 51), (4, 48), (4, 12)]):
+            color = (38, 70, 101)
+        if 26 <= x <= 39 and 48 <= y <= 56:
+            color = (111, 146, 175) if x < 32 else (79, 116, 150)
+        if inside(x, y, [(22, 54), (43, 54), (48, 58), (17, 58)]):
+            color = (161, 187, 208) if y < 56 else (84, 121, 153)
+        if inside(x, y, [(6, 7), (57, 7), (60, 10), (60, 46), (57, 49), (6, 49), (3, 46), (3, 10)]):
+            color = (165, 197, 222)
+        if 6 <= x <= 57 and 8 <= y <= 10:
+            color = (221, 237, 248)
+        if 7 <= x <= 56 and 12 <= y <= 44:
+            t = (y-12)/32
+            color = (19, 43-round(t*7), 62-round(t*7))
+            if any(abs(x-col) < .4 for col in (16, 24, 32, 40, 48)) or any(abs(y-row) < .4 for row in (20, 28, 36)):
+                color = (35, 73, 89)
+            trace = [(9, 33), (17, 33), (23, 25), (28, 37), (34, 18), (39, 30), (45, 30), (50, 24), (54, 24)]
+            if any(distance(x, y, (*a, *b)) < 1.05 for a, b in zip(trace, trace[1:])):
+                color = (105, 235, 214)
+        if 7 <= x <= 56 and 46 <= y <= 47:
+            color = (111, 156, 191)
+        if 51 <= x <= 54 and 46 <= y <= 47:
+            color = (122, 224, 202)
     else:
         if 9 <= x <= 55 and 6 <= y <= 59:
             color = (33, 102, 163)
@@ -99,7 +122,7 @@ def icon(name, size):
             for sy in range(4):
                 for sx in range(4):
                     x, y = (px+(sx+.5)/4)*64/size, (py+(sy+.5)/4)*64/size
-                    if name in ('explorer', 'notepad'):
+                    if name in ('explorer', 'notepad', 'task_manager'):
                         color = desktop_symbol(name, x, y)
                         if color is not None:
                             for i in range(3): sums[i] += color[i]
@@ -141,7 +164,7 @@ def icon(name, size):
 
 
 def main():
-    names = ('terminal', 'application-default', 'visual-test', 'rainbow', 'boot-log', 'counter', 'win_test', 'explorer', 'notepad')
+    names = ('terminal', 'application-default', 'visual-test', 'rainbow', 'boot-log', 'counter', 'win_test', 'explorer', 'notepad', 'task_manager')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--only', choices=names, help='Regenerate one icon family')
     args = parser.parse_args()

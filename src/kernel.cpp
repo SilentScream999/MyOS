@@ -56,6 +56,24 @@ static bool desktop_queue_launch(const char* path) {
     if(desktop_launcher_task&&desktop_launcher_task->state==TaskState::BLOCKED)desktop_launcher_task->state=TaskState::READY;
     return true;
 }
+static bool desktop_shortcut(char key,uint32_t mods,bool repeat) {
+    if(key!=27||mods!=(WIN_MOD_CTRL|WIN_MOD_SHIFT))return false;
+    if(repeat)return true;
+    TtyIrqGuard guard;
+    if(g_menu_open)wm_menu_close();
+    const char* path="/bin/task_manager.wiz";
+    for(int i=0;i<g_window_count;++i){Window* win=g_window_list[i];
+        if(win&&!win->is_system&&strcmp(win->executable,path)==0){
+            wm_raise_window(i);return true;}}
+    // A queued/starting instance may not own a window yet. Avoid duplicate
+    // launches without reading the filesystem in the keyboard IRQ/dispatcher.
+    Task* task=g_task_list;
+    if(task)do{if(task->state!=TaskState::DEAD&&strcmp(task->executable,path)==0)return true;task=task->next;}while(task!=g_task_list);
+    for(unsigned i=desktop_launch_tail;i!=desktop_launch_head;i=(i+1)%8)
+        if(strcmp(desktop_launch_paths[i],path)==0)return true;
+    if(!desktop_queue_launch(path))print((char*)"[launcher] Task Manager shortcut: launch queue is full.");
+    return true;
+}
 static void desktop_launch_worker() {
     for(;;){char path[256];int power=0;
         {TtyIrqGuard guard;
@@ -698,7 +716,8 @@ void compositor_thread_main() {
 
         Window* cursor_window=wm_find_window(g_focused_win_id);
         term_cursor_tick(now_refresh/(tsc_hz/1000),tty_raw_mode&&g_term_view_offset==0&&
-            cursor_window&&cursor_window->visible&&!cursor_window->minimized&&cursor_window->is_system&&cursor_window->type==WIN_TYPE_TERM);
+            cursor_window&&cursor_window->visible&&!cursor_window->minimized&&cursor_window->is_system&&cursor_window->type==WIN_TYPE_TERM&&
+            wm_client_rect_exposed(cursor_window,g_term_ox+term_x*8,g_term_oy+term_y*10+8,8,2));
         if (g_needs_refresh) {
             g_needs_refresh  = false;
 
@@ -733,11 +752,11 @@ void compositor_thread_main() {
 				bool overlay_done = false;
 				uint64_t a_bg = 0, a_win = 0, a_rain = 0, a_lock = 0, a_vram = 0;
 				if (total == 0) {
-					// Nothing damaged (e.g. the mouse only moved): the compose call
-					// with an empty box runs the cursor / ghost-outline overlay update.
-					if (wm_compose_dirty(fx1, fx2, fy1, fy2, true)) overlay_done = true;
-					a_bg += g_time_bg_ticks; a_win += g_time_win_ticks; a_rain += g_time_rain_ticks;
-					a_lock += g_time_lock_ticks; a_vram += g_time_vram_ticks;
+                    // Pointer/outline motion changes only the VRAM overlay.
+                    // Never enter scene composition with the empty damage box.
+                    uint64_t overlay_started=rdtsc();
+                    wm_overlay_update(g_mouse_x,g_mouse_y,g_mouse_buttons);
+                    overlay_done=true;a_vram=rdtsc()-overlay_started;
 				} else {
 					uint32_t idx = 0;
 					for (uint32_t i = 0; i < frame_dmg.n; i++, idx++) {
@@ -960,7 +979,7 @@ extern "C" void kmain(void) {
     
     // Spawn compositor thread extremely early so it guarantees 60fps
     // screen refreshes regardless of whether USB enumeration blocks.
-    scheduler_add_task(task_create(compositor_thread_main));
+    scheduler_add_task(task_create(compositor_thread_main,0,"Compositor"));
 
 
 
@@ -1167,9 +1186,10 @@ extern "C" void kmain(void) {
         if (disk_root_active) wm_load_disk_wallpaper();
         g_resources_requested=false;
         wm_resources_reload();
-        scheduler_add_task(task_create(wm_resource_worker,16));
-        desktop_launcher_task=task_create(desktop_launch_worker,16);
+        scheduler_add_task(task_create(wm_resource_worker,16,"Desktop resources"));
+        desktop_launcher_task=task_create(desktop_launch_worker,16,"Desktop launcher");
         scheduler_add_task(desktop_launcher_task);
+        g_desktop_shortcut_hook=desktop_shortcut;
         if (!g_wallpaper) {
 #if BOOT_DIAGNOSTICS
             uint64_t fallback_started = rdtsc();
@@ -1389,6 +1409,7 @@ extern "C" void kmain(void) {
 
 		// Bound each batch so a noisy port cannot starve hotplug, input repeat
 		// and desktop work indefinitely. Process every controller each round.
+        { KernelCpuScope cpu_scope(KCPU_USB_EVENTS);
 		while (event_count < ER_RING_SIZE) {
             bool any_resp = false;
             for (int ctrl_idx = 0; ctrl_idx < xhci_count; ctrl_idx++) {
@@ -1510,6 +1531,7 @@ extern "C" void kmain(void) {
 					if (which_kbd >= 0) {
 						int     k         = which_kbd;
 						uint8_t modifiers = report[0];
+                        g_kbd_modifiers=wm_hid_modifiers(modifiers); // Publish releases even with no printable keys.
 						uint64_t now      = rdtsc();
 
 						// Mark device as a dongle if it's sending keyboard traffic
@@ -1541,9 +1563,7 @@ extern "C" void kmain(void) {
 								// Fresh press: record TSC time and emit immediately.
 								key_down_at[k][key] = now;
 								bool shift = (modifiers & 0x22u) != 0;
-								bool ctrl  = (modifiers & 0x11u) != 0;
-								bool alt   = (modifiers & 0x44u) != 0;
-								uint32_t mods = (ctrl ? WIN_MOD_CTRL : 0) | (shift ? WIN_MOD_SHIFT : 0) | (alt ? WIN_MOD_ALT : 0);
+								uint32_t mods = wm_hid_modifiers(modifiers);
 								g_kbd_modifiers = mods;
 
 								if (key >= 0x4F && key <= 0x52) {
@@ -1693,9 +1713,11 @@ extern "C" void kmain(void) {
         } // closes for loop
         if (!any_resp) break;
 		}
+        }
 		// Actual VRAM rendering is deferred to the 60 Hz compositor thread
 		// to avoid exhausting PCIe transaction limits with 1000 Hz micro-writes.
 
+        { KernelCpuScope cpu_scope(KCPU_HUBS);
 		for (int h = 0; h < hub_count; ++h) {
 			uint8_t changed_port = hub_poll_changes(h);
 			if (changed_port) {
@@ -1703,10 +1725,12 @@ extern "C" void kmain(void) {
 				goto restart;
 			}
 		}
+        }
 
 		// Sample all ports even if the controller misses a PSC. Require 150 ms
 		// of stable CCS before port-local enumeration; also pick up a timed-out
 		// port that becomes enabled later. Neither path resets mounted disks.
+        { KernelCpuScope cpu_scope(KCPU_ROOT_PORTS);
         for (int ctrl_idx = 0; ctrl_idx < xhci_count; ctrl_idx++) {
             XHCIController* hc = &xhci_hc[ctrl_idx];
             if (hc->needsResetting) continue;
@@ -1715,10 +1739,12 @@ extern "C" void kmain(void) {
                 if (usb_root_poll(hc, p, now)) goto restart;
             }
         }
+        }
 
 		// ── Software Typematic Repeat ─────────────────────────────────────────────
 		// USB keyboards do not repeat keys in hardware when SET_IDLE is configured
 		// to 0. We implement standard 500ms delay + 30ms repeat rate in software.
+        { KernelCpuScope cpu_scope(KCPU_KEY_REPEAT);
 		uint64_t current_tsc = rdtsc();
 		uint64_t ms_to_tsc = _usb_tsc_hz() / 1000;
 		uint64_t repeat_delay_tsc = 500 * ms_to_tsc;
@@ -1736,9 +1762,7 @@ extern "C" void kmain(void) {
 							// Repeat key emission
 							uint8_t modifiers = last_mods[k];
 							bool shift = (modifiers & 0x22u) != 0;
-							bool ctrl  = (modifiers & 0x11u) != 0;
-							bool alt   = (modifiers & 0x44u) != 0;
-							uint32_t mods = (ctrl ? WIN_MOD_CTRL : 0) | (shift ? WIN_MOD_SHIFT : 0) | (alt ? WIN_MOD_ALT : 0);
+							uint32_t mods = wm_hid_modifiers(modifiers);
 							g_kbd_modifiers = mods;
 							
 							if (key >= 0x4F && key <= 0x52) {
@@ -1770,7 +1794,7 @@ extern "C" void kmain(void) {
 								}
 							} else {
 								char c = shift ? hid_to_ascii_shift[key] : hid_to_ascii[key];
-								wm_dispatch_key(c, key, true, mods);
+								wm_dispatch_key(c, key, true, mods,true);
 							}
 						}
 					}
@@ -1778,6 +1802,7 @@ extern "C" void kmain(void) {
 			}
 		}
 
+        }
         if (disk_root_active && !g_recovery_retired && g_terminal_shell_ready) {
             // No more boot fallback after the disk shell has entered its input
             // loop. Runtime RAM mounts and the live log remain in use by VFS.

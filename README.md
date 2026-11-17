@@ -67,6 +67,12 @@ options; header dependencies are tracked automatically.
   double-click app launching. Open it from Start or `run /bin/explorer.wiz`.
 - Native Notepad: text editing, Save/Save As and unsaved-change prompts. Explorer
   opens text documents in it and offers a right-click Open with menu.
+- Native Task Manager: a 60-second Core 0 CPU graph, collapsible Programs,
+  Background processes and Kernel / System sections, CPU sorting within each,
+  PID and scheduler state. Open with Ctrl+Shift+Esc, from Start, or
+  `run /bin/task_manager.wiz`. The shortcut restores/focuses an existing window.
+  Click Kernel details for an on-demand breakdown of input, USB, interrupts and
+  scheduler CPU time; return to Processes to stop profiling.
 - App manifests and runtime PNG icons with CPU alpha blending, theme fallback
   and demand-driven caching; PNG/JPEG wallpapers and runtime TTF fonts.
 - Journaled ext4 root on USB, persistent apps/settings/files, atomic replacement,

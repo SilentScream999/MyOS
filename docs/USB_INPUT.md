@@ -58,6 +58,8 @@ handling. Quiet audits are staggered instead of scanning all ports every input
 tick; `usb_hub_poll_policy.h` schedules audits from completion time. Initial and
 actual hotplug enumeration still use bounded synchronous control requests with
 a shared probe deadline. Failed controllers/ports must not enter reset storms.
+Root-port status scans run with the 8 ms HID event dispatcher (about 125 Hz).
+The existing 150 ms stability checks still gate enumeration.
 Timed-out control transfers retain DMA ownership until safely recovered; do not
 free their buffers simply because the caller's deadline expired.
 

@@ -19,6 +19,7 @@
 #include "window_resize.h"
 #include "window_decorations.h"
 #include "window_overlay.h"
+#include "overlay_renderer.h"
 #include "power_icons.h"
 
 void* image_allocate(uint64_t size) { return kmalloc(size); }
@@ -124,6 +125,10 @@ static char* hud_put_ms1(char* sp, uint64_t ticks) {
 #define WIN_MOD_SHIFT (1u << 1)
 #define WIN_MOD_ALT   (1u << 2)
 #define WIN_MOD_GUI   (1u << 3)
+static uint32_t wm_hid_modifiers(uint8_t bits) {
+    return ((bits&0x11)?WIN_MOD_CTRL:0)|((bits&0x22)?WIN_MOD_SHIFT:0)|
+           ((bits&0x44)?WIN_MOD_ALT:0)|((bits&0x88)?WIN_MOD_GUI:0);
+}
 #define WIN_KEY_HOME   0x1100u
 #define WIN_KEY_END    0x1101u
 #define WIN_KEY_DELETE 0x1102u
@@ -275,8 +280,7 @@ static inline void wm_surface_damage(Window* win, int32_t x1, int32_t y1, int32_
     if (!surface_damage_to_screen(win->x, win->y, win->w, win->h, x1, y1, x2, y2,
                                   (int32_t)fb->width, (int32_t)fb->height, &sx1, &sy1, &sx2, &sy2)) return;
     uint32_t ux1 = (uint32_t)sx1, ux2 = (uint32_t)sx2 - 1;
-    uint32_t uy1 = (uint32_t)sy1, uy2 = (uint32_t)sy2;
-    if (uy2 > fb->height - 1) uy2 = fb->height - 1;
+    uint32_t uy1 = (uint32_t)sy1, uy2 = (uint32_t)sy2 - 1;
     wm_dirty_add(ux1, ux2, uy1, uy2);
     g_needs_refresh = true;
 }
@@ -1088,6 +1092,7 @@ static inline void wm_draw_window_chrome(int32_t x, int32_t y, int32_t w, int32_
 // Currently live on VRAM beyond master_backbuffer:
 static OverlayFrame g_presented_overlay{{-999,-999,0,0},{},0};
 static uint32_t wm_cursor_color(unsigned edges,int x,int y,uint8_t buttons);
+static const uint32_t* wm_cursor_sprite(const OverlayCursor& cursor);
 static void wm_capture_overlay(OverlayFrame* frame,const OverlayCursor& cursor) {
     static_assert(OverlayFrame::capacity>=MAX_WINDOWS);
     frame->cursor=cursor;frame->count=0;
@@ -1100,13 +1105,8 @@ static void wm_capture_overlay(OverlayFrame* frame,const OverlayCursor& cursor) 
     }
 }
 static inline void vram_present_span(int left,int right,int y,const OverlayFrame& frame) {
-    if(left<0)left=0;if(right>(int)fb->width)right=fb->width;
-    if(left>=right||y<0||y>=(int)fb->height)return;
-    auto* source=(uint32_t*)(g_master_backbuffer+(uint64_t)y*fb->pitch);
-    auto* dest=(uint32_t*)((uint8_t*)fb->address+(uint64_t)y*fb->pitch);
-    overlay_present_row(dest,source,left,right,y,frame,
-        [](const OverlayCursor& cursor,int x,int cy){return wm_cursor_color(cursor.edges,x,cy,cursor.buttons);},
-        [](uint32_t* d,const uint32_t* s,int bytes){memcpy_vram_sse_headless(d,s,bytes);});
+    OverlayTarget target{(uint8_t*)fb->address,g_master_backbuffer,(int)fb->width,(int)fb->height,(int)fb->pitch};
+    overlay_render_span(target,left,right,y,frame,wm_cursor_sprite(frame.cursor));
 }
 // Draw a 2px ghost outline rectangle directly to VRAM (not master_backbuffer).
 static inline void vram_draw_outline(int32_t x, int32_t y,
@@ -1209,6 +1209,16 @@ static uint32_t wm_cursor_color(unsigned edges,int x,int y,uint8_t buttons) {
     if(x<0||x>=CURSOR_W||y<0||y>=CURSOR_H)return 0;
     unsigned pixel=g_cursor_bitmap[y][x];
     return pixel==1?0xFFFFFFFF:pixel==2?((buttons&1)?0xFFFF0000:(buttons&2)?0xFF00FFFF:0xFF000000):0;
+}
+static const uint32_t* wm_cursor_sprite(const OverlayCursor& cursor) {
+    static uint32_t pixels[CURSOR_SPRITE_SIZE*CURSOR_SPRITE_SIZE];
+    static bool ready=false;static unsigned edges=0;static uint8_t buttons=0;
+    if(!ready||edges!=cursor.edges||buttons!=cursor.buttons){
+        for(int y=0;y<CURSOR_SPRITE_SIZE;++y)for(int x=0;x<CURSOR_SPRITE_SIZE;++x)
+            pixels[y*CURSOR_SPRITE_SIZE+x]=wm_cursor_color(cursor.edges,x-CURSOR_SPRITE_ORIGIN,y-CURSOR_SPRITE_ORIGIN,cursor.buttons);
+        edges=cursor.edges;buttons=cursor.buttons;ready=true;
+    }
+    return pixels;
 }
 // ─── Ghost frame geometry ────────────────────────────────────────────────────
 
@@ -1349,6 +1359,8 @@ static inline Window* wm_create_window(const char* title, int32_t x, int32_t y, 
     g_window_list[idx] = win;
     g_window_order[idx] = idx;
     g_window_count++;
+    if(!is_system&&g_current_task&&g_current_task->pid==owner&&g_current_task->focus_first_window){
+        g_current_task->focus_first_window=false;wm_raise_window(idx);}
     ++g_resource_demand_generation; g_resources_requested=true;
     
     wm_damage_window_full(win);
@@ -1444,9 +1456,11 @@ static void wm_event_coordinates(Window* win,int x,int y,WinEvent* event) {
     event->y=(int64_t)(y-win->y)*win->canvas_height/win->h;
 }
 
-static inline void wm_dispatch_key(char c, uint32_t scancode, bool is_down, uint32_t mods) {
+static bool (*g_desktop_shortcut_hook)(char,uint32_t,bool)=nullptr;
+static inline void wm_dispatch_key(char c, uint32_t scancode, bool is_down, uint32_t mods,bool repeat=false) {
     g_kbd_modifiers = mods;
     if (!is_down) return;
+    if(g_desktop_shortcut_hook&&g_desktop_shortcut_hook(c,mods,repeat))return;
     Window* focused = wm_find_window(g_focused_win_id);
     if (focused && focused->is_system && focused->type==WIN_TYPE_TERM &&
         (mods & WIN_MOD_CTRL) && (c == 'c' || c == 'C' || c == 3)) {
@@ -1507,6 +1521,14 @@ static inline void wm_visible_client(Window* win, VisibleRegion* region) {
         }
         if (!region->count) return;
     }
+}
+
+static bool wm_client_rect_exposed(Window* win,int x,int y,int w,int h) {
+    VisibleRegion region{};wm_visible_client(win,&region);
+    VisibleRect target{x,y,x+w,y+h};
+    for(unsigned i=0;i<region.count;++i)
+        if(visibility_valid(visibility_intersect(region.rects[i],target)))return true;
+    return false;
 }
 
 static uint64_t g_rain_render_count = 0;
@@ -1609,11 +1631,10 @@ volatile bool g_vram_lock = false;
 // =============================================================================
 //  wm_overlay_update_unlocked
 // =============================================================================
-static inline void wm_overlay_present_unlocked(const OverlayFrame& frame) {
+static inline void wm_overlay_present_unlocked(const OverlayFrame& frame,bool scene_changed=false) {
     if(!fb||!g_master_backbuffer)return;
-    overlay_transition(g_presented_overlay,frame,fb->height,[&](int left,int right,int y){
-        vram_present_span(left,right,y,frame);
-    });
+    OverlayTarget target{(uint8_t*)fb->address,g_master_backbuffer,(int)fb->width,(int)fb->height,(int)fb->pitch};
+    overlay_render_transition(target,g_presented_overlay,frame,wm_cursor_sprite(frame.cursor),scene_changed);
     // Remember exactly what these writes presented, never re-read live windows
     // here: input can change them between a scene snapshot and its final blit.
     g_presented_overlay.cursor=frame.cursor;
@@ -1738,15 +1759,16 @@ static uint32_t g_overlay_backup[256];
 // With present=false, prepare the backbuffer only (boot's first desktop frame).
 // When several rects are composed in one frame the caller passes do_overlay=true only for the LAST one:
 // each completed blit presents/tracks its own snapshot; the final call reports completion.
+static uint64_t g_scene_compose_count=0,g_scene_compose_pixels=0;
 static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                                      uint32_t min_y, uint32_t max_y, bool do_overlay = true,
                                      bool present = true) {
     if (!fb || !fb->address || !g_backbuffer || !g_master_backbuffer) return false;
-    if (min_x >= fb->width)  min_x = 0;
+    if (min_x>max_x || min_y>max_y || min_x>=fb->width || min_y>=fb->height) return false;
     if (max_x >= fb->width)  max_x = fb->width - 1;
-    if (min_y >= fb->height) min_y = 0;
     if (max_y >= fb->height) max_y = fb->height - 1;
     if (min_y > max_y || min_x > max_x) return false;
+    ++g_scene_compose_count;g_scene_compose_pixels+=(uint64_t)(max_x-min_x+1)*(max_y-min_y+1);
     ResourceRead resource_read;
 
     // Chrome/taskbar currently repaint whole horizontal spans on damaged rows.
@@ -1858,7 +1880,11 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         Source source_surface=sources[idx];int display_w=r.x2-r.x1,display_h=r.y2-r.y1-g_title_h;
 
         int32_t dr1 = (r.y1 > (int32_t)min_y) ? r.y1 : (int32_t)min_y;
-        int32_t dr2 = (r.y2 < (int32_t)max_y) ? r.y2 : (int32_t)max_y;
+        // Window bounds and row loops are half-open; damage max_y is inclusive.
+        // Omitting its last row leaves lower-window chrome in the saved scene,
+        // later exposed by cursor restoration across a small caret repaint.
+        int32_t bottom = (int32_t)max_y + 1;
+        int32_t dr2 = (r.y2 < bottom) ? r.y2 : bottom;
         // Don't draw windows over taskbar area
         if (dr2 > (int32_t)(fb->height - g_taskbar_h)) dr2 = fb->height - g_taskbar_h;
         if (dr1 >= dr2) continue;
@@ -2365,7 +2391,7 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
 
     // ── Blit dirty rect (64-byte aligned for max throughput) ───────────────
     uint32_t min_x_aligned = min_x & ~15u; // 16-byte align for SSE (64 would be safer but might over-copy too much)
-    uint32_t max_x_aligned = (max_x + 15) & ~15u;
+    uint32_t max_x_aligned = (max_x + 1 + 15) & ~15u;
     if (max_x_aligned > fb->width) max_x_aligned = fb->width;
     uint32_t bw_aligned = (max_x_aligned - min_x_aligned) * 4;
 
@@ -2406,7 +2432,7 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
     // Each dirty blit can introduce a new outline snapshot. Transition and
     // remember that exact snapshot even when this is not the final dirty rect.
     // Otherwise a later snapshot can leave fragments of this one untracked.
-    wm_overlay_present_unlocked(overlays);
+    wm_overlay_present_unlocked(overlays,true);
     __sync_lock_release(&g_vram_lock);
     return do_overlay;
 }

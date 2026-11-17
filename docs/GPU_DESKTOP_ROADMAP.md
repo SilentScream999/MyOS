@@ -25,6 +25,15 @@ The cursor is stamped into the master buffer before dirty-region presentation
 and restored afterward; cursor/drag overlays also have an update path when the
 scene is unchanged. Preserve those paths' ordering instead of assuming every
 cursor draw is a direct post-flip VRAM write.
+Pointer-only/ghost-outline frames bypass scene composition entirely. The
+isolated overlay renderer is compiled with optimization independently of kernel
+`OPT`, caches cursor rasterization, and skips unchanged overlay footprints.
+Scene blits still reapply their overlay snapshots to preserve cursor/corner
+ordering. The shell caret damages its two scanlines only on blink transitions,
+and stops blinking when inactive, minimized, off-screen or covered.
+Damage maxima are inclusive in both axes; surface endpoints and copy-loop ends
+are exclusive. Preserve that conversion for every copied row, including the last
+row of tiny caret damage, and include the last pixel when aligning presentations.
 
 `GPU=1` brings up the Intel Gen9 blitter: PCI/MMIO, fixed GGTT mappings, fill/copy
 commands and polled fences. There is no GPU allocator, render engine, shader

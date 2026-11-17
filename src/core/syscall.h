@@ -57,6 +57,7 @@
 #include "gdt.h"
 #include "helpers.h"
 #include "scheduler.h"
+#include "process_info.h"
 #include "vfs.h"
 #include "app.h"
 #include "tty.h"
@@ -123,6 +124,8 @@ static inline uint64_t rdmsr(uint32_t msr) {
 #define SYS_DOCUMENT_PATH 215u // copy the optional launch document path
 #define SYS_OPEN_WITH 216u // desktop GUI launch: app path, document path
 #define SYS_TEXT_CLIPBOARD 217u // action 0=set bytes, 1=get NUL-terminated text
+#define SYS_PROCESS_INFO 218u // (ProcessInfo*, capacity<=256, ProcessTotals*, optional ProcessMetadata*)
+#define SYS_KERNEL_CPU 219u // (KernelCpuInfo*); renew PID 0 profiling lease
 #include "text_clipboard.h"
 static TextClipboard g_text_clipboard;
 #define SYS_CHDIR   80u
@@ -630,6 +633,41 @@ static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uin
                 (a1==0&&a3>TextClipboard::capacity))return (uint64_t)-1;
             TtyIrqGuard guard;
             return a1==0?g_text_clipboard.set((const char*)a2,a3):g_text_clipboard.get((char*)a2,a3);
+        }
+        case SYS_KERNEL_CPU: {
+            if(!a1 || a1>=USERSPACE_END || sizeof(KernelCpuInfo)>USERSPACE_END-a1)return (uint64_t)-1;
+            TtyIrqGuard guard;
+            if(!kernel_cpu_active()) {
+                for(unsigned i=0;i<KCPU_COUNT;++i){g_kernel_cpu.cycles[i]=0;g_kernel_cpu.calls[i]=0;}
+            }
+            g_kernel_cpu_until_tick=g_tick_count+2000;
+            uint64_t now=scheduler_cycles();scheduler_account_cpu(now);g_kernel_cpu.sampled_at=now;
+            g_kernel_cpu.tick=g_tick_count;
+            copy_string_to_user(a1,(const char*)&g_kernel_cpu,sizeof(g_kernel_cpu));return 0;
+        }
+        case SYS_PROCESS_INFO: {
+            if(a2>256 || (a2 && (!a1 || a1>=USERSPACE_END || a2*sizeof(ProcessInfo)>USERSPACE_END-a1)) ||
+               !a3 || a3>=USERSPACE_END || sizeof(ProcessTotals)>USERSPACE_END-a3 ||
+               (a4 && (a4>=USERSPACE_END || sizeof(ProcessMetadata)>USERSPACE_END-a4))) return (uint64_t)-1;
+            TtyIrqGuard guard;
+            uint64_t now=scheduler_cycles();scheduler_account_cpu(now);
+            ProcessTotals totals{now-g_cpu_started_at,g_idle_tsc_accum};
+            copy_string_to_user(a3,(const char*)&totals,sizeof(totals));
+            ProcessMetadata metadata{};metadata.tick_ms=g_tick_count;
+            uint64_t count=0;Task* t=g_task_list;
+            if(t) do {
+                if(count<a2) {
+                    ProcessInfo info{};info.pid=t->pid;info.state=(uint32_t)t->state;info.cpu_cycles=t->cpu_cycles;
+                    const char* name=t->executable[0]?t->executable:"Kernel worker";
+                    unsigned i=0;for(;name[i]&&i<255;++i)info.name[i]=name[i];
+                    copy_string_to_user(a1+count*sizeof(info),(const char*)&info,sizeof(info));
+                    if(a4)metadata.kinds[count]=!t->user_entry?PROCESS_KERNEL:
+                        (t->gui_app||t->console||t->pid==g_terminal_foreground_pid)?PROCESS_PROGRAM:PROCESS_BACKGROUND;
+                }
+                ++count;t=t->next;
+            } while(t!=g_task_list);
+            if(a4)copy_string_to_user(a4,(const char*)&metadata,sizeof(metadata));
+            return count;
         }
         case SYS_DOCUMENT_PATH: {
             if(!g_current_task||!a1||a1>=USERSPACE_END)return (uint64_t)-1;

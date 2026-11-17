@@ -14,6 +14,16 @@ struct CpuIdleClock {
         return now-started;
     }
 };
+// One clock shared by scheduled tasks. Each checkpoint charges the outgoing
+// task, while resume skips a halt interval before interrupt work begins.
+struct CpuTaskClock {
+    uint64_t accounted_at=0;
+    void resume(uint64_t now) { accounted_at=now; }
+    uint64_t charge(uint64_t now) {
+        uint64_t elapsed=now-accounted_at;
+        accounted_at=now;return elapsed;
+    }
+};
 struct CpuUsageSample {
     uint64_t total=0,idle=0;
     uint32_t percent=0;

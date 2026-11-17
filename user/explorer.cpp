@@ -297,7 +297,10 @@ static void render() {
         surface.folder(17,y+4+(ui_font_for_pixels(14)->height-20)/2,20);surface.text(46,y+4,labels[i],INK,155);}
     if(HEIGHT>=520){surface.text(17,HEIGHT-150,"WyzarOS",MUTED,155,16);surface.text(17,HEIGHT-124,"File Explorer",MUTED,155,12);}
     int type_x=WIDTH-233,size_x=WIDTH-90,header=LIST_TOP-33;
-    surface.rect(SIDE,header,WIDTH-SIDE,32,PANEL);surface.text(216,header+7,"Name",MUTED,type_x-17,12);
+    surface.rect(SIDE+1,header,WIDTH-SIDE-1,32,0xff2b273b);
+    surface.rect(SIDE,header,1,33,LINE);
+    surface.rect(SIDE+1,header+32,WIDTH-SIDE-1,1,LINE);
+    surface.text(216,header+7,"Name",MUTED,type_x-17,12);
     surface.text(type_x,header+7,"Type",MUTED,size_x-20,12);surface.text(size_x,header+7,"Size",MUTED,WIDTH-20,12);
     for(int row=0;row<VISIBLE;++row) {
         int index=scroll_row+row;if(index>=entry_count)break;int y=LIST_TOP+row*ROW;

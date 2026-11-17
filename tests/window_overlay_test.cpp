@@ -4,6 +4,7 @@
 #include <vector>
 #include "../src/gui/window_decorations.h"
 #include "../src/gui/window_overlay.h"
+#include "../src/gui/overlay_renderer.h"
 
 static uint32_t cursor_color(const OverlayCursor& c,int x,int y) {
     if(!c.edges)return 0;
@@ -61,7 +62,7 @@ int main(){
     // Consecutive frames, rather than repeated erasure within a static frame:
     // scene blits can introduce a snapshot before the overlay's final pass.
     // Window release/destruction must erase it without consulting live windows.
-    screen=background;
+    screen=background;auto rendered=background;
     OverlayFrame previous{{-999,-999,0,0},{},0};
     for(int step=0;step<240;++step){
         OverlayFrame next{};
@@ -89,8 +90,22 @@ int main(){
         if(step%2==0)for(int y=4;y<20;++y)present(10,450,y);
         overlay_transition(previous,next,height,present);
         assert(screen==expected);
+        uint32_t sprite[CURSOR_SPRITE_SIZE*CURSOR_SPRITE_SIZE];
+        for(int y=0;y<CURSOR_SPRITE_SIZE;++y)for(int x=0;x<CURSOR_SPRITE_SIZE;++x)
+            sprite[y*CURSOR_SPRITE_SIZE+x]=cursor_color(next.cursor,x-CURSOR_SPRITE_ORIGIN,y-CURSOR_SPRITE_ORIGIN);
+        OverlayTarget target{(uint8_t*)rendered.data(),(const uint8_t*)background.data(),width,height,stride*4};
+        overlay_render_transition(target,previous,next,sprite,false);
+        __asm__ volatile("sfence" ::: "memory");
+        assert(rendered==expected);
         previous=next;
     }
     assert(screen==background);
+    OverlayFrame still{{20,20,0,0},{{10,10,200,80}},1};
+    unsigned spans=0;
+    overlay_transition(still,still,height,[&](int,int,int){++spans;});assert(spans==0);
+    auto moved=still;moved.cursor.x+=3;
+    overlay_transition(still,moved,height,[&](int,int,int){++spans;});assert(spans<=64);
+    spans=0;overlay_transition(still,still,height,[&](int,int,int){++spans;},true);
+    assert(spans>64); // Scene damage must reapply even unchanged overlays.
     std::printf("Overlay: %u writes and 240 moving/released/closed snapshots leave no fragments.\n",writes);
 }

@@ -1,0 +1,7 @@
+id=task_manager
+name=Task Manager
+version=1.1.0
+abi=10
+type=gui
+icon=task_manager
+description=Live CPU history, grouped programs and system tasks, and kernel CPU diagnostics.

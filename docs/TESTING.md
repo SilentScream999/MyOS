@@ -50,16 +50,93 @@ changing the fixture document.
 ## CPU usage and terminal wakeups
 
 ```sh
+make test-task-manager
+make iso PERSIST_DISK=.storage-test/root.img ROOT_MIB=64
+python3 tests/qemu_task_manager_test.py
+python3 tests/qemu_task_manager_test.py --ps2
 clang++ -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/tty_idle_test.cpp -o .storage-test/tty-idle-test
 .storage-test/tty-idle-test
 python3 tests/qemu_cpu_idle_test.py
+python3 tests/qemu_kernel_cpu_test.py
+make test-resize test-text-input
+python3 tests/qemu_pointer_perf_test.py
+python3 tests/qemu_caret_pointer_test.py
 ```
 
-The host test covers idle intervals interrupted by scheduled work, sample
+Task Manager's host test covers PID matching across reordered snapshots, new
+and exited processes, CPU sorting, idle samples, failed reads, truncation and
+native rendering, group collapse/scroll behavior, CPU-history timestamps and
+ring-buffer wrap. Its PPM preview is `.storage-test/task-manager.ppm`. The real
+QEMU syscall probe checks kernel/background/foreground/GUI classification,
+optional metadata compatibility, invalid buffers/capacities and timestamps.
+The UI test saves `.storage-test/task-manager-programs.png` and exercises the
+collapsible section headers. The same test checks Ctrl+Shift+Esc launch, focus,
+minimized-window restoration, held-key duplicate suppression, modifier release,
+and absence of shortcut input in the shell.
+`--ps2` uses the PS/2 keyboard instead of USB HID. The icon is a bundled,
+transparent CPU-monitor silhouette matching Explorer and Notepad; regenerate
+only its seven sizes with `tools/create_default_icons.py --only task_manager`.
+Process categories come from task metadata; the shared shell appears under
+Background processes. CPU percentages are for the
+single scheduled core, and the graph retains up to 60 seconds of valid samples.
+
+The idle host test covers idle intervals interrupted by scheduled work, per-task
+cycle accounting across context switches and halts, sample
 initialization and raw/canonical/launch/cancellation wakeups. QEMU verifies that
 an untouched prompt blocks, Counter returns to the same sleeping prompt, real
-input and Start wake the shell, and a busy loop reports busy CPU time. The HUD
+input wakes the shell, Start launches a private console without waking the shared
+prompt, and a busy loop reports busy CPU time. The HUD
 includes desktop/driver work; an idle prompt does not imply a zero-percent OS.
+
+The kernel profiling test clicks Task Manager's Kernel details button, compares
+the exclusive category sum to PID 0's actual CPU-cycle counter, verifies interrupt
+and scheduler activity, then returns to Processes and verifies the profiling
+lease expires. It saves `.storage-test/kernel-cpu-details.png`. This checks the
+measurement path in QEMU; identifying a physical laptop's idle overhead requires
+that laptop's breakdown. CPU rates from the emulator are not hardware benchmarks.
+
+The pointer test closes the animated fixtures through real controls, then
+measures scene compositions and compositor CPU during idle, pointer movement,
+ghost dragging and ghost resizing. Pointer-only updates must use the overlay
+path; HUD/caret scene damage remains bounded. It also checks that an inactive
+terminal generates no caret transitions and drag/resize geometry commits only
+on release. `--baseline` records the same measurements without those assertions.
+Overlay host tests compare the optimized renderer to a pixel reference and
+check that unchanged overlays produce no writes unless scene damage requires
+reapplying them. The CPU kernel remains at its configured optimization level;
+only the isolated overlay pixel renderer has its own optimized build rule.
+
+The caret/pointer regression places the shell caret's damage rows over a window
+title behind the terminal, moves the pointer horizontally through those rows,
+and compares the completed saved scene with the terminal surface across multiple
+blinks. This catches background pixels left by an inclusive/exclusive bottom-row
+mismatch. The captured result is `.storage-test/caret-pointer-passed.png`.
+
+### CPU and desktop regression map (2026-11-16)
+
+- **Explorer header:** `user/explorer.cpp` gives the Name/Type/Size strip its own
+  color and borders so it no longer merges visually into the sidebar.
+- **Task Manager:** `scheduler.h` accounts scheduled cycles per task and closes
+  halt intervals at interrupt entry. CPU percentages describe Core 0. ABI 10 adds
+  optional process categories/timestamps without changing older snapshot layouts.
+  Kernel details profiles PID 0 only, adds measurement overhead, and expires two
+  seconds after its last read. The laptop's reported idle usage was not explained
+  by root-port polling; do not treat emulator percentages as hardware targets.
+- **Pointer/ghost performance:** empty scene damage now takes the overlay path.
+  `overlay_renderer.cpp` has a local optimized build rule; kernel `OPT=-O0` stays
+  unchanged. Cached cursor pixels and whole-pixel thin-span stores reduce work.
+  Unchanged overlays can skip writes, but scene blits must force their reapplication
+  to avoid missing cursor/outline pixels. Check `qemu_pointer_perf_test.py` and
+  `window_overlay_test.cpp` if trails, corners or CPU costs regress.
+- **Shell caret and thin-line artifact:** inactive/covered carets stop blinking.
+  The line exposing a background window came from dropping the last window-copy
+  row of a tiny caret repaint. `wm.h` now converts inclusive damage maxima to
+  exclusive copy ends; `framebufferstuff.h` converts terminal bounds in the other
+  direction, and aligned presentation includes the final pixel. Preserve these
+  conversions together. `qemu_caret_pointer_test.py` reproduced the defect before
+  the fix and checks completed scene rows across multiple blinks afterward.
+- **USB cadence:** root-port scans were restored to the original 8 ms input loop
+  (about 125 Hz); the temporary 100 ms root-port throttle was removed.
 
 For rainbow animation visibility and repaint cost:
 

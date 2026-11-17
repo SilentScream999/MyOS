@@ -197,6 +197,7 @@ static int64_t launch_program(const char* path,bool desktop,bool* gui,const char
     if(g_current_task)strcpy(t->cwd,g_current_task->cwd);
     if(document)strcpy(t->document_path,document);
     t->gui_app=desktop||*gui;
+    t->focus_first_window=desktop;
     if(host){
         auto* c=(AppConsole*)kmalloc(sizeof(AppConsole));if(!c){task_free(t);return -1;}
         memset(c,0,sizeof(*c));c->refs=1;c->echo=true;t->console=c;t->console_host=true;

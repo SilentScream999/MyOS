@@ -23,7 +23,7 @@ static void overlay_outline_spans(const OverlayOutline& r,int y,Span span) {
 // Damage comes from the snapshots actually presented, independent of a window's
 // current geometry or lifetime. The same snapshot is used for drawing/tracking.
 template<class Present>
-static void overlay_transition(const OverlayFrame& previous,const OverlayFrame& next,int height,Present present) {
+static void overlay_transition(const OverlayFrame& previous,const OverlayFrame& next,int height,Present present,bool scene_changed=false) {
     auto cursor=[&](const OverlayCursor& c){
         int top=c.y-CURSOR_SPRITE_ORIGIN,bottom=top+CURSOR_SPRITE_SIZE;
         if(top<0)top=0;if(bottom>height)bottom=height;
@@ -31,15 +31,19 @@ static void overlay_transition(const OverlayFrame& previous,const OverlayFrame& 
     };
     // Place the new cursor first. Every following write composes this complete
     // next frame, preserving both the cursor and the new resize corner.
-    cursor(next.cursor);cursor(previous.cursor);
-    auto outlines=[&](const OverlayFrame& f){
+    bool cursor_changed=previous.cursor.x!=next.cursor.x||previous.cursor.y!=next.cursor.y||
+        previous.cursor.edges!=next.cursor.edges||previous.cursor.buttons!=next.cursor.buttons;
+    if(scene_changed||cursor_changed){cursor(next.cursor);cursor(previous.cursor);}
+    auto outlines=[&](const OverlayFrame& f,const OverlayFrame& other){
         for(unsigned i=0;i<f.count;++i){const auto& r=f.outlines[i];
+            if(!scene_changed&&i<other.count){const auto& old=other.outlines[i];
+                if(r.x==old.x&&r.y==old.y&&r.w==old.w&&r.h==old.h)continue;}
             int top=r.y,bottom=r.y+r.h;
             if(top<0)top=0;if(bottom>height)bottom=height;
             for(int y=top;y<bottom;++y)overlay_outline_spans(r,y,[&](int left,int right){present(left,right,y);});
         }
     };
-    outlines(previous);outlines(next);
+    outlines(previous,next);outlines(next,previous);
 }
 
 // Compose in bounded scratch memory before each framebuffer write. In

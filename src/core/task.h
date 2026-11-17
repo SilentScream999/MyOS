@@ -71,6 +71,8 @@ struct Task {
 
     char      cwd[256];    // Current working directory (always canonical absolute)
     char      executable[256]; // Runtime app identity; never inferred from a window title.
+    uint64_t  cpu_cycles; // Scheduled TSC time, excluding CPU halt intervals.
+    uint32_t  cpu_phase; // PID 0's current optional profiling category.
 
     // ── Saved CPU context ─────────────────────────────────────────────────────
     // After a context switch OUT, the stack contains (from high to low):
@@ -113,6 +115,7 @@ struct Task {
     bool waiting_tty_input;
     void* console;         // Private desktop-console channel; never the shell TTY.
     bool gui_app;
+    bool focus_first_window; // Desktop launch intent, consumed by the first owned window.
     bool console_host;
     char launch_target[256];
     char document_path[256]; // Optional document supplied by desktop Open with.
@@ -211,10 +214,15 @@ static void task_setup_stack(Task* t, void (*entry)()) {
 //
 // `stack_pages` — number of 4 KiB pages for the stack (0 = use default 4).
 
-static Task* task_create(void (*entry)(), uint32_t stack_pages = 0) {
+static Task* task_create(void (*entry)(), uint32_t stack_pages = 0, const char* name = nullptr) {
     if (stack_pages == 0) stack_pages = TASK_DEFAULT_STACK_PAGES;
 
     Task* t = task_alloc();
+
+    if (name) {
+        unsigned i=0; for (; name[i] && i<255; ++i) t->executable[i]=name[i];
+        t->executable[i]=0;
+    }
 
     t->stack_size = (uint64_t)stack_pages * PAGE_SIZE;
     t->stack_base = (uint8_t*)kmalloc(t->stack_size);

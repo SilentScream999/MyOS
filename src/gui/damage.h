@@ -9,9 +9,9 @@
 // line also went stale because its strip was too narrow). With a list, each region is composed and flipped
 // on its own.
 //
-// Rectangles use the compositor's existing convention: x1,y1,x2,y2 are MIN/MAX values (x2 inclusive; see
-// wm_compose_dirty for the y quirk), so a rect handed to wm_compose_dirty(x1,x2,y1,y2) behaves exactly as
-// before. Pure header (no kernel dependencies).
+// Rectangles use inclusive x2/y2 maxima. Convert surface/drawing half-open ends
+// at the caller boundary, and convert back to exclusive ends for row/copy loops.
+// Pure header (no kernel dependencies).
 // Callers must disable interrupts around damage_add()/damage_take() (see wm_dirty_add in framebufferstuff.h).
 
 #include <stdint.h>

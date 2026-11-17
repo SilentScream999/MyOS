@@ -2,6 +2,7 @@
 from pathlib import Path
 import subprocess
 import socket
+import struct
 import sys
 import time
 import qemu_storage_smoke as smoke
@@ -54,7 +55,9 @@ def wait_scan(count, label):
     for _ in range(100):
         time.sleep(.2)
         log = q.capture(label)
-        if log.count('[boot] USB discovery milliseconds:') >= count: return log
+        # This completion marker is present in normal builds too; boot timing
+        # diagnostics are opt-in and cannot be used to detect a finished scan.
+        if log.count('About to enter main loop') >= count: return log
     raise AssertionError('hotplug did not finish: ' + log[-3500:])
 
 try:
@@ -142,12 +145,15 @@ try:
 finally:
     q.close()
 sys.path.insert(0, str(ROOT / 'tools'))
-from system_volume import SystemVolume
-from make_usb_image import START, BOOT_SECTORS, DATA_SECTORS
-raw = smoke.IMAGE.read_bytes()
-offset = (START + BOOT_SECTORS) * 512
-data = SystemVolume(raw[offset:offset + DATA_SECTORS * 512])
+from image_io import copy_sparse
+# Validate the current ext4 root, rather than the removed legacy volume format.
+partition=ROOT/'.storage-test/root-hotplug-ext4.img'
+with smoke.IMAGE.open('rb') as source,partition.open('wb') as target:
+    mbr=source.read(512);start,sectors=struct.unpack_from('<II',mbr,446+16+8)
+    source.seek(start*512);copy_sparse(source,target,sectors*512)
+def read_file(path):
+    return subprocess.check_output(['debugfs','-R',f'cat /{path}',str(partition)],stderr=subprocess.DEVNULL)
 for cycle in range(5):
-    assert data.read(f'plug{cycle}.txt') == b'keyboard-and-disk-alive'
-assert data.read('late.txt') == b'late-keyboard-working'
+    assert read_file(f'plug{cycle}.txt') == b'keyboard-and-disk-alive'
+assert read_file('late.txt') == b'late-keyboard-working'
 print('Five root keyboard attach/removal cycles plus missed reset completion: keyboard, mouse and disk survived; no xHCI reset')

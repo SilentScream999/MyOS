@@ -45,6 +45,7 @@
 #include "task.h"
 #include "gdt.h"
 #include "helpers.h"
+#include "process_info.h"
 
 // ── Scheduler configuration ───────────────────────────────────────────────────
 
@@ -88,16 +89,59 @@ static void task_complete(Task* exiting, uint64_t code);
 extern volatile uint64_t g_idle_tsc_accum;
 #include "cpu_idle.h"
 static CpuIdleClock g_cpu_idle_clock{};
+static CpuTaskClock g_cpu_task_clock{};
+static uint64_t g_cpu_started_at=0;
+extern volatile uint64_t g_tick_count;
+static uint64_t g_kernel_cpu_until_tick=0;
+static KernelCpuInfo g_kernel_cpu{};
+static bool kernel_cpu_active() { return g_kernel_cpu_until_tick && g_tick_count<g_kernel_cpu_until_tick; }
+static uint64_t scheduler_cycles() {
+    uint32_t lo,hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi<<32)|lo;
+}
+// IRQs must be disabled. Charge before changing the current task or halting.
+static void scheduler_account_cpu(uint64_t now) {
+    if (g_scheduler_ready && g_current_task && !g_cpu_idle_clock.halted) {
+        uint64_t delta=g_cpu_task_clock.charge(now);
+        g_current_task->cpu_cycles += delta;
+        if(g_current_task->pid==0 && kernel_cpu_active() && g_current_task->cpu_phase<KCPU_COUNT)
+            g_kernel_cpu.cycles[g_current_task->cpu_phase]+=delta;
+    }
+    else g_cpu_task_clock.resume(now);
+}
+// A category follows its task across preemption and excludes halts. Nested
+// interrupt/scheduler scopes temporarily replace the interrupted input phase.
+struct KernelCpuScope {
+    Task* task=nullptr;uint32_t previous=0;
+    explicit KernelCpuScope(KernelCpuPhase phase) {
+        if(!g_current_task || g_current_task->pid!=0 || !kernel_cpu_active())return;
+        uint64_t flags;__asm__ volatile("pushfq; popq %0; cli":"=r"(flags)::"memory");
+        scheduler_account_cpu(scheduler_cycles());task=g_current_task;
+        previous=task->cpu_phase;task->cpu_phase=phase;++g_kernel_cpu.calls[phase];
+        __asm__ volatile("pushq %0; popfq"::"r"(flags):"memory","cc");
+    }
+    ~KernelCpuScope() {
+        if(!task)return;
+        uint64_t flags;__asm__ volatile("pushfq; popq %0; cli":"=r"(flags)::"memory");
+        scheduler_account_cpu(scheduler_cycles());task->cpu_phase=previous;
+        __asm__ volatile("pushq %0; popfq"::"r"(flags):"memory","cc");
+    }
+};
 static void scheduler_idle_interrupt() {
     uint64_t now;
     __asm__ volatile("rdtsc; shl $32, %%rdx; or %%rdx, %%rax" : "=a"(now) :: "rdx");
-    g_idle_tsc_accum=g_idle_tsc_accum+g_cpu_idle_clock.end(now);
+    if (g_cpu_idle_clock.halted) {
+        g_idle_tsc_accum=g_idle_tsc_accum+g_cpu_idle_clock.end(now);
+        g_cpu_task_clock.resume(now);
+    }
 }
 // Caller holds IRQs disabled. Interrupt entry closes the interval even if the
 // handler schedules another task before this suspended stack can resume.
 static void scheduler_idle_halt() {
     uint64_t now;
     __asm__ volatile("rdtsc; shl $32, %%rdx; or %%rdx, %%rax" : "=a"(now) :: "rdx");
+    scheduler_account_cpu(now);
     g_cpu_idle_clock.begin(now);
     __asm__ volatile("sti; hlt; cli" ::: "memory");
     scheduler_idle_interrupt();
@@ -227,6 +271,8 @@ static void schedule() {
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
 
+    KernelCpuScope cpu_scope(KCPU_SCHEDULER);
+
     scheduler_reap_dead();
 
     Task* pending = g_task_list;
@@ -294,6 +340,7 @@ switch_now:
         old->state = TaskState::READY;
     next->state    = TaskState::RUNNING;
     next->yielded  = false; // always clear yielded flag when starting a turn
+    scheduler_account_cpu(scheduler_cycles());
     g_current_task = next;
 
     // Update TSS.rsp[0] and g_current_kstack_top so hardware interrupts and syscalls
@@ -465,6 +512,9 @@ static void scheduler_init() {
     g_task_list    = idle;
     idle->next     = idle;
 
+    const char* name="Kernel / input";
+    for (unsigned i=0; name[i]; ++i) idle->executable[i]=name[i];
+    g_cpu_started_at=scheduler_cycles();g_cpu_task_clock.resume(g_cpu_started_at);
     g_scheduler_ready = true;
 
     char str[32];

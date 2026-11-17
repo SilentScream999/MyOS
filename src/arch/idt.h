@@ -189,6 +189,7 @@ static void scheduler_idle_interrupt();
 extern "C" __attribute__((used))
 void exception_dispatch(ExceptionFrame* f) {
     scheduler_idle_interrupt();
+    KernelCpuScope cpu_scope(KCPU_INTERRUPTS);
     if (f->vector == LOCAL_SPURIOUS_VECTOR) return; // APIC spurious: no EOI
     if (f->vector == LOCAL_TIMER_VECTOR && g_local_timer_handler) {
         g_local_timer_handler();

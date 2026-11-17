@@ -36,6 +36,15 @@ int main() {
     clock.begin(200); idle+=clock.end(220);
     idle+=clock.end(900); // Old sleeping stack finally resumes: no double count.
     assert(idle==30);
+    CpuTaskClock tasks{};uint64_t first_cycles=0,second_cycles=0;
+    tasks.resume(100);
+    first_cycles+=tasks.charge(120); // Switch from the first task to the second.
+    second_cycles+=tasks.charge(150); // Second task halts after 30 cycles of work.
+    tasks.resume(250); // Interrupt ends a 100-cycle halt, before scheduling.
+    second_cycles+=tasks.charge(260); // Charge interrupt work to the interrupted task.
+    first_cycles+=tasks.charge(280); // The first task runs again.
+    assert(first_cycles==40&&second_cycles==40);
+    assert(tasks.charge(280)==0); // Repeated snapshot must not double count.
     CpuUsageSample sample{};
     sample.update(1000,100,1000); assert(sample.percent==0);
     sample.update(1500,200,1000); assert(sample.total==1000);

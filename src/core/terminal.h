@@ -18,6 +18,7 @@ static uint32_t term_x = 0;
 static uint32_t term_y = 0;
 static uint32_t term_color = 0xFFFFFFFF; // White
 static bool term_cursor_enabled=false,term_cursor_visible=false;
+static uint64_t term_cursor_transitions=0;
 static uint64_t term_cursor_epoch=0,term_cursor_now=0;
 
 static bool term_escape = false;
@@ -315,7 +316,7 @@ static void term_cursor_tick(uint64_t milliseconds,bool active) {
     bool visible=active&&((milliseconds-term_cursor_epoch)/500%2==0);
     bool changed=visible!=term_cursor_visible||active!=term_cursor_enabled;
     term_cursor_enabled=active;term_cursor_visible=visible;
-    if(changed){term_erase_cursor();term_render_cursor();g_needs_refresh=true;}
+    if(changed){++term_cursor_transitions;term_erase_cursor();term_render_cursor();g_needs_refresh=true;}
 }
 
 static void term_write(const char* data, size_t size) {

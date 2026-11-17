@@ -54,7 +54,8 @@ static inline void term_dirty_rect(int32_t x1, int32_t y1, int32_t x2, int32_t y
     if (uy1 > fb->height) uy1 = fb->height;
     if (uy2 > fb->height) uy2 = fb->height;
 
-    wm_dirty_add(ux1, ux2, uy1, uy2);   // was: union into the single global box
+    // Terminal drawing uses half-open bounds; scene damage uses inclusive maxima.
+    if(ux1<ux2 && uy1<uy2)wm_dirty_add(ux1, ux2-1, uy1, uy2-1);
 }
 
 static inline void term_dirty_all() {

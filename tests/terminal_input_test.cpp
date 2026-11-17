@@ -38,6 +38,9 @@ int main(){
     output("\x1b[2K");for(unsigned i=0;i<16;++i)assert(!g_term_matrix[0][i].c);
     term_cursor_tick(700,false);assert(!term_cursor_visible);
     before=damage;term_cursor_tick(1700,false);assert(damage==before);
+    g_needs_refresh=false;auto transitions=term_cursor_transitions;
+    for(unsigned ms=1700;ms<10000;ms+=16)term_cursor_tick(ms,false);
+    assert(damage==before&&!g_needs_refresh&&term_cursor_transitions==transitions);
     term_cursor_tick(1701,true);assert(term_cursor_visible);
     term_cursor_tick(2201,true);assert(!term_cursor_visible);
     output("\x1b[C");assert(term_cursor_visible); // Navigation restarts the blink.
