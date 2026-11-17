@@ -77,7 +77,9 @@ int main(int argc,char** argv){
     request(NEW_DOCUMENT);std::string full(CAP,'x');insert(full.data(),CAP);insert("!",1);assert(length==CAP);
     key_event('a',1);insert("",0);assert(length==0);key_event('z',1);assert(length==CAP);
     request(NEW_DOCUMENT);perform_pending();insert("first\nsecond\nthird",18);caret=anchor=2;
-    key_event(0x1042,0);assert(caret==8);key_event(0x1041,0);assert(caret==2);
+    int desired_x=row_x(row_at(0),caret);
+    key_event(0x1042,0);assert(caret==row_position(row_at(1),desired_x));
+    desired_x=row_x(row_at(1),caret);key_event(0x1041,0);assert(caret==row_position(row_at(0),desired_x));
     key_event(0x1100,0);assert(caret==0);key_event(0x1101,0);assert(caret==5);
     key_event(0x1102,0);assert(!strcmp(text,"firstsecond\nthird"));
     key_event(0x1101,1);assert(caret==length);key_event(0x1100,1);assert(caret==0);
@@ -89,6 +91,30 @@ int main(int argc,char** argv){
         std::string replacement(next()%25,(char)('a'+next()%26));
         model.replace(first,count,replacement);insert(replacement.data(),(unsigned)replacement.size());
         assert(model==std::string(text,length));assert(caret<=length&&anchor<=length);}
+    // Typing beyond both edges wraps and scrolls without changing document bytes.
+    request(NEW_DOCUMENT);perform_pending();std::string overflow="Short line\n"+std::string(2400,'W')+"\nLast line";
+    for(char c:overflow)key_event((uint32_t)c,0);
+    assert(std::string(text,length)==overflow&&top_line>0);
+    assert(caret_row()>=top_line&&caret_row()<top_line+rows());render();
+    assert(save_to("/home/wrapped.txt")&&files["/home/wrapped.txt"]==overflow);
+    key_event(0x1100,1);assert(caret==0&&top_line==0);render();
+    if(argc>1)image(std::string(argv[1])+"-wrapped.ppm",surface);
+    TextRow wrapped=row_at(1);assert(wrapped.end<line_end(wrapped.start));
+    for(int r=0;r<6;++r){TextRow line=row_at(r);unsigned at=line.start+1;
+        int x=row_x(line,at);handle_event({1,EDIT_LEFT+x,EDIT_TOP+r*LINE_HEIGHT+5,1,0,0});assert(caret==at);}
+    key_event(0x1101,1);unsigned saved_caret=caret;
+    for(auto size: {std::pair{480,300},std::pair{1200,720},std::pair{760,520}}){
+        pixels.assign(size.first*size.second,0);surface={pixels.data(),size.first,size.second};reveal();render();
+        assert(caret==saved_caret&&std::string(text,length)==overflow);
+        assert(caret_row()>=top_line&&caret_row()<top_line+rows());}
+    key_event('a',1);key_event('c',1);assert(std::string(clip,text_clipboard.get(clip,sizeof(clip)))==overflow);
+    assert(load("/home/wrapped.txt")&&std::string(text,length)==overflow);
+    // Tabs use tab stops, CRLF is preserved, and a final newline has an empty row.
+    request(NEW_DOCUMENT);perform_pending();insert("i\tW\r\n",5);
+    assert(row_x(row_at(0),2)==4*ui_font_glyph(ui_font_for_pixels(EDIT_SIZE),' ')->advance);
+    assert(caret_row()==1&&row_at(1).start==length);key_event(8,0);
+    assert(std::string(text,length)=="i\tW\r"&&caret_row()==0);key_event('z',1);
+    assert(std::string(text,length)=="i\tW\r\n"&&caret_row()==1);
     request(NEW_DOCUMENT);perform_pending();const char* sample="Notes\n\nWelcome to Notepad.\nYour text files can now be edited in WyzarOS.\n\nCtrl+S saves. Ctrl+O opens a file.";
     insert(sample,native_length(sample));
     // Menus use the same commands as shortcuts and suppress editing while open.

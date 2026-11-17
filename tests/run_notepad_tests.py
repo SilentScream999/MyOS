@@ -13,6 +13,11 @@ def main():
                     '-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-I.',
                     'tests/notepad_test.cpp', '-o', str(binary)], cwd=ROOT, check=True)
     subprocess.run([str(binary), str(OUT / 'notepad-host.ppm')], cwd=ROOT, check=True)
+    performance = OUT / 'notepad-performance-test'
+    subprocess.run(['clang++', '-std=c++20', '-O0', '-g', '-no-pie',
+                    '-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-I.',
+                    'tests/notepad_performance_test.cpp', '-o', str(performance)], cwd=ROOT, check=True)
+    subprocess.run([str(performance)], cwd=ROOT, check=True)
     save_png(OUT / 'notepad-host.ppm', OUT / 'notepad-host.png')
     for ppm in OUT.glob('notepad-host.ppm-*.ppm'):
         save_png(ppm, ppm.with_suffix('.png'))
