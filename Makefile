@@ -173,7 +173,7 @@ user/bundle_demo.o: user/bundle_demo.c user/wizlib.h src/core/wiz.h
 bundle_demo.elf: user/bundle_demo.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
-user/explorer.o: user/explorer.cpp user/native_ui.h user/native_text.h user/native_controls.h src/gui/power_icons.h user/wiz_cmd.h src/core/wiz.h src/core/app.h src/gui/ui_font.h src/gui/ui_font_data.h
+user/explorer.o: user/explorer.cpp user/native_ui.h user/native_text.h user/native_controls.h src/gui/window_input.h src/gui/power_icons.h user/wiz_cmd.h src/core/wiz.h src/core/app.h src/gui/ui_font.h src/gui/ui_font_data.h
 	$(CXX) $(USER_CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -I. -c $< -o $@
 
 explorer.elf: user/explorer.o

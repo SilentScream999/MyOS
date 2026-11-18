@@ -40,7 +40,7 @@ static void render(uint64_t win) {
             screen.rect(12+x*CELL_W+gx,40+y*CELL_H+gy,1,1,0xffffffff);}
     screen.rect(0,H-28,W,28,0xff282137);
     if(running)screen.rect(12+col*CELL_W,40+row*CELL_H+8,7,1,0xffbba4f4);
-    char status[96]="Type here. Ctrl+C interrupts only this application.";
+    char status[96]="Ctrl+V: Paste text   Ctrl+C: Interrupt this application";
     if(!running){char n[24];native_number(exit_code,n);native_copy(status,sizeof(status),"Exit code: ");unsigned at=native_length(status);
         for(unsigned i=0;n[i]&&at+1<sizeof(status);++i)status[at++]=n[i];status[at]=0;}
     screen.text(12,H-21,status,0xffb6a7c9,W-12,12);
@@ -66,6 +66,12 @@ extern "C" void _start() {
             if(event.type==5&&running){
                 if((event.mods&1)&&(event.key=='c'||event.key=='C'||event.key==3))native_call(214,4);
                 else if((event.mods&1)&&(event.key=='d'||event.key=='D'))native_call(214,3);
+                else if((event.mods&1)&&(event.key=='v'||event.key=='V')){
+                    char pasted[4096];int64_t count=native_clipboard_get(pasted,sizeof(pasted));
+                    bool valid=count>0;
+                    for(int64_t i=0;i<count;++i)if(pasted[i]<32||pasted[i]>126){valid=false;break;}
+                    if(valid)native_call(214,2,(uint64_t)pasted,count);
+                }
                 else if(event.key<128){char ch=(char)event.key;native_call(214,2,(uint64_t)&ch,1);}
             }
         }

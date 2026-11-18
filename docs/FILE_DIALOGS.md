@@ -5,7 +5,8 @@ native C++ app. It depends only on `native_ui.h` and the filesystem/window ABI;
 it does not depend on Notepad or a running/installed Explorer process. Include
 the header and declare a static `NativeFileDialog` (its bounded listing is too
 large for a small stack). Packages using it must declare `abi=7` or later.
-Ctrl+V pastes shared clipboard text into filename and folder address fields.
+Ctrl+C and Ctrl+X copy or cut selected text in the file-name and folder-address
+fields. Ctrl+V pastes text from the shared clipboard.
 The compact Up and Refresh toolbar buttons use icons and the Explorer border
 style. Refresh shares Start's restart artwork. Hover shows a status hint;
 Alt+Up goes to the parent, Ctrl+R refreshes, and Up is dimmed at the root.

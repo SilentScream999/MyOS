@@ -127,8 +127,6 @@ static inline uint64_t rdmsr(uint32_t msr) {
 #define SYS_TEXT_CLIPBOARD 217u // action 0=set bytes, 1=get NUL-terminated text
 #define SYS_PROCESS_INFO 218u // (ProcessInfo*, capacity<=256, ProcessTotals*, optional ProcessMetadata*)
 #define SYS_KERNEL_CPU 219u // (KernelCpuInfo*); renew PID 0 profiling lease
-#include "text_clipboard.h"
-static TextClipboard g_text_clipboard;
 #define SYS_CHDIR   80u
 #define SYS_MKDIR   83u
 #define SYS_RMDIR   84u
@@ -633,7 +631,10 @@ static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uin
             if(a1>1||!a2||a2>=USERSPACE_END||a3>USERSPACE_END-a2||
                 (a1==0&&a3>TextClipboard::capacity))return (uint64_t)-1;
             TtyIrqGuard guard;
-            return a1==0?g_text_clipboard.set((const char*)a2,a3):g_text_clipboard.get((char*)a2,a3);
+            if(a1==1)return g_text_clipboard.get((char*)a2,a3);
+            int64_t result=g_text_clipboard.set((const char*)a2,a3);
+            if(result==0)wm_clipboard_damage();
+            return result;
         }
         case SYS_KERNEL_CPU: {
             if(!a1 || a1>=USERSPACE_END || sizeof(KernelCpuInfo)>USERSPACE_END-a1)return (uint64_t)-1;

@@ -55,7 +55,7 @@ validate user pointers and revoke live window mappings on teardown. Harden
 loader failure cleanup and add a shared userspace syscall/window library.
 
 The `.wiz` package manager, native File Explorer and Notepad are implemented.
-Next app work includes Unicode text, terminal clipboard integration, configurable file associations, recursive folder copying,
+Next app work includes Unicode text, terminal output selection, configurable file associations, recursive folder copying,
 cross-filesystem moves and trash/undo. See [Explorer](EXPLORER.md),
 [packages](APP_PACKAGES.md) and the [Window API](../APIDocs/WindowAPI.md).
 

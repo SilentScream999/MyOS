@@ -42,7 +42,10 @@ Keyboard events contain ASCII text, or arrows at `0x1041` through `0x1044`
 (Up, Down, Right, Left). Home, End and Delete use `0x1100`, `0x1101`,
 `0x1102` on USB and PS/2 keyboards. Other non-text keys use `0x2000` plus
 the device scancode, so they cannot accidentally insert ASCII text.
-Modifier bits are Ctrl=1, Shift=2, Alt=4, GUI=8.
+Modifier bits are Ctrl=1, Shift=2, Alt=4, GUI=8. The desktop opens Start on
+release of a standalone GUI key. Selecting an entry in Win+V history delivers
+a Ctrl+V key-down with bit 16 set to identify a text paste. Apps with separate
+file and text paste actions can use that bit to route the event to text input.
 
 ## Resizing
 

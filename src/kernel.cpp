@@ -392,6 +392,7 @@ static void setup_pat() {
 uint64_t g_last_frame_ticks = 0;
 
 extern "C" void mouse_process_scroll(int8_t scroll_dy) {
+    if(g_clipboard_open){wm_clipboard_scroll(scroll_dy);return;}
     if (!fb) return;
     int32_t mx = g_mouse_x, my = g_mouse_y;
     int idx = wm_find_top_window(mx, my);
@@ -423,8 +424,10 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
     bool btn_was_held = (g_mouse_prev_buttons & 1);
     bool mouse_press  = btn_held && !btn_was_held;
     bool mouse_release= !btn_held && btn_was_held;
+    static bool clipboard_press=false;
 
     // 1. Move cursor (clamped to screen)
+    auto clipboard_hover=wm_clipboard_hit(g_mouse_x,g_mouse_y);
     g_mouse_x += dx;
     g_mouse_y += dy;
     if (dx != 0 || dy != 0 || buttons != g_mouse_prev_buttons) g_needs_refresh = true;
@@ -433,6 +436,8 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
     if (g_mouse_x >= (int32_t)fb->width)  g_mouse_x = fb->width  - 1;
     if (g_mouse_y < 0) g_mouse_y = 0;
     if (g_mouse_y >= (int32_t)fb->height) g_mouse_y = fb->height - 1;
+    if((dx||dy)&&g_clipboard_open&&clipboard_hover!=wm_clipboard_hit(g_mouse_x,g_mouse_y))
+        wm_clipboard_damage();
 
     // Repaint only when the pointer enters or leaves a title-bar control.
     static int hover_window=-1,hover_control=WINDOW_NO_CONTROL;
@@ -450,7 +455,8 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
     if (g_menu_open && (dx != 0 || dy != 0)) wm_menu_hover_dirty();
 
     // 2. Start drag / Raise / Close / Taskbar: hit-test Z-stack on fresh click
-    if (mouse_press) {
+    if(mouse_press)clipboard_press=wm_clipboard_click(g_mouse_x,g_mouse_y);
+    if (mouse_press && !clipboard_press) {
         int32_t mx = g_mouse_x, my = g_mouse_y;
         
         // Taskbar / Start button
@@ -540,7 +546,7 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
     }
 
     // Secondary buttons go to native clients without starting title/resize drags.
-    for(unsigned button=2;button<=4;button<<=1){
+    for(unsigned button=2;!g_clipboard_open&&button<=4;button<<=1){
         if((g_mouse_buttons&button)==(g_mouse_prev_buttons&button)||g_menu_open)continue;
         int idx=wm_find_top_window(g_mouse_x,g_mouse_y);
         if(idx<0)continue;Window* win=g_window_list[idx];
@@ -577,7 +583,8 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
         }
     }
 
-    if (mouse_release) {
+    if(mouse_release&&clipboard_press)clipboard_press=false;
+    else if (mouse_release) {
         bool dragged = false;
         for (int i = 0; i < g_window_count; i++) {
             Window* win = g_window_list[i];
@@ -614,7 +621,7 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
             }
         }
     }
-    if(dx||dy){int idx=wm_find_top_window(g_mouse_x,g_mouse_y);
+    if((dx||dy)&&!g_clipboard_open){int idx=wm_find_top_window(g_mouse_x,g_mouse_y);
         if(idx>=0){Window* win=g_window_list[idx];
             if(!win->is_system&&!win->ghost_dragging&&!win->resize_edges&&!wm_is_in_title(idx,g_mouse_x,g_mouse_y)){
                 WinEvent ev{};ev.type=WIN_EVENT_MOUSE_MOVE;wm_event_coordinates(win,g_mouse_x,g_mouse_y,&ev);
@@ -1312,6 +1319,7 @@ extern "C" void kmain(void) {
 
 	uint8_t  last_keys[MAX_KEYBOARDS][6];
 	uint8_t  last_mods[MAX_KEYBOARDS];
+	WinKeyTap win_taps[MAX_KEYBOARDS]{};
 	for (int k = 0; k < MAX_KEYBOARDS; k++) {
 		for (int j = 0; j < 6; j++) last_keys[k][j] = 0;
 		last_mods[k] = 0;
@@ -1558,16 +1566,27 @@ extern "C" void kmain(void) {
 						// Razer dongles (4 interfaces) send Battery/DPI data over 
 						// the keyboard channel. We suppress terminal typing for them.
 						if (keyboards[k]->interface_count != 4) {
+							bool other_key_held=false;
+							for(int b=2;b<8;++b)other_key_held|=report[b]!=0;
+							wm_gui_key_update(win_taps[k],wm_hid_modifiers(modifiers),other_key_held);
 							for (int b = 2; b < 8; b++) {
 								uint8_t key = report[b];
 							if (key == 0) continue;
 							if (key_down_at[k][key] == 0) {
+								bool already_held=false;
+								for(uint8_t previous:last_keys[k])already_held|=previous==key;
+								if(already_held)continue;
 								// Fresh press: record TSC time and emit immediately.
 								key_down_at[k][key] = now;
 								bool shift = (modifiers & 0x22u) != 0;
 								uint32_t mods = wm_hid_modifiers(modifiers);
 								g_kbd_modifiers = mods;
 
+								char c = shift ? hid_to_ascii_shift[key] : hid_to_ascii[key];
+								if(wm_clipboard_key(c,key,mods,false)){
+									if(key<0x4F||key>0x52)key_down_at[k][key]=0;
+									continue;
+								}
 								if (key >= 0x4F && key <= 0x52) {
 									Window* focused = wm_find_window(g_focused_win_id);
 									if (focused && focused->is_system && focused->type == WIN_TYPE_TERM) {
@@ -1596,7 +1615,6 @@ extern "C" void kmain(void) {
 										wm_win_push_event(focused, ev);
 									}
 								} else {
-									char c = shift ? hid_to_ascii_shift[key] : hid_to_ascii[key];
 									wm_dispatch_key(c, key, true, mods);
 								}
 							}
@@ -1767,6 +1785,8 @@ extern "C" void kmain(void) {
 							uint32_t mods = wm_hid_modifiers(modifiers);
 							g_kbd_modifiers = mods;
 							
+							char c = shift ? hid_to_ascii_shift[key] : hid_to_ascii[key];
+							if(wm_clipboard_key(c,key,mods,true))continue;
 							if (key >= 0x4F && key <= 0x52) {
 								Window* focused = wm_find_window(g_focused_win_id);
 								if (focused && focused->is_system && focused->type == WIN_TYPE_TERM) {
@@ -1795,7 +1815,6 @@ extern "C" void kmain(void) {
 									wm_win_push_event(focused, ev);
 								}
 							} else {
-								char c = shift ? hid_to_ascii_shift[key] : hid_to_ascii[key];
 								wm_dispatch_key(c, key, true, mods,true);
 							}
 						}

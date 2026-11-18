@@ -61,6 +61,15 @@ int main(int argc,char** argv) {
     assert(kernel_usage.total==3000&&kernel_usage.cpu[KCPU_INTERRUPTS]==1000&&kernel_usage.calls[KCPU_INTERRUPTS]==1000);
     kernel_details=true;render();assert(syncs==2);
     surface={pixels,620,440};scroll=999;clamp_scroll();render();assert(scroll==row_count()-visible_rows());
+    const int widths[]={620,760};
+    for(int width:widths){
+        surface.w=width;kernel_details=false;render();
+        int x=details_x()+DETAILS_WIDTH/2;
+        assert(pixels[(HEADER_Y+HEADER_ROW/2)*width+details_x()+8]==PANEL);
+        handle_event({1,x,HEADER_Y+HEADER_ROW,1,0,0});assert(!kernel_details);
+        handle_event({1,x,HEADER_Y+HEADER_ROW/2,1,0,0});assert(kernel_details&&scroll==0);
+        handle_event({1,x,HEADER_Y+HEADER_ROW/2,1,0,0});assert(!kernel_details);
+    }
     NativeEvent wheel{4,0,0,0,0,100};handle_event(wheel);assert(scroll==0);
     assert(handle_event({7,0,0,0,0,0}));
     kernel_usage.update(-1);assert(kernel_usage.failed&&kernel_usage.total==3000);

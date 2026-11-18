@@ -3,6 +3,7 @@
 #include "user/native_ui.h"
 #include "user/native_text.h"
 #include "user/native_controls.h"
+#include "src/gui/window_input.h"
 #include "src/core/app.h"
 static char current_dir[256]="/home";
 static char operation_log[2048];
@@ -14,7 +15,8 @@ static void print(const char* s) {
 static void print_dec(uint64_t n) { char b[24]; native_number(n,b); print(b); }
 #include "user/wiz_cmd.h"
 
-constexpr int SIDE=164,ROW=34;
+constexpr int SIDE=164,ROW=34,ADDRESS_X=156,ADDRESS_Y=12,ADDRESS_H=30,
+    ADDRESS_TEXT_X=168,DIALOG_TEXT_INSET=30;
 static int WIDTH=860,HEIGHT=560,LIST_TOP=138,VISIBLE=11,place_step=43;
 constexpr uint32_t BG=0xff1a1925, PANEL=0xff222131, LINE=0xff39334b,
     INK=0xffeeebf8, MUTED=0xffa49bb6, BLUE=0xffc9b5ff;
@@ -30,10 +32,11 @@ enum Dialog { NONE, NEW_FOLDER, RENAME, DELETE_ITEM, PREVIEW, PACKAGE_RESULT, NE
 static Dialog dialog=NONE;
 static bool address_edit=false, edit_replace=false;
 static NativeTextInput address_input,dialog_input;
+static bool field_dirty=false,painted_address_edit=false;
 static char address[256]="/home";
 static uint64_t window_id=0, frame=0, last_click_frame=0;
 static int last_click=-1;
-static int hovered_button=-1;
+static int hovered_button=-1,painted_hovered_button=-1;
 static NativeSurface surface{};
 static bool context_open=false;
 static int context_x=0,context_y=0;
@@ -152,6 +155,7 @@ static void begin_dialog(Dialog kind) {
     if(kind==RENAME)native_copy(edit_text,sizeof(edit_text),entries[selected].name);
     if(kind==NEW_FOLDER)native_copy(edit_text,sizeof(edit_text),"New folder");
     if(kind==NEW_FILE)native_copy(edit_text,sizeof(edit_text),"New file.txt");
+    dialog_input.first=0;dialog_input.cursor.reset((unsigned)frame);
     edit_replace=true;address_edit=false;dialog=kind;dirty=true;
 }
 static bool valid_filename(const char* name) {
@@ -294,13 +298,50 @@ static void multiline(const char* text,int x,int y,int width,int rows) {
         if(c=='\t')c=' ';line[used++]=c<32||c>126?'?':c;pixels+=ui_font_glyph(font,c)->advance;
     }
 }
+static bool editing_dialog(){
+    return dialog==NEW_FOLDER||dialog==NEW_FILE||dialog==RENAME;
+}
+static void draw_address(bool chrome,uint64_t present=0){
+    int width=WIDTH-18-ADDRESS_X;
+    uint32_t fill=address_edit?0xff58416f:0xff15131e;
+    if(chrome){
+        surface.rect(ADDRESS_X,ADDRESS_Y,width,ADDRESS_H,PANEL);
+        surface.rounded(ADDRESS_X,ADDRESS_Y,width,ADDRESS_H,6,fill);
+    }
+    if(address_edit)address_input.draw(surface,ADDRESS_TEXT_X,18,WIDTH-30,address,edit_replace,14,INK,fill,chrome?0:present);
+    else surface.text(ADDRESS_TEXT_X,18,address,INK,WIDTH-30);
+    if(chrome&&present)native_call(204,present,ADDRESS_X,ADDRESS_Y,width,ADDRESS_H);
+    painted_address_edit=address_edit;
+}
+static void draw_dialog_field(uint64_t present=0){
+    int left=(WIDTH-480)/2,top=(HEIGHT-202)/2;
+    dialog_input.draw(surface,left+DIALOG_TEXT_INSET,top+65,left+450,edit_text,edit_replace,14,BLUE,0xff111925,present);
+}
+static void draw_status(){
+    surface.rect(0,HEIGHT-36,WIDTH,36,PANEL);
+    surface.text(14,HEIGHT-25,hovered_button>=0&&hovered_button<4?buttons[hovered_button].label:status_line,
+                 MUTED,WIDTH-12,12);
+}
+static void repaint_hover(){
+    const int changed[]={painted_hovered_button,hovered_button};
+    for(int id:changed){
+        if(id<0)continue;
+        const Button& b=buttons[id];
+        surface.rect(b.x,b.y,b.w,b.h,id<4?PANEL:BG);
+        draw_button(b,id==13&&show_hidden,id);
+        native_call(204,window_id,b.x,b.y,b.w,b.h);
+    }
+    if((painted_hovered_button>=0&&painted_hovered_button<4)||(hovered_button>=0&&hovered_button<4)){
+        draw_status();
+        native_call(204,window_id,0,HEIGHT-36,WIDTH,36);
+    }
+    painted_hovered_button=hovered_button;
+}
 static void render() {
     surface.rect(0,0,WIDTH,HEIGHT,BG);surface.rect(0,0,WIDTH,52,PANEL);
     surface.rect(0,52,SIDE,HEIGHT-52,PANEL);surface.rect(SIDE,52,1,HEIGHT-52,LINE);
     for(int i=0;i<14;++i)draw_button(buttons[i],i==13&&show_hidden,i);
-    surface.rounded(156,12,WIDTH-174,30,6,address_edit?0xff58416f:0xff15131e);
-    if(address_edit)address_input.draw(surface,168,18,WIDTH-30,address,edit_replace,14,INK);
-    else surface.text(168,18,address,INK,WIDTH-30);
+    draw_address(true);
     surface.text(16,72,"PLACES",MUTED,150,12);
     const char* labels[]={"Home","Applications","App samples","Installed apps","System","Devices"};
     const char* paths[]={"/home","/home/Applications","/share/samples","/apps","/","/mnt"};
@@ -330,8 +371,7 @@ static void render() {
         listing_error?"This folder could not be read.":"This folder is empty.",MUTED,16);
     if(entry_count>VISIBLE){int track=VISIBLE*ROW,thumb=track*VISIBLE/entry_count;if(thumb<20)thumb=20;
         surface.rect(WIDTH-10,LIST_TOP,4,track,LINE);surface.rect(WIDTH-10,LIST_TOP+(track-thumb)*scroll_row/(entry_count-VISIBLE),4,thumb,0xff6486b2);}
-    surface.rect(0,HEIGHT-36,WIDTH,36,PANEL);surface.text(14,HEIGHT-25,
-        hovered_button>=0&&hovered_button<4?buttons[hovered_button].label:status_line,MUTED,WIDTH-12,12);
+    draw_status();
     if(context_open) {
         const char* labels[]={"Open","Open with...","Copy","Cut","Copy as path","Rename","Delete"};
         surface.rounded(context_x+3,context_y+3,180,CONTEXT_HEIGHT,6,0xff0c1019);
@@ -356,13 +396,13 @@ static void render() {
         surface.text(left+22,top+16,title,INK,left+458,18);
         if(reading)multiline(dialog_text,left+22,top+55,434,(height-110)/20);
         else if(dialog==DELETE_ITEM){multiline(dialog_target,left+22,top+54,434,2);surface.text(left+22,top+104,"Files and empty folders only. This cannot be undone.",MUTED,left+458,12);}
-        else {surface.rect(left+20,top+57,438,34,0xff111925);dialog_input.draw(surface,left+30,top+65,left+450,edit_text,edit_replace,14,BLUE);}
+        else {surface.rect(left+20,top+57,438,34,0xff111925);draw_dialog_field();}
         int bottom=top+height-44;
         draw_button({left+(reading?372:266),bottom,90,30,reading?"Close":"Cancel"});
         if(!reading)draw_button({left+366,bottom,92,30,dialog==DELETE_ITEM?"Delete":"Save"},true);
         if(!reading)surface.text(left+22,top+height-74,status_line,MUTED,left+457,12);
     }
-    native_call(201,window_id);dirty=false;
+    native_call(201,window_id);dirty=false;field_dirty=false;painted_hovered_button=hovered_button;
 }
 static void button_action(int id) {
     address_edit=false;
@@ -373,38 +413,36 @@ static void button_action(int id) {
     case 12:package_action(false);break;case 13:show_hidden=!show_hidden;load_directory();break;}dirty=true;
 }
 static void edit_key(char* buffer,unsigned capacity,uint32_t key,uint32_t mods=0) {
-    if((mods&1)&&(key=='a'||key=='A'))edit_replace=true;
-    else if(!(mods&5))(address_edit?address_input:dialog_input).key(buffer,capacity,key,edit_replace,(unsigned)frame);
-    dirty=true;
+    if((address_edit?address_input:dialog_input).key(buffer,capacity,key,edit_replace,(unsigned)frame,mods))
+        field_dirty=true;
 }
 static void paste_text(char* buffer,unsigned capacity){
     char value[256];int64_t n=native_clipboard_get(value,sizeof(value));
     if(n<0){status("Clipboard text is too long or unavailable.");return;}
     for(int64_t i=0;i<n;++i)if((unsigned char)value[i]<32){status("Paste a single path or name.");return;}
     if(!(address_edit?address_input:dialog_input).insert(buffer,capacity,value,(unsigned)n,edit_replace,(unsigned)frame)){
-        status("The pasted text is too long.");return;}dirty=true;
+        status("The pasted text is too long.");return;}field_dirty=true;
 }
 static void handle_event(const NativeEvent& event) {
-    if(event.type==5||event.type==1){address_input.cursor.reset((unsigned)frame);dialog_input.cursor.reset((unsigned)frame);dirty=true;}
     if(event.type==8){context_open=false;if(native_accept_resize(window_id,surface))layout(surface.w,surface.h);return;}
     if(event.type==3){int next=-1;if(dialog==NONE)for(int i=0;i<14;++i)
             if(hit(event.x,event.y,buttons[i].x,buttons[i].y,buttons[i].w,buttons[i].h)){next=i;break;}
-        if(next!=hovered_button){hovered_button=next;dirty=true;}return;}
+        if(next!=hovered_button){hovered_button=next;if(dialog!=NONE||context_open)dirty=true;}return;}
     if(event.type==5) {
         uint32_t key=event.key;
         if(context_open){context_open=false;dirty=true;if(key==27)return;}
         if(dialog==OPEN_WITH){if(key==27){dialog=NONE;dirty=true;}else if(key=='i'||key=='I')open_with_viewer();else if(key=='\n'||key=='\r'){if(image_document(entries[selected].name))open_with_viewer();else open_with_notepad();}return;}
         if(dialog!=NONE){if(key==27){dialog=NONE;dirty=true;}else if(key=='\n'||key=='\r')commit_dialog();
-            else if(dialog==NEW_FOLDER||dialog==NEW_FILE||dialog==RENAME){
+            else if(editing_dialog()){
                 if((event.mods&1)&&(key=='v'||key=='V'))paste_text(edit_text,sizeof(edit_text));else edit_key(edit_text,sizeof(edit_text),key,event.mods);}return;}
-        if(address_edit){if(key==27){address_edit=false;native_copy(address,sizeof(address),current_dir);dirty=true;}
+        if(address_edit){if(key==27){address_edit=false;native_copy(address,sizeof(address),current_dir);field_dirty=true;}
             else if(key=='\n'||key=='\r')navigate(address);else if((event.mods&1)&&(key=='v'||key=='V'))paste_text(address,sizeof(address));
             else edit_key(address,sizeof(address),key,event.mods);return;}
         if((event.mods&3)==3&&(key=='c'||key=='C'))copy_as_path();
         else if((event.mods&1)&&(key=='c'||key=='C'))copy_selection(false);
         else if((event.mods&1)&&(key=='x'||key=='X'))copy_selection(true);
-        else if((event.mods&1)&&(key=='v'||key=='V'))paste_selection();
-        else if((event.mods&1)&&(key=='l'||key=='L')){address_edit=true;edit_replace=true;dirty=true;}
+        else if((event.mods&1)&&!(event.mods&WIN_MOD_TEXT_PASTE)&&(key=='v'||key=='V'))paste_selection();
+        else if((event.mods&1)&&(key=='l'||key=='L')){address_edit=true;edit_replace=true;address_input.cursor.reset((unsigned)frame);field_dirty=true;}
         else if((event.mods&4)&&key==0x1044)history_step(-1);
         else if((event.mods&4)&&key==0x1043)history_step(1);
         else if(key==0x1041)select_row(selected<0?0:selected-1);
@@ -432,13 +470,19 @@ static void handle_event(const NativeEvent& event) {
             else if(hit(x,y,left+366,top+158,92,30)){dialog=NONE;dirty=true;}return;}
         if(dialog!=NONE){bool reading=dialog==PREVIEW||dialog==PACKAGE_RESULT;int h=reading?380:202;if(h>HEIGHT-40)h=HEIGHT-40;
             int top=(HEIGHT-h)/2,left=(WIDTH-480)/2;
+            if(editing_dialog()&&hit(x,y,left+20,top+57,438,34)){
+                int offset=(x<left+450?x:left+449)-left-DIALOG_TEXT_INSET;
+                dialog_input.click(edit_text,edit_replace,offset,14,(unsigned)frame,true,event.mods);field_dirty=true;return;}
             if(hit(x,y,left+(reading?372:266),top+h-44,90,30)){dialog=NONE;dirty=true;}
             else if(!reading&&hit(x,y,left+366,top+h-44,92,30))commit_dialog();return;}
-        if(hit(x,y,156,12,WIDTH-174,30)){address_edit=true;edit_replace=true;dirty=true;return;}
+        if(hit(x,y,ADDRESS_X,ADDRESS_Y,WIDTH-18-ADDRESS_X,ADDRESS_H)){
+            int offset=(x<WIDTH-30?x:WIDTH-31)-ADDRESS_TEXT_X;
+            address_input.click(address,edit_replace,offset,14,(unsigned)frame,address_edit,event.mods);
+            address_edit=true;field_dirty=true;return;}
         for(int i=0;i<14;++i)if(hit(x,y,buttons[i].x,buttons[i].y,buttons[i].w,buttons[i].h)){if(button_enabled(i))button_action(i);return;}
         const char* paths[]={"/home","/home/Applications","/share/samples","/apps","/","/mnt"};
         for(int i=0;i<6;++i)if(hit(x,y,8,101+i*place_step,148,36)){navigate(paths[i]);return;}
-        address_edit=false;
+        if(address_edit){address_edit=false;field_dirty=true;}
         if(hit(x,y,SIDE,LIST_TOP,WIDTH-SIDE,VISIBLE*ROW)){int index=scroll_row+(y-LIST_TOP)/ROW;
             if(index<entry_count){bool twice=last_click==index&&frame-last_click_frame<=30;selected=index;
                 last_click=index;last_click_frame=frame;dirty=true;
@@ -447,9 +491,15 @@ static void handle_event(const NativeEvent& event) {
     }
 }
 static void render_frame(){
-    if(address_input.cursor.animate(surface,window_id,(unsigned)frame,address_edit,dirty))dirty=true;
-    if(dialog_input.cursor.animate(surface,window_id,(unsigned)frame,dialog==NEW_FOLDER||dialog==NEW_FILE||dialog==RENAME,dirty))dirty=true;
-    if(dirty)render();
+    if(address_input.cursor.animate(surface,window_id,(unsigned)frame,address_edit,dirty||field_dirty))dirty=true;
+    if(dialog_input.cursor.animate(surface,window_id,(unsigned)frame,editing_dialog(),dirty||field_dirty))dirty=true;
+    if(dirty){render();return;}
+    if(field_dirty){
+        if(editing_dialog())draw_dialog_field(window_id);
+        else draw_address(!address_edit||!painted_address_edit,window_id);
+        field_dirty=false;
+    }
+    if(hovered_button!=painted_hovered_button)repaint_hover();
 }
 #ifndef NATIVE_HOST_TEST
 extern "C" void _start() {

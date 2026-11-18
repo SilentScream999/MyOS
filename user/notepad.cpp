@@ -300,6 +300,11 @@ static void key_event(uint32_t key,uint32_t mods){
         return;}
     if(ctrl&&key==0x1100){caret=0;if(!shift)anchor=caret;reveal();return;}
     if(ctrl&&key==0x1101){caret=length;if(!shift)anchor=caret;reveal();return;}
+    if(ctrl&&(key==0x1043||key==0x1044)){
+        caret=native_word_edge(text,length,caret,key==0x1043);
+        if(!shift)anchor=caret;
+        reveal();return;
+    }
     if(ctrl){
         if(key=='s'||key=='S')save(shift);
         else if(key=='o'||key=='O')request(OPEN_DOCUMENT);

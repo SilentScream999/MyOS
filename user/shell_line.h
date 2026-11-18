@@ -12,4 +12,11 @@ static int shell_line_backspace(char* text,int* length,int* cursor){
     for(int i=*cursor;i<=*length;++i)text[i]=text[i+1];
     return 1;
 }
+static int shell_line_paste(char* text,int capacity,int* length,int* cursor,const char* value,int count){
+    if(count<=0||count>=capacity-*length)return 0;
+    for(int i=0;i<count;++i)if(value[i]<32||value[i]>126)return 0;
+    for(int i=*length;i>=*cursor;--i)text[i+count]=text[i];
+    for(int i=0;i<count;++i)text[*cursor+i]=value[i];
+    *cursor+=count;*length+=count;return 1;
+}
 #endif

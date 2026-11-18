@@ -11,6 +11,8 @@ static int scroll=0;
 static bool dirty=true;
 constexpr uint32_t BG=0xff1a1925,PANEL=0xff2b273b,INK=0xffeeebf8,MUTED=0xffa49bb6,LINE=0xff39334b;
 constexpr int TABLE_TOP=220,LIST_TOP=254,ROW_HEIGHT=30;
+constexpr int INSET=20,HEADER_Y=12,HEADER_ROW=32,DETAILS_WIDTH=152;
+static int details_x(){return surface.w-INSET-DETAILS_WIDTH;}
 
 static void percent(uint32_t tenths,char* out) {
     native_number(tenths/10,out);unsigned n=native_length(out);
@@ -34,9 +36,18 @@ static void toggle_details(){
     if(kernel_details)kernel_usage.update((int64_t)native_call(219,(uint64_t)&kernel_usage.incoming));
 }
 static void render_graph() {
-    surface.rounded(20,84,surface.w-40,124,6,0xff211e30);
-    surface.text(32,93,"Core 0 - CPU history",INK,0,12);
-    int left=32,top=116,width=surface.w-104,height=62,bottom=top+height;
+    constexpr int panel_top=84,top=120,bottom=178,left=INSET+12;
+    constexpr int title_mid=(panel_top+top)/2;
+    int width=surface.w-104,height=bottom-top;
+    surface.rounded(INSET,panel_top,surface.w-2*INSET,124,6,0xff211e30);
+    const UiFont* label_font=ui_font_for_pixels(14);
+    const UiFont* core_font=ui_font_for_pixels(12);
+    const UiFont* value_font=ui_font_for_pixels(20);
+    surface.text(left,title_mid-label_font->height/2,"CPU usage",INK);
+    int core_x=left+ui_text_width(label_font,"CPU usage")+12;
+    surface.text(core_x,title_mid-core_font->height/2,"Core 0",MUTED,0,12);
+    char value[32];percent(usage.total_cpu,value);
+    surface.text(surface.w-left-ui_text_width(value_font,value),title_mid-value_font->height/2,value,INK,0,20);
     for(int row=0;row<=2;++row)surface.rect(left,top+row*height/2,width,1,LINE);
     for(int col=0;col<=6;++col)surface.rect(left+col*(width-1)/6,top,1,height+1,LINE);
     surface.text(left+width+8,top-5,"100%",MUTED,0,12);
@@ -106,12 +117,11 @@ static void render_kernel() {
 }
 static void render() {
     surface.rect(0,0,surface.w,surface.h,BG);
-    surface.text(20,16,"Task Manager",INK,0,20);
-    char value[32];percent(usage.total_cpu,value);
-    surface.text(surface.w-185,20,"Core 0",MUTED);surface.text(surface.w-113,18,value,INK,0,20);
-    surface.text(20,51,kernel_details?"Live breakdown of Kernel / Input CPU time":"Live processes - sorted by CPU within each section",MUTED,surface.w-186,12);
-    surface.rounded(surface.w-172,45,152,28,5,PANEL);
-    surface.centered_text(surface.w-172,45,152,28,kernel_details?"Processes (P)":"Kernel details (K)",INK,12);
+    int title_y=HEADER_Y+(HEADER_ROW-ui_font_for_pixels(20)->height)/2;
+    surface.text(INSET,title_y,"Task Manager",INK,0,20);
+    surface.text(INSET,51,kernel_details?"Live breakdown of Kernel / Input CPU time":"Live processes - sorted by CPU within each section",MUTED,surface.w-INSET,12);
+    surface.rounded(details_x(),HEADER_Y,DETAILS_WIDTH,HEADER_ROW,5,PANEL);
+    surface.centered_text(details_x(),HEADER_Y,DETAILS_WIDTH,HEADER_ROW,kernel_details?"Processes (P)":"Kernel details (K)",INK,12);
     render_graph();if(kernel_details)render_kernel();else render_programs();
     if(row_count()>visible_rows()) {
         int track=visible_rows()*ROW_HEIGHT,thumb=track*visible_rows()/row_count();if(thumb<18)thumb=18;
@@ -131,7 +141,7 @@ static bool handle_event(const NativeEvent& e) {
     if(e.type==7)return true;
     if(e.type==8&&native_accept_resize(window_id,surface)){clamp_scroll();dirty=true;}
     if(e.type==4){scroll-=e.delta*3;clamp_scroll();dirty=true;}
-    if((e.type==1&&e.key==1&&e.y>=45&&e.y<73&&e.x>=surface.w-172&&e.x<surface.w-20) ||
+    if((e.type==1&&e.key==1&&e.y>=HEADER_Y&&e.y<HEADER_Y+HEADER_ROW&&e.x>=details_x()&&e.x<details_x()+DETAILS_WIDTH) ||
        (e.type==5&&((!kernel_details&&(e.key=='k'||e.key=='K'))||(kernel_details&&(e.key=='p'||e.key=='P')))))toggle_details();
     else if(!kernel_details&&e.type==1&&e.key==1&&e.y>=LIST_TOP&&e.y<LIST_TOP+visible_rows()*ROW_HEIGHT) {
         int row=scroll+(e.y-LIST_TOP)/ROW_HEIGHT;

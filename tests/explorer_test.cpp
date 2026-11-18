@@ -21,6 +21,7 @@ static fs::path sandbox;
 static bool write_failure=false;
 static unsigned spawned=0,presents=0;
 static unsigned partial_presents=0;
+static uint64_t damage_x,damage_y,damage_w,damage_h;
 static std::string opened_document,opened_app;
 static bool launch_failure=false;
 static std::string resolve(uint64_t value) { return sandbox.string()+(const char*)value; }
@@ -62,7 +63,8 @@ static uint64_t native_call(uint64_t n,uint64_t a,uint64_t b,uint64_t c,uint64_t
     case 87:return unlink(resolve(a).c_str());
     case 138:{std::ofstream out(resolve(a),std::ios::binary);out.write((const char*)b,c);return out?0:-1;}
     case 201:++presents;return 0;
-    case 204:assert(d==1&&e<=64&&b<(uint64_t)surface.w&&c+e<=(uint64_t)surface.h);++partial_presents;return 0;
+    case 204:assert(d>0&&e>0&&b+d<=(uint64_t)surface.w&&c+e<=(uint64_t)surface.h);
+        damage_x=b;damage_y=c;damage_w=d;damage_h=e;++partial_presents;return 0;
     default:return -1;
     }
 }
@@ -121,14 +123,19 @@ int main(int argc,char** argv) {
     // Path text is shared independently of file-copy state, including spaces.
     choose("zeta.txt");copy_selection(false);std::string file_copy=clipboard;
     handle_event({1,250,LIST_TOP+selected*ROW+8,2,0,0});assert(context_open);
-    handle_event({1,context_x+25,context_y+6+4*31+12,1,0,0});assert(!context_open&&!strcmp(text_clipboard.bytes,"/home/zeta.txt"));
+    handle_event({1,context_x+25,context_y+6+4*31+12,1,0,0});assert(!context_open&&!strcmp(text_clipboard.data(),"/home/zeta.txt"));
     assert(file_copy==clipboard&&!clipboard_cut);
-    choose("destination");handle_event({5,0,0,'C',3,0});assert(!strcmp(text_clipboard.bytes,"/home/destination"));
-    handle_event({5,0,0,'l',1,0});handle_event({5,0,0,'v',1,0});assert(!strcmp(address,"/home/destination"));
+    choose("destination");handle_event({5,0,0,'C',3,0});assert(!strcmp(text_clipboard.data(),"/home/destination"));
+    assert(navigate("/home/destination"));
+    handle_event({5,0,0,'v',WIN_MOD_CTRL|WIN_MOD_TEXT_PASTE,0});
+    assert(!fs::exists(sandbox/"home/destination/zeta.txt"));
+    assert(navigate("/home"));
+    handle_event({5,0,0,'l',1,0});handle_event({5,0,0,'v',WIN_MOD_CTRL|WIN_MOD_TEXT_PASTE,0});
+    assert(!strcmp(address,"/home/destination"));
     handle_event({5,0,0,27,0,0});
     put("/home/name with spaces.txt","");load_directory();choose("name with spaces.txt");copy_as_path();
-    assert(!strcmp(text_clipboard.bytes,"/home/name with spaces.txt"));
-    selected=-1;copy_as_path();assert(!strcmp(text_clipboard.bytes,"/home/name with spaces.txt"));
+    assert(!strcmp(text_clipboard.data(),"/home/name with spaces.txt"));
+    selected=-1;copy_as_path();assert(!strcmp(text_clipboard.data(),"/home/name with spaces.txt"));
     show_hidden=true;load_directory();choose(".hidden");show_hidden=false;load_directory();
     fs::create_directories(sandbox/"many");for(int i=0;i<513;++i)put(("/many/file"+std::to_string(i)).c_str(),"");
     navigate("/many");assert(entry_count==512&&listing_truncated);select_row(511);assert(scroll_row==501);
@@ -156,14 +163,58 @@ int main(int argc,char** argv) {
     handle_event({5,0,0,'a',1,0});handle_event({5,0,0,'Z',0,0});assert(!strcmp(address,"Z"));
     // Clicking the address bar and leaving it idle must not redraw Explorer
     // on each caret blink. The live loop uses the same render_frame function.
-    frame=100;handle_event({1,220,24,1,0,0});render_frame();
+    window_id=1;
+    int first_glyph=ui_font_glyph(ui_font_for_pixels(14),'a')->advance;
+    address_edit=false;native_copy(address,sizeof(address),"abcd");render();
+    auto repaint=[&](NativeEvent event,uint64_t x,uint64_t y,uint64_t w,uint64_t h){
+        auto before=pixels;
+        unsigned full=presents,partial=partial_presents;
+        handle_event(event);render_frame();
+        assert(presents==full&&partial_presents==partial+1);
+        assert(damage_x==x&&damage_y==y&&damage_w==w&&damage_h==h);
+        assert(pixels!=before);
+        for(unsigned i=0;i<pixels.size();++i)
+            if(i%WIDTH<x||i%WIDTH>=x+w||i/WIDTH<y||i/WIDTH>=y+h)assert(pixels[i]==before[i]);
+    };
+    uint64_t address_w=WIDTH-18-ADDRESS_X;
+    uint64_t text_h=ui_font_for_pixels(14)->height;
+    repaint({1,ADDRESS_TEXT_X+first_glyph,24,1,0,0},ADDRESS_X,ADDRESS_Y,address_w,ADDRESS_H);
+    assert(address_edit&&address_input.position==1&&address_input.anchor==1);
+    handle_event({5,0,0,'X',0,0});render_frame();assert(!strcmp(address,"aXbcd"));
+    repaint({1,ADDRESS_TEXT_X,24,1,0,0},ADDRESS_TEXT_X,18,WIDTH-30-ADDRESS_TEXT_X,text_h);
+    frame=100;repaint({1,220,24,1,0,0},ADDRESS_TEXT_X,18,WIDTH-30-ADDRESS_TEXT_X,text_h);
+    assert(address_input.position==5);
     unsigned full_before=presents,partial_before=partial_presents;auto visible_pixels=pixels;
     for(frame=101;frame<=160;++frame)render_frame();
     assert(!dirty&&presents==full_before&&partial_presents==partial_before+2);
     assert(pixels==visible_pixels);
-    handle_event({5,0,0,27,0,0});render_frame();
+    assert(damage_w==1);
+    auto edit_frame=[&](uint32_t key,uint32_t mods,uint64_t x,uint64_t y,uint64_t w){
+        repaint({5,0,0,key,mods,0},x,y,w,text_h);
+    };
+    edit_frame('q',0,168,18,WIDTH-30-168);assert(!strcmp(address,"aXbcdq"));
+    edit_frame(0x1044,2,168,18,WIDTH-30-168);
+    handle_event({5,0,0,'c',1,0});assert(!strcmp(text_clipboard.data(),"q"));
+    edit_frame('x',1,168,18,WIDTH-30-168);assert(!strcmp(address,"aXbcd"));
+    full_before=presents;partial_before=partial_presents;
+    handle_event({5,0,0,0x203a,0,0});render_frame();
+    assert(presents==full_before&&partial_presents==partial_before);
+    repaint({5,0,0,27,0,0},ADDRESS_X,ADDRESS_Y,address_w,ADDRESS_H);
+    // Moving from a toolbar button and clicking the address bar in one frame
+    // updates the former button, its status hint, and the newly focused field.
+    handle_event({3,130,26,0,0,0});render_frame();
+    full_before=presents;partial_before=partial_presents;
+    handle_event({3,220,24,0,0,0});handle_event({1,220,24,1,0,0});render_frame();
+    assert(presents==full_before&&partial_presents==partial_before+3);
+    auto partial_pixels=pixels;render();assert(pixels==partial_pixels);
+    repaint({5,0,0,27,0,0},ADDRESS_X,ADDRESS_Y,address_w,ADDRESS_H);
     full_before=presents;partial_before=partial_presents;
     for(;frame<221;++frame)render_frame();
     assert(presents==full_before&&partial_presents==partial_before);
+    begin_dialog(NEW_FOLDER);render_frame();
+    edit_frame('n',0,(WIDTH-480)/2+30,(HEIGHT-202)/2+65,420);assert(!strcmp(edit_text,"n"));
+    repaint({1,(WIDTH-480)/2+DIALOG_TEXT_INSET,(HEIGHT-202)/2+68,1,0,0},
+            (WIDTH-480)/2+DIALOG_TEXT_INSET,(HEIGHT-202)/2+65,420,text_h);
+    edit_frame('i',0,(WIDTH-480)/2+30,(HEIGHT-202)/2+65,420);assert(!strcmp(edit_text,"in"));
     puts("Explorer navigation, sorting, dialogs, copy failure, moves, detached launch, limits and rendering passed");
 }

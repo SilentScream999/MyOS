@@ -48,7 +48,7 @@ try:
     # Window creation places it on top; clicking its button also gives it input
     # focus, as a user would, before testing the keyboard return shortcut.
     for _ in range(40):
-        dx=804-value('g_mouse_x',4);dy=158-value('g_mouse_y',4)
+        dx=804-value('g_mouse_x',4);dy=128-value('g_mouse_y',4)
         if not dx and not dy:break
         q.monitor(f'mouse_move {max(-100,min(100,dx))} {max(-100,min(100,dy))}');time.sleep(.1)
     q.monitor('mouse_button 1');time.sleep(.1);q.monitor('mouse_button 0');time.sleep(2)

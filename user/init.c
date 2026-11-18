@@ -102,6 +102,11 @@ static inline int64_t sys_take_launch(char* path, uint64_t capacity) {
     __asm__ volatile("syscall" : "=a"(result) : "a"(20UL), "D"(path), "S"(capacity) : "rcx", "r11", "memory");
     return result;
 }
+static inline int64_t sys_clipboard(uint64_t action,void* buffer,uint64_t size) {
+    int64_t result;
+    __asm__ volatile("syscall" : "=a"(result) : "a"(217UL), "D"(action), "S"(buffer), "d"(size) : "rcx", "r11", "memory");
+    return result;
+}
 
 static inline int64_t sys_readdir(const char* path, uint64_t index, char* name_out, uint64_t* size_out, uint64_t* type_out) {
     int64_t ret;
@@ -318,6 +323,7 @@ void _start() {
     print("Welcome to WyzarOS Interactive Terminal!\n");
     print("Shift + Up/Down: Hardware Scrollback\n");
     print("Up/Down: Command History\n");
+    print("Ctrl+Shift+C: Copy command   Ctrl+V: Paste text\n");
     print("Type 'help' for available commands\n");
     print("----------------------------------------\n");
 
@@ -356,6 +362,13 @@ void _start() {
                 buf[pos] = '\0';
                 print("\x1b[0m\n");  // reset color, newline
                 break;
+            } else if(c==3) {
+                if(pos)sys_clipboard(0,buf,pos);
+            } else if(c==22) {
+                char pasted[sizeof(buf)];
+                int64_t count=sys_clipboard(1,pasted,sizeof(pasted));
+                if(count>0&&shell_line_paste(buf,sizeof(buf),&pos,&cursor,pasted,(int)count))
+                    redraw_line(buf,pos,cursor);
             } else if (c == '\b' || c == 127) {
                 if (shell_line_backspace(buf,&pos,&cursor)) {
                     redraw_line(buf, pos, cursor);

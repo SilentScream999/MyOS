@@ -17,10 +17,13 @@
 #include "truetype.h"
 #include "resources.h"
 #include "window_resize.h"
+#include "window_input.h"
 #include "window_decorations.h"
 #include "window_overlay.h"
 #include "overlay_renderer.h"
 #include "power_icons.h"
+#include "clipboard_icons.h"
+#include "text_clipboard.h"
 
 void* image_allocate(uint64_t size) { return kmalloc(size); }
 void image_deallocate(void* pointer) { kfree(pointer); }
@@ -122,10 +125,6 @@ static char* hud_put_ms1(char* sp, uint64_t ticks) {
     return sp;
 }
 
-#define WIN_MOD_CTRL  (1u << 0)
-#define WIN_MOD_SHIFT (1u << 1)
-#define WIN_MOD_ALT   (1u << 2)
-#define WIN_MOD_GUI   (1u << 3)
 static uint32_t wm_hid_modifiers(uint8_t bits) {
     return ((bits&0x11)?WIN_MOD_CTRL:0)|((bits&0x22)?WIN_MOD_SHIFT:0)|
            ((bits&0x44)?WIN_MOD_ALT:0)|((bits&0x88)?WIN_MOD_GUI:0);
@@ -426,6 +425,156 @@ static inline void wm_menu_close() {
 static inline void wm_menu_hover_dirty() {
     if (!g_menu_open) return;
     wm_menu_dirty_rect();
+}
+
+static TextClipboard g_text_clipboard;
+static bool g_clipboard_open=false;
+static int g_clipboard_selected=0,g_clipboard_first=0,g_clipboard_target=-1;
+static constexpr int CLIPBOARD_HEADER=40,CLIPBOARD_ROW=68,CLIPBOARD_FOOTER=32,
+    CLIPBOARD_PAD=10,CLIPBOARD_GAP=6,CLIPBOARD_VISIBLE_ROWS=4,
+    CLIPBOARD_CLEAR_WIDTH=116,CLIPBOARD_ACTION_WIDTH=32,CLIPBOARD_ACTION_HEIGHT=23,
+    CLIPBOARD_PIN_TOP=6,CLIPBOARD_DELETE_TOP=33;
+struct ClipboardPanel {
+    int x,y,w,h,rows;
+    bool scrollable;
+    int list_top()const{return y+CLIPBOARD_HEADER+CLIPBOARD_PAD;}
+    int card_right()const{return x+w-CLIPBOARD_PAD-(scrollable?8:0);}
+    int action_left()const{return card_right()-8-CLIPBOARD_ACTION_WIDTH;}
+    int clear_left()const{return x+w-6-CLIPBOARD_CLEAR_WIDTH;}
+};
+static ClipboardPanel wm_clipboard_panel(){
+    int w=(int)fb->width-16;if(w>440)w=440;
+    int available=(int)fb->height-(int)g_taskbar_h-16-CLIPBOARD_HEADER-CLIPBOARD_FOOTER-2*CLIPBOARD_PAD;
+    int rows=available/CLIPBOARD_ROW;
+    int count=g_text_clipboard.history_size();
+    if(rows>count)rows=count;
+    if(rows<1)rows=1;
+    if(rows>CLIPBOARD_VISIBLE_ROWS)rows=CLIPBOARD_VISIBLE_ROWS;
+    int h=CLIPBOARD_HEADER+2*CLIPBOARD_PAD+rows*CLIPBOARD_ROW+CLIPBOARD_FOOTER;
+    return {(int)fb->width-w-8,(int)fb->height-(int)g_taskbar_h-h-8,w,h,rows,count>rows};
+}
+static void wm_clipboard_damage(){
+    if(!fb||!g_clipboard_open)return;
+    auto p=wm_clipboard_panel();
+    wm_dirty_add(p.x,p.x+p.w-1,p.y,p.y+p.h-1);
+    g_needs_refresh=true;
+}
+static void wm_clipboard_close(){
+    wm_clipboard_damage();
+    g_clipboard_open=false;
+}
+static void wm_gui_key_update(WinKeyTap& tap,uint32_t mods,bool other_key_held){
+    if(!tap.update(mods,other_key_held)||!fb)return;
+    TtyIrqGuard guard;
+    if(g_menu_open)wm_menu_close();
+    else {wm_clipboard_close();wm_menu_open();}
+}
+static void wm_clipboard_paste(int target);
+static void wm_clipboard_accept(unsigned index){
+    if(!g_text_clipboard.select(index))return;
+    wm_clipboard_close();
+    wm_clipboard_paste(g_clipboard_target);
+}
+enum class ClipboardAction { Paste, Pin, Delete };
+struct ClipboardHit {
+    int index=-1;
+    ClipboardAction action=ClipboardAction::Paste;
+    bool operator==(const ClipboardHit&)const=default;
+};
+static ClipboardHit wm_clipboard_hit(int x,int y){
+    if(!g_clipboard_open)return {};
+    auto p=wm_clipboard_panel();
+    int offset=y-p.list_top();
+    if(x<p.x+CLIPBOARD_PAD||x>=p.card_right()||offset<0||offset>=p.rows*CLIPBOARD_ROW||
+        offset%CLIPBOARD_ROW>=CLIPBOARD_ROW-CLIPBOARD_GAP)return {};
+    int index=g_clipboard_first+offset/CLIPBOARD_ROW;
+    if(index>=(int)g_text_clipboard.history_size())return {};
+    if(x>=p.action_left()&&x<p.action_left()+CLIPBOARD_ACTION_WIDTH){
+        int y=offset%CLIPBOARD_ROW;
+        if(y>=CLIPBOARD_PIN_TOP&&y<CLIPBOARD_PIN_TOP+CLIPBOARD_ACTION_HEIGHT)return {index,ClipboardAction::Pin};
+        if(y>=CLIPBOARD_DELETE_TOP&&y<CLIPBOARD_DELETE_TOP+CLIPBOARD_ACTION_HEIGHT)return {index,ClipboardAction::Delete};
+    }
+    return {index,ClipboardAction::Paste};
+}
+static void wm_clipboard_move(int delta){
+    TtyIrqGuard guard;
+    int last=(int)g_text_clipboard.history_size()-1;
+    if(last<0){g_clipboard_first=g_clipboard_selected=0;wm_clipboard_damage();return;}
+    auto p=wm_clipboard_panel();
+    g_clipboard_selected+=delta;
+    if(g_clipboard_selected<0)g_clipboard_selected=0;
+    if(g_clipboard_selected>last)g_clipboard_selected=last;
+    int last_page=last-p.rows+1;
+    if(last_page<0)last_page=0;
+    if(g_clipboard_first>last_page)g_clipboard_first=last_page;
+    if(g_clipboard_selected<g_clipboard_first)g_clipboard_first=g_clipboard_selected;
+    if(g_clipboard_selected>=g_clipboard_first+p.rows)g_clipboard_first=g_clipboard_selected-p.rows+1;
+    wm_clipboard_damage();
+}
+static void wm_clipboard_scroll(int delta){
+    TtyIrqGuard guard;
+    auto p=wm_clipboard_panel();
+    if(!p.scrollable)return;
+    int last=(int)g_text_clipboard.history_size()-p.rows;
+    int first=g_clipboard_first+delta;
+    if(first<0)first=0;
+    if(first>last)first=last;
+    if(first==g_clipboard_first)return;
+    g_clipboard_first=first;
+    if(g_clipboard_selected<first)g_clipboard_selected=first;
+    if(g_clipboard_selected>=first+p.rows)g_clipboard_selected=first+p.rows-1;
+    wm_clipboard_damage();
+}
+static void wm_clipboard_toggle_pin(unsigned index){
+    if(g_text_clipboard.toggle_pin(index)){g_clipboard_selected=index;wm_clipboard_damage();}
+}
+static void wm_clipboard_delete(unsigned index){
+    if(index>=g_text_clipboard.history_size())return;
+    wm_clipboard_damage();
+    g_text_clipboard.erase(index);
+    g_clipboard_selected=index;
+    wm_clipboard_move(0);
+}
+static bool wm_clipboard_click(int x,int y){
+    if(!g_clipboard_open)return false;
+    TtyIrqGuard guard;
+    auto p=wm_clipboard_panel();
+    if(x>=p.x&&x<p.x+p.w&&y>=p.y&&y<p.y+p.h){
+        if(y>=p.y+6&&y<p.y+CLIPBOARD_HEADER-6&&x>=p.clear_left()&&x<p.x+p.w-6){
+            wm_clipboard_damage();
+            g_text_clipboard.clear_unpinned();g_clipboard_selected=g_clipboard_first=0;wm_clipboard_damage();
+        }else{
+            auto hit=wm_clipboard_hit(x,y);
+            if(hit.index>=0){
+                if(hit.action==ClipboardAction::Pin)wm_clipboard_toggle_pin(hit.index);
+                else if(hit.action==ClipboardAction::Delete)wm_clipboard_delete(hit.index);
+                else wm_clipboard_accept(hit.index);
+            }
+        }
+    }else wm_clipboard_close();
+    return true;
+}
+static bool wm_clipboard_key(char c,uint32_t key,uint32_t mods,bool repeat){
+    if(!g_clipboard_open&&!((c=='v'||c=='V')&&mods==WIN_MOD_GUI))return false;
+    TtyIrqGuard guard;
+    if((c=='v'||c=='V')&&mods==WIN_MOD_GUI){
+        if(!repeat&&fb&&fb->width>=236&&
+            fb->height>=g_taskbar_h+16+CLIPBOARD_HEADER+2*CLIPBOARD_PAD+CLIPBOARD_ROW+CLIPBOARD_FOOTER){
+            if(g_clipboard_open)wm_clipboard_close();
+            else {
+                wm_menu_close();g_clipboard_selected=g_clipboard_first=0;
+                g_clipboard_target=g_focused_win_id;g_clipboard_open=true;wm_clipboard_damage();
+            }
+        }
+        return true;
+    }
+    if(key==0x52)wm_clipboard_move(-1);
+    else if(key==0x51)wm_clipboard_move(1);
+    else if(c==27)wm_clipboard_close();
+    else if(!repeat&&!(mods&~WIN_MOD_SHIFT)&&(c=='p'||c=='P'))wm_clipboard_toggle_pin(g_clipboard_selected);
+    else if(!repeat&&!mods&&key==0x4c)wm_clipboard_delete(g_clipboard_selected);
+    else if(!repeat&&(c=='\n'||c=='\r'))wm_clipboard_accept(g_clipboard_selected);
+    return true;
 }
 
 static uint32_t wm_icon_size(uint32_t value, uint32_t minimum, uint32_t maximum) {
@@ -992,6 +1141,39 @@ static uint32_t wm_text_height(uint32_t scale_100 = 100) { return wm_ui_font(sca
 static int32_t wm_text_width(const char* text, uint32_t scale_100 = 100) {
     return ui_text_width(wm_ui_font(scale_100), text);
 }
+struct ClipboardPreview {
+    char lines[2][96];
+    bool pinned;
+};
+static void wm_clipboard_preview(const TextClipboard::Entry& entry,ClipboardPreview& preview,
+                                 const UiFont* font,int width){
+    preview.pinned=entry.pinned;
+    unsigned offset=0;
+    for(int row=0;row<2;++row){
+        auto& line=preview.lines[row];
+        unsigned n=0,wrap_length=0,wrap_offset=0;
+        int used=0;
+        while(offset<entry.length&&n<sizeof(line)-4){
+            unsigned char c=entry.bytes[offset];
+            if(c=='\r'){++offset;continue;}
+            if(c=='\n'){++offset;break;}
+            if(c<32||c==127)c=' ';
+            int advance=ui_font_glyph(font,c)->advance;
+            if(used+advance>width&&n){
+                if(!row&&wrap_length){offset=wrap_offset;n=wrap_length;}
+                break;
+            }
+            if(c==' '&&n){wrap_offset=offset+1;wrap_length=n;}
+            line[n++]=c;++offset;used+=advance;
+        }
+        if(row==1&&offset<entry.length){
+            int dots=3*ui_font_glyph(font,'.')->advance;
+            while(n&&(line[n-1]==' '||used+dots>width))used-=ui_font_glyph(font,line[--n])->advance;
+            line[n++]='.';line[n++]='.';line[n++]='.';
+        }
+        line[n]=0;
+    }
+}
 static void wm_draw_string(int32_t x, int32_t y, const char* text, uint32_t color,
                            uint32_t scale_100 = 100, int32_t max_width = -1) {
     if (!fb || !g_master_backbuffer || !text || max_width == 0) return;
@@ -1243,6 +1425,8 @@ static inline int wm_find_top_window(int32_t mx, int32_t my) {
 static inline void wm_raise_window(int idx) {
     if (idx < 0 || idx >= g_window_count) return;
     Window* win = g_window_list[idx];
+    if (win && !win->minimized && g_focused_win_id == win->id &&
+        g_window_order[g_window_count - 1] == idx) return;
     if (win) { win->minimized=false;g_focused_win_id = win->id; }
     int old_pos = -1;
     for (int i = 0; i < g_window_count; i++) if (g_window_order[i] == idx) old_pos = i;
@@ -1464,11 +1648,34 @@ static void wm_event_coordinates(Window* win,int x,int y,WinEvent* event) {
 }
 
 static bool (*g_desktop_shortcut_hook)(char,uint32_t,bool)=nullptr;
+static bool wm_terminal_paste(Window* win,bool repeat=false){
+    if(!win||!win->is_system||win->type!=WIN_TYPE_TERM||!tty_raw_mode||g_terminal_foreground_pid)return false;
+    if(!repeat)tty_input(22);
+    return true;
+}
+static void wm_clipboard_paste(int target){
+    if(target!=g_focused_win_id)return;
+    Window* win=wm_find_window(target);
+    if(!win||!win->visible||win->minimized)return;
+    if(win->is_system){wm_terminal_paste(win);return;}
+    WinEvent paste{};
+    paste.type=WIN_EVENT_KEY_DOWN;
+    paste.key='v';
+    paste.mods=WIN_MOD_CTRL|WIN_MOD_TEXT_PASTE;
+    wm_win_push_event(win,paste);
+}
 static inline void wm_dispatch_key(char c, uint32_t scancode, bool is_down, uint32_t mods,bool repeat=false) {
     g_kbd_modifiers = mods;
     if (!is_down) return;
+    if(wm_clipboard_key(c,scancode,mods,repeat))return;
+    if(g_menu_open&&c==27&&!mods){wm_menu_close();return;}
     if(g_desktop_shortcut_hook&&g_desktop_shortcut_hook(c,mods,repeat))return;
     Window* focused = wm_find_window(g_focused_win_id);
+    if(focused&&focused->is_system&&focused->type==WIN_TYPE_TERM&&tty_raw_mode&&
+        !g_terminal_foreground_pid&&(mods&WIN_MOD_CTRL)&&!(mods&(WIN_MOD_ALT|WIN_MOD_GUI))){
+        if(c=='v'||c=='V'){wm_terminal_paste(focused,repeat);return;}
+        if((mods&WIN_MOD_SHIFT)&&(c=='c'||c=='C')){if(!repeat)tty_input(3);return;}
+    }
     if (focused && focused->is_system && focused->type==WIN_TYPE_TERM &&
         (mods & WIN_MOD_CTRL) && (c == 'c' || c == 'C' || c == 3)) {
         task_request_interrupt(g_terminal_foreground_pid);
@@ -2355,6 +2562,95 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
             }
             int32_t label_x=ix+icon_size+6;
             text(label_x,by+(button_h-char_h)/2,i?"Shut down":"Restart",0xFFE6E8FF,bx+button_w-label_x-6);
+        }
+    }
+    if(g_clipboard_open){
+        auto panel=wm_clipboard_panel();
+        int x=panel.x,y=panel.y,w=panel.w;
+        if((int)min_x<x+w&&(int)max_x>=x&&(int)min_y<y+panel.h&&(int)max_y>=y){
+            ClipboardPreview previews[CLIPBOARD_VISIBLE_ROWS];
+            int count=0,total,first,selected;
+            ClipboardHit hover;
+            bool can_pin;
+            int card_x=x+CLIPBOARD_PAD,card_w=panel.card_right()-card_x;
+            int preview_width=panel.action_left()-card_x-18;
+            const UiFont* font=wm_ui_font();
+            {
+                TtyIrqGuard guard;
+                total=g_text_clipboard.history_size();first=g_clipboard_first;
+                selected=g_clipboard_selected-first;
+                hover=wm_clipboard_hit(g_mouse_x,g_mouse_y);
+                can_pin=g_text_clipboard.pinned_count()<TextClipboard::pin_limit;
+                for(int i=first;i<total&&count<panel.rows;++i){
+                    wm_clipboard_preview(g_text_clipboard.history(i),previews[count++],font,preview_width);
+                }
+            }
+            draw_btn(x,y,w,panel.h,0xff23283d,0xff181c30,0xff303560,false);
+            draw_btn(x,y,w,CLIPBOARD_HEADER,0xff3d4d80,0xff28366a,0xff5568b0,false);
+            int line=font->height;
+            wm_draw_string(x+12,y+(CLIPBOARD_HEADER-line)/2,"Clipboard history",0xffeeeeff,100,panel.clear_left()-x-20);
+            draw_btn(panel.clear_left(),y+6,CLIPBOARD_CLEAR_WIDTH,CLIPBOARD_HEADER-12,0xff263456,0xff202742,0xff6777a2,false);
+            const char* clear="Clear unpinned";
+            wm_draw_string(panel.clear_left()+(CLIPBOARD_CLEAR_WIDTH-wm_text_width(clear))/2,
+                           y+(CLIPBOARD_HEADER-line)/2,clear,0xffeeeeff,100,CLIPBOARD_CLEAR_WIDTH-8);
+            int card_h=CLIPBOARD_ROW-CLIPBOARD_GAP;
+            const char* hint="Select an entry to paste";
+            if(!count)wm_draw_string(card_x+10,panel.list_top()+(card_h-line)/2,"Nothing copied yet",0xffb9c5ee,100,card_w-20);
+            for(int i=0;i<count;++i){
+                int top=panel.list_top()+i*CLIPBOARD_ROW;
+                bool active=i==selected,pointed=first+i==hover.index;
+                uint32_t fill=active?0xff344469:pointed?0xff2d3a55:0xff242b41;
+                uint32_t edge=active?0xff667aaa:pointed?0xff52617f:0xff343d55;
+                draw_btn(card_x,top,card_w,card_h,fill,fill,edge,false);
+                if(active)draw_btn(card_x+1,top+5,3,card_h-10,0xffa6b9f0,0xffa6b9f0,0xffa6b9f0,false);
+                const auto& preview=previews[i];
+                int text_y=top+(card_h-(preview.lines[1][0]?2*line+3:line))/2;
+                wm_draw_string(card_x+10,text_y,preview.lines[0],0xffeeeeff,100,preview_width);
+                if(preview.lines[1][0])wm_draw_string(card_x+10,text_y+line+3,preview.lines[1],0xffeeeeff,100,preview_width);
+                auto action=[&](int action_y,ClipboardIcon icon,uint32_t button_fill,uint32_t border,uint32_t ink){
+                    int ax=panel.action_left(),ay=top+action_y;
+                    draw_btn(ax,ay,CLIPBOARD_ACTION_WIDTH,CLIPBOARD_ACTION_HEIGHT,button_fill,button_fill,border,false);
+                    constexpr int size=19;
+                    static uint8_t masks[3][size][size]{};
+                    static bool rasterized[3]{};
+                    unsigned index=(unsigned)icon;
+                    auto& mask=masks[index];
+                    if(!rasterized[index]){
+                        for(int row=0;row<size;++row)for(int col=0;col<size;++col)
+                            mask[row][col]=(clipboard_icon_coverage(icon,col,row,size)*255+8)/16;
+                        rasterized[index]=true;
+                    }
+                    int ix=ax+(CLIPBOARD_ACTION_WIDTH-size)/2,iy=ay+(CLIPBOARD_ACTION_HEIGHT-size)/2;
+                    for(int row=0;row<size;++row){
+                        int yy=iy+row;
+                        if(yy<(int)min_y||yy>(int)max_y)continue;
+                        auto* pixels=(uint32_t*)(g_master_backbuffer+(uint64_t)yy*fb->pitch)+ix;
+                        for(int col=0;col<size;++col){
+                            if(mask[row][col])pixels[col]=ui_font_blend(pixels[col],ink,mask[row][col]);
+                        }
+                    }
+                };
+                bool pin_enabled=preview.pinned||can_pin;
+                bool pin_hover=pointed&&hover.action==ClipboardAction::Pin;
+                bool delete_hover=pointed&&hover.action==ClipboardAction::Delete;
+                bool pin_highlight=preview.pinned||(pin_hover&&pin_enabled);
+                action(CLIPBOARD_PIN_TOP,preview.pinned?ClipboardIcon::Pinned:ClipboardIcon::Pin,
+                       pin_highlight?0xff475980:fill,pin_highlight?0xff7186ba:edge,
+                       pin_enabled?0xffe4ebff:0xff9098ae);
+                action(CLIPBOARD_DELETE_TOP,ClipboardIcon::Delete,delete_hover?0xff59364a:fill,
+                       delete_hover?0xffa46780:edge,delete_hover?0xffffc7d8:0xffdedff0);
+                if(pin_hover)hint=preview.pinned?"Unpin entry":can_pin?"Pin entry":"Pin limit reached";
+                if(delete_hover)hint="Delete entry";
+            }
+            if(total>panel.rows){
+                int track=panel.rows*CLIPBOARD_ROW-CLIPBOARD_GAP,thumb=track*panel.rows/total;
+                int rail_x=panel.card_right()+4,rail_y=panel.list_top();
+                int offset=(track-thumb)*first/(total-panel.rows);
+                draw_btn(rail_x,rail_y,3,track,0xff293148,0xff293148,0xff293148,false);
+                draw_btn(rail_x,rail_y+offset,3,thumb,0xff7b8cb7,0xff7b8cb7,0xff7b8cb7,false);
+            }
+            if(count)wm_draw_string(card_x,y+panel.h-(CLIPBOARD_FOOTER+line)/2,
+                                    hint,0xffb9c5ee,100,w-24);
         }
     }
     t2 = rdtsc_val();

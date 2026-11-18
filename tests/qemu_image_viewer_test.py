@@ -100,6 +100,7 @@ def main():
         visible_icon('File Explorer',120,12,32,30)
         capture('explorer-navigation-icons')
         _,(x,y,_,_)=windows()['File Explorer'];click(x+300,y+26)
+        q.monitor('sendkey ctrl-a 40');time.sleep(.1)
         q.type('/home/viewer-test\n',pause=.5)
         click(x+260,y+150);click(x+260,y+150)
         wait_for(lambda:'Image Viewer' in windows(),'PNG association did not launch viewer')

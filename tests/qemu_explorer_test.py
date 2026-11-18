@@ -85,7 +85,8 @@ def main():
         q.monitor('mouse_button 0');time.sleep(.5)
         return windows()[title][1]
     def go(path):
-        client(300,26);q.type(path+'\n',pause=.4)
+        client(300,26);q.monitor('sendkey ctrl-a 40');time.sleep(.1)
+        q.type(path+'\n',pause=.4)
     def terminal():
         data=memory(address('g_term_matrix'),640000)[::8]
         return '\n'.join(data[i:i+160].decode('latin1').rstrip('\0 ') for i in range(0,len(data),160))

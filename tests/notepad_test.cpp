@@ -21,6 +21,7 @@ static std::set<std::string> directories={"/","/home","/home/Applications","/hom
 static std::map<uint64_t,std::vector<uint32_t>> windows;
 static std::map<uint64_t,uint64_t> window_roles;
 static uint64_t next_window=100;
+static unsigned field_presents=0;
 static uint64_t native_call(uint64_t n,uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e){
     switch(n){
     case 2:if(!files.count((char*)a))return -1;reading=(char*)a;offset=0;return 10;
@@ -37,6 +38,7 @@ static uint64_t native_call(uint64_t n,uint64_t a,uint64_t b,uint64_t c,uint64_t
         if(b>=listing.size())return 0;strcpy((char*)c,listing[b].first.c_str());*(uint64_t*)d=0;*(uint64_t*)e=listing[b].second;return 1;}
     case 138:if(fail_save)return -1;files[(char*)a]=std::string((char*)b,c);return 0;
     case 201:return 0;
+    case 204:if(windows.count(a)&&d>1)++field_presents;return 0;
     case 200:windows[++next_window].resize(d*e);return next_window;
     case 202:windows.erase(a);window_roles.erase(a);return 0;
     case 203:case 206:return (uint64_t)windows[a].data();
@@ -53,8 +55,45 @@ int main(int argc,char** argv){
     std::vector<uint32_t> pixels(760*520);surface={pixels.data(),760,520};
     assert(text_clipboard.set("old",3)==0);char tiny[2]={'X','Y'};
     assert(text_clipboard.get(tiny,2)==-1&&tiny[0]=='X'&&tiny[1]=='Y');
-    assert(text_clipboard.set("bad\0value",9)==-1&&!strcmp(text_clipboard.bytes,"old"));
-    assert(text_clipboard.set("x",TextClipboard::capacity+1)==-1&&!strcmp(text_clipboard.bytes,"old"));
+    assert(text_clipboard.set("bad\0value",9)==-1&&!strcmp(text_clipboard.data(),"old"));
+    assert(text_clipboard.set("x",TextClipboard::capacity+1)==-1&&!strcmp(text_clipboard.data(),"old"));
+    assert(text_clipboard.set("new",3)==0&&text_clipboard.history_size()==2);
+    assert(text_clipboard.select(1)&&!strcmp(text_clipboard.data(),"old"));
+    assert(text_clipboard.set("new",3)==0&&text_clipboard.history_size()==2);
+    std::string big(TextClipboard::capacity,'x'),readback(big.size()+1,'\0');
+    assert(text_clipboard.set(big.data(),big.size())==0);
+    for(unsigned i=0;i<TextClipboard::history_limit;++i){
+        char digit='a'+i;assert(text_clipboard.set(&digit,1)==0);
+    }
+    assert(text_clipboard.history_size()==TextClipboard::history_limit);
+    assert(!text_clipboard.select(TextClipboard::history_limit));
+    assert(text_clipboard.select(TextClipboard::history_limit-1)&&!strcmp(text_clipboard.data(),"a"));
+    assert(text_clipboard.set(big.data(),big.size())==0&&text_clipboard.get(readback.data(),readback.size())==(int64_t)big.size());
+    assert(readback.compare(0,big.size(),big)==0);
+    assert(text_clipboard.set("",0)==0&&text_clipboard.get(tiny,sizeof(tiny))==0);
+    assert(text_clipboard.select(0)&&text_clipboard.data()[0]=='x');
+    text_clipboard.clear_unpinned();assert(!text_clipboard.history_size()&&text_clipboard.get(tiny,sizeof(tiny))==0);
+    assert(text_clipboard.set("Keep me",7)==0&&text_clipboard.toggle_pin(0));
+    for(unsigned i=0;i<TextClipboard::history_limit;++i){
+        char value='a'+i;assert(text_clipboard.set(&value,1)==0);
+    }
+    assert(text_clipboard.history(TextClipboard::history_limit-1).pinned);
+    assert(text_clipboard.set("Keep me",7)==0&&text_clipboard.history(0).pinned);
+    assert(text_clipboard.erase(1)&&!strcmp(text_clipboard.data(),"Keep me"));
+    assert(text_clipboard.set("Discard me",10)==0);
+    text_clipboard.clear_unpinned();
+    assert(text_clipboard.history_size()==1&&text_clipboard.history(0).pinned&&!text_clipboard.data()[0]);
+    assert(text_clipboard.select(0)&&!strcmp(text_clipboard.data(),"Keep me"));
+    assert(text_clipboard.erase(0)&&!text_clipboard.history_size()&&!text_clipboard.data()[0]);
+    for(unsigned i=0;i<TextClipboard::pin_limit;++i){
+        char value='a'+i;assert(text_clipboard.set(&value,1)==0&&text_clipboard.toggle_pin(0));
+    }
+    assert(text_clipboard.set("first",5)==0&&!text_clipboard.toggle_pin(0));
+    assert(text_clipboard.set("second",6)==0&&text_clipboard.pinned_count()==TextClipboard::pin_limit);
+    assert(text_clipboard.history_size()==TextClipboard::history_limit&&!strcmp(text_clipboard.data(),"second"));
+    for(unsigned i=0;i<text_clipboard.history_size();++i)
+        if(text_clipboard.history(i).pinned)assert(text_clipboard.toggle_pin(i));
+    text_clipboard.clear_unpinned();
     files["/home/notes.txt"]="one\ntwo\n";assert(load("/home/notes.txt"));assert(!modified&&length==8);
     caret=anchor=3;insert("!",1);assert(!strcmp(text,"one!\ntwo\n"));
     anchor=0;caret=4;insert("A",1);assert(!strcmp(text,"A\ntwo\n")); // overlapping shrink
@@ -83,6 +122,9 @@ int main(int argc,char** argv){
     key_event(0x1100,0);assert(caret==0);key_event(0x1101,0);assert(caret==5);
     key_event(0x1102,0);assert(!strcmp(text,"firstsecond\nthird"));
     key_event(0x1101,1);assert(caret==length);key_event(0x1100,1);assert(caret==0);
+    key_event(0x1043,1);assert(caret==12&&anchor==12);
+    key_event(0x1044,3);assert(low()==0&&high()==12);
+    key_event(0x1043,3);assert(caret==12&&anchor==12);
     unsigned before=length;key_event(0x203a,0);assert(length==before); // Function keys are not text.
     // Compare arbitrary overlapping replacements against the standard string implementation.
     std::string model(text,length);unsigned random=12345;
@@ -134,6 +176,17 @@ int main(int argc,char** argv){
     fail_role=true;assert(!browser.show(false,"/home/")&&!browser.window&&windows.empty());fail_role=false;
     assert(browser.show(false,"/home/"));assert(window_roles[browser.window]==1);assert(browser.entries[0].type==2);
     browser.render();
+    browser.event({5,0,0,'q',0,0},1);browser.tick(1);
+    assert(!browser.dirty&&field_presents==1&&!strcmp(browser.filename,"q"));
+    browser.event({5,0,0,'a',1,0},2);browser.event({5,0,0,'c',1,0},2);
+    assert(!strcmp(text_clipboard.data(),"q"));
+    browser.event({5,0,0,'a',1,0},2);browser.event({5,0,0,8,0,0},2);browser.tick(2);
+    assert(!browser.dirty&&field_presents==2&&!browser.filename[0]);
+    anchor=0;caret=5;key_event('c',1);
+    browser.event({5,0,0,'v',1,0},3);assert(!strcmp(browser.filename,"Notes"));
+    assert(text_clipboard.select(1));
+    browser.event({5,0,0,'a',1,0},4);browser.event({5,0,0,'v',1,0},4);assert(!strcmp(browser.filename,"q"));
+    browser.event({5,0,0,'a',1,0},5);browser.event({5,0,0,8,0,0},5);
     for(const auto& nav:browser.navigation){
         unsigned ink=0;for(int y=nav.y+6;y<nav.y+nav.h-6;++y)for(int x=nav.x+6;x<nav.x+nav.w-6;++x)
             if((browser.canvas.pixels[y*browser.canvas.w+x]&0xffffff)>0xb0b0b0)++ink;
@@ -205,6 +258,12 @@ int main(int argc,char** argv){
     browser.event({5,0,0,8,0,0},103);assert(!strcmp(browser.filename,"abcd"));
     browser.tick(133);assert(!browser.name_input.cursor.visible);
     browser.event({5,0,0,0x1101,0,0},134);assert(browser.name_input.cursor.visible);
+    int glyph_width=ui_font_glyph(ui_font_for_pixels(12),'a')->advance;
+    browser.event({1,NativeFileDialog::name_text_x+glyph_width,browser.canvas.h-90,1,0,0},135);
+    browser.event({5,0,0,'X',0,0},136);assert(!strcmp(browser.filename,"aXbcd"));
+    glyph_width=ui_font_glyph(ui_font_for_pixels(12),'/')->advance;
+    browser.event({1,NativeFileDialog::address_text_x+glyph_width,25,1,0,0},137);
+    browser.event({5,0,0,'X',0,0},138);assert(!strcmp(browser.address,"/Xhome"));
     for(auto size: {std::pair{560,360},std::pair{1000,680}}){std::vector<uint32_t> dialog_pixels(size.first*size.second);
         browser.canvas={dialog_pixels.data(),size.first,size.second};browser.bound_scroll();browser.render();}
     browser.hide();
