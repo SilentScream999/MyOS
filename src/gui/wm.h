@@ -219,6 +219,7 @@ static inline bool wm_win_push_event(Window* win, const WinEvent& ev) {
     }
     win->event_queue[win->event_head] = ev;
     win->event_head = next_head;
+    task_wake_console(win->owner_pid);
     return true;
 }
 
@@ -323,6 +324,8 @@ static uint32_t g_wbtn_w = 124;
 // ── Start Menu (taskbar popup) ────────────────────────────────
 #define g_menu_app_count ((int)g_resources_catalog->count)
 static bool  g_menu_open = false;
+static void wm_taskbar_close();
+static bool wm_taskbar_escape(char c,uint32_t mods);
 // Action IDs never overlap catalog indices.
 static constexpr int MENU_RESTART = -2, MENU_SHUTDOWN = -3;
 static inline int32_t wm_menu_scale(int32_t value, int32_t minimum) {
@@ -403,6 +406,7 @@ static inline void wm_menu_dirty_rect() {
 }
 
 static inline void wm_menu_open() {
+    wm_taskbar_close();
     g_menu_open = true;
     // Rapid reopenings reuse the complete snapshot. Refresh at the next open
     // after five seconds, preserving discovery of externally replaced assets.
@@ -562,7 +566,7 @@ static bool wm_clipboard_key(char c,uint32_t key,uint32_t mods,bool repeat){
             fb->height>=g_taskbar_h+16+CLIPBOARD_HEADER+2*CLIPBOARD_PAD+CLIPBOARD_ROW+CLIPBOARD_FOOTER){
             if(g_clipboard_open)wm_clipboard_close();
             else {
-                wm_menu_close();g_clipboard_selected=g_clipboard_first=0;
+                wm_menu_close();wm_taskbar_close();g_clipboard_selected=g_clipboard_first=0;
                 g_clipboard_target=g_focused_win_id;g_clipboard_open=true;wm_clipboard_damage();
             }
         }
@@ -1471,11 +1475,11 @@ static inline bool wm_is_in_close(int idx, int32_t mx, int32_t my) {
 static inline void wm_close_window(int idx) {
     if (idx < 0 || idx >= g_window_count) return;
     Window* win = g_window_list[idx];
-    if (win->is_system && win->type == WIN_TYPE_TERM) return; // Terminal is immortal
     if (!win->is_system) {
         // Applications decide whether to exit, close one of several windows,
         // or ask the user to save. Keep the surface alive until they respond.
         win->close_pending = true;
+        task_wake_console(win->owner_pid);
         return;
     }
     win->visible = false;
@@ -1624,7 +1628,7 @@ static void wm_commit_resize(Window* win) {
             if(g_log_rows_visible>LOG_WIN_LINES)g_log_rows_visible=LOG_WIN_LINES;
             g_log_stride=win->w;g_log_win_backbuffer=win->buffer;log_last_rendered_scroll=-1;wm_log_render_to_buffer();}
         else if(win->type==WIN_TYPE_TEST)checker_render_surface(win->buffer,win->w,win->h,win->buffer_pitch);
-    }else if(win->native_resize){wm_discard_pointer_events(win);win->resize_pending=true;}
+    }else if(win->native_resize){wm_discard_pointer_events(win);win->resize_pending=true;task_wake_console(win->owner_pid);}
     win->resize_edges=0;win->chrome_drawn=false;
     g_dirty_min_x=0;g_dirty_min_y=0;g_dirty_max_x=fb->width-1;g_dirty_max_y=fb->height-1;g_needs_refresh=true;
 }
@@ -1667,6 +1671,7 @@ static void wm_clipboard_paste(int target){
 static inline void wm_dispatch_key(char c, uint32_t scancode, bool is_down, uint32_t mods,bool repeat=false) {
     g_kbd_modifiers = mods;
     if (!is_down) return;
+    if(wm_taskbar_escape(c,mods))return;
     if(wm_clipboard_key(c,scancode,mods,repeat))return;
     if(g_menu_open&&c==27&&!mods){wm_menu_close();return;}
     if(g_desktop_shortcut_hook&&g_desktop_shortcut_hook(c,mods,repeat))return;
@@ -1711,6 +1716,8 @@ static inline void wm_dispatch_key(char c, uint32_t scancode, bool is_down, uint
     ev.delta = 0;
     wm_win_push_event(focused, ev);
 }
+
+#include "taskbar.h"
 
 // Current client surfaces are opaque. Only windows above this client can hide
 // its animation; ghost outlines are overlays and must not count as occluders.
@@ -1928,21 +1935,12 @@ static inline void wm_init() {
     // g_term_max_cols/rows already set above
 
     // Create initial windows using the unified surface API
-    g_win_terminal = wm_create_window("Terminal", term_x, term_y, (int32_t)test_w, (int32_t)test_h, false, true, WIN_TYPE_TERM);
-    if (g_win_terminal) {
-        g_backbuffer = (uint8_t*)g_win_terminal->buffer;
-        memset_32(g_win_terminal->buffer, 0xFF0A0A14, (uint64_t)test_w * test_h);
-    }
+    // The initial terminal is launched through the userspace console host.
     g_win_test = wm_create_window("Visual Test", (int32_t)wm_win_x + 50, (int32_t)wm_win_y + 50 + (int32_t)g_title_h, (int32_t)test_w, (int32_t)test_h, true, true, WIN_TYPE_TEST);
     wm_test_render(g_win_test);
     g_win_rain = wm_create_window("Rainbow Animation", (int32_t)wm_win_x + 100, (int32_t)wm_win_y + 100 + (int32_t)g_title_h, (int32_t)test_w, (int32_t)test_h, true, true, WIN_TYPE_RAIN);
     g_win_log = wm_create_window("Boot Log", (int32_t)wm_win_x + 150, (int32_t)wm_win_y + 150 + (int32_t)g_title_h, (int32_t)test_w, (int32_t)test_h, true, true, WIN_TYPE_LOG);
 
-    // Default focus to Terminal and raise it to top of stack
-    if (g_win_terminal) {
-        wm_raise_window(0); // Terminal is first window created (index 0)
-        g_focused_win_id = g_win_terminal->id;
-    }
 
     for (int i = 0; i < 360; i++) {
         g_rainbow_lut[i] = wm_rainbow_color(i * 2);
@@ -1977,7 +1975,7 @@ static uint64_t g_scene_compose_count=0,g_scene_compose_pixels=0;
 static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                                      uint32_t min_y, uint32_t max_y, bool do_overlay = true,
                                      bool present = true) {
-    if (!fb || !fb->address || !g_backbuffer || !g_master_backbuffer) return false;
+    if (!fb || !fb->address || !g_master_backbuffer) return false;
     if (min_x>max_x || min_y>max_y || min_x>=fb->width || min_y>=fb->height) return false;
     if (max_x >= fb->width)  max_x = fb->width - 1;
     if (max_y >= fb->height) max_y = fb->height - 1;
@@ -2257,24 +2255,24 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         // ── Window task buttons ───────────────────────────────────────────────
         const int32_t WBTN_GAP = (int32_t)(4 * fb->height) / 1080;
         int32_t cur_x = sb_x + g_sb_w + (int32_t)(10 * fb->height) / 1080;
-        int32_t active_idx = (g_window_count > 0) ? g_window_order[g_window_count - 1] : -1;
+        auto tasks=wm_taskbar_snapshot();
+        int32_t button_width=tasks.layout.width;
 
-        for (int idx = 0; idx < g_window_count; idx++) {
-            Window* win = g_window_list[idx];
-            if (!win || !win->visible) continue;
-            bool active = !win->minimized&&(win->id == g_focused_win_id);
+        for (int group = 0; group < tasks.layout.shown; group++) {
+            Window* win = tasks.windows[tasks.layout.groups[group].representative];
+            bool active = tasks.layout.groups[group].active;
 
             uint32_t top_c  = active ? 0xFF3d4d80 : 0xFF23283d;
             uint32_t bot_c  = active ? 0xFF28366a : 0xFF181c30;
             uint32_t edge_c = active ? 0xFF5568b0 : 0xFF2c3258;
 
-            draw_btn(cur_x, sb_y, g_wbtn_w, sb_h, top_c, bot_c, edge_c, active);
+            draw_btn(cur_x, sb_y, button_width, sb_h, top_c, bot_c, edge_c, active);
 
             if(win->minimized){
                 int py=sb_y+sb_h-4;
                 if(py>=(int)min_y&&py<=(int)max_y&&py>=0&&py<(int)fb->height){
                     auto* pixels=(uint32_t*)(g_master_backbuffer+(uint64_t)py*fb->pitch);
-                    for(int px=cur_x+g_wbtn_w/2-8;px<cur_x+(int)g_wbtn_w/2+8;++px)
+                    for(int px=cur_x+3;px<cur_x+button_width-3;++px)
                         if(px>=0&&px<(int)fb->width)pixels[px]=0xFF9C87BB;
                 }
             }
@@ -2284,7 +2282,7 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                 if (bar_y >= (int32_t)min_y && bar_y <= (int32_t)max_y &&
                     bar_y >= 0 && (uint32_t)bar_y < fb->height) {
                     uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)bar_y * fb->pitch);
-                    int32_t bar_x1 = cur_x + 2, bar_x2 = cur_x + g_wbtn_w - 3;
+                    int32_t bar_x1 = cur_x + 2, bar_x2 = cur_x + button_width - 3;
                     if (bar_x1 < 0) bar_x1 = 0;
                     if (bar_x2 >= (int32_t)fb->width) bar_x2 = (int32_t)fb->width - 1;
                     if (bar_x2 > bar_x1) memset_32(drow + bar_x1, 0xFF6688FF, (uint32_t)(bar_x2 - bar_x1));
@@ -2295,15 +2293,35 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
             int32_t text_offset=8;
             if (task_icon.pixels) {
                 wm_draw_icon(task_icon,cur_x+6,sb_y+((int32_t)sb_h-(int32_t)task_icon.height)/2,
-                             cur_x,min_y,cur_x+(int32_t)g_wbtn_w,max_y+1);
+                             cur_x,min_y,cur_x+button_width,max_y+1);
                 text_offset=12+task_icon.width;
             }
-            wm_draw_string(cur_x + text_offset, sb_y + (int32_t)(sb_h - char_h) / 2,
-                        win->title,
+            char label[96];resources::copy(label,sizeof(label),win->title);
+            if(tasks.layout.groups[group].count>1){
+                char number[24];to_str(tasks.layout.groups[group].count,number);
+                resources::append(label,sizeof(label)," (");resources::append(label,sizeof(label),number);resources::append(label,sizeof(label),")");
+            }
+            if(button_width>text_offset+8)wm_draw_string(cur_x + text_offset, sb_y + (int32_t)(sb_h - char_h) / 2,
+                        label,
                         active ? 0xFFEEEEFF : 0xFF8888AA,
-                        g_font_scale_100, g_wbtn_w - text_offset - 8);
+                        g_font_scale_100, button_width - text_offset - 8);
 
-            cur_x += g_wbtn_w + WBTN_GAP;
+            cur_x += button_width + WBTN_GAP;
+        }
+        if(tasks.layout.overflow_width){
+            int x=tasks.layout.overflow_x,w=tasks.layout.overflow_width;
+            draw_btn(x,sb_y,w,sb_h,0xff303955,0xff1c243c,0xff465475,g_taskbar_popup==1);
+            int dot=sb_h>=40?3:2;
+            int spacing=dot*2;
+            int center_x=x+w/2,center_y=sb_y+sb_h/2;
+            for(int i=-1;i<=1;++i)for(int y=center_y-dot/2;y<center_y-dot/2+dot;++y){
+                if(y<(int)min_y||y>(int)max_y)continue;
+                auto* pixels=(uint32_t*)(g_master_backbuffer+(uint64_t)y*fb->pitch);
+                for(int dx=0;dx<dot;++dx){
+                    int px=center_x+i*spacing-dot/2+dx;
+                    if(px>=x&&px<x+w&&px>=0&&px<(int)fb->width)pixels[px]=0xffeeeeff;
+                }
+            }
         }
     }
 
@@ -2481,6 +2499,7 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         }
     }
     
+    wm_taskbar_render_popup(min_y,max_y);
     // Stage 2.8: Start menu popup (topmost scene layer, below the cursor overlay)
     if (g_menu_open && fb) {
         int32_t px, py, pw, ph;

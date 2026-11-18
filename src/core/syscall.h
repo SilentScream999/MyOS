@@ -238,6 +238,7 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf_va, uint64_t len) {
     
     if (fd == 0) { // stdin
         if(g_current_task->console){if(!buf_va||buf_va>=USERSPACE_END||len>USERSPACE_END-buf_va)return (uint64_t)-1;
+            if(g_current_task->pid==g_terminal_shell_pid)g_terminal_shell_ready=true;
             return console_read((AppConsole*)g_current_task->console,(char*)buf_va,len);}
         if(g_current_task->gui_app)return 0;
         if (g_current_task->pid==g_terminal_shell_pid) g_terminal_shell_ready=true;
@@ -416,6 +417,24 @@ static uint64_t sys_win_poll_event(uint64_t win_id, uint64_t ev_va) {
 }
 
 // ── syscall_dispatch ──────────────────────────────────────────────────────────
+static uint64_t sys_console_wait(uint64_t win_id) {
+    Task* self=g_current_task;
+    Window* win=wm_find_window((int)win_id);
+    if(!self||!self->console_host||!self->console||!win||win->owner_pid!=self->pid)return (uint64_t)-1;
+    auto* console=(AppConsole*)self->console;
+    if(console->host_pid!=self->pid)return (uint64_t)-1;
+    TtyIrqGuard guard;
+    uint64_t deadline=g_tick_count+500;
+    while(!self->interrupt_requested&&console->output_head==console->output_tail&&!console->child_exited&&
+          win->event_head==win->event_tail&&!win->close_pending&&!win->resize_pending&&g_tick_count<deadline){
+        self->waiting_console=true;self->wake_at_tick=deadline;self->state=TaskState::BLOCKED;
+        while(self->state==TaskState::BLOCKED){schedule();if(self->state==TaskState::BLOCKED)scheduler_idle_halt();}
+        self->waiting_console=false;
+    }
+    console->child_exited=false;
+    bool cursor=win->visible&&!win->minimized&&win->id==g_focused_win_id&&console->raw;
+    return (g_tick_count<<1)|(cursor?1:0);
+}
 // Called from the naked entry stub.  Returns the value to place in RAX.
 
 static uint64_t sys_readdir(uint64_t path_va, uint64_t index, uint64_t name_out_va, uint64_t size_out_va, uint64_t type_out_va) {
@@ -536,7 +555,7 @@ static uint64_t sys_spawn(uint64_t path_va) {
     char path[256];
     if (!get_user_path(path_va, path, sizeof(path))) return (uint64_t)-1;
     // Guard: prevent spawning a duplicate interactive init shell
-    if (app_path_is_shell(path)) {
+    if (app_path_is_shell(path) && !(g_current_task && g_current_task->console_host)) {
         print((char*)"[spawn] Refused: cannot spawn duplicate init shell\n");
         return (uint64_t)-1;
     }
@@ -547,9 +566,10 @@ static uint64_t sys_spawn(uint64_t path_va) {
         strcpy(t->cwd, g_current_task->cwd);
         {TtyIrqGuard guard;t->gui_app=g_current_task->gui_app;
             t->console=g_current_task->console;
-            if(t->console){auto* c=(AppConsole*)t->console;++c->refs;if(g_current_task->console_host)c->foreground=t->pid;t->gui_app=false;}}
+            if(t->console){auto* c=(AppConsole*)t->console;++c->refs;
+                c->foreground=t->pid;if(g_current_task->console_host)c->root_pid=t->pid;t->gui_app=false;}}
     }
-    if (t->parent_pid == g_terminal_shell_pid) g_terminal_foreground_pid = t->pid;
+    if (!t->console && t->parent_pid == g_terminal_shell_pid) g_terminal_foreground_pid = t->pid;
     scheduler_add_task(t);
     return (uint64_t)t->pid;
 }
@@ -621,7 +641,7 @@ static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uin
             bool gui=false;int64_t pid=launch_program(path,a2==1,&gui);
             if(pid>0&&a3)*(uint64_t*)a3=gui?1:0;return pid;
         }
-        case SYS_CONSOLE:return sys_console(a1,a2,a3);
+        case SYS_CONSOLE:return a1==7?sys_console_wait(a2):sys_console(a1,a2,a3);
         case SYS_OPEN_WITH: {
             char app[256],document[256];
             if(!get_user_path(a1,app,sizeof(app))||!get_user_path(a2,document,sizeof(document)))return (uint64_t)-1;

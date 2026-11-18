@@ -57,6 +57,10 @@ static bool desktop_queue_launch(const char* path) {
     return true;
 }
 static bool desktop_shortcut(char key,uint32_t mods,bool repeat) {
+    if((key=='t'||key=='T')&&mods==(WIN_MOD_CTRL|WIN_MOD_ALT)){
+        if(!repeat)desktop_queue_launch("/bin/init.elf");
+        return true;
+    }
     if(key!=27||mods!=(WIN_MOD_CTRL|WIN_MOD_SHIFT))return false;
     if(repeat)return true;
     TtyIrqGuard guard;
@@ -392,6 +396,7 @@ static void setup_pat() {
 uint64_t g_last_frame_ticks = 0;
 
 extern "C" void mouse_process_scroll(int8_t scroll_dy) {
+    if(g_taskbar_popup){wm_taskbar_scroll(scroll_dy);return;}
     if(g_clipboard_open){wm_clipboard_scroll(scroll_dy);return;}
     if (!fb) return;
     int32_t mx = g_mouse_x, my = g_mouse_y;
@@ -453,9 +458,10 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
 
     // Start menu hover highlight follows the pointer
     if (g_menu_open && (dx != 0 || dy != 0)) wm_menu_hover_dirty();
+    if(g_taskbar_popup&&(dx!=0||dy!=0))wm_taskbar_damage(false);
 
     // 2. Start drag / Raise / Close / Taskbar: hit-test Z-stack on fresh click
-    if(mouse_press)clipboard_press=wm_clipboard_click(g_mouse_x,g_mouse_y);
+    if(mouse_press)clipboard_press=wm_clipboard_click(g_mouse_x,g_mouse_y)||wm_taskbar_popup_click(g_mouse_x,g_mouse_y);
     if (mouse_press && !clipboard_press) {
         int32_t mx = g_mouse_x, my = g_mouse_y;
         
@@ -467,18 +473,7 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
                 else            wm_menu_open();
             } else {
                 if (g_menu_open) wm_menu_close(); // any other taskbar click dismisses it
-                const int32_t WBTN_GAP = (int32_t)(4 * fb->height) / 1080;
-                int32_t cur_x = 6 + g_sb_w + (int32_t)(10 * fb->height) / 1080;
-                for (int i = 0; i < g_window_count; i++) {
-                    Window* win = g_window_list[i];
-                    if (!win || !win->visible) continue;
-                    if (mx >= cur_x && mx < cur_x + (int32_t)g_wbtn_w) {
-                        if(win->id==g_focused_win_id&&!win->minimized)wm_minimize_window(i);
-                        else wm_raise_window(i);
-                        break;
-                    }
-                    cur_x += g_wbtn_w + WBTN_GAP;
-                }
+                wm_taskbar_click_bar(mx);
             }
         } else {
             bool in_menu=false;
@@ -547,7 +542,7 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
 
     // Secondary buttons go to native clients without starting title/resize drags.
     for(unsigned button=2;!g_clipboard_open&&button<=4;button<<=1){
-        if((g_mouse_buttons&button)==(g_mouse_prev_buttons&button)||g_menu_open)continue;
+        if((g_mouse_buttons&button)==(g_mouse_prev_buttons&button)||g_menu_open||g_taskbar_popup)continue;
         int idx=wm_find_top_window(g_mouse_x,g_mouse_y);
         if(idx<0)continue;Window* win=g_window_list[idx];
         if(win->is_system||g_mouse_y<win->y||g_mouse_y>=win->y+win->h)continue;
@@ -621,7 +616,7 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
             }
         }
     }
-    if((dx||dy)&&!g_clipboard_open){int idx=wm_find_top_window(g_mouse_x,g_mouse_y);
+    if((dx||dy)&&!g_clipboard_open&&!g_taskbar_popup){int idx=wm_find_top_window(g_mouse_x,g_mouse_y);
         if(idx>=0){Window* win=g_window_list[idx];
             if(!win->is_system&&!win->ghost_dragging&&!win->resize_edges&&!wm_is_in_title(idx,g_mouse_x,g_mouse_y)){
                 WinEvent ev{};ev.type=WIN_EVENT_MOUSE_MOVE;wm_event_coordinates(win,g_mouse_x,g_mouse_y,&ev);
@@ -637,7 +632,7 @@ void compositor_thread_main() {
     }
     // Keep the ring on screen throughout the expensive initial composition.
     // The normal dirty-rectangle presenter starts only after this full handoff.
-    if (!fb || !g_backbuffer || !g_master_backbuffer) {
+    if (!fb || !g_master_backbuffer) {
         print((char*)"[boot] ERROR: No buffers for the initial desktop frame.");
         hcf();
     }
@@ -923,7 +918,7 @@ extern "C" void kmain(void) {
     if (fb_req.response && fb_req.response->framebuffer_count > 0) {
         fb = fb_req.response->framebuffers[0];
         
-        // Terminal buffer is now allocated on demand as g_win_terminal's surface in wm_init()
+        // Userspace terminal surfaces are allocated through the window API.
 
         // Page-aligned: the GPU maps this buffer page-by-page into the GGTT and the PRM
         // requires 64-byte-aligned linear surface bases. kmalloc only guarantees 16 bytes.
@@ -1255,14 +1250,18 @@ extern "C" void kmain(void) {
 	static bool init_started = false;
 	if (!init_started) {
 		Task* init_task = execve_path("/bin/init.elf");
-        if (!init_task && disk_root_active) {
+        Task* console_host=exec_console_host("/bin/init.elf");
+        if ((!init_task || !console_host) && disk_root_active) {
+            if(init_task){task_free(init_task);init_task=nullptr;}
+            if(console_host){console_release(console_host);task_free(console_host);console_host=nullptr;}
             // Failed disk shell: enter the complete RAM recovery environment.
             vfs_mount_root(recovery_root);
             disk_root_active = false;
             g_resources_refresh=true; g_resources_requested=true; ++g_resource_demand_generation;
-            print((char*)"[storage] Disk init failed; RAM recovery mode.");
-            storage_record_recovery(runtime_run, "System partition mounted, but loading /bin/init.elf failed.");
+            print((char*)"[storage] Disk terminal failed; RAM recovery mode.");
+            storage_record_recovery(runtime_run, "System partition mounted, but loading the terminal or shell failed.");
             init_task = execve_path("/bin/init.elf");
+            console_host=exec_console_host("/bin/init.elf");
         }
         if (!init_task && module_req.response) {
             for (uint64_t m = 0; m < module_req.response->module_count; ++m) {
@@ -1277,20 +1276,30 @@ extern "C" void kmain(void) {
                 }
             }
         }
-		if (init_task) {
+		if (init_task && console_host) {
 			g_terminal_shell_ready=false;
 			g_terminal_shell_pid = init_task->pid;
+            auto* console=(AppConsole*)console_host->console;
+            ++console->refs;
+            console->root_pid=console->foreground=init_task->pid;
+            init_task->console=console;
+            init_task->parent_pid=console_host->pid;
+            console_host->gui_app=true;
+            console_host->focus_first_window=true;
 			// Phase 9: register post-flip chrome hook
 			g_pre_flip_hook = nullptr; // Phase 18: handled by wm_compose_full
 			g_post_flip_hook = nullptr;
 
 			// Re-enable the shell task — it now runs "inside" the WM window
 			scheduler_add_task(init_task);
+            scheduler_add_task(console_host);
 			init_started = true;
 			g_klog_bypass_framebuffer = true;
 			print((char*)"[wm] Shell task started inside WM frame.");
 		} else {
-			print((char*)"[init] Failed to load shell task.");
+            if(init_task)task_free(init_task);
+            if(console_host){console_release(console_host);task_free(console_host);}
+			print((char*)"[init] Failed to load terminal or shell task.");
 		}
 	}
 

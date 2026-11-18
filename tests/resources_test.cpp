@@ -74,10 +74,12 @@ int main(int argc,char** argv) {
     directories["/apps"]={{"pictures",true},{"invalid",true},{"..",true}};
     text("/apps/pictures/app.manifest",good);
     text("/apps/invalid/app.manifest","name=bad\nexec=relative");
-    directories["/bin"]={{"init.elf",false},{"counter.wiz",false},{"README",false},{"folder.elf",true}};
+    directories["/bin"]={{"counter.wiz",false},{"init.elf",false},{"README",false},{"folder.elf",true}};
     reads.clear(); decodes=store.decodes;
     auto* catalog=resources::build(store,24,16,24);
-    assert(catalog && catalog->count==2);
+    assert(catalog && catalog->count==3);
+    assert(resources::equal(catalog->apps[2].app.name,"Terminal"));
+    assert(resources::equal(catalog->apps[2].app.exec,"/bin/init.elf"));
     assert(resources::equal(catalog->apps[0].app.id,"pictures"));
     assert(!catalog->apps[0].icons.menu.pixels && !catalog->apps[1].icons.menu.pixels);
     assert(!catalog->apps[0].icons.title.pixels && !catalog->apps[0].icons.task.pixels);
@@ -113,9 +115,9 @@ int main(int argc,char** argv) {
     resources::release(catalog);
     // Manifest registration takes precedence over the compatibility bin scan.
     text("/apps/pictures/app.manifest","name=Counter\nexec=/bin/counter.wiz\nicon=pictures\n");
-    catalog=resources::build(store,24,16,24); assert(catalog && catalog->count==1); resources::release(catalog);
+    catalog=resources::build(store,24,16,24); assert(catalog && catalog->count==2); resources::release(catalog);
     files.erase("/apps/pictures/app.manifest");
-    catalog=resources::build(store,24,16,24); assert(catalog && catalog->count==1);
+    catalog=resources::build(store,24,16,24); assert(catalog && catalog->count==2);
     assert(resources::equal(catalog->apps[0].app.id,"counter")); resources::release(catalog);
     for(int i=0;i<80;++i) {
         auto path="/home/icon-"+std::to_string(i)+".png";

@@ -113,6 +113,7 @@ struct Task {
     bool in_syscall;
     bool interrupt_requested;
     bool waiting_tty_input;
+    bool waiting_console;
     void* console;         // Private desktop-console channel; never the shell TTY.
     bool gui_app;
     bool focus_first_window; // Desktop launch intent, consumed by the first owned window.

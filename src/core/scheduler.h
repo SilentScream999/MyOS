@@ -72,7 +72,7 @@ static bool task_request_interrupt(pid_t pid) {
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
     bool found = false;
     Task* t = g_task_list;
-    if (t && pid && pid != g_terminal_shell_pid) do {
+    if (t && pid) do {
         if (t->pid == pid && t->user_entry && t->state != TaskState::DEAD) {
             t->interrupt_requested = true;
             if (t->state == TaskState::BLOCKED) { t->wake_at_tick = 0; t->state = TaskState::READY; }
@@ -84,6 +84,15 @@ static bool task_request_interrupt(pid_t pid) {
     return found;
 }
 static void task_complete(Task* exiting, uint64_t code);
+static void task_wake_console(pid_t pid) {
+    Task* task=g_task_list;
+    if(task)do{
+        if(task->pid==pid&&task->waiting_console&&task->state==TaskState::BLOCKED){
+            task->wake_at_tick=0;task->state=TaskState::READY;return;
+        }
+        task=task->next;
+    }while(task!=g_task_list);
+}
 
 // CPU idle cycles end before interrupt work or scheduler preemption.
 extern volatile uint64_t g_idle_tsc_accum;

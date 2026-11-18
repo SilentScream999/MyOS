@@ -69,6 +69,9 @@ console has isolated stdin, stdout/stderr, line editing, raw/echo modes and EOF.
 Its window remains after completion so output can be read; closing it cancels
 remaining programs attached to that channel. The helper is `/share/system/console.elf`.
 Console text uses the shell's unstretched 8x8 bitmap glyphs in 8x10 cells.
+The initial terminal uses the same host and channel lifecycle. Start's Terminal
+entry and Ctrl+Alt+T open additional shells. Shift+Up/Down scrolls each window's
+500-line history. Closing a terminal cancels its attached shell and programs.
 
 Ctrl+C in the main Terminal cancels its foreground console app with status 130.
 Ctrl+C in a private console cancels that console's program. GUI apps receive the
@@ -100,7 +103,7 @@ mounts remain valid. [Storage](PERSISTENT_STORAGE.md) defines the boot contract.
   signals; the small native helpers still need a general application SDK.
 - Window-ID authorization and user-pointer/mapping checks remain incomplete.
   Use trusted WyzarOS apps rather than treating this as secure isolation.
-- Terminal, Boot Log and compositor demos remain built into `wm_init`.
+- Boot Log and compositor demos remain built into `wm_init`.
 - File Explorer uses the shared native surface/syscall helpers in
   `user/native_ui.h`. General argument passing, Unicode text and a full widget
   toolkit remain future work. Package behavior is in [APP_PACKAGES](APP_PACKAGES.md).

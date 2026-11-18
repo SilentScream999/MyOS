@@ -1,13 +1,15 @@
 #ifndef WYZAR_APP_CONSOLE_H
 #define WYZAR_APP_CONSOLE_H
 #include "tty.h"
+#include "app.h"
 
 // Independent byte channels for desktop console apps. The userspace terminal
 // owns presentation; the kernel owns routing, blocking and channel lifetime.
 struct AppConsole {
     unsigned refs, input_head,input_tail,output_head,output_tail,line_len;
-    bool raw,echo,eof;
-    pid_t foreground;
+    bool raw,echo,eof,child_exited;
+    pid_t host_pid,root_pid,foreground;
+    int32_t geometry[4];
     char input[4096],output[32768],line[4096];
 };
 static void console_wake(AppConsole* c) {
@@ -22,6 +24,7 @@ static void console_output(AppConsole* c,const char* bytes,uint64_t size) {
     for(uint64_t i=0;i<size;++i){unsigned next=(c->output_head+1)%sizeof(c->output);
         if(next==c->output_tail)c->output_tail=(c->output_tail+1)%sizeof(c->output);
         c->output[c->output_head]=bytes[i];c->output_head=next;}
+    task_wake_console(c->host_pid);
 }
 static void console_release(Task* task) {
     auto* c=(AppConsole*)task->console;if(!c)return;
@@ -30,6 +33,17 @@ static void console_release(Task* task) {
         if(other)do{if(other!=task&&other->console==c)task_request_interrupt(other->pid);other=other->next;}while(other!=g_task_list);
         console_wake(c);
     }
+    if(c->foreground==task->pid){
+        c->foreground=0;
+        Task* parent=g_task_list;
+        if(parent)do{
+            if(parent->pid==task->parent_pid&&parent->console==c&&!parent->console_host&&parent->state!=TaskState::DEAD){
+                c->foreground=parent->pid;break;
+            }
+            parent=parent->next;
+        }while(parent!=g_task_list);
+    }
+    if(c->root_pid==task->pid){c->root_pid=0;c->child_exited=true;task_wake_console(c->host_pid);}
     task->console=nullptr;if(--c->refs==0)kfree(c);
 }
 static uint64_t console_read(AppConsole* c,char* out,uint64_t capacity) {
@@ -62,6 +76,7 @@ static void console_input(AppConsole* c,char ch) {
 static uint64_t sys_console(uint64_t action,uint64_t buffer,uint64_t size) {
     if(!g_current_task||!g_current_task->console_host||!g_current_task->console)return (uint64_t)-1;
     auto* c=(AppConsole*)g_current_task->console;TtyIrqGuard guard;
+    if(c->host_pid!=g_current_task->pid)return (uint64_t)-1;
     if(action<=2&&(!buffer||buffer>=USERSPACE_END||size>USERSPACE_END-buffer||size>4096))return (uint64_t)-1;
     if(action==0){size_t n=strlen(g_current_task->launch_target);if(size<=n)return (uint64_t)-1;
         for(size_t i=0;i<=n;++i)((char*)buffer)[i]=g_current_task->launch_target[i];return n;}
@@ -70,7 +85,23 @@ static uint64_t sys_console(uint64_t action,uint64_t buffer,uint64_t size) {
     if(action==3){unsigned available=(c->input_tail+sizeof(c->input)-c->input_head-1)%sizeof(c->input);
         if(available>=c->line_len)for(unsigned i=0;i<c->line_len;++i){c->input[c->input_head]=c->line[i];c->input_head=(c->input_head+1)%sizeof(c->input);}
         c->line_len=0;c->eof=true;console_wake(c);return 0;}
-    if(action==4)return task_request_interrupt(c->foreground)?0:(uint64_t)-1;
+    if(action==4){
+        Task* task=g_task_list;
+        if(task)do{
+            if(task->pid==c->foreground&&task->console==c){
+                if(task->pid==c->root_pid&&app_path_is_shell(g_current_task->launch_target))return 0;
+                return task_request_interrupt(task->pid)?0:(uint64_t)-1;
+            }
+            task=task->next;
+        }while(task!=g_task_list);
+        return (uint64_t)-1;
+    }
+    if(action==5)return c->root_pid;
+    if(action==6){
+        if(!buffer||buffer>=USERSPACE_END||size!=sizeof(c->geometry)||size>USERSPACE_END-buffer)return (uint64_t)-1;
+        for(unsigned i=0;i<4;++i)((int32_t*)buffer)[i]=c->geometry[i];
+        return 0;
+    }
     return (uint64_t)-1;
 }
 #endif

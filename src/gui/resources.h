@@ -328,7 +328,7 @@ static Catalog* build(Store& store, uint32_t menu, uint32_t title, uint32_t task
         }
         for (const char* root:scan_roots) {
             for (unsigned i=0;i<4096 && catalog->count<max_apps && store.io.list(root,i,name,&directory)>0;++i) {
-                if (directory || !app_name_supported(name) || app_name_is_shell(name)) continue;
+                if (directory || !app_name_supported(name)) continue;
                 App app{}; copy(app.exec,sizeof(app.exec),root);
                 if (!append(app.exec,sizeof(app.exec),"/") || !append(app.exec,sizeof(app.exec),name)) continue;
                 if (has_exec(catalog,app.exec)) continue;
@@ -337,6 +337,10 @@ static Catalog* build(Store& store, uint32_t menu, uint32_t title, uint32_t task
                 unsigned display=n<sizeof(app.name)-1?n:sizeof(app.name)-1;
                 for (unsigned k=0;k<display;++k) app.name[k]=app.id[k]; app.name[display]=0;
                 copy(app.icon,sizeof(app.icon),app.id);
+                if(app_name_is_shell(name)){
+                    copy(app.name,sizeof(app.name),"Terminal");
+                    copy(app.icon,sizeof(app.icon),"terminal");
+                }
                 if (wiz_name_is_package(name)) {
                     App packaged=app; packaged.name[0]=0;
                     int status=0;

@@ -321,7 +321,7 @@ void _start() {
     print("\x1b[2J\x1b[H"); 
     print("\n----------------------------------------\n");
     print("Welcome to WyzarOS Interactive Terminal!\n");
-    print("Shift + Up/Down: Hardware Scrollback\n");
+    print("Shift + Up/Down: Scrollback\n");
     print("Up/Down: Command History\n");
     print("Ctrl+Shift+C: Copy command   Ctrl+V: Paste text\n");
     print("Type 'help' for available commands\n");
@@ -354,7 +354,11 @@ void _start() {
                 break;
             }
 
-            if (n == 0 || n == (uint64_t)-1) continue;
+            if (n == 0) {
+                __asm__ volatile("syscall" : : "a"(60UL), "D"(0UL) : "rcx", "r11", "memory");
+                for (;;) {}
+            }
+            if (n == (uint64_t)-1) continue;
 
             if (c == '\n' || c == '\r') {
                 move_cursor(pos-cursor,'C');

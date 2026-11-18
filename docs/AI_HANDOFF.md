@@ -43,8 +43,8 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
 - QEMU does not emulate our Intel Gen9 GPU. Keep CPU fallbacks and bounded
   hardware waits; record what was actually tested on physical hardware.
 - Apps are files plus metadata. Do not add new applications permanently to
-  `wm_init`; Terminal, Boot Log, Rainbow and Visual Test remain built-in fixtures
-  pending migration to ordinary applications.
+  `wm_init`. Boot Log, Rainbow and Visual Test remain built-in fixtures.
+  All terminals use the userspace console host with independent channels.
 - Separate parser/state logic from MMIO so host tests can exercise actual code.
 - Single-core IRQ guards are not SMP locks. Storage uses a sleeping mutex plus
   short IRQ guards; do not restore interrupt-disabled runtime disk transactions.
@@ -76,7 +76,7 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
   authorization and malformed-ELF/failure cleanup remain incomplete. Normal
   user-task reap releases loader-owned pages and private page tables. The app API
   is for trusted programs, not a finished security boundary.
-- One foreground application per shared terminal; no process groups, general
+- One foreground application per console channel; no process groups, general
   signals, argument/environment passing or dynamic linking.
 - No translucent client windows, hardware cursor plane, page flipping, GPU
   render engine or GPU client API. PNG/font alpha works on the CPU already.

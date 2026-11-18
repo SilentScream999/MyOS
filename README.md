@@ -60,7 +60,10 @@ options; header dependencies are tracked automatically.
 - Native `.wiz` packages (icons/metadata inside, portable or installed) and `.elf` programs, spawn/wait/exit, foreground Ctrl+C and mapped
   user-window surfaces/events. Both extensions currently contain WyzarOS ELFs.
 - Surface-backed desktop windows, damage tracking, taskbar, Start menu and
-  CPU/SSE presentation. Terminal and compositor demos remain built-in fixtures.
+  CPU/SSE presentation. Terminals use independent userspace console hosts.
+  Open more from Start or with Ctrl+Alt+T. Shift+Up/Down scrolls terminal history.
+  Taskbar buttons group windows by application. Select a group to pick a window,
+  or use the overflow menu for applications beyond the available taskbar space.
 - Start uses the taskbar's navy gradients and bordered controls, with an All apps
   header and Restart / Shut down buttons that flush storage before the power action.
 - Native File Explorer: folder navigation, file management, text previews and

@@ -35,17 +35,10 @@ static Task* execve_memory(const uint8_t* elf_data) {
         return nullptr;
     }
     
-    // The scheduler restores each task's recorded CR3. It must not preempt
-    // this temporary address-space switch while segments are being populated.
-    uint64_t mapping_flags;
-    __asm__ volatile("pushfq; popq %0; cli" : "=r"(mapping_flags) :: "memory");
-
-    // Create a new Address Space (PML4) isolating this process.
-    uint64_t new_cr3 = create_user_page_table();
-    
-    // Temporarily switch to the new address space so map_page affects it directly.
-    uint64_t old_cr3 = read_cr3();
-    switch_to_cr3(new_cr3);
+    // Populate the unpublished address space through HHDM so large BSS segments
+    // can be cleared with preemption enabled, without switching the caller's CR3.
+    uint64_t new_cr3;
+    { TtyIrqGuard guard; new_cr3=create_user_page_table(); }
     
     // Iterate over Program Headers to map segments
     const Elf64_Phdr* phdr = (const Elf64_Phdr*)(elf_data + ehdr->e_phoff);
@@ -62,18 +55,19 @@ static Task* execve_memory(const uint8_t* elf_data) {
             
             // Allocate and map physical pages for this segment
             for (uint64_t p = start_page; p < end_page; p += PAGE_SIZE) {
-                uint64_t phys = alloc_phys_page();
-                // 0x04 = USER bit, 0x02 = WRITABLE bit
-                map_page(p, phys, 0x04 | 0x02 | USER_PAGE_OWNED);
-                
-                // Zero the newly allocated page
-                for (int j = 0; j < (int)PAGE_SIZE; j++) ((uint8_t*)p)[j] = 0;
+                uint64_t phys;
+                {
+                    TtyIrqGuard guard;
+                    phys=alloc_phys_page();
+                    map_page_in(new_cr3,p,phys,0x04|0x02|USER_PAGE_OWNED);
+                }
+                auto* destination=(uint8_t*)(HHDM+phys);
+                memset(destination,0,PAGE_SIZE);
+                uint64_t begin=p>vaddr?p:vaddr;
+                uint64_t end=p+PAGE_SIZE;
+                if(end>vaddr+filesz)end=vaddr+filesz;
+                if(end>begin)memcpy(destination+(begin-p),elf_data+offset+(begin-vaddr),end-begin);
             }
-            
-            // Copy file data into the mapped segment
-            uint8_t* dest = (uint8_t*)vaddr;
-            const uint8_t* src = elf_data + offset;
-            for (uint64_t j = 0; j < filesz; j++) dest[j] = src[j];
         }
     }
     
@@ -84,13 +78,14 @@ static Task* execve_memory(const uint8_t* elf_data) {
     uint64_t user_stack_bottom = user_stack_top - (user_stack_pages * PAGE_SIZE);
     
     for (uint64_t p = user_stack_bottom; p < user_stack_top; p += PAGE_SIZE) {
-        uint64_t phys = alloc_phys_page();
-        map_page(p, phys, 0x04 | 0x02 | USER_PAGE_OWNED);
+        uint64_t phys;
+        {
+            TtyIrqGuard guard;
+            phys=alloc_phys_page();
+            map_page_in(new_cr3,p,phys,0x04|0x02|USER_PAGE_OWNED);
+        }
+        memset((void*)(HHDM+phys),0,PAGE_SIZE);
     }
-    
-    // Restore the kernel's original address space
-    switch_to_cr3(old_cr3);
-    if (mapping_flags & (1u << 9)) __asm__ volatile("sti" ::: "memory");
     
     // ── Create the PCB ────────────────────────────────────────────────────────
     Task* t = task_create_user(exec_trampoline, new_cr3, 4); // 4 pages for kernel stack
@@ -188,22 +183,35 @@ static bool exec_is_gui(const char* path) {
     }
     vfs_close(&f);return gui;
 }
+static Task* exec_console_host(const char* path) {
+    Task* host=execve_path("/share/system/console.elf");
+    if(!host)return nullptr;
+    auto* console=(AppConsole*)kmalloc(sizeof(AppConsole));
+    if(!console){task_free(host);return nullptr;}
+    memset(console,0,sizeof(*console));
+    console->refs=1;console->echo=true;console->host_pid=host->pid;
+    console->geometry[0]=wm_win_x;console->geometry[1]=wm_win_y+g_title_h;
+    console->geometry[2]=test_w;console->geometry[3]=test_h;
+    host->console=console;host->console_host=true;
+    strcpy(host->launch_target,path);
+    return host;
+}
 static int64_t launch_program(const char* path,bool desktop,bool* gui,const char* document) {
-    if(app_path_is_shell(path))return -1;
+    if(app_path_is_shell(path)&&!desktop)return -1;
     *gui=exec_is_gui(path);bool host=desktop&&!*gui;
     if(document&&*document&&!*gui)return -1; // Document handlers currently require a GUI package.
-    Task* t=execve_path(host?"/share/system/console.elf":path);if(!t)return -1;
+    Task* t=host?exec_console_host(path):execve_path(path);if(!t)return -1;
     t->parent_pid=(desktop||*gui)?0:g_current_task?g_current_task->pid:0;
     if(g_current_task)strcpy(t->cwd,g_current_task->cwd);
     if(document)strcpy(t->document_path,document);
     t->gui_app=desktop||*gui;
     t->focus_first_window=desktop;
-    if(host){
-        auto* c=(AppConsole*)kmalloc(sizeof(AppConsole));if(!c){task_free(t);return -1;}
-        memset(c,0,sizeof(*c));c->refs=1;c->echo=true;t->console=c;t->console_host=true;
-        strcpy(t->launch_target,path);
+    if(!desktop&&!*gui&&g_current_task&&g_current_task->console){
+        TtyIrqGuard guard;
+        auto* c=(AppConsole*)g_current_task->console;
+        t->console=c;++c->refs;c->foreground=t->pid;
     }
-    if(!desktop&&!*gui&&t->parent_pid==g_terminal_shell_pid)g_terminal_foreground_pid=t->pid;
+    if(!t->console&&!desktop&&!*gui&&t->parent_pid==g_terminal_shell_pid)g_terminal_foreground_pid=t->pid;
     scheduler_add_task(t);return t->pid;
 }
 #endif // exec_h
