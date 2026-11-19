@@ -60,6 +60,8 @@ struct vfs_ops {
     int (*replace)(vnode* dir, const char* name, const void* data, uint64_t len);
     // Atomically swap two closed regular files in the same directory.
     int (*exchange)(vnode* dir, const char* name, const char* other);
+    // Eject an external physical drive. 1 means explicit device flush unavailable.
+    int (*eject)(vnode* vn);
 };
 
 // VNODE: A node in the VFS tree (represents a file or directory inode)
@@ -85,6 +87,7 @@ static int (*vfs_shutdown_hook)() = nullptr;
 struct vfs_mount_entry { vnode* point; vnode* root; };
 static vfs_mount_entry vfs_mounts[16];
 static unsigned vfs_mount_count = 0;
+static uint64_t vfs_storage_generation = 0;
 static vnode* vfs_follow_mount(vnode* vn) {
     for (unsigned i = 0; vn && i < vfs_mount_count; ++i)
         if (vn == vfs_mounts[i].point) return vfs_mounts[i].root;
@@ -96,7 +99,20 @@ static int vfs_mount(vnode* point, vnode* root) {
     for (unsigned i = 0; i < vfs_mount_count; ++i)
         if (vfs_mounts[i].point == point) return -1;
     vfs_mounts[vfs_mount_count++] = {point, root};
+    ++vfs_storage_generation;
     return 0;
+}
+// Retire only the namespace attachment. Open files retain their original
+// filesystem vnodes and must never be rebound to replacement media.
+static int vfs_unmount(vnode* point, vnode* root) {
+    for (unsigned i = 0; i < vfs_mount_count; ++i) {
+        if (vfs_mounts[i].point != point || vfs_mounts[i].root != root) continue;
+        for (unsigned j = i + 1; j < vfs_mount_count; ++j) vfs_mounts[j - 1] = vfs_mounts[j];
+        --vfs_mount_count;
+        ++vfs_storage_generation;
+        return 0;
+    }
+    return -1;
 }
 
 // ── VFS GLOBAL API ────────────────────────────────────────────────────────
@@ -104,6 +120,7 @@ static int vfs_mount(vnode* point, vnode* root) {
 static inline void vfs_mount_root(vnode* root_vnode) {
     vfs_root = root_vnode;
     vfs_mount_count = 0;
+    ++vfs_storage_generation;
 }
 
 // Simple path parser: extracts the next path component.
@@ -362,9 +379,12 @@ static int vfs_readdir(const char* path, uint64_t index, char* name_out, uint64_
         vnode* covered = vn->ops->lookup(vn, name_out);
         vnode* visible = vfs_follow_mount(covered);
         if (visible != covered) {
-            file_info info;
-            if (vfs_stat_node(visible, &info) != 0) return -1;
-            if (size_out) *size_out = info.size;
+            // Listing a parent must remain possible when one mounted device
+            // is offline. Directory metadata needs no access to that device.
+            uint64_t size = visible->size;
+            file_info info{};
+            if (visible->type != VnodeType::DIRECTORY && vfs_stat_node(visible, &info) == 0) size = info.size;
+            if (size_out) *size_out = size;
             if (type_out) *type_out = visible->type;
         }
     }
@@ -432,4 +452,8 @@ static int vfs_statfs(const char* path, fs_info* out) {
     return vn->ops->statfs(vn, out);
 }
 
+static int vfs_eject(const char* path) {
+    vnode* vn = vfs_namei(path);
+    return vn && vn->ops && vn->ops->eject ? vn->ops->eject(vn) : -1;
+}
 #endif // VFS_H

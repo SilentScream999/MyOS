@@ -3,6 +3,21 @@
 Updated 2026-11-11. Storage boot behavior is in
 [PERSISTENT_STORAGE](PERSISTENT_STORAGE.md); test commands are in [TESTING](TESTING.md).
 
+Initial USB disk readiness polling tolerates `02/3A/00` (medium not present)
+within the existing five-second startup deadline. This permits a controller
+that reports absent media during startup to become ready. A continuously absent
+medium fails at the deadline. Capacity checks and mounted reads reject this
+sense immediately. Readiness errors include the disk index, xHCI controller,
+root port, slot and USB VID/PID so a flash drive can be distinguished from an
+empty reader. Repeated identical sense responses are logged once per operation.
+Completed SCSI rejections of writes and cache flushes also request and log sense
+data. A failed transport returns immediately. Failed writes are never replayed.
+If SYNCHRONIZE CACHE(10) receives current sense `05/20/00` (unsupported opcode),
+the driver records that capability for this device and completes subsequent
+flush requests using completed USB writes. The device provides no explicit
+cache-flush guarantee in this mode. Other flush failures, invalid sense data
+and failed WRITE(10) commands still fail the operation.
+
 ## HID pointers
 
 `src/drivers/hid_pointer_setup.h` configures relative pointers, including composite

@@ -62,7 +62,29 @@ int main() {
     assert(!run(unavailable) && unavailable.now >= 5000 && unavailable.now < 5250 && unavailable.commands <= 20);
     fake_disk persistent_attention{{{1,6,0x29,0}}};
     assert(!run(persistent_attention) && persistent_attention.commands == 32);
-    for (reply fatal : {reply{1,3,0x11,0}, reply{1,5,0x20,0}, reply{1,2,0x3a,0}, reply{1,2,4,3}}) {
+    fake_disk starting_flash;
+    starting_flash.replies.assign(6, {1,2,0x3a,0}); starting_flash.replies.push_back({0});
+    assert(run(starting_flash) && starting_flash.commands == 7 && starting_flash.pauses == 6);
+    assert(starting_flash.now >= 1500 && starting_flash.now < 5000 && starting_flash.reports == 1);
+    fake_disk empty_reader{{{1,2,0x3a,0}}};
+    assert(!run(empty_reader) && empty_reader.now >= 5000 && empty_reader.now < 5250);
+    assert(empty_reader.commands <= 20 && empty_reader.reports == 1);
+    // Changing the readiness reason must not restart the shared deadline.
+    fake_disk changing_startup;
+    changing_startup.replies.assign(10, {1,2,0x3a,0});
+    changing_startup.replies.insert(changing_startup.replies.end(), 20, {1,2,4,1});
+    assert(!run(changing_startup) && changing_startup.now < 5250 && changing_startup.reports == 2);
+    for (uint8_t opcode : {0, 0x25, 0x28}) {
+        fake_disk absent{{{1,2,0x3a,0},{0}}};
+        assert(!run(absent, opcode, false) && absent.commands == 1 && absent.pauses == 0);
+    }
+    for (uint8_t opcode : {0x25, 0x28}) {
+        fake_disk absent{{{1,2,0x3a,0},{0}}};
+        assert(!run(absent, opcode, true) && absent.commands == 1 && absent.pauses == 0);
+    }
+    fake_disk no_budget{{{1,2,0x3a,0},{0}}};
+    assert(!run(no_budget, 0, true, 0) && no_budget.commands == 1 && no_budget.pauses == 0);
+    for (reply fatal : {reply{1,3,0x11,0}, reply{1,5,0x20,0}, reply{1,2,0x3a,1}, reply{1,2,4,3}}) {
         fake_disk bad{{fatal}};
         assert(!run(bad) && bad.commands == 1 && bad.senses == 1 && bad.pauses == 0);
     }
@@ -74,6 +96,8 @@ int main() {
     assert(run(startup_changed) && startup_changed.commands == 2);
     fake_disk descriptor{{{1,6,0x29,0},{0}}}; descriptor.format = 0x72;
     assert(run(descriptor));
+    fake_disk descriptor_starting{{{1,2,0x3a,0},{0}}}; descriptor_starting.format = 0x72;
+    assert(run(descriptor_starting) && descriptor_starting.pauses == 1);
     for (uint8_t format : {0,0x71,0x73}) {
         fake_disk invalid{{{1,6,0x29,0},{0}}}; invalid.format = format;
         assert(!run(invalid) && invalid.commands == 1);

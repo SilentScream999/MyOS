@@ -50,8 +50,26 @@ adds it without requiring `FRESH=1`. Its build output is
 - Copy/Cut and Paste work across folders. File copies are staged under an
   exclusive hidden temporary name, synchronized, then renamed without overwrite.
   A failed copy keeps the original. Existing destination names are never overwritten.
-- Cut/Paste can move files and directories within the same filesystem. Recursive
-  folder copying and cross-filesystem moves are not implemented yet.
+- File copies show a transfer popup with progress, transferred size, average
+  speed, estimated time remaining and Cancel. Escape cancels an active transfer.
+  Closing Explorer also cancels and removes its staged file when storage is reachable.
+  Successful transfers close the popup automatically. Errors stay visible.
+- Paste errors during initial source/destination checks or file creation also
+  open the transfer popup, including failures before copying begins.
+- Cut/Paste moves files and directories within the same filesystem. Files can
+  also move across filesystems, removing the source after the destination is
+  synchronized and published. Recursive folder copying is pending.
+- Devices opens `/mnt`. External FAT32 and exFAT volumes use their volume labels,
+  with capacity-based names for unlabeled drives. Connected drives also appear
+  in the sidebar. Arrival/removal refreshes automatically, preserving selection
+  where possible. Refresh is deferred while a dialog or address edit is active.
+- The Devices disclosure arrow shows or hides its drive rows. Clicking the
+  Devices label opens the drive list. Expansion state is kept for that Explorer
+  window while drives arrive and leave. External volumes use a thumb-drive icon.
+  Oversized FAT32 files and insufficient free space are rejected before copying.
+- Select an external drive in Devices, or browse inside it, and choose Eject.
+  Busy drives are refused. Successful eject returns to Devices with a status
+  message, including a warning when the device cannot explicitly flush its cache.
 - Delete asks for confirmation. It removes files and empty folders only; it
   refuses nonempty directories. There is no trash or undo.
 
@@ -82,8 +100,10 @@ Existing ABI 1 through 6 apps remain supported. Icons are geometric PNGs generat
 
 Explorer's file rows use small antialiased vector drawings: connected gold
 folders, paper documents and purple wizard hats for `.wiz` packages. Rounded
-toolbar buttons share the violet/gold palette, include action glyphs where they
-fit, highlight on hover and dim actions that do not apply to the selection.
+toolbar buttons share the violet/gold palette, highlight on hover and dim actions
+that do not apply to the selection. New file, Rename, Copy, Cut, Paste, Delete
+and Hidden use icons with hover tooltips. New folder, Install, Pin and Eject keep
+their text labels.
 
 ```sh
 make test-explorer

@@ -127,6 +127,8 @@ static inline uint64_t rdmsr(uint32_t msr) {
 #define SYS_TEXT_CLIPBOARD 217u // action 0=set bytes, 1=get NUL-terminated text
 #define SYS_PROCESS_INFO 218u // (ProcessInfo*, capacity<=256, ProcessTotals*, optional ProcessMetadata*)
 #define SYS_KERNEL_CPU 219u // (KernelCpuInfo*); renew PID 0 profiling lease
+#define SYS_EJECT 220u // external drive path; 0=done, 1=no explicit flush, -2=busy, -3=flush failed
+#define SYS_STORAGE_STATE 221u // action 0=mount generation; action 1=path supports external-drive eject
 #define SYS_CHDIR   80u
 #define SYS_MKDIR   83u
 #define SYS_RMDIR   84u
@@ -712,6 +714,18 @@ static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uin
         case SYS_MKDIR:  return sys_mkdir(a1, a2);
         case SYS_RMDIR:  return sys_rmdir(a1);
         case SYS_STATFS: return sys_statfs(a1, a2);
+        case SYS_EJECT: {
+            char path[256];
+            if (!get_user_path(a1, path, sizeof(path))) return (uint64_t)-1;
+            return vfs_eject(path);
+        }
+        case SYS_STORAGE_STATE: {
+            if (a1 == 0) return vfs_storage_generation;
+            char path[256];
+            if (a1 != 1 || !get_user_path(a2, path, sizeof(path))) return (uint64_t)-1;
+            vnode* vn = vfs_namei(path);
+            return vn && vn->ops && vn->ops->eject ? 1 : 0;
+        }
         case SYS_SHUTDOWN: return sys_shutdown();
         case SYS_REBOOT:
             storage_prepare_poweroff();

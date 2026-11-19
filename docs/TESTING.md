@@ -66,6 +66,19 @@ replacement, menu/window resource lifetimes and failed-disk-shell fallback.
 
 ## Native File Explorer
 
+External filesystem regression tests include FAT32 and exFAT copies, a sparse
+exFAT fixture larger than 4 GiB, RTC timestamp packing, abandoned-stage cleanup,
+MBR/unpartitioned discovery, busy-drive checks and failed/successful eject.
+Replacement tests inject failures at each sector-write boundary and verify a
+complete old or complete new document after remount. Explorer tests cover drive
+arrival/removal, preserving selection, editing deferral and icon hover feedback.
+Formatting is enabled only in the host fixture library.
+
+```sh
+make test-fat32 test-exfat test-explorer
+python3 tests/run_usb_hub_tests.py
+```
+
 ```sh
 make test-explorer
 make test-notepad

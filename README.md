@@ -82,6 +82,8 @@ options; header dependencies are tracked automatically.
   and demand-driven caching; PNG/JPEG wallpapers and runtime TTF fonts.
 - Journaled ext4 root on USB, persistent apps/settings/files, atomic replacement,
   rename, directory operations and automatic first-boot capacity setup.
+- External FAT32/exFAT drives in Explorer, progress/cancel for file transfers,
+  local-clock timestamps and Eject with busy-drive checks.
 - USB xHCI storage/HID/hubs, descriptor-based relative pointers, PS/2 keyboard
   and Synaptics input. Hardware coverage and limitations are in the input guide.
 - An opt-in Intel Gen9 blitter path. QEMU tests the CPU path, not this GPU.
@@ -113,7 +115,7 @@ console app; `run /bin/win_test.elf` demonstrates mapped GUI surfaces.
 | [Testing](docs/TESTING.md) | Host/QEMU commands and hardware verification scope |
 
 Key gaps: ELF/user-pointer/window-ownership hardening, loader failure cleanup,
-runtime timezone/DST, safe eject/reconnect, internal-drive installation,
+runtime timezone/DST, stable drive identity and recovery, internal-drive installation,
 translucent client windows and hardware page flipping. PNG/font alpha already
 works; general window surfaces are still composed opaque.
 

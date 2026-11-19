@@ -80,10 +80,11 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
   signals, argument/environment passing or dynamic linking.
 - No translucent client windows, hardware cursor plane, page flipping, GPU
   render engine or GPU client API. PNG/font alpha works on the CPU already.
-- Safe eject/reconnect, stable boot-volume identity, GPT, internal-drive drivers
+- Stable boot-volume identity, GPT, internal-drive drivers
   and installation remain pending. Permissions, links and UTC file timestamps
   also need defined semantics.
-- Runtime timezone/DST configuration and file-transfer UI are absent. Icon
+- External FAT32/exFAT file transfers, progress/cancel, timestamps and eject are
+  implemented. Runtime timezone/DST configuration is pending. Icon
   themes implement the native subset in [IMAGES](IMAGES.md).
 - A failing device can delay sibling HID discovery during synchronous
   enumeration. Surface/ZM3310 wireless stutter is not confirmed resolved.

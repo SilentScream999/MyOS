@@ -3,7 +3,10 @@
 #include "native_ui.h"
 #include "src/gui/power_icons.h"
 
-enum class NativeIcon { Up, Refresh, Open, Minus, Plus, Fit, ActualSize, Back, Forward };
+enum class NativeIcon {
+    Up, Refresh, Open, Minus, Plus, Fit, ActualSize, Back, Forward,
+    NewFolder, NewFile, Rename, Copy, Cut, Paste, Delete, Install, Pin, ShowHidden, Eject, DisclosureDown
+};
 
 // Use the Start menu's restart artwork for refresh. Other toolbar symbols use
 // the same stroke width and integer supersampling, without font glyphs/assets.
@@ -13,6 +16,10 @@ static unsigned native_icon_coverage(NativeIcon icon,int x,int y,int size){
     for(int sy=0;sy<4;++sy)for(int sx=0;sx<4;++sx){
         int px=(x*8+sx*2+1)*24/size-96,py=(y*8+sy*2+1)*24/size-96;
         auto stroke=[&](int a,int b,int c,int d){return power_icon_stroke(px,py,a,b,c,d);};
+        auto ring=[&](int cx,int cy,int radius){
+            int dx=px-cx,dy=py-cy,distance=dx*dx+dy*dy;
+            return distance>=(radius-6)*(radius-6)&&distance<=(radius+6)*(radius+6);
+        };
         bool ink=false;
         if(icon==NativeIcon::Up)ink=stroke(0,56,0,-48)||stroke(-40,-8,0,-48)||stroke(0,-48,40,-8);
         else if(icon==NativeIcon::Back)ink=stroke(32,-48,-16,0)||stroke(-16,0,32,48);
@@ -31,6 +38,49 @@ static unsigned native_icon_coverage(NativeIcon icon,int x,int y,int size){
             stroke(24,16,-24,16)||stroke(-24,16,-24,-16);
         else if(icon==NativeIcon::ActualSize)ink=stroke(-52,-52,52,-52)||stroke(52,-52,52,52)||
             stroke(52,52,-52,52)||stroke(-52,52,-52,-52)||(px>=-12&&px<=12&&py>=-12&&py<=12);
+        else if(icon==NativeIcon::NewFolder)ink=
+            stroke(-64,-24,-64,-56)||stroke(-64,-56,-20,-56)||stroke(-20,-56,8,-24)||
+            stroke(8,-24,64,-24)||stroke(64,-24,64,56)||stroke(64,56,-64,56)||
+            stroke(-64,56,-64,-24)||stroke(-64,-8,64,-8)||stroke(-12,24,28,24)||stroke(8,4,8,44);
+        else if(icon==NativeIcon::NewFile)ink=
+            stroke(-48,-64,16,-64)||stroke(16,-64,48,-32)||stroke(48,-32,48,64)||
+            stroke(48,64,-48,64)||stroke(-48,64,-48,-64)||stroke(16,-64,16,-32)||
+            stroke(16,-32,48,-32)||stroke(-28,20,12,20)||stroke(-8,0,-8,40);
+        else if(icon==NativeIcon::Rename)ink=
+            stroke(-56,56,-48,28)||stroke(-48,28,36,-56)||stroke(36,-56,56,-36)||
+            stroke(56,-36,-28,48)||stroke(-28,48,-56,56)||
+            stroke(-48,28,-28,48)||stroke(20,-40,40,-20);
+        else if(icon==NativeIcon::Copy)ink=
+            stroke(-64,24,-64,-64)||stroke(-64,-64,24,-64)||stroke(24,-64,24,-40)||
+            stroke(-64,24,-40,24)||stroke(-32,-32,64,-32)||stroke(64,-32,64,64)||
+            stroke(64,64,-32,64)||stroke(-32,64,-32,-32);
+        else if(icon==NativeIcon::Cut)ink=ring(-40,40,24)||ring(40,40,24)||
+            stroke(-24,20,52,-64)||stroke(24,20,-52,-64);
+        else if(icon==NativeIcon::Paste)ink=
+            stroke(-52,-48,-24,-48)||stroke(24,-48,52,-48)||stroke(52,-48,52,64)||
+            stroke(52,64,-52,64)||stroke(-52,64,-52,-48)||stroke(-24,-64,24,-64)||
+            stroke(24,-64,24,-28)||stroke(24,-28,-24,-28)||stroke(-24,-28,-24,-64)||
+            stroke(-24,4,24,4)||stroke(-24,32,24,32);
+        else if(icon==NativeIcon::Delete)ink=
+            stroke(-64,-40,64,-40)||stroke(-24,-40,-24,-64)||stroke(-24,-64,24,-64)||
+            stroke(24,-64,24,-40)||stroke(-48,-16,-40,64)||stroke(-40,64,40,64)||
+            stroke(40,64,48,-16)||stroke(-16,0,-16,40)||stroke(16,0,16,40);
+        else if(icon==NativeIcon::Install)ink=
+            stroke(0,-64,0,24)||stroke(-32,-8,0,24)||stroke(0,24,32,-8)||
+            stroke(-64,24,-64,64)||stroke(-64,64,64,64)||stroke(64,64,64,24);
+        else if(icon==NativeIcon::Pin)ink=
+            stroke(-36,-64,36,-64)||stroke(-24,-64,-24,-12)||stroke(-24,-12,-52,16)||
+            stroke(-52,16,52,16)||stroke(52,16,24,-12)||stroke(24,-12,24,-64)||stroke(0,16,0,72);
+        else if(icon==NativeIcon::ShowHidden)ink=
+            stroke(-72,0,-48,-28)||stroke(-48,-28,0,-44)||stroke(0,-44,48,-28)||stroke(48,-28,72,0)||
+            stroke(72,0,48,28)||stroke(48,28,0,44)||stroke(0,44,-48,28)||stroke(-48,28,-72,0)||
+            px*px+py*py<=18*18;
+        else if(icon==NativeIcon::Eject){
+            int distance=px<0?-px:px;
+            ink=(py>=-56&&py<=20&&distance*76<=(py+56)*56)||
+                (px>=-56&&px<=56&&py>=44&&py<=60);
+        }
+        else if(icon==NativeIcon::DisclosureDown)ink=stroke(-48,-24,0,24)||stroke(0,24,48,-24);
         if(ink)++coverage;
     }
     return coverage;

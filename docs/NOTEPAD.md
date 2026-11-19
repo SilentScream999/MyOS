@@ -25,7 +25,9 @@ Cancel or closing the browser leaves the document intact.
 Save As asks before replacing an existing file. New, Open and closing the
 window ask to Save, Discard or Cancel if there are unsaved edits. A failed
 read retains the current document; a failed save retains edits in memory.
-Saves use the existing atomic VFS replacement operation.
+Saves use VFS replacement. ext4 uses atomic replacement. External FAT32/exFAT
+saves stage the new content and keep a backup during publication, with recovery
+on subsequent lookup if a save is interrupted.
 
 Click to place the caret. Arrow keys move it; Shift+arrows and Shift+click
 select text. Ctrl+A selects all. Ctrl+C/X/V use the shared desktop text clipboard,

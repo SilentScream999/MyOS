@@ -4,6 +4,39 @@ Updated 2026-11-11. The normal root filesystem is journaled ext4 on USB.
 FAT16 is used only for the firmware boot partition. See [EXT4](EXT4.md) for
 the supported filesystem profile and write-ordering details.
 
+External USB FAT32 and exFAT volumes mount under their volume labels, for example
+`/mnt/TRAVEL`. Unlabeled volumes use a capacity-based name such as
+`/mnt/USB Drive (1.9 GiB)`. Duplicate names receive a numbered suffix. Empty
+mount folders from earlier boots are reused. Folders containing data are preserved.
+Explorer's Devices view and drive sidebar update when volumes arrive or leave.
+This supports primary MBR partitions of type 0x0B/0x0C (FAT32), type 0x07 (exFAT), and unpartitioned
+media with 512-byte sectors. The system-root disk is excluded from this scan.
+Files and directories support long UTF-8 names, reads, writes, rename and deletion.
+Explorer copies files in either direction and can move individual files across
+filesystems. FAT32's maximum file size is 4 GiB minus one byte. exFAT transfers
+support files larger than 4 GiB. Creation and modification timestamps use the
+local RTC, with January 1, 1980 as the fallback if the clock is unavailable.
+
+External GPT/extended partitions, formatting and repair remain pending.
+Eject in Explorer flushes filesystem metadata and the device, refuses open files,
+then detaches every mounted volume on that physical drive. Devices without an
+explicit cache-flush command display that limitation after logical eject.
+Writes close and synchronize their FatFs handle before returning, and failed
+I/O offlines that volume. The background mount worker removes unavailable mounts and reuses free
+mount folder names when newly enumerated devices arrive. Open handles retain
+the retired volume and cannot access replacement media.
+
+Notepad and shell `write` use VFS replacement on external volumes. New contents
+are staged in a `.wyzar-save-<number>` transaction folder with a validated target
+record. The original is retained as a backup until publication. Interrupted saves
+are recovered during lookup or folder browsing. FAT32/exFAT use this recovery
+scheme without journaling. Power loss can still require filesystem repair,
+especially on devices without explicit cache-flush support.
+
+On the first browse of each folder after mounting, abandoned files matching
+`.explorer-copy-<digits>.tmp` are removed. Open files and stages created during
+the current mount are protected. Cleanup scans up to 8192 entries per browse.
+
 ## Build, update and flash
 
 ```sh

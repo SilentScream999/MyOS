@@ -13,6 +13,7 @@ struct usb_storage {
     uint64_t dma_allocation; // retained allocation, including alignment padding
     uint32_t tag;
     block_device disk;
+    bool sync_unsupported;
 };
 static usb_storage usb_disks[8] = {};
 static int usb_disk_count = 0;
@@ -145,14 +146,32 @@ static void usb_scsi_retry_pause(void*, uint32_t ms) {
         __asm__ volatile("pause");
     }
 }
+static void usb_storage_log_device(usb_storage* s) {
+    char line[192] = {}, value[32]; char* cursor = line;
+    auto text = [&](const char* part) {
+        while (*part && cursor < line + sizeof(line) - 1) *cursor++ = *part++;
+        *cursor = 0;
+    };
+    auto number = [&](uint64_t n) { to_str(n, value); text(value); };
+    text("[storage] USB disk="); number(s - usb_disks);
+    text(" controller="); number(s->dev->hc - xhci_hc);
+    text(" root-port="); number(s->dev->root_port_num);
+    text(" slot="); number(s->dev->slot_id);
+    text(" VID="); to_hex(s->dev->vendor_id, value); text(value);
+    text(" PID="); to_hex(s->dev->product_id, value); text(value);
+    print(line);
+}
 static void usb_scsi_retry_report(void* context, uint8_t opcode, const scsi_sense* sense) {
     char value[32];
+    usb_storage_log_device((usb_storage*)context);
     print((char*)"[storage] SCSI command failed; opcode:");
     to_hex(opcode, value); print(value);
     if (!sense) { print((char*)"[storage] Invalid/unsupported REQUEST SENSE response."); return; }
     // Pack key/ASC/ASCQ for a compact, unambiguous hardware diagnostic.
     print((char*)"[storage] Sense key/ASC/ASCQ (hex 0xKKAAQQ):");
     to_hex(((uint32_t)sense->key << 16) | ((uint32_t)sense->asc << 8) | sense->ascq, value); print(value);
+    if (sense->key == 2 && sense->asc == 0x3a && sense->ascq == 0)
+        print((char*)"[storage] Device reports no medium.");
     if (opcode == 0x28 && sense->key == 6 && sense->asc == 0x28) {
         ((usb_storage*)context)->disk.online = false;
         print((char*)"[storage] Media changed; disk offline until reboot.");
@@ -183,6 +202,29 @@ static bool usb_disk_read_sectors(block_device* d, uint64_t lba, uint32_t count,
 static bool usb_disk_read(block_device* d, uint64_t lba, void* data) {
     return usb_disk_read_sectors(d, lba, 1, data);
 }
+static bool usb_storage_write_command(usb_storage* s, const uint8_t* cdb,
+                                      void* data, uint32_t bytes) {
+    int result = usb_storage_command(s, cdb, 10, false, data, bytes);
+    if (result != 1) return result == 0;
+    // A completed SCSI rejection permits REQUEST SENSE. Capture the reason
+    // without replaying a write or reusing a failed transport.
+    uint8_t request[6] = {3, 0, 0, 0, 18, 0}, response[18] = {};
+    scsi_sense sense{};
+    if (usb_storage_command(s, request, 6, true, response, sizeof(response)) == 0) {
+        bool valid = scsi_decode_sense(response, sizeof(response), &sense);
+        usb_scsi_retry_report(s, cdb[0], valid ? &sense : nullptr);
+        // SYNCHRONIZE CACHE is optional on some USB flash controllers. A
+        // precise unsupported-opcode response permits completion using the
+        // device's WRITE(10) completion semantics, without an explicit flush.
+        if (valid && cdb[0] == 0x35 && !data && !bytes &&
+            sense.key == 5 && sense.asc == 0x20 && sense.ascq == 0) {
+            s->sync_unsupported = true;
+            print((char*)"[storage] Cache flush unsupported; using completed USB writes without an explicit device flush.");
+            return true;
+        }
+    }
+    return false;
+}
 static bool usb_disk_write_sectors(block_device* d, uint64_t lba, uint32_t count, const void* data) {
     if (!d->online || !data || !count || lba >= d->sectors || count > d->sectors - lba ||
         lba > 0xffffffffULL || count > 0x100000000ULL - lba) return false;
@@ -192,7 +234,7 @@ static bool usb_disk_write_sectors(block_device* d, uint64_t lba, uint32_t count
         uint8_t cdb[10] = {0x2a}; usb_scsi_put32(cdb + 2, (uint32_t)lba);
         cdb[7] = take >> 8; cdb[8] = take;
         // Never retry a failed write: completion may be uncertain.
-        if (usb_storage_command(s, cdb, 10, false, (void*)data, take * 512) != 0) return false;
+        if (!usb_storage_write_command(s, cdb, (void*)data, take * 512)) return false;
         lba += take; count -= take; data = (const uint8_t*)data + take * 512;
     }
     return true;
@@ -201,8 +243,13 @@ static bool usb_disk_write(block_device* d, uint64_t lba, const void* data) {
     return usb_disk_write_sectors(d, lba, 1, data);
 }
 static bool usb_disk_flush(block_device* d) {
+    if (!d || !d->online) return false;
+    auto* s = (usb_storage*)d->context;
+    if (s->sync_unsupported) { d->flush_unsupported = true; return true; }
     uint8_t cdb[10] = {0x35};
-    return usb_storage_command((usb_storage*)d->context, cdb, 10, false, nullptr, 0) == 0;
+    bool ok = usb_storage_write_command(s, cdb, nullptr, 0);
+    d->flush_unsupported = s->sync_unsupported;
+    return ok;
 }
 static bool usb_storage_is_device(USBDevice* dev) {
     for (int i = 0; i < usb_disk_count; ++i) if (usb_disks[i].dev == dev) return true;
@@ -220,6 +267,8 @@ static bool usb_storage_configure(USBDevice* dev, uint8_t in_ep, uint16_t in_mps
     if (usb_disk_count == 8 || !in_ep || !out_ep || !in_mps || !out_mps) return false;
     usb_storage* s = &usb_disks[usb_disk_count++];
     s->dev = dev; s->in_dci = in_ep * 2 + 1; s->out_dci = out_ep * 2; s->tag = 0;
+    s->sync_unsupported = false;
+    s->disk.flush_unsupported = false;
     // Retain both allocation and aligned subrange while any old handle exists.
     s->dma_allocation = alloc_phys_pages((USB_STORAGE_DMA_BYTES * 2) / PAGE_SIZE);
     uint64_t aligned = (s->dma_allocation + USB_STORAGE_DMA_BYTES - 1) & ~(uint64_t)(USB_STORAGE_DMA_BYTES - 1);
@@ -253,9 +302,11 @@ static bool usb_storage_configure(USBDevice* dev, uint8_t in_ep, uint16_t in_mps
     s->disk.read_sectors = usb_disk_read_sectors;
     s->disk.write_sectors = usb_disk_write_sectors;
     // Give a cold device up to five seconds of readiness polling. A device
-    // already ready proceeds immediately, without a fixed boot delay.
+    // already ready proceeds immediately, without a fixed boot delay. Initial
+    // no-medium responses share this deadline with other startup conditions.
     uint8_t tur[6] = {};
-    print((char*)"[storage] Checking cold-start disk readiness...");
+    usb_storage_log_device(s);
+    print((char*)"[storage] Checking cold-start disk readiness (up to five seconds)...");
 #if BOOT_DIAGNOSTICS
     uint64_t readiness_started = usb_scsi_retry_now(nullptr);
 #endif
@@ -263,7 +314,9 @@ static bool usb_storage_configure(USBDevice* dev, uint8_t in_ep, uint16_t in_mps
     uint8_t cdb[10] = {0x25}, capacity[8];
     if (!ready || !usb_scsi_read_retry(s, cdb, 10, true, capacity, 8, 2000, true) ||
         usb_scsi_be32(capacity + 4) != 512 || usb_scsi_be32(capacity) == 0xffffffff) {
-        print((char*)"[storage] Disk readiness/capacity check failed; leaving disk offline.");
+        usb_storage_log_device(s);
+        print((char*)(ready ? "[storage] Disk capacity check failed; leaving disk offline." :
+                            "[storage] Disk readiness failed or timed out; leaving disk offline."));
         s->disk.online = false; return false;
     }
     s->disk.sectors = (uint64_t)usb_scsi_be32(capacity) + 1;
@@ -271,7 +324,10 @@ static bool usb_storage_configure(USBDevice* dev, uint8_t in_ep, uint16_t in_mps
     char elapsed[32]; to_str(usb_scsi_retry_now(nullptr) - readiness_started, elapsed);
     print((char*)"[storage] Readiness/capacity milliseconds:"); print(elapsed);
 #endif
+    usb_storage_log_device(s);
+    char size[32]; to_str(s->disk.sectors, size);
     print((char*)"[storage] USB SCSI disk ready (512-byte sectors).");
+    print((char*)"[storage] Sector count:"); print(size);
     return true;
 }
 #endif

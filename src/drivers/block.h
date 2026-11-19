@@ -16,6 +16,7 @@ struct block_device {
     // Optional acceleration. A successful call fills all count sectors.
     bool (*read_sectors)(block_device*, uint64_t lba, uint32_t count, void* data);
     bool (*write_sectors)(block_device*, uint64_t lba, uint32_t count, const void* data);
+    bool flush_unsupported;
 };
 
 static bool block_read(block_device* d, uint64_t lba, void* buf) {

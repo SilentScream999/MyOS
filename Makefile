@@ -38,7 +38,7 @@ LDFLAGS=-nostdlib -z max-page-size=0x1000
 SRC=src/kernel.cpp
 OBJ=$(SRC:.cpp=.o) src/gui/image.o src/gui/overlay_renderer.o
 include src/fs/ext4_config_flags.mk
-EXT4_OBJ = $(EXT4_SRC:.c=.o) src/fs/ext4_libc.o
+EXT4_OBJ = $(EXT4_SRC:.c=.o) src/fs/ext4_libc.o third_party/fatfs/ff.o third_party/fatfs/ffunicode.o
 CXXFLAGS += $(EXT4_CONFIG) $(EXT4_INC) -Isrc/fs/ext4_libc
 $(OBJ) $(EXT4_OBJ): src/fs/ext4_config_flags.mk Makefile
 
@@ -74,6 +74,21 @@ src/gui/overlay_renderer.o: src/gui/overlay_renderer.cpp src/gui/overlay_rendere
 
 .storage-test/ext4-test: tests/ext4_test.cpp src/fs/ext4_vfs.h src/fs/vfs.h src/drivers/block.h Makefile $(patsubst third_party/lwext4/src/%.c,.storage-test/ext4-host/%.o,$(EXT4_SRC))
 	$(CXX) -O1 -g -std=c++20 -no-pie -fsanitize=address,undefined $(EXT4_CONFIG) $(EXT4_INC) -Isrc/fs -Isrc/drivers $< $(filter %.o,$^) -o $@
+
+.storage-test/fatfs-host/%.o: third_party/fatfs/%.c third_party/fatfs/ff.h third_party/fatfs/ffconf.h Makefile
+	mkdir -p .storage-test/fatfs-host
+	$(CC) -O1 -g -fsanitize=address,undefined -DFF_USE_MKFS=1 -c $< -o $@
+
+.storage-test/fat32-test: tests/fat32_test.cpp src/fs/fat32_vfs.h src/fs/fat_time.h src/fs/vfs.h src/drivers/block.h .storage-test/fatfs-host/ff.o .storage-test/fatfs-host/ffunicode.o
+	$(CXX) -O1 -g -std=c++20 -no-pie -fsanitize=address,undefined -I. -Isrc/fs -Isrc/drivers $< $(filter %.o,$^) -o $@
+
+.PHONY: test-fat32
+test-fat32: .storage-test/fat32-test
+	./.storage-test/fat32-test
+
+.PHONY: test-exfat
+test-exfat: .storage-test/fat32-test
+	./.storage-test/fat32-test exfat
 
 .storage-test/autogrow-test: tests/autogrow_test.cpp src/fs/usb_autogrow.h src/fs/storage_policy.h src/fs/ext4_vfs.h src/fs/vfs.h src/drivers/block.h Makefile $(patsubst third_party/lwext4/src/%.c,.storage-test/ext4-host/%.o,$(EXT4_SRC))
 	$(CXX) -O1 -g -std=c++20 -no-pie -fsanitize=address,undefined $(EXT4_CONFIG) $(EXT4_INC) -Isrc/fs -Isrc/drivers $< $(filter %.o,$^) -o $@

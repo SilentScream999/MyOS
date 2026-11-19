@@ -41,6 +41,8 @@ static bool scsi_read_with_retry(const scsi_retry_ops& ops, const uint8_t* cdb,
                                 uint32_t budget_ms, bool startup) {
     if (!cdb || !length || (cdb[0] != 0 && cdb[0] != 0x25 && cdb[0] != 0x28)) return false;
     uint64_t start = ops.now_ms(ops.context);
+    scsi_sense reported_sense{};
+    bool reported = false;
     for (unsigned attempt = 0; attempt < 32; ++attempt) {
         int status = ops.command(ops.context, cdb, length, in, data, bytes);
         if (status == 0) return true;
@@ -51,9 +53,20 @@ static bool scsi_read_with_retry(const scsi_retry_ops& ops, const uint8_t* cdb,
         if (ops.command(ops.context, request, 6, true, response, sizeof(response)) != 0) return false;
         scsi_sense sense;
         bool valid = scsi_decode_sense(response, sizeof(response), &sense);
-        if (ops.report) ops.report(ops.context, cdb[0], valid ? &sense : nullptr);
+        // Keep slow startup from filling the boot log with the same sense.
+        if (ops.report && (!valid || !reported || sense.key != reported_sense.key ||
+                          sense.asc != reported_sense.asc || sense.ascq != reported_sense.ascq)) {
+            ops.report(ops.context, cdb[0], valid ? &sense : nullptr);
+            if (valid) { reported_sense = sense; reported = true; }
+        }
         uint64_t elapsed = ops.now_ms(ops.context) - start;
-        if (!valid || !scsi_transient_sense(sense, startup) || elapsed >= budget_ms || attempt == 31) return false;
+        // Some removable devices report no medium while their controller starts.
+        // Allow only initial TEST UNIT READY to wait through 02/3A/00. Mounted
+        // reads and capacity probes still reject absent media immediately.
+        bool starting_media = valid && startup && cdb[0] == 0 &&
+            sense.key == 2 && sense.asc == 0x3a && sense.ascq == 0;
+        if (!valid || (!starting_media && !scsi_transient_sense(sense, startup)) ||
+            elapsed >= budget_ms || attempt == 31) return false;
         if (sense.key == 2) {
             uint32_t delay = budget_ms - elapsed < 250 ? budget_ms - elapsed : 250;
             ops.pause_ms(ops.context, delay);

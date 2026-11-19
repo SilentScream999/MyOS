@@ -22,7 +22,7 @@ distinct from the reproducible host/QEMU checks in [TESTING](TESTING.md).
 The requested storage work already includes batched writes, responsive runtime
 waits, atomic saves, rename and automatic capacity setup. Remaining follow-up:
 
-1. Safe eject and stable volume identity; explicit reconnect/recovery policy.
+1. Stable volume identity and an explicit reconnect/recovery policy. External FAT32/exFAT eject is implemented.
 2. Permissions/user identity, link semantics and a consistent UTC timestamp basis.
 3. Reclaimable vnode caches and broader, deliberately validated ext4 profiles.
 4. More asynchronous discovery/control probes; current waits are bounded but

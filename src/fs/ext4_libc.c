@@ -33,6 +33,10 @@ int strncmp(const char *a, const char *b, size_t n) {
     return 0;
 }
 char *strcpy(char *d, const char *s) { char *p = d; while ((*p++ = *s++)) {} return d; }
+char *strchr(const char *s, int c) {
+    do { if (*s == (char)c) return (char*)s; } while (*s++);
+    return NULL;
+}
 char *strncpy(char *d, const char *s, size_t n) {
     char *result = d;
     while (n && *s) { *d++ = *s++; --n; }

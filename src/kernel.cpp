@@ -20,6 +20,7 @@
 #include "arch/boot_module.h"
 #include "fs/ext4_vfs.h"
 #include "fs/usb_autogrow.h"
+#include "fs/fat32_vfs.h"
 
 extern "C" void* wyzar_ext4_malloc(size_t n) { return kmalloc(n); }
 extern "C" void* wyzar_ext4_realloc(void* p, size_t n) { return krealloc(p, n); }
@@ -1303,6 +1304,11 @@ extern "C" void kmain(void) {
 		}
 	}
 
+    static bool external_storage_started = false;
+    if (!external_storage_started) {
+        external_storage_started = true;
+        scheduler_add_task(task_create(fat_mount_worker,16,"External drives"));
+    }
 	// ── Wait for a keyboard ONLY if we need to enumerate first pass ─────────
 	// We no longer block indefinitely here. The main loop will handle hotplug.
 	if (keyboard_count == 0) {

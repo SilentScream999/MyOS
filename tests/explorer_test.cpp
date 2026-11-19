@@ -19,6 +19,11 @@ static TextClipboard text_clipboard;
 namespace fs=std::filesystem;
 static fs::path sandbox;
 static bool write_failure=false;
+static bool create_failure=false;
+static bool cross_volume_move=false;
+static int64_t eject_result=0;
+static std::string ejected_path;
+static uint64_t mount_generation=0;
 static unsigned spawned=0,presents=0;
 static unsigned partial_presents=0;
 static uint64_t damage_x,damage_y,damage_w,damage_h;
@@ -29,7 +34,7 @@ static uint64_t native_call(uint64_t n,uint64_t a,uint64_t b,uint64_t c,uint64_t
     switch(n){
     case 0:return read((int)a,(void*)b,c);
     case 1:return write_failure?(uint64_t)-1:write((int)a,(void*)b,c);
-    case 2:{int flags=(int)b;
+    case 2:{if(create_failure&&(b&0x40))return -1;int flags=(int)b;
 #ifdef _WIN32
         // Native ABI flags follow Linux values; translate for the Windows host.
         flags=O_BINARY|((b&3)==2?O_RDWR:(b&3)==1?O_WRONLY:O_RDONLY);
@@ -50,6 +55,10 @@ static uint64_t native_call(uint64_t n,uint64_t a,uint64_t b,uint64_t c,uint64_t
     case 59:case 213:++spawned;return 100+spawned;
     case 216:opened_app=(char*)a;opened_document=(char*)b;return launch_failure?(uint64_t)-1:100+(++spawned);
     case 217:return a==0?text_clipboard.set((char*)b,c):a==1?text_clipboard.get((char*)b,c):-1;
+    case 218:{static uint64_t tick=0;tick+=100;((ProcessMetadata*)d)->tick_ms=tick;return 0;}
+    case 220:ejected_path=(const char*)a;return eject_result;
+    case 221:{if(a==0)return mount_generation;const char* path=(const char*)b;
+        return strncmp(path,"/mnt/",5)==0&&fs::is_directory(resolve(b))?1:0;}
     case 74:
 #ifdef _WIN32
         return _commit((int)a);
@@ -57,7 +66,8 @@ static uint64_t native_call(uint64_t n,uint64_t a,uint64_t b,uint64_t c,uint64_t
         return fsync((int)a);
 #endif
     case 80:return fs::is_directory(resolve(a))?0:-1;
-    case 82:{if(fs::exists(resolve(b)))return -1;std::error_code ec;fs::rename(resolve(a),resolve(b),ec);return ec?-1:0;}
+    case 82:{if(cross_volume_move&&!strstr((const char*)a,".explorer-copy-"))return -1;
+        if(fs::exists(resolve(b)))return -1;std::error_code ec;fs::rename(resolve(a),resolve(b),ec);return ec?-1:0;}
     case 83:{std::error_code ec;bool made=fs::create_directory(resolve(a),ec);return made&&!ec?0:-1;}
     case 84:return rmdir(resolve(a).c_str());
     case 87:return unlink(resolve(a).c_str());
@@ -73,6 +83,10 @@ static std::string get(const char* path) { std::ifstream in(sandbox.string()+pat
 static void choose(const char* name) {
     for(int i=0;i<entry_count;++i)if(!std::strcmp(entries[i].name,name)){select_row(i);return;}
     assert(false&&"missing explorer entry");
+}
+static void complete_transfer() {
+    while(transfer.active)advance_transfer();
+    if(dialog==TRANSFER)cancel_transfer();
 }
 int main(int argc,char** argv) {
     assert(argc==3);sandbox=fs::absolute(argv[1]);
@@ -91,15 +105,17 @@ int main(int argc,char** argv) {
     assert(dialog==NEW_FILE&&get("/home/note.txt")=="do not overwrite");dialog=NONE;load_directory();
     choose("note.txt");begin_dialog(RENAME);native_copy(edit_text,256,"renamed.txt");commit_dialog();
     assert(get("/home/renamed.txt")=="do not overwrite"&&!fs::exists(sandbox/"home/note.txt"));
-    choose("large.txt");copy_selection(false);navigate("destination");paste_selection();
+    choose("large.txt");copy_selection(false);navigate("destination");paste_selection();complete_transfer();
     assert(get("/home/destination/large.txt")==std::string(9001,'X'));paste_selection();
+    assert(dialog==TRANSFER&&!transfer.active&&!transfer.success&&strstr(transfer.message,"already exists"));
+    complete_transfer();
     assert(get("/home/destination/large.txt")==std::string(9001,'X'));
-    navigate("/home");choose("empty.txt");copy_selection(false);navigate("destination");paste_selection();
+    navigate("/home");choose("empty.txt");copy_selection(false);navigate("destination");paste_selection();complete_transfer();
     assert(fs::exists(sandbox/"home/destination/empty.txt"));
-    navigate("/home");choose("zeta.txt");copy_selection(false);navigate("destination");write_failure=true;paste_selection();write_failure=false;
+    navigate("/home");choose("zeta.txt");copy_selection(false);navigate("destination");write_failure=true;paste_selection();complete_transfer();write_failure=false;
     assert(!fs::exists(sandbox/"home/destination/zeta.txt")&&get("/home/zeta.txt")=="hello explorer\n");
     for(auto& item:fs::directory_iterator(sandbox/"home/destination"))assert(item.path().filename().string().find(".explorer-copy-")!=0);
-    navigate("/home");choose("renamed.txt");copy_selection(true);navigate("destination");paste_selection();
+    navigate("/home");choose("renamed.txt");copy_selection(true);navigate("destination");paste_selection();complete_transfer();
     assert(!fs::exists(sandbox/"home/renamed.txt")&&get("/home/destination/renamed.txt")=="do not overwrite");
     choose("renamed.txt");begin_dialog(DELETE_ITEM);assert(fs::exists(sandbox/"home/destination/renamed.txt"));commit_dialog();
     assert(!fs::exists(sandbox/"home/destination/renamed.txt"));
@@ -152,7 +168,7 @@ int main(int argc,char** argv) {
     choose_open_with();render();dialog=NONE;
     for(auto size: {std::pair{600,360},std::pair{1200,720},std::pair{860,560}}){
         layout(size.first,size.second);pixels.assign(WIDTH*HEIGHT,0);surface={pixels.data(),WIDTH,HEIGHT};
-        for(int i=4;i<14;++i)assert(buttons[i].x>=SIDE&&buttons[i].x+buttons[i].w<=WIDTH-16);
+        for(int i=4;i<BUTTON_COUNT;++i)assert(buttons[i].x>=SIDE&&buttons[i].x+buttons[i].w<=WIDTH-16);
         assert(VISIBLE>0&&LIST_TOP+VISIBLE*ROW<=HEIGHT-36);render();
         begin_dialog(NEW_FOLDER);render();dialog=NONE;
     }
@@ -216,5 +232,86 @@ int main(int argc,char** argv) {
     repaint({1,(WIDTH-480)/2+DIALOG_TEXT_INSET,(HEIGHT-202)/2+68,1,0,0},
             (WIDTH-480)/2+DIALOG_TEXT_INSET,(HEIGHT-202)/2+65,420,text_h);
     edit_frame('i',0,(WIDTH-480)/2+30,(HEIGHT-202)/2+65,420);assert(!strcmp(edit_text,"in"));
+    dialog=NONE;address_edit=false;
+    put("/home/cancel.bin",std::string(200000,'C'));navigate("/home");choose("cancel.bin");
+    copy_selection(false);navigate("destination");paste_selection();
+    assert(transfer.active&&dialog==TRANSFER&&transfer.done==0);
+    render();advance_transfer();assert(transfer.active&&transfer.done==65536);
+    render();
+    {
+        std::ofstream popup(std::string(argv[2])+".transfer.ppm",std::ios::binary);
+        popup<<"P6\n"<<WIDTH<<" "<<HEIGHT<<"\n255\n";
+        for(uint32_t pixel:pixels){char rgb[]={(char)(pixel>>16),(char)(pixel>>8),(char)pixel};popup.write(rgb,3);}
+    }
+    handle_event({5,0,0,27,0,0});
+    assert(!transfer.active&&!fs::exists(sandbox/"home/destination/cancel.bin"));
+    assert(get("/home/cancel.bin")==std::string(200000,'C'));
+    for(auto& item:fs::directory_iterator(sandbox/"home/destination"))assert(item.path().filename().string().find(".explorer-copy-")!=0);
+    cancel_transfer();paste_selection();while(transfer.active)advance_transfer();
+    assert(dialog==NONE&&transfer.success);
+    assert(get("/home/destination/cancel.bin")==std::string(200000,'C'));
+    put("/home/move.bin",std::string(90000,'M'));navigate("/home");choose("move.bin");
+    copy_selection(true);navigate("destination");cross_volume_move=true;paste_selection();
+    assert(transfer.active&&fs::exists(sandbox/"home/move.bin"));
+    complete_transfer();cross_volume_move=false;
+    assert(!fs::exists(sandbox/"home/move.bin")&&get("/home/destination/move.bin")==std::string(90000,'M'));
+    put("/home/create-fail.txt","source");navigate("/home");choose("create-fail.txt");
+    copy_selection(false);navigate("destination");create_failure=true;paste_selection();create_failure=false;
+    assert(dialog==TRANSFER&&!transfer.active&&!transfer.success&&strstr(transfer.message,"Cannot create"));
+    assert(!fs::exists(sandbox/"home/destination/create-fail.txt"));complete_transfer();
+    fs::create_directories(sandbox/"mnt/Camera");navigate("/mnt");choose("Camera");
+    assert(button_enabled(14));eject_result=-2;button_action(14);
+    assert(ejected_path=="/mnt/Camera"&&strstr(status_line,"busy"));
+    eject_result=0;button_action(14);assert(strstr(status_line,"You can remove"));
+    navigate("/mnt/Camera");eject_result=1;button_action(14);
+    assert(!strcmp(current_dir,"/mnt")&&strstr(status_line,"no explicit"));
+    navigate("/home");choose("zeta.txt");
+    fs::create_directories(sandbox/"mnt/TRAVEL");++mount_generation;frame+=31;poll_storage_changes();
+    assert(drive_count==2&&selected>=0&&!strcmp(entries[selected].name,"zeta.txt"));
+    navigate("/mnt");choose("TRAVEL");open_selected();assert(current_external&&!strcmp(current_dir,"/mnt/TRAVEL"));
+    fs::remove(sandbox/"mnt/TRAVEL");++mount_generation;frame+=31;poll_storage_changes();
+    assert(!strcmp(current_dir,"/mnt")&&drive_count==1&&!listing_error);
+    fs::create_directories(sandbox/"mnt/BACKUP");++mount_generation;address_edit=true;
+    frame+=31;poll_storage_changes();assert(drive_count==1&&address_edit);
+    address_edit=false;frame+=31;poll_storage_changes();assert(drive_count==2);
+    assert(icon_only(7)&&buttons[7].w==32&&!icon_only(14)&&!strcmp(buttons[14].label,"Eject"));
+    handle_event({3,buttons[7].x+8,buttons[7].y+8,0,0,0});render_frame();
+    assert(hovered_button==7);
+    put("/mnt/Camera/sample.wiz","preview");navigate("/mnt/Camera");choose("sample.wiz");copy_selection(false);
+    handle_event({3,buttons[9].x+8,buttons[9].y+8,0,0,0});render_frame();
+    {
+        std::ofstream snapshot(std::string(argv[2])+".drives.ppm",std::ios::binary);
+        snapshot<<"P6\n"<<WIDTH<<" "<<HEIGHT<<"\n255\n";
+        for(uint32_t pixel:pixels){char rgb[]={(char)(pixel>>16),(char)(pixel>>8),(char)pixel};snapshot.write(rgb,3);}
+    }
+    navigate("/mnt");choose("Camera");hovered_button=-1;render();
+    assert(entries[selected].external_drive);
+    {
+        std::ofstream snapshot(std::string(argv[2])+".disks.ppm",std::ios::binary);
+        snapshot<<"P6\n"<<WIDTH<<" "<<HEIGHT<<"\n255\n";
+        for(uint32_t pixel:pixels){char rgb[]={(char)(pixel>>16),(char)(pixel>>8),(char)pixel};snapshot.write(rgb,3);}
+    }
+    int camera_row=-1;for(int i=0;i<drive_count;++i)if(!strcmp(drives[i].name,"Camera"))camera_row=i;
+    assert(camera_row>=0&&camera_row<visible_drives());
+    int disclosure_y=101+5*place_step+place_height()/2;
+    handle_event({1,23,disclosure_y,1,0,0});assert(!devices_expanded&&visible_drives()==0);
+    assert(!strcmp(current_dir,"/mnt"));
+    ++mount_generation;frame+=31;poll_storage_changes();assert(!devices_expanded&&drive_count==2);
+    handle_event({1,DRIVE_TEXT_X+5,drive_sidebar_top()+DRIVE_ROW/2,1,0,0});
+    assert(!strcmp(current_dir,"/mnt"));render();
+    {
+        std::ofstream snapshot(std::string(argv[2])+".collapsed.ppm",std::ios::binary);
+        snapshot<<"P6\n"<<WIDTH<<" "<<HEIGHT<<"\n255\n";
+        for(uint32_t pixel:pixels){char rgb[]={(char)(pixel>>16),(char)(pixel>>8),(char)pixel};snapshot.write(rgb,3);}
+    }
+    handle_event({1,60,disclosure_y,1,0,0});assert(!devices_expanded&&!strcmp(current_dir,"/mnt"));
+    handle_event({1,23,disclosure_y,1,0,0});assert(devices_expanded&&visible_drives()==2);
+    handle_event({1,DRIVE_TEXT_X+5,drive_sidebar_top()+camera_row*DRIVE_ROW+DRIVE_ROW/2,1,0,0});
+    assert(!strcmp(current_dir,"/mnt/Camera"));
+    layout(600,360);pixels.assign(WIDTH*HEIGHT,0);surface={pixels.data(),WIDTH,HEIGHT};render();
+    assert(drive_sidebar_top()+DRIVE_ROW<=HEIGHT-36);
+    handle_event({1,DRIVE_TEXT_X+5,drive_sidebar_top()+DRIVE_ROW/2,1,0,0});
+    assert(!strcmp(current_dir,"/mnt"));
+    drive_count=1;layout_sidebar();assert(visible_drives()==1&&drive_sidebar_top()+DRIVE_ROW<=HEIGHT-36);
     puts("Explorer navigation, sorting, dialogs, copy failure, moves, detached launch, limits and rendering passed");
 }

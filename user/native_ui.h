@@ -131,6 +131,27 @@ struct NativeSurface {
         polygon(x,y,size,face,0xffe9bd70);polygon(x,y,size,highlight,0xffffdc99);
         polygon(x,y,size,shade,0xffc79549);
     }
+    void external_disk(int x,int y,int size=28) {
+        static const Point connector[]={{10,2},{22,2},{22,14},{10,14}};
+        static const Point metal[]={{11,3},{21,3},{21,13},{11,13}};
+        static const Point metal_light[]={{11,3},{13,3},{13,12},{11,12}};
+        static const Point contact_left[]={{13,5},{15,5},{15,8},{13,8}};
+        static const Point contact_right[]={{17,5},{19,5},{19,8},{17,8}};
+        static const Point outline[]={{8,11},{24,11},{26,13},{26,27},{23,30},{9,30},{6,27},{6,13}};
+        static const Point body[]={{9,12},{23,12},{25,14},{25,26},{22,29},{10,29},{7,26},{7,14}};
+        static const Point highlight[]={{9,12},{23,12},{25,14},{8,14},{7,16},{7,14}};
+        static const Point sheen[]={{8,15},{10,15},{10,25},{8,25}};
+        static const Point side[]={{23,15},{25,14},{25,26},{22,29},{21,27},{23,25}};
+        static const Point bottom[]={{8,26},{11,27},{21,27},{23,26},{22,29},{10,29}};
+        static const Point light[]={{14,21},{18,21},{18,23},{14,23}};
+        polygon(x,y,size,connector,0xff69768c);polygon(x,y,size,metal,0xffccd5e1);
+        polygon(x,y,size,metal_light,0xffedf2f7);
+        polygon(x,y,size,contact_left,0xff68758b);polygon(x,y,size,contact_right,0xff68758b);
+        polygon(x,y,size,outline,0xff53496f);polygon(x,y,size,body,0xff9787c4);
+        polygon(x,y,size,highlight,0xffc9bbec);polygon(x,y,size,sheen,0xffb2a1db);
+        polygon(x,y,size,side,0xff6c5e94);polygon(x,y,size,bottom,0xff7c69aa);
+        polygon(x,y,size,light,0xffedc985);
+    }
     void wizard(int x,int y,int size=28) {
         static const Point brim[]={{2,23},{7,20},{23,19},{30,23},{28,26},{19,28},{8,27}};
         static const Point crown[]={{7,21},{12,9},{18,3},{25,4},{20,8},{24,21},{17,24}};
