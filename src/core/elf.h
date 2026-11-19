@@ -55,6 +55,14 @@ typedef struct {
 #define PF_W       2
 #define PF_R       4
 
+// Native apps use an ordinary compiled C/C++ function as their ELF entry.
+// IRETQ does not push a return address, so reserve its slot explicitly to
+// reproduce the System V function-entry alignment (RSP % 16 == 8). The
+// loader's zeroed stack supplies a null return sentinel in that slot.
+static constexpr uint64_t elf_user_entry_stack(uint64_t stack_top) {
+    return (stack_top & ~uint64_t(15)) - sizeof(uint64_t);
+}
+
 // ── elf_check_magic ───────────────────────────────────────────────────────────
 
 static inline bool elf_check_magic(const Elf64_Ehdr* hdr) {

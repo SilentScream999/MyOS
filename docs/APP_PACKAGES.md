@@ -124,6 +124,10 @@ Upgrades keep your edits.
 
 ## Building a package
 
+Native ELF entry points are ordinary C/C++ `_start` functions. The loader
+enters them with `RSP % 16 == 8`, reserving a zero return-address slot to match
+the System V function ABI. Entry functions must exit through the exit syscall.
+
 ```text
 make counter.wiz          # shortcut; writes build/packages/counter.wiz
 make packages             # all sample packages in build/packages/

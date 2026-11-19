@@ -7,7 +7,7 @@ Build/setup instructions are in [README](../README.md).
 ## Image Viewer and retained Start icons
 
 ```sh
-make test-image-viewer test-explorer test-user-memory
+make test-image-viewer test-explorer test-user-memory test-user-entry
 python3 tests/run_image_tests.py
 make iso PERSIST_DISK=.storage-test/viewer-seed.img ROOT_MIB=64
 python3 tests/qemu_image_viewer_test.py
@@ -22,6 +22,9 @@ python3 tests/qemu_simd_test.py
 The native probe keeps distinct patterns in XMM0-15, nondefault MXCSR and live
 x87 values across blocking syscalls and timer-driven preemption. It reproduced
 failures on both paths before entry stubs saved/restored the extended state.
+`test-user-entry` checks the loader's initial stack pointer and jumps onto a
+test stack to execute the aligned SIMD store that faulted during Image Viewer
+startup when the function-entry return-address slot was missing.
 The viewer guest suite also checks solid bands in its plus button and the
 shared file-picker text field after repeated repaints, avoiding text/corner
 pixels that legitimately differ from the background.

@@ -90,7 +90,7 @@ static Task* execve_memory(const uint8_t* elf_data) {
     // ── Create the PCB ────────────────────────────────────────────────────────
     Task* t = task_create_user(exec_trampoline, new_cr3, 4); // 4 pages for kernel stack
     t->user_entry = ehdr->e_entry;
-    t->user_stack = user_stack_top;
+    t->user_stack = elf_user_entry_stack(user_stack_top);
     
     return t;
 }

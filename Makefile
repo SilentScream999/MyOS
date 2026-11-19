@@ -217,6 +217,13 @@ image_viewer.elf: user/image_viewer.o user/image_codec.o
 
 test-image-viewer:
 	python3 tests/run_image_viewer_tests.py
+
+test-user-entry:
+	mkdir -p .storage-test
+	$(CXX) -std=c++20 -O2 tests/user_entry_stack_test.cpp -o .storage-test/user-entry-stack-test
+	.storage-test/user-entry-stack-test
+
+.PHONY: test-user-entry
 .PHONY: test-image-viewer
 
 test-user-memory:
