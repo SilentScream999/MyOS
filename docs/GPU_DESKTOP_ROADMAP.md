@@ -312,6 +312,24 @@ host tests run 2,050 acknowledged reset passes and exercise preparation and
 domain timeout cleanup. This addresses another real protocol omission; it is
 not confirmation of the physical freeze's cause or resolution.
 
+The owner subsequently ran that reset-handshake revision for 800 seconds with
+interaction and no freezes, reporting 5-7% CPU for maximized Rainbow or the demo
+but about 30% with them side by side. The guarded baseline is preserved at
+`6baa52b` on `codex/gpu-rcs-stable-800s`, with hash-verified USB/ISO/kernel copies
+in `.storage-test/checkpoints/gpu-rcs-stable-800s-2026-11-20/`.
+
+At the owner's request, `codex/gpu-resized-composition` restores ordinary
+scaled-client RCS and retains the reset handshake. A new retained scene path
+plans BCS and RCS work at the actual damage bounds. It copies uncovered desktop
+gaps on CPU, preserves unchanged chrome, and draws exposed resize-grip marks
+after GPU completion. Any uncovered window chrome or unsupported client falls
+back to the full scene renderer. This avoids the old full-width CPU band for
+side-by-side client animation. Damage crossing the visible desktop HUD is split
+into a small complete top band and retained client work below it, with one
+presentation and accumulated timings. Host/QEMU tests cover the planner, pixels,
+occlusion, grips, undamaged pixels and failure recovery; physical restored-size
+stability and measured CPU improvements remain unverified until a laptop run.
+
 1. **Finish the CPU surface contract.** Define alpha/opacity behavior for client
    windows separately from image alpha. Retain fast opaque copies, add tested
    blending, then cached decorations/shadows and optional client double buffering.

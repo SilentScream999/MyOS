@@ -6,12 +6,14 @@ static uint32_t g_gpu_test_sample[3]{};
 static uint8_t* g_gpu_test_recovery;
 #ifdef GPU_RENDER_TEST
 static uint64_t g_gpu_test_render_calls=0;
+static uint64_t g_gpu_test_demo_render_calls=0;
 static bool g_gpu_test_render_fail=false;
 static uint32_t g_gpu_test_scaled_sample[3]{};
 static bool gpu_test_render(const GpuScenePlan& plan) {
     ++g_gpu_test_render_calls;
     for(unsigned i=0;i<plan.count;++i){
         const auto& copy=plan.copies[i];const auto& c=plan.clients[copy.source];
+        if(c.width==480&&c.height==320)++g_gpu_test_demo_render_calls;
         GpuTextureDraw draw{{0x10000000,c.width,c.height,c.pitch},
             {0x2000000,(uint32_t)fb->width,(uint32_t)fb->height,(uint32_t)fb->pitch},
             {c.client.x1,c.client.y1,c.client.x2,c.client.y2},
@@ -94,6 +96,9 @@ static void gpu_test_install() {
     for(unsigned y=0;y<48;++y)for(unsigned x=0;x<64;++x)
         fixture->buffer[y*64+x]=0xFF000000u|(x*3u<<16)|(y*5u<<8)|((x+y)*2u);
     fixture->w=128;fixture->h=96;
+    auto* neighbor=wm_create_window("GPU native fixture",1148,180,128,96,false,false,WIN_TYPE_USER,0);
+    if(!neighbor)hcf();
+    for(unsigned i=0;i<128*96;++i)neighbor->buffer[i]=0xFF113355;
     g_gpu_render_hook=gpu_test_render;
 #endif
 #ifdef GPU_PRESENT_TEST

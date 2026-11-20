@@ -176,7 +176,8 @@ static void scaled_occlusion_test() {
         assert(r.y1>=20&&r.y2<=150);
     }
     plan.clients[0].resize_grip=true;gpu_scaled_scene_plan(&plan,{0,0,200,150});
-    assert(!plan.count&&!plan.accelerated); // arbitrary resized clients stay CPU
+    assert(plan.count>0&&plan.accelerated==1);
+    for(unsigned i=0;i<plan.count;++i)assert(plan.copies[i].destination.y2<=138);
     plan.clients[0].rainbow=true;gpu_scaled_scene_plan(&plan,{0,0,200,150});
     assert(!plan.count&&!plan.accelerated);
     plan.clients[0].rainbow=false;plan.clients[0].resize_grip=false;
@@ -186,17 +187,34 @@ static void scaled_occlusion_test() {
     plan.clients[0].resize_grip=true;
     assert(!gpu_scaled_damage_plan(&plan,{0,20,70,80}));
 }
-static void resized_shape_fallback_test() {
+static void resized_shape_test() {
     GpuScenePlan plan{};plan.client_count=1;
-    // Odd sizes, narrow strips and mixed upscale/downscale all stay on CPU
-    // without marking any pixels as GPU-owned. Native-size BCS is separate.
+    // Odd sizes and mixed upscale/downscale are eligible again. The generic
+    // path preserves CPU grip rows; retained client damage includes them.
     const unsigned widths[]={32,33,127,479,480,481,639,1023,1919};
     const unsigned heights[]={32,33,63,319,320,321,767,1001};
     for(unsigned w:widths)for(unsigned h:heights){
         plan.clients[0]={{0,0,(int)w,(int)h+20},{0,20,(int)w,(int)h+20},
                           (uint32_t*)0x1000,480,320,1920,true,false,true};
         gpu_scaled_scene_plan(&plan,{0,0,1920,1080});
-        assert(!plan.count&&!plan.accelerated);
+        bool scaled=w!=480||h!=320;
+        assert(plan.count==(scaled?1u:0u));
+        assert(plan.accelerated==(scaled?1u:0u));
+        if(scaled)assert(plan.copies[0].destination.y2==(int)h+20-12);
+        gpu_scaled_scene_plan(&plan,{0,0,1920,1080},true);
+        assert(plan.count==(scaled?1u:0u));
+        if(scaled){
+            assert(plan.copies[0].destination.y2==(int)h+20);
+            auto r=plan.copies[0].destination;
+            uint32_t batch[1024];
+            GpuTextureDraw draw{{0x10000000,480,320,1920},{0x2000000,1920,1080,7680},
+                                {0,20,(int)w,(int)h+20},{r.x1,r.y1,r.x2,r.y2},false};
+            assert(gpu_build_texture_batch(batch,0x100000,draw));
+            const auto* vertices=batch+GPU_RENDER_VERTEX_OFFSET/4;
+            assert(vertices[0]==(w|((h+20)<<16)));
+            assert(floating(vertices[1])==1.f&&floating(vertices[2])==1.f);
+            assert(floating(vertices[7])==0.f&&floating(vertices[8])==0.f);
+        }
         assert(!gpu_scaled_damage_plan(&plan,{0,20,(int)w,(int)h+20}));
     }
     plan.clients[0]={{0,0,1920,1040},{0,20,1920,1040},
@@ -204,5 +222,37 @@ static void resized_shape_fallback_test() {
     assert(gpu_scaled_damage_plan(&plan,{0,20,1920,122}));
     assert(plan.count==1&&plan.accelerated==1);
 }
-int main(){reset_handshake_test();texture_state_test();logical_context_test();sustained_ring_test();readback_sampling_test();scaled_occlusion_test();resized_shape_fallback_test();
+static void retained_mixed_scene_test() {
+    GpuScenePlan bcs{},rcs{};VisibleRegion background{};
+    bcs.client_count=rcs.client_count=2;
+    bcs.clients[0]={{0,0,100,100},{0,20,100,100},(uint32_t*)0x1000,100,80,400,true,true,true};
+    bcs.clients[1]={{100,0,200,100},{100,20,200,100},(uint32_t*)0x2000,50,40,200,true,false,true};
+    auto build=[&](VisibleRect damage,bool grips){
+        for(unsigned i=0;i<bcs.client_count;++i)rcs.clients[i]=bcs.clients[i];
+        rcs.client_count=bcs.client_count;
+        gpu_scene_plan(&bcs,damage,grips);gpu_scaled_scene_plan(&rcs,damage,grips);
+    };
+    VisibleRect damage{0,20,200,100};
+    build(damage,false);assert(!gpu_retained_damage(bcs,rcs,damage,&background));
+    build(damage,true);assert(bcs.count==1&&rcs.count==1);
+    assert(gpu_retained_damage(bcs,rcs,damage,&background)&&!background.count);
+    // A desktop gap only costs the gap's pixels, not both windows' chrome.
+    bcs.clients[1].outer.x1=110;bcs.clients[1].outer.x2=210;
+    bcs.clients[1].client.x1=110;bcs.clients[1].client.x2=210;
+    damage.x2=210;build(damage,true);
+    assert(gpu_retained_damage(bcs,rcs,damage,&background)&&background.count==1);
+    auto gap=background.rects[0];assert(gap.x1==100&&gap.x2==110&&gap.y1==20&&gap.y2==100);
+    // Chrome and unsupported foreground content must still repaint on CPU.
+    damage.y1=0;build(damage,true);
+    assert(!gpu_retained_damage(bcs,rcs,damage,&background));
+    damage.y1=20;bcs.client_count=3;
+    bcs.clients[2]={{40,30,60,80},{40,40,60,80},(uint32_t*)0x3004,20,40,80,true,false,true};
+    build(damage,true);assert(!gpu_retained_damage(bcs,rcs,damage,&background));
+    assert(!gpu_scene_pixel_exposed(bcs,0,50,50));
+    assert(gpu_scene_pixel_exposed(bcs,0,98,98));
+    // Invalid copy bounds cannot authorize a retained update.
+    bcs.client_count=2;build(damage,true);rcs.copies[0].destination.x2=211;
+    assert(!gpu_retained_damage(bcs,rcs,damage,&background));
+}
+int main(){reset_handshake_test();texture_state_test();logical_context_test();sustained_ring_test();readback_sampling_test();scaled_occlusion_test();resized_shape_test();retained_mixed_scene_test();
     puts("Gen9 texture/scaling/alpha state, logical contexts and occlusion tests passed.");}

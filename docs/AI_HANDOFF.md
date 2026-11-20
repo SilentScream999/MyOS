@@ -1,6 +1,6 @@
 # Project handoff
 
-Updated 2026-11-19. This is the current working snapshot, not a change log.
+Updated 2026-11-20. This is the current working snapshot, not a change log.
 Start with [README](../README.md), then the guide for the area being changed.
 Pending work is in [NEXT_STEPS](NEXT_STEPS.md); commands are in [TESTING](TESTING.md).
 
@@ -37,20 +37,17 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
 
 ## Decisions and implementation constraints
 
-- Active RCS freeze investigation: the owner confirms `GPU_RENDER=0` prevents
-  resize-triggered demo freezes. Corrected KBL GAM-hang workaround ordering to
-  null PC, DC flush, invalidate/post-sync, trailing CS stall (i915
-  `gen8_emit_flush_rcs`). Previously the trailing stall was before invalidation.
-  Host coverage checks the order; physical stability is not yet confirmed.
-  Follow-up: fullscreen now works, but some ordinary aspect ratios instantly
-  freeze. The planner temporarily limits RCS to maximized clients; arbitrary
-  scaled windows use CPU composition. Do not remove that guard based on QEMU
-  results: the physical arbitrary-geometry fault remains unresolved.
-  Latest correction: fullscreen also froze after several minutes. It is NOT a
-  confirmed stable path. RCS reset lacked Gen8/9 ready-for-reset preparation;
-  `gpu_render_reset.h` now requires the acknowledgement and cancels preparation
-  on success or timeout. No forced domain reset is issued without that ack.
-  Physical effect is unverified; `GPU_RENDER=0` remains the stable comparison.
+- The owner ran the RCS reset-handshake revision for 800 seconds without
+  freezes while interacting, including maximizing and restoring. That version
+  still guarded ordinary scaled clients onto CPU. Preserve `6baa52b` on
+  `codex/gpu-rcs-stable-800s`; hash-verified USB/ISO/kernel copies are under
+  `.storage-test/checkpoints/gpu-rcs-stable-800s-2026-11-20/`.
+  The owner explicitly authorized restoring ordinary resized-client RCS and
+  improving side-by-side composition. Work is on `codex/gpu-resized-composition`.
+  Retained damage now combines BCS/RCS client copies, CPU wallpaper gaps and
+  small exposed CPU grips; chrome/unsupported clients force full CPU repaint.
+  The restored geometry coverage and physical CPU savings still need a laptop
+  run. Retain the reset handshake and KBL null/DC/invalidate/trailing-stall order.
 
 - `GPU=1` is now the default after owner validation. Composition follows GPU,
   presentation follows composition, and runtime discovery/readback select the

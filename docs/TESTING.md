@@ -214,11 +214,14 @@ coordinates and sentinels, validates logical-context register slots, and checks
 foreground subtraction for scaled clients. It does not execute GPU shaders.
 Build with `make iso GPU_RENDER=1` for the physical offscreen RCS readback gate.
 Keep its failed RCS register diagnostics if the hook is rejected.
-On the laptop, launch `run /bin/win_test.elf` and maximize its fixed
-480x320 canvas to exercise RCS scaling. Arbitrary resized shapes currently use
-CPU composition. Some shapes freeze physical RCS immediately, and fullscreen
-has also frozen after several minutes; it is not a confirmed stable path. Verify
-ordinary resizing stays responsive, then maximize again. Check the gradient, animated top bar,
+On the laptop, launch `run /bin/win_test.elf` and resize or maximize its fixed
+480x320 canvas to exercise RCS scaling. The owner ran the reset-handshake
+baseline for 800 seconds without a freeze; that baseline restricted ordinary
+scaled windows to CPU and is preserved at `6baa52b`. The current revision
+restores ordinary resized-client RCS at the owner's request. Verify odd sizes,
+wide/short and tall/narrow shapes, minimizing/restoring, and sustained fullscreen
+use. Place Rainbow and the demo side by side and compare Compositor CPU usage
+with the saved baseline. Check the gradient, animated top bar,
 click stamps, foreground occlusion and restore. Compare Compositor CPU usage
 at identical geometry with `GPU_RENDER=0`. Rainbow uses the existing BCS path.
 Gen9 RCS uses explicit pixel flushes and emits the non-coherent HDC and render
@@ -231,6 +234,15 @@ cycles and refuses domain writes when preparation times out. Neither those
 checks nor QEMU establish physical reset or sustained render stability.
 QEMU also maximizes the actual demo and checks that its
 partial animation uses the retained scaled path before injecting render failure.
+It also checks adjacent ordinary RCS/BCS clients use retained damage, their
+pixels and CPU resize grips remain correct, and an undamaged sentinel on the
+same scanline is preserved. Host coverage checks wallpaper gaps and requires
+full CPU repaint for damaged chrome or unsupported foreground content.
+The real demo is pointer-resized to 639x477 before maximizing, and the test
+requires its fixed-canvas source to reach RCS. An animation crossing the desktop
+HUD must preserve HUD pixels, retain client damage below the top band and
+present only once. The HUD band uses the complete scene renderer; maximized
+applications continue to hide desktop statistics.
 The render host test also checks 2,048 fixed-size ring packets across wraps.
 The demo publishes immutable snapshots and carries pending damage across a
 deferred publish; the optional publish height preserves full updates for old

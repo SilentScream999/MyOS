@@ -91,9 +91,10 @@ options; header dependencies are tracked automatically.
   and Synaptics input. Hardware coverage and limitations are in the input guide.
 - Automatic Intel Gen9 probing, including visible opaque client composition
   and a resident rainbow palette. Chrome, image/font alpha and resize grips
-  use CPU rendering. `GPU_RENDER=1` adds maximized scaled-client draws after hardware
-  readback checks. Ordinary scaled windows temporarily use CPU composition
-  while RCS hangs (including sustained fullscreen use) are investigated. Supported hardware uses GPU copies to hidden scanout buffers
+  use CPU rendering. `GPU_RENDER=1` adds resized and maximized scaled-client
+  draws after hardware readback checks. Client-only damage can combine BCS and
+  RCS updates while retaining chrome, with CPU copies for uncovered wallpaper
+  gaps and tiny resize grips. Supported hardware uses GPU copies to hidden scanout buffers
   and vblank page flips;
   unsupported firmware layouts keep CPU presentation. QEMU cannot
   validate Intel hardware or establish physical CPU savings.

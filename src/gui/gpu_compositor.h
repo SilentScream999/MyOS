@@ -36,7 +36,7 @@ extern uint64_t g_gpu_surface_epoch;
 // A failure to subtract an occluder must fall back to CPU composition. Unlike
 // animation damage, conservatively retaining hidden pixels would overwrite
 // foreground windows when the GPU executes these copies after CPU chrome.
-static inline void gpu_scene_plan(GpuScenePlan* plan, VisibleRect damage) {
+static inline void gpu_scene_plan(GpuScenePlan* plan, VisibleRect damage,bool include_resize_grip=false) {
     plan->count = 0;
     plan->accelerated = 0;
     if (plan->client_count > GpuScenePlan::max_clients) return;
@@ -53,7 +53,7 @@ static inline void gpu_scene_plan(GpuScenePlan* plan, VisibleRect damage) {
         if (!visibility_valid(rect)) continue;
         // The resize grip is still a CPU decoration; keep its last twelve rows
         // on the CPU so GPU copies cannot erase it.
-        int bottom = client.client.y2-(client.resize_grip?12:0);
+        int bottom = client.client.y2-(client.resize_grip&&!include_resize_grip?12:0);
         if (rect.y2 > bottom) rect.y2 = bottom;
         if (!visibility_valid(rect)) continue;
         visible.rects[visible.count++] = rect;
@@ -71,25 +71,22 @@ static inline void gpu_scene_plan(GpuScenePlan* plan, VisibleRect damage) {
     }
 }
 
-// Scaled opaque clients use textured RCS draws. During hardware bring-up only
-// maximized clients are eligible, reducing arbitrary-geometry exposure while
-// investigating RCS hangs. Fullscreen has also failed in longer physical runs;
-// this geometry restriction alone does not establish hardware stability.
-// resize_grip is the existing WM snapshot of !maximized, not an aspect cutoff.
-// Keep CPU composition for ordinary scaled windows until that fault is fixed.
-static inline void gpu_scaled_scene_plan(GpuScenePlan* plan,VisibleRect damage) {
+// Scaled opaque clients use textured RCS draws, including ordinary resized
+// windows. The retained path includes the grip background, then redraws its
+// small CPU decoration after GPU retirement; the generic path excludes it.
+static inline void gpu_scaled_scene_plan(GpuScenePlan* plan,VisibleRect damage,bool include_resize_grip=false) {
     plan->count=0;plan->accelerated=0;
     if(plan->client_count>GpuScenePlan::max_clients)return;
     for(unsigned i=0;i<plan->client_count;++i){
         const auto& c=plan->clients[i];
         int64_t width=(int64_t)c.client.x2-c.client.x1;
         int64_t height=(int64_t)c.client.y2-c.client.y1;
-        if(!c.visible||c.rainbow||c.resize_grip||!c.pixels||!c.width||!c.height||width<=0||height<=0||
+        if(!c.visible||c.rainbow||!c.pixels||!c.width||!c.height||width<=0||height<=0||
            width>16384||height>16384||c.width>16384||c.height>16384||
            (width==(int)c.width&&height==(int)c.height)||((uintptr_t)c.pixels&63)||
            c.pitch<c.width*4||c.pitch>262144||(c.pitch&3))continue;
         auto r=visibility_intersect(c.client,damage);
-        int bottom=c.client.y2-(c.resize_grip?12:0);
+        int bottom=c.client.y2-(c.resize_grip&&!include_resize_grip?12:0);
         if(r.y2>bottom)r.y2=bottom;
         if(!visibility_valid(r))continue;
         VisibleRegion visible{};visible.rects[visible.count++]=r;
@@ -100,6 +97,38 @@ static inline void gpu_scaled_scene_plan(GpuScenePlan* plan,VisibleRect damage) 
         plan->accelerated|=1u<<i;
         for(unsigned j=0;j<visible.count;++j)plan->copies[plan->count++]={i,visible.rects[j],0,0};
     }
+}
+
+// Reuse the existing scene if every damaged window pixel has a GPU copy.
+// Remaining rectangles may contain desktop background only. Any uncovered
+// chrome or unsupported client requires the full CPU scene path. Subtraction
+// handles occlusion and gaps without assuming that window areas are disjoint.
+static inline bool gpu_retained_damage(const GpuScenePlan& bcs,const GpuScenePlan& rcs,
+                                      VisibleRect damage,VisibleRegion* background) {
+    if(!background||!visibility_valid(damage)||bcs.client_count>GpuScenePlan::max_clients||
+       rcs.client_count!=bcs.client_count||bcs.count>GpuScenePlan::capacity||
+       rcs.count>GpuScenePlan::capacity||(!bcs.count&&!rcs.count))return false;
+    background->count=1;background->rects[0]=damage;
+    const GpuScenePlan* plans[]={&bcs,&rcs};
+    for(const auto* plan:plans)for(unsigned i=0;i<plan->count;++i){
+        auto r=plan->copies[i].destination;
+        if(plan->copies[i].source>=plan->client_count||!visibility_valid(r)||
+           r.x1<damage.x1||r.y1<damage.y1||r.x2>damage.x2||r.y2>damage.y2||
+           !visibility_subtract(background,r))return false;
+    }
+    for(unsigned n=0;n<background->count;++n)
+        for(unsigned i=0;i<bcs.client_count;++i)
+            if(bcs.clients[i].visible&&visibility_valid(
+                visibility_intersect(background->rects[n],bcs.clients[i].outer)))return false;
+    return true;
+}
+
+static inline bool gpu_scene_pixel_exposed(const GpuScenePlan& plan,unsigned source,int x,int y) {
+    for(unsigned j=source+1;j<plan.client_count;++j){
+        const auto& c=plan.clients[j];
+        if(c.visible&&x>=c.outer.x1&&x<c.outer.x2&&y>=c.outer.y1&&y<c.outer.y2)return false;
+    }
+    return true;
 }
 
 static inline bool gpu_scaled_damage_plan(GpuScenePlan* plan,VisibleRect damage) {

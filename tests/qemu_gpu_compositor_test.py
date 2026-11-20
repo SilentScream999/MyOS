@@ -55,21 +55,66 @@ def main():
         window=('struct Window {'+wm.split('struct Window {',1)[1].split('\n};',1)[0]+'\n};').replace('pid_t','uint32_t')
         helper.write_text('#include <cstdio>\n#include <cstddef>\n#include <cstdint>\n#include "limine.h"\n'
                           '#include "src/gui/window_resize.h"\n#define WIN_EVENT_QUEUE_SIZE 64\n'+published+event+window+
-                          'int main(){printf("%zu %zu %zu %zu %zu",offsetof(limine_framebuffer,pitch),offsetof(Window,x),offsetof(Window,y),offsetof(Window,w),offsetof(Window,title));}\n')
+                          'int main(){printf("%zu %zu %zu %zu %zu %zu %zu",offsetof(limine_framebuffer,pitch),offsetof(Window,x),offsetof(Window,y),offsetof(Window,w),offsetof(Window,title),offsetof(Window,visible),offsetof(Window,h));}\n')
         subprocess.run(['clang++','-std=c++20','-I.',str(helper),'-o',str(binary)],check=True)
-        offset,x_offset,y_offset,w_offset,title_offset=map(int,subprocess.check_output([str(binary)]).split())
+        offset,x_offset,y_offset,w_offset,title_offset,visible_offset,h_offset=map(int,subprocess.check_output([str(binary)]).split())
         pitch=int.from_bytes(debug.read(value('fb')+offset,8),'little')
         x,y,expected=struct.unpack('<III',debug.read(address('g_gpu_test_sample'),12))
         master=value('g_master_backbuffer')
         if render_test:
-            # The ordinary 128x96 fixture scales a 64x48 canvas. Arbitrary
-            # window shapes must remain visible through CPU fallback without
-            # submitting RCS; the maximized real demo below still uses RCS.
-            assert value('g_gpu_test_render_calls')==0
+            # Ordinary resized clients use the actual RCS scene hook again.
+            assert value('g_gpu_test_render_calls')>0
             sx,sy=1084,228
             pixel=0xFF000000|(32*3<<16)|(24*5<<8)|((32+24)*2)
             actual=int.from_bytes(debug.read(master+sy*pitch+sx*4,4),'little')
             assert actual==pixel,(sx,sy,hex(actual),hex(pixel))
+            # Isolate adjacent RCS/BCS client animation. Confirm a retained
+            # update, both clients' pixels and CPU grips, and no repaint of
+            # an undamaged pixel elsewhere on the same scanline.
+            visibility=[];fixtures=[]
+            for index in range(value('g_window_count',4)):
+                pointer=int.from_bytes(debug.read(address('g_window_list')+index*8,8),'little')
+                name=debug.read(pointer+title_offset,64).split(b'\0')[0]
+                if name not in (b'GPU scaled fixture',b'GPU native fixture'):
+                    visibility.append((pointer,debug.read(pointer+visible_offset,1)))
+                    debug.write(pointer+visible_offset,b'\0')
+                else:fixtures.append(pointer)
+            before=value('g_gpu_retained_fast_count')
+            rcs_before=value('g_gpu_test_render_calls');bcs_before=value('g_gpu_test_calls')
+            sentinel=0xFF2468AC
+            debug.write(master+200*pitch+1000*4,sentinel.to_bytes(4,'little'))
+            for name,number in [('g_dirty_min_x',1044),('g_dirty_min_y',180),
+                                ('g_dirty_max_x',1275),('g_dirty_max_y',275)]:
+                debug.write(address(name),number.to_bytes(4,'little'))
+            debug.write(address('g_needs_refresh'),b'\1')
+            for _ in range(4):frame()
+            assert value('g_gpu_retained_fast_count')>before,'Mixed clients repainted the CPU scene'
+            assert value('g_gpu_test_render_calls')>rcs_before and value('g_gpu_test_calls')>bcs_before
+            for px,py,color in [(1084,228,pixel),(1200,200,0xFF113355),
+                                (1146,270,0xFF81728F),(1274,270,0xFF81728F),(1000,200,sentinel)]:
+                actual=int.from_bytes(debug.read(master+py*pitch+px*4,4),'little')
+                assert actual==color,(px,py,hex(actual),hex(color))
+            # Animation crossing the desktop HUD uses a small complete top
+            # band and retained client pixels below it, with one presentation.
+            for pointer in fixtures:debug.write(pointer+y_offset,(26).to_bytes(4,'little'))
+            before=value('g_gpu_retained_fast_count')
+            presentations=value('g_gpu_test_present_calls') if present_test else 0
+            for name,number in [('g_dirty_min_x',1044),('g_dirty_min_y',26),
+                                ('g_dirty_max_x',1275),('g_dirty_max_y',121)]:
+                debug.write(address(name),number.to_bytes(4,'little'))
+            debug.write(address('g_needs_refresh'),b'\1')
+            frame()
+            if present_test:assert value('g_gpu_test_present_calls')==presentations+1
+            assert value('g_gpu_retained_fast_count')>before,'HUD crossing forced the whole client onto CPU'
+            assert int.from_bytes(debug.read(master+49*pitch+1250*4,4),'little')==0xCC1A1F35,'GPU erased HUD'
+            for pointer in fixtures:debug.write(pointer+y_offset,(180).to_bytes(4,'little'))
+            for pointer,visible in visibility:debug.write(pointer+visible_offset,visible)
+            for name,number in [('g_dirty_min_x',0),('g_dirty_min_y',0),
+                                ('g_dirty_max_x',1279),('g_dirty_max_y',799)]:
+                debug.write(address(name),number.to_bytes(4,'little'))
+            debug.write(address('g_needs_refresh'),b'\1')
+            for _ in range(4):frame()
+        x,y,expected=struct.unpack('<III',debug.read(address('g_gpu_test_sample'),12))
         assert int.from_bytes(debug.read(master+y*pitch+x*4,4),'little')==expected
         assert not value('g_rain_surface_current',1),'GPU path kept rendering the full CPU rainbow'
         # Close a real surface-backed window through its control. Retirement
@@ -95,6 +140,31 @@ def main():
             assert not q.monitor(f'memsave 0x{address(name):x} 4 "{path}"')
             return int.from_bytes(path.read_bytes(),'little',signed=True)
         if render_test:
+            # Resize the real published 480x320 demo through the actual corner
+            # before maximizing. Odd display dimensions must activate RCS.
+            hh=int.from_bytes(debug.read(window_pointer+h_offset,4),'little',signed=True)
+            demo_before=value('g_gpu_test_demo_render_calls')
+            target_x=wx+ww-2;target_y=wy+hh-2
+            debug.close();debug=None;q.command('cont')
+            for _ in range(80):
+                dx=target_x-running_value('g_mouse_x');dy=target_y-running_value('g_mouse_y')
+                if not dx and not dy:break
+                q.monitor(f'mouse_move {max(-80,min(80,dx))} {max(-80,min(80,dy))}');time.sleep(.04)
+            else:raise AssertionError('Pointer did not reach demo resize corner')
+            q.monitor('mouse_button 1');time.sleep(.15)
+            target_x+=159;target_y+=157
+            for _ in range(80):
+                dx=target_x-running_value('g_mouse_x');dy=target_y-running_value('g_mouse_y')
+                if not dx and not dy:break
+                q.monitor(f'mouse_move {max(-80,min(80,dx))} {max(-80,min(80,dy))}');time.sleep(.04)
+            else:raise AssertionError('Pointer did not complete demo resize drag')
+            q.monitor('mouse_button 0');time.sleep(.5)
+            q.command('stop');debug=DebugMemory()
+            for _ in range(6):frame()
+            ww=int.from_bytes(debug.read(window_pointer+w_offset,4),'little',signed=True)
+            hh=int.from_bytes(debug.read(window_pointer+h_offset,4),'little',signed=True)
+            assert (ww,hh)==(639,477),('Demo resize dimensions',ww,hh)
+            assert value('g_gpu_test_demo_render_calls')>demo_before,'Resized demo did not use RCS'
             target_x=wx+ww-pad-2*button-2+button//2;target_y=wy-title//2
             fast_before=value('g_gpu_scaled_fast_count')
             debug.close();debug=None;q.command('cont')

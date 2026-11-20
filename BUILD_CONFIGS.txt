@@ -49,11 +49,12 @@ make iso GPU_RENDER=1
 This implies GPU_PRESENT=1, GPU_COMPOSE=1 and GPU=1. The driver checks a logical
 context fence, texture/scaling pixels and premultiplied alpha in offscreen RAM
 before enabling scaled client draws. Look for RCS readback PASSED and HUD RCS.
-RCS is temporarily restricted to maximized clients. Physical testing has still
-found hard freezes, including fullscreen after several minutes. Ordinary
-scaled clients use CPU composition; the geometry guard alone does not establish
-RCS stability. A missing ready-for-reset handshake has now been added, but its
-effect on physical freezes needs verification. QEMU cannot execute Intel RCS.
+The owner ran the reset-handshake revision for 800 seconds without a freeze;
+that source baseline is saved on codex/gpu-rcs-stable-800s at 6baa52b.
+Resized client RCS is restored in codex/gpu-resized-composition. Client-only
+damage combines BCS/RCS copies, retains unchanged chrome, and copies uncovered
+wallpaper gaps on CPU. Physical stability and side-by-side CPU savings of this
+revision still require a laptop run; QEMU cannot execute Intel RCS.
 Fonts, icons and general alpha layers still use their CPU renderers.
 
 Force the CPU renderer, preserving saved files:

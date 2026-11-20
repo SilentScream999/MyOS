@@ -2011,7 +2011,8 @@ static uint32_t g_overlay_backup[256];
 static uint64_t g_scene_compose_count=0,g_scene_compose_pixels=0;
 static uint64_t g_gpu_fullscreen_fast_count=0;
 static uint64_t g_gpu_scaled_fast_count=0;
-static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
+static uint64_t g_gpu_retained_fast_count=0;
+static inline bool wm_compose_dirty_band(uint32_t min_x, uint32_t max_x,
                                      uint32_t min_y, uint32_t max_y, bool do_overlay = true,
                                      bool present = true) {
 retry_scene:
@@ -2035,17 +2036,22 @@ retry_scene:
             wm_get_win_rect(win,&rects[i]);sources[i]={win->buffer,win->canvas_width,win->canvas_height,win->buffer_pitch};
             const auto& slot=win->published[win->published_slot];
             if(slot.pixels && !g_gpu_quarantine_sources)sources[i]={slot.pixels,slot.width,slot.height,(uint32_t)slot.width*4};}}
+    bool show_desktop_stats=true;
+    for(int i=0;i<frame_count;++i)
+        if(rects[i].visible&&frame_windows[i]->maximized){show_desktop_stats=false;break;}
 
     // Only this thread owns the plan; keep its bounded storage off the kernel
     // stack. Match the existing full-width scene updates on damaged rows.
     static GpuScenePlan gpu_plan{};
     static GpuScenePlan render_plan{};
+    static VisibleRegion retained_background{};
     render_plan.count=0;render_plan.accelerated=0;
     gpu_plan.client_count=frame_count;gpu_plan.scroll=rain_scroll;
     gpu_plan.rainbow_colors=g_rainbow_wide;
     gpu_plan.count=0;gpu_plan.accelerated=0;
     bool fullscreen_fast=false;
     bool scaled_fast=false;
+    bool retained_fast=false;
     if(g_gpu_compose_hook && present){
         for(int s=0;s<frame_count;++s){
             int index=frame_order[s];const auto& r=rects[index];auto* win=frame_windows[index];
@@ -2063,9 +2069,18 @@ retry_scene:
                 scaled_fast=gpu_scaled_damage_plan(&render_plan,
                     {(int)min_x,(int)min_y,(int)max_x+1,(int)max_y+1});
         }
-        if(!fullscreen_fast && !scaled_fast)gpu_scene_plan(&gpu_plan,{0,(int)min_y,(int)fb->width,
+        if(!fullscreen_fast && !scaled_fast && !g_menu_open && !g_clipboard_open && !g_taskbar_popup &&
+           max_y<fb->height-g_taskbar_h && (!show_desktop_stats||min_y>=60)){
+            VisibleRect damage{(int)min_x,(int)min_y,(int)max_x+1,(int)max_y+1};
+            gpu_scene_plan(&gpu_plan,damage,true);
+            render_plan.client_count=frame_count;
+            for(unsigned s=0;s<(unsigned)frame_count;++s)render_plan.clients[s]=gpu_plan.clients[s];
+            if(g_gpu_render_hook)gpu_scaled_scene_plan(&render_plan,damage,true);
+            retained_fast=gpu_retained_damage(gpu_plan,render_plan,damage,&retained_background);
+        }
+        if(!fullscreen_fast && !scaled_fast && !retained_fast)gpu_scene_plan(&gpu_plan,{0,(int)min_y,(int)fb->width,
             (int)(max_y+1 < fb->height-g_taskbar_h ? max_y+1 : fb->height-g_taskbar_h)});
-        if(!fullscreen_fast && !scaled_fast && g_gpu_render_hook){
+        if(!fullscreen_fast && !scaled_fast && !retained_fast && g_gpu_render_hook){
             gpu_scaled_scene_plan(&render_plan,{0,(int)min_y,(int)fb->width,
                 (int)(max_y+1<fb->height-g_taskbar_h?max_y+1:fb->height-g_taskbar_h)});
             gpu_plan.accelerated|=render_plan.accelerated;
@@ -2077,11 +2092,47 @@ retry_scene:
     g_time_win_ticks  = 0;
     g_time_rain_ticks = 0;
     g_time_lock_ticks = 0;
+    g_time_vram_ticks = 0;
 
     uint64_t t0 = rdtsc_val();
     uint64_t t1, t2, t3;
 
-    if(fullscreen_fast || scaled_fast){
+    if(retained_fast){
+        // Only uncovered desktop gaps need CPU pixels. Window chrome and
+        // unchanged clients remain in the master; GPU copies cover all other
+        // damage, including the backgrounds beneath resize-grip decorations.
+        for(unsigned i=0;i<retained_background.count;++i){
+            auto r=retained_background.rects[i];
+            for(int y=r.y1;y<r.y2;++y){
+                auto* row=(uint32_t*)(g_master_backbuffer+(uint64_t)y*fb->pitch)+r.x1;
+                if(g_wallpaper)memcpy_vram_sse_headless(row,
+                    g_wallpaper+(uint64_t)y*fb->width+r.x1,(r.x2-r.x1)*4);
+                else memset_32(row,0xFF008080,r.x2-r.x1);
+            }
+        }
+        t1=rdtsc_val();g_time_bg_ticks=t1-t0;
+        if(gpu_plan.count&&!g_gpu_compose_hook(gpu_plan)){
+            g_gpu_compose_hook=nullptr;g_rain_surface_current=false;
+            min_x=0;min_y=0;max_x=fb->width-1;max_y=fb->height-1;goto retry_scene;
+        }
+        if(render_plan.count&&(!g_gpu_render_hook||!g_gpu_render_hook(render_plan))){
+            g_gpu_render_hook=nullptr;
+            min_x=0;min_y=0;max_x=fb->width-1;max_y=fb->height-1;goto retry_scene;
+        }
+        for(unsigned i=0;i<gpu_plan.client_count;++i){
+            const auto& c=gpu_plan.clients[i];
+            if(!c.visible||!c.resize_grip)continue;
+            for(int bottom=1;bottom<12;++bottom)for(int right=1;right<12;++right){
+                if(right+bottom!=6&&right+bottom!=10&&right+bottom!=14)continue;
+                int x=c.client.x2-1-right,y=c.client.y2-1-bottom;
+                if(x<(int)min_x||x>(int)max_x||y<(int)min_y||y>(int)max_y||
+                   x<c.client.x1||y<c.client.y1||!gpu_scene_pixel_exposed(gpu_plan,i,x,y))continue;
+                ((uint32_t*)(g_master_backbuffer+(uint64_t)y*fb->pitch))[x]=0xff81728f;
+            }
+        }
+        ++g_gpu_retained_fast_count;
+        t2=rdtsc_val();g_time_win_ticks=t2-t1;
+    }else if(fullscreen_fast || scaled_fast){
         bool complete=scaled_fast?g_gpu_render_hook(render_plan):g_gpu_compose_hook(gpu_plan);
         if(!complete){
             if(scaled_fast)g_gpu_render_hook=nullptr;
@@ -2443,9 +2494,6 @@ retry_scene:
     }
 
     // Keep diagnostic overlays off maximized applications and their controls.
-    bool show_desktop_stats=true;
-    for(int i=0;i<frame_count;++i)
-        if(rects[i].visible&&frame_windows[i]->maximized){show_desktop_stats=false;break;}
     // Stage 2.6: RAM display (top-right)
     if(show_desktop_stats){
         uint64_t total_mb = get_total_ram_count() / (1024 * 1024);
@@ -2896,6 +2944,33 @@ retry_scene:
     wm_overlay_present_unlocked(overlays,true);
     __sync_lock_release(&g_vram_lock);
     return do_overlay;
+}
+
+// Keep the small desktop HUD band on the complete scene path. Client damage
+// below it can still use retained BCS/RCS composition, rather than making a
+// tall animation repaint the whole CPU scene merely because it crosses HUD.
+// These are sequential calls, not recursion into the large compositor frame.
+static inline bool wm_compose_dirty(uint32_t min_x,uint32_t max_x,
+                                    uint32_t min_y,uint32_t max_y,bool do_overlay=true,
+                                    bool present=true) {
+    bool stats_visible=true;
+    if(present&&g_gpu_compose_hook&&min_y<60&&max_y>=60){
+        TtyIrqGuard guard;
+        for(int i=0;i<g_window_count;++i){
+            auto* w=g_window_list[i];
+            if(w&&w->visible&&!w->minimized&&w->maximized){stats_visible=false;break;}
+        }
+    }else stats_visible=false;
+    if(stats_visible){
+        wm_compose_dirty_band(min_x,max_x,min_y,59,false,present);
+        uint64_t bg=g_time_bg_ticks,win=g_time_win_ticks,rain=g_time_rain_ticks;
+        uint64_t lock=g_time_lock_ticks,vram=g_time_vram_ticks;
+        bool result=wm_compose_dirty_band(min_x,max_x,60,max_y,do_overlay,present);
+        g_time_bg_ticks+=bg;g_time_win_ticks+=win;g_time_rain_ticks+=rain;
+        g_time_lock_ticks+=lock;g_time_vram_ticks+=vram;
+        return result;
+    }
+    return wm_compose_dirty_band(min_x,max_x,min_y,max_y,do_overlay,present);
 }
 
 #endif // WM_H
