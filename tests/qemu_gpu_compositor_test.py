@@ -22,6 +22,7 @@ def main():
     # Fail before boot if accidentally given a production build.
     address('g_gpu_test_calls')
     present_test=any(line.split()[-1]=='g_gpu_test_present_calls' for line in symbols)
+    render_test=any(line.split()[-1]=='g_gpu_test_render_calls' for line in symbols)
     smoke.BOOT_ISO=True
     q=smoke.Qemu(storage=False,resolution=(1280,800),extra_args=('-no-shutdown','-gdb','tcp:127.0.0.1:45456'))
     debug=None
@@ -50,15 +51,25 @@ def main():
         helper=smoke.OUT/'gpu-fb-offset.cpp';binary=smoke.OUT/'gpu-fb-offset'
         wm=(ROOT/'src/gui/wm.h').read_text()
         event='struct WinEvent {'+wm.split('struct WinEvent {',1)[1].split('\n};',1)[0]+'\n};'
+        published='struct PublishedPixels {'+wm.split('struct PublishedPixels {',1)[1].split('\n};',1)[0]+'\n};'
         window=('struct Window {'+wm.split('struct Window {',1)[1].split('\n};',1)[0]+'\n};').replace('pid_t','uint32_t')
         helper.write_text('#include <cstdio>\n#include <cstddef>\n#include <cstdint>\n#include "limine.h"\n'
-                          '#include "src/gui/window_resize.h"\n#define WIN_EVENT_QUEUE_SIZE 64\n'+event+window+
+                          '#include "src/gui/window_resize.h"\n#define WIN_EVENT_QUEUE_SIZE 64\n'+published+event+window+
                           'int main(){printf("%zu %zu %zu %zu %zu",offsetof(limine_framebuffer,pitch),offsetof(Window,x),offsetof(Window,y),offsetof(Window,w),offsetof(Window,title));}\n')
         subprocess.run(['clang++','-std=c++20','-I.',str(helper),'-o',str(binary)],check=True)
         offset,x_offset,y_offset,w_offset,title_offset=map(int,subprocess.check_output([str(binary)]).split())
         pitch=int.from_bytes(debug.read(value('fb')+offset,8),'little')
         x,y,expected=struct.unpack('<III',debug.read(address('g_gpu_test_sample'),12))
         master=value('g_master_backbuffer')
+        if render_test:
+            # The ordinary 128x96 fixture scales a 64x48 canvas. Arbitrary
+            # window shapes must remain visible through CPU fallback without
+            # submitting RCS; the maximized real demo below still uses RCS.
+            assert value('g_gpu_test_render_calls')==0
+            sx,sy=1084,228
+            pixel=0xFF000000|(32*3<<16)|(24*5<<8)|((32+24)*2)
+            actual=int.from_bytes(debug.read(master+sy*pitch+sx*4,4),'little')
+            assert actual==pixel,(sx,sy,hex(actual),hex(pixel))
         assert int.from_bytes(debug.read(master+y*pitch+x*4,4),'little')==expected
         assert not value('g_rain_surface_current',1),'GPU path kept rendering the full CPU rainbow'
         # Close a real surface-backed window through its control. Retirement
@@ -79,12 +90,41 @@ def main():
         wy=int.from_bytes(debug.read(window_pointer+y_offset,4),'little',signed=True)
         ww=int.from_bytes(debug.read(window_pointer+w_offset,4),'little',signed=True)
         pad=max(2,title//10);button=min(title+8,(ww-2*pad-4)//3)
-        target_x=wx+ww-pad-button//2;target_y=wy-title//2
-        debug.close();debug=None;q.command('cont')
         def running_value(name):
             path=smoke.OUT/'gpu-pointer-state.bin'
             assert not q.monitor(f'memsave 0x{address(name):x} 4 "{path}"')
             return int.from_bytes(path.read_bytes(),'little',signed=True)
+        if render_test:
+            target_x=wx+ww-pad-2*button-2+button//2;target_y=wy-title//2
+            fast_before=value('g_gpu_scaled_fast_count')
+            debug.close();debug=None;q.command('cont')
+            for _ in range(80):
+                dx=target_x-running_value('g_mouse_x');dy=target_y-running_value('g_mouse_y')
+                if not dx and not dy:break
+                q.monitor(f'mouse_move {max(-80,min(80,dx))} {max(-80,min(80,dy))}');time.sleep(.04)
+            else:raise AssertionError('Pointer did not reach demo maximize')
+            q.monitor('mouse_button 1');time.sleep(.15);q.monitor('mouse_button 0');time.sleep(.4)
+            q.command('stop');debug=DebugMemory()
+            for _ in range(6):frame()
+            assert value('g_gpu_scaled_fast_count')>fast_before,'Scaled animation repainted the covered desktop'
+            sx,sy,pixel=struct.unpack('<III',debug.read(address('g_gpu_test_scaled_sample'),12))
+            assert int.from_bytes(debug.read(master+sy*pitch+sx*4,4),'little')==pixel
+            calls=value('g_gpu_test_render_calls')
+            debug.write(address('g_gpu_test_render_fail'),b'\1')
+            for name,number in [('g_dirty_min_x',0),('g_dirty_min_y',0),
+                                ('g_dirty_max_x',1279),('g_dirty_max_y',799)]:
+                debug.write(address(name),number.to_bytes(4,'little'))
+            debug.write(address('g_needs_refresh'),b'\1')
+            for _ in range(4):frame()
+            assert value('g_gpu_test_render_calls')==calls+1
+            assert value('g_gpu_render_hook')==0
+            assert value('g_gpu_compose_hook')!=0 and value('g_master_backbuffer')==master
+            wx=int.from_bytes(debug.read(window_pointer+x_offset,4),'little',signed=True)
+            wy=int.from_bytes(debug.read(window_pointer+y_offset,4),'little',signed=True)
+            ww=int.from_bytes(debug.read(window_pointer+w_offset,4),'little',signed=True)
+            button=min(title+8,(ww-2*pad-4)//3)
+        target_x=wx+ww-pad-button//2;target_y=wy-title//2
+        debug.close();debug=None;q.command('cont')
         for _ in range(80):
             dx=target_x-running_value('g_mouse_x');dy=target_y-running_value('g_mouse_y')
             if not dx and not dy:break
@@ -142,7 +182,7 @@ def main():
         assert running_value('g_mouse_x')>mouse_before,'Pointer input stalled after fallback'
         log=q.capture('gpu-test-fallback')
         assert 'KERNEL PANIC' not in log and q.command('query-status')['running']
-        print('WM GPU fullscreen pixels, retained scene, frame presentation, surface retirement and CPU fallback passed.',flush=True)
+        print('WM GPU scaled/fullscreen pixels, retained scene, frame presentation, surface retirement and CPU fallback passed.',flush=True)
     except Exception:
         q.command('stop')
         q.capture('gpu-test-failure')

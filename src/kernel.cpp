@@ -30,6 +30,7 @@ extern "C" void wyzar_ext4_free(void* p) { kfree(p); }
 #include "gui/graphics.h"
 #include "gui/wm.h"
 #include "drivers/intel_gpu.h"
+#include "drivers/intel_render.h"
 #ifdef GPU_COMPOSITOR_TEST
 #include "../tests/gpu_compositor_backend.h"
 #endif
@@ -265,6 +266,7 @@ post_flip_hook_fn g_post_flip_hook = nullptr;
 #endif
 gpu_flip_hook_fn g_gpu_flip_hook = nullptr;
 gpu_compose_hook_fn g_gpu_compose_hook = nullptr;
+gpu_compose_hook_fn g_gpu_render_hook = nullptr;
 gpu_present_hook_fn g_gpu_present_hook = nullptr;
 bool g_gpu_quarantine_sources = false;
 uint64_t g_gpu_surface_epoch = 0;
@@ -1068,6 +1070,7 @@ extern "C" void kmain(void) {
 #if GPU_BRINGUP
 		if (gpu_bringup(g_rainbow_wide)) {
             if(g_gpu_compose_ready)g_gpu_compose_hook=gpu_compose_scene;
+            if(GPU_RENDER && g_gpu_compose_ready && gpu_render_initialize())g_gpu_render_hook=gpu_render_scene;
             if(g_gpu_present_ready)g_gpu_present_hook=gpu_present_frame;
             else if(!GPU_COMPOSE && g_gpu_flip_preferred)g_gpu_flip_hook=gpu_flip_rect;
         }

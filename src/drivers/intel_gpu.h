@@ -15,13 +15,14 @@
 
 // ─── Intel iGPU (Gen9 / Gen9.5 — Skylake/Kaby Lake, e.g. HD 620) ──────────
 //
-// Blitter-only 2D acceleration: solid fills and surface copies, with a CPU
+// Blitter 2D acceleration: solid fills and surface copies, with a CPU
 // fallback in the compositor whenever the GPU path is unavailable or hangs.
 //
 // What the blitter can NOT do (Intel PRM, Blitter volume): alpha blending.
 // "Alpha BLTs" are classified as 3D-engine operations. Anything with per-pixel
-// alpha (translucent shadows, AA text over a background) stays on the CPU until
-// someone writes a render-engine (RCS) path.
+// alpha (translucent shadows, AA text over a background) uses the CPU today.
+// intel_render.h adds an opt-in logical RCS context, verified textured/alpha
+// draws and opaque scaled-client integration as the next rendering stage.
 //
 // All command encodings and register offsets live in gpu_cmds.h (no kernel
 // dependencies). This file is the kernel glue:
@@ -62,6 +63,11 @@ static bool gpu_prepare_display();
 #ifndef GPU_PRESENT
 #define GPU_PRESENT 0
 #endif
+#ifndef GPU_RENDER
+#define GPU_RENDER 0
+#endif
+static uint64_t g_gpu_render_gfx=0;
+static constexpr uint64_t GPU_RENDER_OWNED_BYTES=256*1024;
 
 struct IntelGPU {
     bool     found = false;
@@ -431,6 +437,7 @@ static bool gpu_reserve_gtt(uint64_t framebuffer_bytes) {
     uint64_t bytes=IGPU_RING_BYTES+4096+buffer_bytes;
     if(GPU_COMPOSE)bytes+=4096+GPU_SOURCE_BYTES;
     if(GPU_PRESENT)bytes+=buffer_bytes*2;
+    if(GPU_RENDER)bytes+=GPU_RENDER_OWNED_BYTES;
     auto read=[](uint64_t address){return *gtt_pte_ptr(address);};
     auto free=gpu_gtt_largest_run(0x04000000,limit,read,
         [](uint64_t pte){return !(pte&1);},false);
@@ -499,6 +506,7 @@ static bool gpu_reserve_gtt(uint64_t framebuffer_bytes) {
             g_gpu_scanout_gfx[0]=g_gpu_source_base;g_gpu_scanout_gfx[1]=g_gpu_source_base+buffer_bytes;
             g_gpu_source_base+=buffer_bytes*2;
         }
+        if(GPU_RENDER){g_gpu_render_gfx=g_gpu_source_base;g_gpu_source_base+=GPU_RENDER_OWNED_BYTES;}
         gpu_log_hex("GPU GGTT owned interval starts:",base);
         gpu_log_hex("GPU GGTT owned interval ends:",base+bytes);
         return true;

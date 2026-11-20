@@ -19,9 +19,11 @@ make clean && make run FRESH=1 DEBUG=1
 
 Build ISO/USB images without launching QEMU, preserving saved files:
 make clean && make iso
+Supported Intel GPUs now automatically attempt composition and page flips.
+Unsupported hardware or failed checks retain CPU rendering/presentation.
 
 Experimental Intel Gen9 opaque compositor and GPU rainbow (hardware testing):
-make clean && make iso GPU_COMPOSE=1
+make clean && make iso GPU_COMPOSE=1 GPU_PRESENT=0
 This implies GPU=1. Boot must report offscreen composition readback PASSED and
 dirty CPU/GPU cache coherence PASSED before enabling it. The HUD then shows
 GPU:opaque+rainbow LLC. Failure retains/rebuilds the CPU path. Composition-mode
@@ -29,10 +31,10 @@ boot tests stay offscreen; GPU=1 alone retains visible developer diagnostics.
 Chrome, alpha blending, scaled surfaces and screen presentation remain on the
 CPU in this mode. The owner reported 24% CPU fullscreen versus 60% in CPU mode.
 
-Experimental GPU presentation (same-mode double buffering; laptop retest needed):
-make clean && make iso GPU_PRESENT=1
-This implies GPU_COMPOSE=1 and GPU=1.
-Repeat GPU_PRESENT=1 on later make run / make iso commands. Kernel objects now
+GPU presentation (same-mode double buffering, now enabled by default):
+make clean && make iso
+GPU, GPU_COMPOSE and GPU_PRESENT default to enabled, with runtime checks.
+Kernel objects now
 rebuild automatically when compiler/GPU flags change. Boot Log explicitly
 reports whether page flipping was requested or disabled by the build.
 Supported linear firmware planes use two hidden scanout buffers and
@@ -42,8 +44,20 @@ GPU: first vblank page flip latched. Unsupported layouts retain CPU presentation
 The rest of GUI rasterization (fonts, icons, alpha, general scaling) is still CPU.
 For the previously tested presenter, rebuild with GPU_COMPOSE=1 GPU_PRESENT=0.
 
-Return to the default CPU renderer, preserving saved files:
-make clean && make iso GPU_COMPOSE=0 GPU=0
+Experimental render-engine bring-up and scaled client composition:
+make iso GPU_RENDER=1
+This implies GPU_PRESENT=1, GPU_COMPOSE=1 and GPU=1. The driver checks a logical
+context fence, texture/scaling pixels and premultiplied alpha in offscreen RAM
+before enabling scaled client draws. Look for RCS readback PASSED and HUD RCS.
+RCS is temporarily restricted to maximized clients. Physical testing has still
+found hard freezes, including fullscreen after several minutes. Ordinary
+scaled clients use CPU composition; the geometry guard alone does not establish
+RCS stability. A missing ready-for-reset handshake has now been added, but its
+effect on physical freezes needs verification. QEMU cannot execute Intel RCS.
+Fonts, icons and general alpha layers still use their CPU renderers.
+
+Force the CPU renderer, preserving saved files:
+make clean && make iso GPU=0
 
 Build fresh images without launching QEMU:
 make clean && make iso FRESH=1

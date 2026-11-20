@@ -41,6 +41,12 @@ static inline void sys_win_sync(uint64_t id) {
     __asm__ volatile ("syscall" : : "a"((uint64_t)201), "D"(id) : "rcx", "r11", "memory");
 }
 
+static inline int64_t sys_win_publish(uint64_t id,uint64_t height) {
+    uint64_t result=222;
+    __asm__ volatile("syscall" : "+a"(result) : "D"(id),"S"(height) : "rcx","r11","memory");
+    return (int64_t)result;
+}
+
 static inline uint64_t sys_win_get_buffer(uint64_t id) {
     uint64_t ret;
     __asm__ volatile ("syscall" : "=a"(ret) : "a"((uint64_t)203), "D"(id) : "rcx", "r11", "memory");
@@ -114,9 +120,11 @@ void _start() {
     uint32_t frame = 0;
     uint32_t draw_color = 0xFFFFFFFF; // White brush by default
     int32_t color_shift = 0;
+    uint32_t pending_damage_bottom=32;
 
     while (1) {
         frame++;
+        uint32_t damage_bottom=pending_damage_bottom;
         
         // Poll and process pending events
         WinEvent ev;
@@ -129,6 +137,7 @@ void _start() {
                 for (int dy = -8; dy <= 8; dy++) {
                     int py = ev.y + dy;
                     if (py < 32 || py >= 320) continue;
+                    if(damage_bottom<(uint32_t)py+1)damage_bottom=(uint32_t)py+1;
                     for (int dx = -8; dx <= 8; dx++) {
                         int px = ev.x + dx;
                         if (px < 0 || px >= 480) continue;
@@ -139,6 +148,7 @@ void _start() {
                 color_shift += ev.delta * 16;
             } else if (ev.type == WIN_EVENT_KEY_DOWN) {
                 if (ev.key == 'c' || ev.key == 'C') {
+                    damage_bottom=320;
                     for (uint32_t y = 32; y < 320; y++) {
                         for (uint32_t x = 0; x < 480; x++) {
                             uint8_t r = (uint8_t)(x * 255 / 480);
@@ -169,7 +179,12 @@ void _start() {
             }
         }
         
-        sys_win_sync(win);
+        // The gradient/stamps are retained; normal animation changes only the
+        // top bar. Scale and recompose the rows actually changed this frame.
+        // Publish an immutable frame so the GPU never samples the canvas while
+        // the next animation tick edits it. Preserve damage when publication
+        // must wait for the compositor to retire a previous snapshot.
+        pending_damage_bottom=sys_win_publish(win,damage_bottom)<0?damage_bottom:32;
         sys_sleep(33); // ~30 FPS, yields CPU
     }
 }

@@ -4,6 +4,39 @@ static uint64_t g_gpu_test_calls=0,g_gpu_test_rainbow_calls=0;
 static bool g_gpu_test_fail=false;
 static uint32_t g_gpu_test_sample[3]{};
 static uint8_t* g_gpu_test_recovery;
+#ifdef GPU_RENDER_TEST
+static uint64_t g_gpu_test_render_calls=0;
+static bool g_gpu_test_render_fail=false;
+static uint32_t g_gpu_test_scaled_sample[3]{};
+static bool gpu_test_render(const GpuScenePlan& plan) {
+    ++g_gpu_test_render_calls;
+    for(unsigned i=0;i<plan.count;++i){
+        const auto& copy=plan.copies[i];const auto& c=plan.clients[copy.source];
+        GpuTextureDraw draw{{0x10000000,c.width,c.height,c.pitch},
+            {0x2000000,(uint32_t)fb->width,(uint32_t)fb->height,(uint32_t)fb->pitch},
+            {c.client.x1,c.client.y1,c.client.x2,c.client.y2},
+            {copy.destination.x1,copy.destination.y1,copy.destination.x2,copy.destination.y2},false};
+        uint32_t batch[1024];if(!gpu_build_texture_batch(batch,0x100000,draw))return false;
+        auto r=copy.destination;
+        for(int y=r.y1;y<r.y2;++y){
+            unsigned sy=(uint64_t)(2*(y-c.client.y1)+1)*c.height/(2*(c.client.y2-c.client.y1));
+            auto* row=(const uint32_t*)((const uint8_t*)c.pixels+(uint64_t)sy*c.pitch);
+            auto* to=(uint32_t*)(g_master_backbuffer+(uint64_t)y*fb->pitch);
+            for(int x=r.x1;x<r.x2;++x){
+                unsigned sx=(uint64_t)(2*(x-c.client.x1)+1)*c.width/(2*(c.client.x2-c.client.x1));
+                to[x]=row[sx];
+            }
+        }
+        unsigned x=(r.x1+r.x2)/2,y=(r.y1+r.y2)/2;
+        unsigned sx=(uint64_t)(2*(x-c.client.x1)+1)*c.width/(2*(c.client.x2-c.client.x1));
+        unsigned sy=(uint64_t)(2*(y-c.client.y1)+1)*c.height/(2*(c.client.y2-c.client.y1));
+        g_gpu_test_scaled_sample[0]=x;g_gpu_test_scaled_sample[1]=y;
+        g_gpu_test_scaled_sample[2]=*(const uint32_t*)((const uint8_t*)c.pixels+(uint64_t)sy*c.pitch+sx*4);
+        if(g_gpu_test_render_fail)return false;
+    }
+    return true;
+}
+#endif
 #ifdef GPU_PRESENT_TEST
 static uint64_t g_gpu_test_present_calls=0;
 static bool g_gpu_test_present_fail=false;
@@ -55,6 +88,14 @@ static void gpu_test_install() {
     if(!g_gpu_test_recovery)hcf();
     memset(g_gpu_test_recovery,0,(uint64_t)fb->pitch*fb->height);
     g_gpu_compose_hook=gpu_test_compose;
+#ifdef GPU_RENDER_TEST
+    auto* fixture=wm_create_window("GPU scaled fixture",1020,180,64,48,false,false,WIN_TYPE_USER,0);
+    if(!fixture)hcf();
+    for(unsigned y=0;y<48;++y)for(unsigned x=0;x<64;++x)
+        fixture->buffer[y*64+x]=0xFF000000u|(x*3u<<16)|(y*5u<<8)|((x+y)*2u);
+    fixture->w=128;fixture->h=96;
+    g_gpu_render_hook=gpu_test_render;
+#endif
 #ifdef GPU_PRESENT_TEST
     for(auto& pointer:g_gpu_test_present_buffers){
         pointer=(uint8_t*)kmalloc((uint64_t)fb->pitch*fb->height);

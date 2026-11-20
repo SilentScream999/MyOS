@@ -37,7 +37,25 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
 
 ## Decisions and implementation constraints
 
-- Keep `GPU=0`, `GPU_COMPOSE=0`, `GPU_PRESENT=0` and kernel `OPT=-O0` as defaults. The image codec and isolated
+- Active RCS freeze investigation: the owner confirms `GPU_RENDER=0` prevents
+  resize-triggered demo freezes. Corrected KBL GAM-hang workaround ordering to
+  null PC, DC flush, invalidate/post-sync, trailing CS stall (i915
+  `gen8_emit_flush_rcs`). Previously the trailing stall was before invalidation.
+  Host coverage checks the order; physical stability is not yet confirmed.
+  Follow-up: fullscreen now works, but some ordinary aspect ratios instantly
+  freeze. The planner temporarily limits RCS to maximized clients; arbitrary
+  scaled windows use CPU composition. Do not remove that guard based on QEMU
+  results: the physical arbitrary-geometry fault remains unresolved.
+  Latest correction: fullscreen also froze after several minutes. It is NOT a
+  confirmed stable path. RCS reset lacked Gen8/9 ready-for-reset preparation;
+  `gpu_render_reset.h` now requires the acknowledgement and cancels preparation
+  on success or timeout. No forced domain reset is issued without that ack.
+  Physical effect is unverified; `GPU_RENDER=0` remains the stable comparison.
+
+- `GPU=1` is now the default after owner validation. Composition follows GPU,
+  presentation follows composition, and runtime discovery/readback select the
+  supported hardware path or CPU fallback. `GPU=0` forces CPU mode. Keep
+  `GPU_RENDER=0` and kernel `OPT=-O0` as defaults. The image codec and isolated
   overlay pixel renderer have their own optimized rules. Test kernel-wide
   optimization changes separately.
 - QEMU does not emulate our Intel Gen9 GPU. Keep CPU fallbacks and bounded
@@ -61,7 +79,7 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
   rows directly; do not read its stale full backing as the current image. The
   visibility calculation assumes today's opaque client windows.
 - GPU composition completes before CPU menus/HUD/cursor. CPU presentation is the
-  default; `GPU_PRESENT=1` optionally copies the clean master into a hidden GPU
+  fallback; supported GPU presentation copies the clean master into a hidden GPU
   scanout, overlays its cursor/outline, then arms a synchronous plane flip.
   Never reuse/free a batch's sources before its fence/reset. Failed reset pins
   the old destination and swaps to a reserved CPU buffer before full recomposition.
@@ -74,6 +92,21 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
   Reject FBC/PSR and unsupported plane layouts; reuse a buffer only after LIVE
   and the frame counter confirm the other buffer latched. Failed flips restore
   firmware scanout or retain the pinned live private buffer for CPU fallback.
+- Experimental `GPU_RENDER=1` adds a private logical RCS context and PPGTT
+  tables. It enables desktop scaled-client draws only after fence/schedule-out
+  and offscreen textured scaling/alpha readback pass. Gen9 HDC noncoherent
+  context/operation and CACHE_MODE_1 workarounds precede TLB invalidation in
+  every RCS packet. Keep explicit pixel clflush; the no-flush probe is removed.
+  RCS recycles its idle context/ring before wrapping. Retain control-line flushing, retirement-
+  aware source-map reuse and Gen9/Kaby Lake invalidation sequencing. An RCS
+  reset failure requires destination quarantine independently of BCS reset.
+  Font/icon rasterization and general alpha-layer integration remain CPU work.
+  Gen9 state/context host tests and the mock QEMU scaled-client/failure path
+  passed. CPU, page-flip and RCS production kernels build; ISO/USB/recovery
+  boot checks pass on VGA. The owner subsequently supplied a physical log passing
+  the context fence and textured copy/scaling/premultiplied alpha readbacks,
+  followed by a page-flip latch. Scaled desktop correctness/performance still
+  need measurements. `GPU_RENDER=1` is opt-in and implies presentation.
 - Kernel string helpers are local definitions, not a hosted C runtime.
   Compiler-generated libc calls and the ext4/codec shim need deliberate linkage.
 - Interrupt and syscall entry preserve x87/SSE state in aligned stack frames
@@ -94,8 +127,9 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
   is for trusted programs, not a finished security boundary.
 - One foreground application per console channel; no process groups, general
   signals, argument/environment passing or dynamic linking.
-- No translucent client windows, hardware cursor plane, general modesetting, GPU
-  render engine or GPU client API. PNG/font alpha works on the CPU already.
+- No translucent client windows, hardware cursor plane, general modesetting or
+  GPU client API. Experimental RCS support requires physical readback validation.
+  PNG/font alpha works on the CPU already.
 - Stable boot-volume identity, GPT, internal-drive drivers
   and installation remain pending. Permissions, links and UTC file timestamps
   also need defined semantics.

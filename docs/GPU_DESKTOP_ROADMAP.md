@@ -1,14 +1,16 @@
 # GPU and display roadmap
 
-Updated 2026-11-19. Keep Intel GPU bring-up opt-in and preserve the CPU path.
+Updated 2026-11-19. Supported Intel composition/page flips now probe by default
+after owner validation. Render-engine bring-up remains opt-in. Preserve CPU fallback.
 General platform priorities are in [NEXT_STEPS](NEXT_STEPS.md).
 
 ## Current renderer
 
 Applications draw into off-screen surfaces and report damage. A roughly 60 Hz
 compositor builds damaged regions in a master buffer and copies them into
-Limine's scanout framebuffer using CPU/SSE stores by default. An experimental
-`GPU_PRESENT=1` presenter uses hidden scanout buffers instead. Terminal, Boot Log and demos
+Limine's scanout framebuffer using CPU/SSE stores on the fallback path.
+Supported Intel hardware uses hidden scanout buffers and page flips by default.
+Terminal, Boot Log and demos
 use the same surface composition path as user windows. Damage lists hold up to
 eight rectangles, with a full/global box used by some writers.
 
@@ -38,20 +40,22 @@ are exclusive. Preserve that conversion for every copied row, including the last
 row of tiny caret damage, and include the last pixel when aligning presentations.
 
 `GPU=1` brings up the Intel Gen9 blitter: PCI/MMIO, owned GGTT mappings, fill/copy
-commands and polled fences. There is no general GPU allocator, render engine,
-shader pipeline, interrupt-driven submission or client API. User-window backing is
+commands and polled fences. The optional logical render engine is described
+below. General GPU allocation, interrupt-driven submission and a client GPU API
+remain pending. User-window backing is
 contiguous physical memory mapped to userspace; system surfaces use kernel memory.
 
 Recorded 800×600 laptop copies were CPU 296 µs, blitter 2,911 µs without cache
 flush and 6,878 µs with `clflush`. These are historical measurements on that
-machine, not current general performance claims. Default `GPU=0` stays in place.
+machine, not current general performance claims. Validated composition and
+page flipping now probe supported hardware by default.
 
 ## Experimental opaque composition
 
-Build with `make clean && make iso GPU_COMPOSE=1` (implies `GPU=1`). Both flags
-remain off by default. The original presentation benchmark still selects a copy
-path for bring-up-only mode; composition is a separately requested experiment,
-not a claim that the slower historical blitter copy became faster.
+Build normally with `make iso` to probe supported hardware. `GPU=0` forces CPU
+rendering, and `GPU_PRESENT=0` keeps GPU composition with CPU presentation.
+The original presentation benchmark still selects a copy path for the explicit
+developer configuration `GPU=1 GPU_COMPOSE=0`.
 
 - The compositor snapshots clients in stacking order and subtracts all higher
   opaque window rectangles. Unsupported alignment/pitch, scaled clients and
@@ -129,7 +133,8 @@ versus roughly 60% fullscreen with CPU rendering.
 ## Experimental complete-frame presentation
 
 `make clean && make iso GPU_PRESENT=1` implies composition and GPU bring-up.
-Default flags remain zero. The existing `Compositor` kernel task owns the WM;
+Composition and presentation now default to enabled with runtime checks.
+The existing `Compositor` kernel task owns the WM;
 this does not create a separate userspace desktop executable.
 
 The presenter copies the clean master with the GPU into one of two hidden
@@ -191,6 +196,121 @@ CPU usage and repeated warm restarts. Font/icon rasterization, alpha and
 scaling remain CPU work pending render-engine support.
 
 ## Remaining stages
+
+### Experimental logical render context
+
+`GPU_RENDER=1` adds a serial kernel-owned Gen9 RCS context using execlist
+submission, private four-level PPGTT tables, a pinned context/ring/batch and
+explicit UC render-surface cache policy. It implies the existing composition
+and page-flip flags. A context fence and schedule-out must both complete before
+CPU reuse. Gen9 VF invalidation and conservative Kaby Lake DC-flush sequencing
+precede textured draws. Runtime RCS failure disables the hook and recomposes
+the complete scene. Failed reset swaps the destination and pins GPU sources.
+
+Boot tests target private RAM and compare textured scaling, clipped borders and
+premultiplied source-over alpha against expected pixels before enabling the
+hook. The first desktop integration handles opaque scaled window clients,
+subtracting foreground windows and preserving CPU resize grips. Fonts, icons,
+wallpaper and translucent client policy are additional integration work.
+RCS uses the Gen9 force-noncoherent HDC context workarounds and explicit pixel
+cache handoffs. The earlier no-flush diagnostic probe has been removed because
+it does not establish a supported coherent mode under those required settings.
+Source PPGTT mappings are reused only while page range and retirement epoch
+match. Context/ring/batch/fence control-line flushing remains.
+
+The fixed 3D state and SIMD16 sampler shader derive from MIT-licensed IGT v1.28
+`rendercopy_gen9.c`; the license and pinned source URL accompany the template.
+Host tests check packed state, clipping, alpha factors and context registers.
+The QEMU backend exercises WM scaled-client pixels and partial-render fallback
+without executing Intel commands. HUD includes RCS only after readback.
+
+The first owner RCS log confirms logical-context fence and retirement succeeded.
+The first texture probe produced pixels but failed at a nearest-sampler boundary:
+expected FF4E1638, actual FF4E0B31 (the adjacent source row). The original
+16-to-12 scale placed pixel centers exactly on texel edges. Readback now uses
+1:1 copying and exact 2x enlargement with binary-exact, unambiguous coordinates,
+keeping strict pixel comparisons and larger 32x32 border guards. Host regression
+checks every probe sample stays at least a quarter texel from a selection edge.
+The owner reported about 80% fullscreen demo CPU in the failed-probe build,
+which retained CPU scaling. The subsequent physical log passes the context
+fence and all textured copy, scaling and premultiplied alpha readbacks, followed
+by the first vblank page-flip latch. Desktop correctness and CPU cost under
+scaled workloads still need owner measurements.
+
+The owner subsequently reported lag/high CPU confined to fullscreen win_test.
+The performance revision adds retained maximized scaled-client damage, the
+RCS coherence gate, source-map reuse and rectangle-sized flushes on the
+noncoherent path. The demo now reports its changing top 32 source rows during
+normal animation, expanding damage for paint/clear input. Its gradient/stamps
+and animation rate are preserved. The same demo damage applies in CPU mode.
+New performance and coherence behavior still need laptop measurements.
+
+After that revision the owner reported improved speed, intermittent demo
+tearing and a freeze within a few seconds, including a stopped pointer. RCS
+submission now writes all four execlist descriptor words without reading the
+write-only port and forces full context restore for serial requests. Portable
+packet tests exercise 2,048 submissions across repeated ring wraps. These checks
+do not establish that the physical freeze is resolved.
+
+The demo now publishes immutable snapshots with a partial top-damage height,
+retaining damage if publication defers. Publication and retirement stamping are
+atomic against compositor-frame advancement. Existing publish callers keep
+full damage when the optional height is zero. Laptop stability and tear removal
+for this revision still require confirmation.
+
+The owner confirmed tear removal but another freeze around eight seconds after
+maximizing. The stability revision avoids submitting a wrapped RCS tail: after
+127 serial packets, once the last fence and schedule-out have completed, it
+resets only RCS and reinitializes its context/HWS/ring before reuse. Batch,
+fence, page tables and pixel buffers retain their allocations. Failure enters
+the existing reset/quarantine fallback. Boot Log records recycle start,
+completed sequence and successful completion. A host test exercises 2,048
+packets with this recycling policy and verifies that no wrapped tail is used.
+Pixel clflush is restored conservatively while retaining partial repainting,
+source-map reuse and immutable publication. Both ring reuse and cache sharing
+remain hypotheses; physical sustained stability still needs confirmation.
+
+Further owner feedback isolates failure to maximizing the fixed-canvas demo;
+its unscaled small window uses BCS and does not exercise runtime RCS. Review
+found missing non-MCR Gen9 context hang workarounds. Each RCS packet now emits
+masked HDC_CHICKEN0 settings for non-coherent context save/restore and HDC
+operation, plus CACHE_MODE_1 STC/partial-resolve disables, before invalidation.
+These match i915 gen9_ctx_workarounds_init's documented TLB-invalidation/PSD-
+flush hang precautions. Host tests verify register masks and ordering across
+repeated packets. The settings address a real omission; whether they resolve
+the laptop freeze is still physically unverified.
+
+Owner comparison now confirms that resizing the same demo stays stable with
+`GPU_RENDER=0`, while enabling RCS can freeze the whole machine too quickly to
+save a crash log. The latest saved log contains two completed idle ring recycles
+without a timeout. Review found the Kaby Lake `WaForGAMHang` PIPE_CONTROL
+sequence was incorrectly emitted as null, DC flush, CS stall, invalidation.
+It now matches i915 `gen8_emit_flush_rcs`: null, DC flush, invalidation/post-sync,
+then CS stall. The trailing stall must follow invalidation. Sustained packet
+tests check the complete sequence and scratch address. This is a command-order
+correction, not physical confirmation that the freeze is resolved.
+
+The owner now confirms fullscreen works after that correction, but certain
+ordinary resized aspect ratios still freeze immediately. No exact dimensions
+or failing packet are available yet. As containment, the scaled-scene planner
+now accepts maximized clients only (the WM's existing `resize_grip=false`
+snapshot). Ordinary scaled windows remain CPU-composited; native-size BCS and
+GPU presentation stay enabled. Host shape coverage verifies that odd, narrow,
+wide and mixed-scale ordinary clients do not skip CPU rendering or submit RCS.
+QEMU checks an ordinary scaled fixture uses CPU and the maximized demo uses RCS.
+This is a temporary restriction, not a fix for arbitrary-geometry RCS hangs.
+
+The fullscreen stability inference was subsequently disproved: the owner saw a
+freeze after several minutes. No geometry is established stable for sustained
+RCS use. Reset review found `render_reset()` directly wrote GDRST without the
+Gen8/9 `RING_RESET_CTL` request/ready handshake. i915 explicitly warns an
+unprepared KBL reset can hang the system during batch execution. RCS now
+requests reset preparation, waits with a deadline, resets only after the ack,
+and cancels preparation on every exit. Failed preparation returns to existing
+disable/quarantine handling without forcing the RCS domain reset. Portable
+host tests run 2,050 acknowledged reset passes and exercise preparation and
+domain timeout cleanup. This addresses another real protocol omission; it is
+not confirmation of the physical freeze's cause or resolution.
 
 1. **Finish the CPU surface contract.** Define alpha/opacity behavior for client
    windows separately from image alpha. Retain fast opaque copies, add tested

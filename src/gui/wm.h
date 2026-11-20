@@ -2010,6 +2010,7 @@ static uint32_t g_overlay_backup[256];
 // each completed blit presents/tracks its own snapshot; the final call reports completion.
 static uint64_t g_scene_compose_count=0,g_scene_compose_pixels=0;
 static uint64_t g_gpu_fullscreen_fast_count=0;
+static uint64_t g_gpu_scaled_fast_count=0;
 static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                                      uint32_t min_y, uint32_t max_y, bool do_overlay = true,
                                      bool present = true) {
@@ -2038,10 +2039,13 @@ retry_scene:
     // Only this thread owns the plan; keep its bounded storage off the kernel
     // stack. Match the existing full-width scene updates on damaged rows.
     static GpuScenePlan gpu_plan{};
+    static GpuScenePlan render_plan{};
+    render_plan.count=0;render_plan.accelerated=0;
     gpu_plan.client_count=frame_count;gpu_plan.scroll=rain_scroll;
     gpu_plan.rainbow_colors=g_rainbow_wide;
     gpu_plan.count=0;gpu_plan.accelerated=0;
     bool fullscreen_fast=false;
+    bool scaled_fast=false;
     if(g_gpu_compose_hook && present){
         for(int s=0;s<frame_count;++s){
             int index=frame_order[s];const auto& r=rects[index];auto* win=frame_windows[index];
@@ -2052,8 +2056,20 @@ retry_scene:
         }
         if(!g_menu_open && !g_clipboard_open && !g_taskbar_popup)
             fullscreen_fast=gpu_rain_damage_plan(&gpu_plan,{(int)min_x,(int)min_y,(int)max_x+1,(int)max_y+1});
-        if(!fullscreen_fast)gpu_scene_plan(&gpu_plan,{0,(int)min_y,(int)fb->width,
+        if(!fullscreen_fast && g_gpu_render_hook){
+            render_plan.client_count=frame_count;
+            for(unsigned s=0;s<(unsigned)frame_count;++s)render_plan.clients[s]=gpu_plan.clients[s];
+            if(!g_menu_open && !g_clipboard_open && !g_taskbar_popup)
+                scaled_fast=gpu_scaled_damage_plan(&render_plan,
+                    {(int)min_x,(int)min_y,(int)max_x+1,(int)max_y+1});
+        }
+        if(!fullscreen_fast && !scaled_fast)gpu_scene_plan(&gpu_plan,{0,(int)min_y,(int)fb->width,
             (int)(max_y+1 < fb->height-g_taskbar_h ? max_y+1 : fb->height-g_taskbar_h)});
+        if(!fullscreen_fast && !scaled_fast && g_gpu_render_hook){
+            gpu_scaled_scene_plan(&render_plan,{0,(int)min_y,(int)fb->width,
+                (int)(max_y+1<fb->height-g_taskbar_h?max_y+1:fb->height-g_taskbar_h)});
+            gpu_plan.accelerated|=render_plan.accelerated;
+        }
     }
     
     // Metrics reset (B/W/r/L are updated DURING the frame, V is from last)
@@ -2065,12 +2081,15 @@ retry_scene:
     uint64_t t0 = rdtsc_val();
     uint64_t t1, t2, t3;
 
-    if(fullscreen_fast){
-        if(!g_gpu_compose_hook(gpu_plan)){
-            g_gpu_compose_hook=nullptr;g_rain_surface_current=false;
+    if(fullscreen_fast || scaled_fast){
+        bool complete=scaled_fast?g_gpu_render_hook(render_plan):g_gpu_compose_hook(gpu_plan);
+        if(!complete){
+            if(scaled_fast)g_gpu_render_hook=nullptr;
+            else {g_gpu_compose_hook=nullptr;g_rain_surface_current=false;}
             min_x=0;min_y=0;max_x=fb->width-1;max_y=fb->height-1;goto retry_scene;
         }
-        ++g_gpu_fullscreen_fast_count;t1=t0;t2=rdtsc_val();g_time_win_ticks=t2-t0;
+        if(scaled_fast)++g_gpu_scaled_fast_count;else ++g_gpu_fullscreen_fast_count;
+        t1=t0;t2=rdtsc_val();g_time_win_ticks=t2-t0;
     }else{
 
     // Stage 1: Desktop wallpaper (hole-punched)
@@ -2223,6 +2242,11 @@ retry_scene:
     }
 
     // ── Shared shell control: taskbar and Start menu ─────────────────────────────
+    if(render_plan.count && (!g_gpu_render_hook || !g_gpu_render_hook(render_plan))){
+        g_gpu_render_hook=nullptr;
+        min_x=0;min_y=0;max_x=fb->width-1;max_y=fb->height-1;
+        goto retry_scene;
+    }
     // top_c/bot_c are the gradient endpoints; edge_c is the 1px border;
     // shine=true draws a bright highlight row on top (glass effect).
     auto draw_btn = [&](int32_t bx, int32_t by, int32_t bw, int32_t bh,

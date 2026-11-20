@@ -15,14 +15,22 @@ CFLAGS = $(OPT) -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
          -fno-unwind-tables -fno-asynchronous-unwind-tables \
          -I. -Isrc -Isrc/arch -Isrc/core -Isrc/drivers -Isrc/fs -Isrc/gui
 
-# Intel GPU bring-up + self-test + benchmark at boot. OFF by default: on the Gen9 test laptop the CPU
-# copy (~0.3 ms) beats the GPU copy (~3 ms), and the self-test briefly draws test patterns on screen.
-# Developer use:  make clean && make GPU=1 iso
-# Opaque GPU composition and the resident rainbow palette (experimental).
-# Enables bring-up as well; CPU presentation remains independent of composition.
-GPU_PRESENT ?= 0
-GPU_COMPOSE ?= $(GPU_PRESENT)
-GPU ?= $(GPU_COMPOSE)
+# Probe supported Intel hardware and use validated composition/page flips by
+# default. Unsupported devices and failed bring-up keep the CPU path. GPU=0
+# disables acceleration; GPU=1 GPU_COMPOSE=0 runs the visible blitter diagnostics.
+# Logical RCS bring-up remains opt-in until physical readback is confirmed.
+GPU_RENDER ?= 0
+GPU ?= 1
+GPU_COMPOSE ?= $(GPU)
+GPU_PRESENT ?= $(GPU_COMPOSE)
+ifeq ($(GPU_RENDER),1)
+ifneq ($(GPU_COMPOSE),1)
+$(error GPU_RENDER=1 requires GPU_COMPOSE=1)
+endif
+ifneq ($(GPU),1)
+$(error GPU_RENDER=1 requires GPU=1)
+endif
+endif
 ifeq ($(GPU_PRESENT),1)
 ifneq ($(GPU_COMPOSE),1)
 $(error GPU_PRESENT=1 requires GPU_COMPOSE=1)
@@ -44,6 +52,7 @@ BOOT_DIAGNOSTICS ?= 0
 CXXFLAGS = $(CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -mno-red-zone -DGPU_BRINGUP=$(GPU) \
            -DGPU_COMPOSE=$(GPU_COMPOSE) \
            -DGPU_PRESENT=$(GPU_PRESENT) \
+           -DGPU_RENDER=$(GPU_RENDER) \
            -DCLOCK_UTC_OFFSET_MIN=$(CLOCK_UTC_OFFSET_MIN) -DCLOCK_SHOW_SECONDS=$(CLOCK_SHOW_SECONDS) \
            -DBOOT_DIAGNOSTICS=$(BOOT_DIAGNOSTICS)
 
@@ -67,6 +76,12 @@ FORCE_KERNEL_CONFIG:
 	@cmp -s $@.tmp $@ && rm $@.tmp || mv $@.tmp $@
 
 $(OBJ) $(EXT4_OBJ): .storage-test/kernel-config
+
+.PHONY: test-gpu-render
+test-gpu-render:
+	mkdir -p .storage-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. tests/gpu_render_test.cpp -o .storage-test/gpu-render-test
+	.storage-test/gpu-render-test
 
 all: wyzar init.elf counter.elf win_test.elf initrd.tar
 

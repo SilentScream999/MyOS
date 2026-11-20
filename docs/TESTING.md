@@ -208,10 +208,40 @@ on the host; this does not measure physical GPU performance.
 
 ## Experimental GPU composition
 
+For the render-engine state/context regression, run `make test-gpu-render`.
+The ASan/UBSan test decodes Gen9 texture/alpha fields, checks clipped texture
+coordinates and sentinels, validates logical-context register slots, and checks
+foreground subtraction for scaled clients. It does not execute GPU shaders.
+Build with `make iso GPU_RENDER=1` for the physical offscreen RCS readback gate.
+Keep its failed RCS register diagnostics if the hook is rejected.
+On the laptop, launch `run /bin/win_test.elf` and maximize its fixed
+480x320 canvas to exercise RCS scaling. Arbitrary resized shapes currently use
+CPU composition. Some shapes freeze physical RCS immediately, and fullscreen
+has also frozen after several minutes; it is not a confirmed stable path. Verify
+ordinary resizing stays responsive, then maximize again. Check the gradient, animated top bar,
+click stamps, foreground occlusion and restore. Compare Compositor CPU usage
+at identical geometry with `GPU_RENDER=0`. Rainbow uses the existing BCS path.
+Gen9 RCS uses explicit pixel flushes and emits the non-coherent HDC and render
+cache workarounds before invalidation. Look for `GPU: Gen9 RCS hang workarounds
+enabled; explicit pixel handoffs`. The earlier no-flush probe is removed.
+Look for `GPU: idle RCS ring recycle completed` after enough submissions.
+RCS reset now requires the engine's ready-for-reset handshake before each
+domain reset. The host regression exercises repeated prepare/ack/reset/cancel
+cycles and refuses domain writes when preparation times out. Neither those
+checks nor QEMU establish physical reset or sustained render stability.
+QEMU also maximizes the actual demo and checks that its
+partial animation uses the retained scaled path before injecting render failure.
+The render host test also checks 2,048 fixed-size ring packets across wraps.
+The demo publishes immutable snapshots and carries pending damage across a
+deferred publish; the optional publish height preserves full updates for old
+clients when zero. Physical sustained RCS stability remains a separate check.
+Normal builds now probe supported composition/page flips automatically. Host
+tests need no GPU flags; use `GPU=0` for an explicit CPU-only build.
+
 ```sh
 make test-gpu
 make clean
-make iso GPU_COMPOSE=1 PERSIST_DISK=.storage-test/gpu-hardware.img ROOT_MIB=64
+make iso GPU_COMPOSE=1 GPU_PRESENT=0 PERSIST_DISK=.storage-test/gpu-hardware.img ROOT_MIB=64
 ```
 
 The host test interprets the actual BLT command stream against a pixel
@@ -233,7 +263,7 @@ To test WM integration without Intel hardware, use the explicit test backend:
 
 ```sh
 make clean
-make iso CXX='clang++ -DGPU_COMPOSITOR_TEST -DGPU_PRESENT_TEST' PERSIST_DISK=.storage-test/gpu-test.img ROOT_MIB=64
+make iso CXX='clang++ -DGPU_COMPOSITOR_TEST -DGPU_PRESENT_TEST -DGPU_RENDER_TEST' PERSIST_DISK=.storage-test/gpu-test.img ROOT_MIB=64
 python3 tests/qemu_gpu_compositor_test.py
 ```
 
@@ -257,7 +287,7 @@ Check fullscreen Rainbow's moving tear, cursor/drag outlines, menus, native
 windows, smoothness/frame rate and CPU usage. QEMU's mocked presenter cannot
 validate Intel vblank, cache visibility or actual scanout rollback.
 
-For physical testing, use `GPU_COMPOSE=1` and look for
+For physical LLC/CPU-presentation testing, use `GPU_COMPOSE=1 GPU_PRESENT=0` and look for
 `GPU: offscreen composition readback PASSED` followed by
 `GPU: dirty CPU/GPU cache coherence PASSED - bulk clflush disabled` and
 `opaque GPU composition enabled; CPU presentation` in Boot Log. The HUD shows
