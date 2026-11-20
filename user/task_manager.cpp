@@ -135,7 +135,7 @@ static void render() {
         usage.failed?"Could not read process information.":
         usage.truncated?"Showing first 256 processes. Scroll to browse.":
         !usage.sampled?"Sampling CPU usage...":"Click a section to collapse. Scroll to browse. CPU is measured on Core 0.",MUTED,surface.w-16,12);
-    native_call(201,window_id);dirty=false;
+    dirty=(int64_t)native_call(222,window_id)<0;
 }
 static bool handle_event(const NativeEvent& e) {
     if(e.type==7)return true;

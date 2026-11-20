@@ -206,6 +206,85 @@ overflow. QEMU drags actual windows, verifies fully covered animation stops and
 resumes on exposure, and records CPU/frame costs and screenshots. Timings depend
 on the host; this does not measure physical GPU performance.
 
+## Experimental GPU composition
+
+```sh
+make test-gpu
+make clean
+make iso GPU_COMPOSE=1 PERSIST_DISK=.storage-test/gpu-hardware.img ROOT_MIB=64
+```
+
+The host test interprets the actual BLT command stream against a pixel
+reference for stacked/clipped clients, unaligned/scaled CPU fallbacks, rainbow
+phase wrap and row replication, command bounds, ring wrap, operation-budget
+overflow and GGTT reservations. Firmware-layout regressions include a fully
+present shared-scratch table, a unique PTE inside an otherwise uniform run,
+invalid/all-ones reads, framebuffer-page exclusions, programmed/live display
+bases, high cursor addresses, and rejection of compressed/tiled/rotated or
+unknown display formats. Mapping-cache tests check steady-state reuse, address,
+size/order changes, palette-only work, retirement-epoch invalidation, and
+preservation of all other private-PAT entries when selecting entry zero.
+Display tests cover guarded plane selection, complete-frame/overlay pixels,
+no writes to the visible frame, no pending/front-buffer reuse, frame-count wrap,
+timeout state and retained fullscreen damage with intersecting foreground apps.
+ASan/UBSan are enabled.
+
+To test WM integration without Intel hardware, use the explicit test backend:
+
+```sh
+make clean
+make iso CXX='clang++ -DGPU_COMPOSITOR_TEST -DGPU_PRESENT_TEST' PERSIST_DISK=.storage-test/gpu-test.img ROOT_MIB=64
+python3 tests/qemu_gpu_compositor_test.py
+```
+
+That backend lives in `tests/` and is absent from normal kernels. The test reads
+the master buffer at completed frame boundaries, verifies current rainbow
+pixels and skipped full CPU surface generation, then injects a partially
+executed batch failure that switches to an empty replacement master buffer.
+It also launches/closes a native window and checks that retirement invalidates
+cached bindings, then checks hook disablement, resumed CPU animation and
+continued pointer input after failure. Actual Rainbow maximize exercises the
+retained fullscreen path. The optional software presenter checks one complete
+presentation per frame and display failure while preserving GPU composition.
+These are software integration results, not GPU performance or reset tests.
+Rebuild without either test macro before physical testing.
+
+For experimental page flips, build `make clean && make iso GPU_PRESENT=1`.
+Look for HUD `GPU:opaque+rainbow flip UC` and Boot Log
+`GPU: first vblank page flip latched`. Unsupported plane/power/cache layouts
+retain CPU presentation; preserve the `GPU display` diagnostics in a fresh log.
+Check fullscreen Rainbow's moving tear, cursor/drag outlines, menus, native
+windows, smoothness/frame rate and CPU usage. QEMU's mocked presenter cannot
+validate Intel vblank, cache visibility or actual scanout rollback.
+
+For physical testing, use `GPU_COMPOSE=1` and look for
+`GPU: offscreen composition readback PASSED` followed by
+`GPU: dirty CPU/GPU cache coherence PASSED - bulk clflush disabled` and
+`opaque GPU composition enabled; CPU presentation` in Boot Log. The HUD shows
+`GPU:opaque+rainbow LLC`. A failed cache-policy/coherence test retains CPU
+composition; the earlier flush-every-frame path is no longer enabled at runtime.
+Record device
+ID, resolution/pitch, CPU usage and frame times with Rainbow exposed, partially
+covered and fully hidden, plus dragging/resizing, cursor/ghost outlines, menus,
+native apps and repeated window close/reopen. Compare with the same build and
+workload using `GPU=0 GPU_COMPOSE=0`. The owner's previous revision regressed
+from roughly 8% CPU in CPU mode to 24% in GPU mode with Rainbow mostly covered,
+about 6% hidden and up to 80% exposed. Those observations do not validate the
+new page-flip stage. The owner subsequently reported about 8% mostly covered
+and 24% fullscreen versus 60% fullscreen on CPU after the coherence changes.
+
+If initialization reports `no unused GGTT interval for owned buffers`, retain
+the new `GPU GGTT` and `GPU firmware display` lines: these report required space,
+largest non-present/alias runs, protected ranges and representative PTEs.
+The previous non-present-only allocator hit this condition on the `0x5916`
+laptop. The owner subsequently reported the composition-enabled HUD, but the
+new page-flip stage still requires a physical retest.
+
+The older `qemu_rainbow_test.py` still assumes a legacy terminal pointer and its
+dragging fixture needs updating for native console hosts. Do not count it as a
+passed GPU regression. The new host tests cover visibility and the integration
+test covers GPU-hook animation and failure recovery.
+
 ## Storage and capacity
 
 Prepare the dedicated ext4 fixture before its dependent tests:

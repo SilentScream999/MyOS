@@ -16,11 +16,12 @@ src/kernel.o: src/kernel.cpp src/core/helpers.h src/core/structures.h \
   src/arch/irq.h src/arch/timer.h src/arch/rtc.h src/core/tty.h \
   src/core/terminal.h src/arch/acpi.h src/core/syscall.h src/core/app.h \
   src/gui/wm.h src/gui/graphics.h src/drivers/mouse.h src/gui/surface.h \
-  src/gui/visibility.h src/gui/ui_font.h src/gui/ui_font_data.h \
-  src/gui/truetype.h src/gui/resources.h src/gui/image.h \
-  src/gui/../core/app.h src/gui/../core/wiz.h src/gui/window_resize.h \
-  src/gui/window_input.h src/gui/window_decorations.h \
-  src/gui/window_overlay.h src/gui/overlay_renderer.h \
+  src/gui/visibility.h src/gui/gpu_compositor.h \
+  src/gui/gpu_presentation.h src/gui/window_overlay.h src/gui/ui_font.h \
+  src/gui/ui_font_data.h src/gui/truetype.h src/gui/resources.h \
+  src/gui/image.h src/gui/../core/app.h src/gui/../core/wiz.h \
+  src/gui/window_resize.h src/gui/window_input.h \
+  src/gui/window_decorations.h src/gui/overlay_renderer.h \
   src/gui/power_icons.h src/gui/clipboard_icons.h \
   src/core/text_clipboard.h src/gui/wallpaper.h src/gui/taskbar.h \
   src/gui/taskbar_layout.h src/core/app_console.h src/fs/ramfs.h \
@@ -43,6 +44,8 @@ src/kernel.o: src/kernel.cpp src/core/helpers.h src/core/structures.h \
   src/fs/fat_time.h third_party/fatfs/ff.h third_party/fatfs/ffconf.h \
   third_party/fatfs/diskio.h src/fs/tar.h src/core/exec.h src/core/elf.h \
   src/core/wiz.h src/drivers/intel_gpu.h src/drivers/gpu_cmds.h \
+  src/drivers/gpu_scene_commands.h src/drivers/gpu_address_space.h \
+  src/drivers/gpu_mapping_cache.h src/drivers/gpu_display.h \
   src/arch/apic_timer.h src/gui/boot_splash.h src/drivers/synaptics.h \
   src/drivers/ps2kb.h
 
@@ -148,6 +151,12 @@ src/gui/surface.h:
 
 src/gui/visibility.h:
 
+src/gui/gpu_compositor.h:
+
+src/gui/gpu_presentation.h:
+
+src/gui/window_overlay.h:
+
 src/gui/ui_font.h:
 
 src/gui/ui_font_data.h:
@@ -167,8 +176,6 @@ src/gui/window_resize.h:
 src/gui/window_input.h:
 
 src/gui/window_decorations.h:
-
-src/gui/window_overlay.h:
 
 src/gui/overlay_renderer.h:
 
@@ -251,6 +258,14 @@ src/core/wiz.h:
 src/drivers/intel_gpu.h:
 
 src/drivers/gpu_cmds.h:
+
+src/drivers/gpu_scene_commands.h:
+
+src/drivers/gpu_address_space.h:
+
+src/drivers/gpu_mapping_cache.h:
+
+src/drivers/gpu_display.h:
 
 src/arch/apic_timer.h:
 

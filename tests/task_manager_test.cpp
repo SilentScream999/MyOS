@@ -4,7 +4,7 @@
 #include "user/task_manager.cpp"
 static unsigned syncs;
 static uint64_t native_call(uint64_t n,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t) {
-    if(n==201)++syncs;
+    if(n==222)++syncs;
     return 0;
 }
 static uint32_t pixels[760*600];
@@ -61,6 +61,7 @@ int main(int argc,char** argv) {
     assert(kernel_usage.total==3000&&kernel_usage.cpu[KCPU_INTERRUPTS]==1000&&kernel_usage.calls[KCPU_INTERRUPTS]==1000);
     kernel_details=true;render();assert(syncs==2);
     surface={pixels,620,440};scroll=999;clamp_scroll();render();assert(scroll==row_count()-visible_rows());
+    kernel_usage.update(-1);assert(kernel_usage.failed&&kernel_usage.total==3000);
     const int widths[]={620,760};
     for(int width:widths){
         surface.w=width;kernel_details=false;render();
@@ -72,7 +73,6 @@ int main(int argc,char** argv) {
     }
     NativeEvent wheel{4,0,0,0,0,100};handle_event(wheel);assert(scroll==0);
     assert(handle_event({7,0,0,0,0,0}));
-    kernel_usage.update(-1);assert(kernel_usage.failed&&kernel_usage.total==3000);
     kernel_usage.reset();assert(!kernel_usage.sampled&&!kernel_usage.initialized);
     kernel_usage.incoming={};kernel_usage.incoming.sampled_at=30000;kernel_usage.update(0);
     assert(!kernel_usage.sampled&&kernel_usage.total==0);

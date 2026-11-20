@@ -30,6 +30,9 @@ extern "C" void wyzar_ext4_free(void* p) { kfree(p); }
 #include "gui/graphics.h"
 #include "gui/wm.h"
 #include "drivers/intel_gpu.h"
+#ifdef GPU_COMPOSITOR_TEST
+#include "../tests/gpu_compositor_backend.h"
+#endif
 #include "arch/apic_timer.h"
 
 static void process_exit_ui(pid_t pid) {
@@ -261,6 +264,10 @@ post_flip_hook_fn g_post_flip_hook = nullptr;
 #define GPU_BRINGUP 0   // set by the Makefile: make GPU=1
 #endif
 gpu_flip_hook_fn g_gpu_flip_hook = nullptr;
+gpu_compose_hook_fn g_gpu_compose_hook = nullptr;
+gpu_present_hook_fn g_gpu_present_hook = nullptr;
+bool g_gpu_quarantine_sources = false;
+uint64_t g_gpu_surface_epoch = 0;
 char g_gpu_status[64] = "GPU:none";
 pre_flip_hook_fn  g_pre_flip_hook  = nullptr;
 static uint64_t last_mouse_flip_tsc = 0;
@@ -671,6 +678,9 @@ void compositor_thread_main() {
 #endif
     wm_overlay_update(g_mouse_x, g_mouse_y, g_mouse_buttons);
     g_desktop_ready = true;
+#ifdef GPU_COMPOSITOR_TEST
+    gpu_test_install();
+#endif
 
     uint64_t target_tsc = rdtsc(); // Start cadence from current time
     static uint64_t last_hud_tick     = 0;
@@ -700,6 +710,7 @@ void compositor_thread_main() {
         // Periodic HUD update: ensure Core0 stats refresh every 1 second
         if (now_refresh - last_hud_tick > tsc_hz) {
             last_hud_tick = now_refresh;
+            g_hud_sample_due=true;
             g_needs_refresh = true;
 
             // Explicitly 'dirty' the HUD area (top-right strip)
@@ -1055,7 +1066,11 @@ extern "C" void kmain(void) {
 		// Full bring-up + self-test (fill, copy, 64x backbuffer flip). Never halts: on any
 		// failure the compositor simply keeps using the CPU copy path.
 #if GPU_BRINGUP
-		if (gpu_bringup() && g_gpu_flip_preferred) g_gpu_flip_hook = gpu_flip_rect;
+		if (gpu_bringup(g_rainbow_wide)) {
+            if(g_gpu_compose_ready)g_gpu_compose_hook=gpu_compose_scene;
+            if(g_gpu_present_ready)g_gpu_present_hook=gpu_present_frame;
+            else if(!GPU_COMPOSE && g_gpu_flip_preferred)g_gpu_flip_hook=gpu_flip_rect;
+        }
 #else
 		gpu_status_set("GPU:off");   // found, but not initialised (see Makefile: GPU=1)
 #endif

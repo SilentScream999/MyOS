@@ -18,7 +18,19 @@ CFLAGS = $(OPT) -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
 # Intel GPU bring-up + self-test + benchmark at boot. OFF by default: on the Gen9 test laptop the CPU
 # copy (~0.3 ms) beats the GPU copy (~3 ms), and the self-test briefly draws test patterns on screen.
 # Developer use:  make clean && make GPU=1 iso
-GPU ?= 0
+# Opaque GPU composition and the resident rainbow palette (experimental).
+# Enables bring-up as well; CPU presentation remains independent of composition.
+GPU_PRESENT ?= 0
+GPU_COMPOSE ?= $(GPU_PRESENT)
+GPU ?= $(GPU_COMPOSE)
+ifeq ($(GPU_PRESENT),1)
+ifneq ($(GPU_COMPOSE),1)
+$(error GPU_PRESENT=1 requires GPU_COMPOSE=1)
+endif
+ifneq ($(GPU),1)
+$(error GPU_PRESENT=1 requires GPU=1)
+endif
+endif
 
 # Taskbar clock (src/arch/rtc.h). Windows keeps LOCAL time in the hardware clock, so 0 matches the Windows clock on
 # Windows-installed test machines. If the clock is off by whole hours, set minutes to ADD to the RTC value,
@@ -30,6 +42,8 @@ CLOCK_SHOW_SECONDS ?= 0
 BOOT_DIAGNOSTICS ?= 0
 
 CXXFLAGS = $(CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -mno-red-zone -DGPU_BRINGUP=$(GPU) \
+           -DGPU_COMPOSE=$(GPU_COMPOSE) \
+           -DGPU_PRESENT=$(GPU_PRESENT) \
            -DCLOCK_UTC_OFFSET_MIN=$(CLOCK_UTC_OFFSET_MIN) -DCLOCK_SHOW_SECONDS=$(CLOCK_SHOW_SECONDS) \
            -DBOOT_DIAGNOSTICS=$(BOOT_DIAGNOSTICS)
 
@@ -41,6 +55,18 @@ include src/fs/ext4_config_flags.mk
 EXT4_OBJ = $(EXT4_SRC:.c=.o) src/fs/ext4_libc.o third_party/fatfs/ff.o third_party/fatfs/ffunicode.o
 CXXFLAGS += $(EXT4_CONFIG) $(EXT4_INC) -Isrc/fs/ext4_libc
 $(OBJ) $(EXT4_OBJ): src/fs/ext4_config_flags.mk Makefile
+
+# Make does not otherwise notice command-line flag changes. Preserve the stamp
+# timestamp for identical builds, and rebuild kernel objects when flags change.
+.PHONY: FORCE_KERNEL_CONFIG
+FORCE_KERNEL_CONFIG:
+
+.storage-test/kernel-config: FORCE_KERNEL_CONFIG
+	@mkdir -p .storage-test
+	@printf '%s\n' '$(CC) $(CXX) $(CFLAGS) $(CXXFLAGS)' > $@.tmp
+	@cmp -s $@.tmp $@ && rm $@.tmp || mv $@.tmp $@
+
+$(OBJ) $(EXT4_OBJ): .storage-test/kernel-config
 
 all: wyzar init.elf counter.elf win_test.elf initrd.tar
 
@@ -146,6 +172,12 @@ test-task-manager:
 	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. tests/task_manager_test.cpp -o .storage-test/task-manager-test
 	.storage-test/task-manager-test .storage-test/task-manager.ppm
 .PHONY: test-task-manager
+
+test-gpu:
+	mkdir -p .storage-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. -Isrc/gui -Isrc/drivers tests/gpu_compositor_test.cpp -o .storage-test/gpu-compositor-test
+	.storage-test/gpu-compositor-test
+.PHONY: test-gpu
 
 test-text-input:
 	mkdir -p .storage-test

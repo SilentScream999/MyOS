@@ -20,13 +20,38 @@ make clean && make run FRESH=1 DEBUG=1
 Build ISO/USB images without launching QEMU, preserving saved files:
 make clean && make iso
 
+Experimental Intel Gen9 opaque compositor and GPU rainbow (hardware testing):
+make clean && make iso GPU_COMPOSE=1
+This implies GPU=1. Boot must report offscreen composition readback PASSED and
+dirty CPU/GPU cache coherence PASSED before enabling it. The HUD then shows
+GPU:opaque+rainbow LLC. Failure retains/rebuilds the CPU path. Composition-mode
+boot tests stay offscreen; GPU=1 alone retains visible developer diagnostics.
+Chrome, alpha blending, scaled surfaces and screen presentation remain on the
+CPU in this mode. The owner reported 24% CPU fullscreen versus 60% in CPU mode.
+
+Experimental GPU presentation (same-mode double buffering; laptop retest needed):
+make clean && make iso GPU_PRESENT=1
+This implies GPU_COMPOSE=1 and GPU=1.
+Repeat GPU_PRESENT=1 on later make run / make iso commands. Kernel objects now
+rebuild automatically when compiler/GPU flags change. Boot Log explicitly
+reports whether page flipping was requested or disabled by the build.
+Supported linear firmware planes use two hidden scanout buffers and
+vblank-latched flips instead of CPU live-screen
+copies. The HUD must show GPU:opaque+rainbow flip UC and Boot Log must report
+GPU: first vblank page flip latched. Unsupported layouts retain CPU presentation.
+The rest of GUI rasterization (fonts, icons, alpha, general scaling) is still CPU.
+For the previously tested presenter, rebuild with GPU_COMPOSE=1 GPU_PRESENT=0.
+
+Return to the default CPU renderer, preserving saved files:
+make clean && make iso GPU_COMPOSE=0 GPU=0
+
 Build fresh images without launching QEMU:
 make clean && make iso FRESH=1
 
 For a fresh fixed-size build without QEMU, add DEBUG=1 to that last command.
 make run already builds the ISO and refreshes USB files; a preceding make iso
 is unnecessary. Source/header edits usually need only make run, not make clean.
-Clean when changing compiler options such as OPT/GPU.
+Kernel compiler/GPU option changes now trigger automatic object rebuilding.
 
 Flags and outputs
 -----------------

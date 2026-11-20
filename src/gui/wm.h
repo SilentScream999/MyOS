@@ -11,6 +11,8 @@
 #include "string.h"
 #include "surface.h"
 #include "visibility.h"
+#include "gpu_compositor.h"
+#include "gpu_presentation.h"
 
 #include "font8x8_basic.h"
 #include "ui_font.h"
@@ -110,6 +112,7 @@ static uint64_t g_time_vram_ticks = 0;
 // Capacity (chars) of the top-right HUD line. The compositor thread dirties a region this wide once a second,
 // so EVERY part of the line is flipped to the screen, not just its right-hand end.
 #define HUD_MSG_CAP 200
+static bool g_hud_sample_due=true;
 static uint64_t g_client_render_ticks = 0; // time the rainbow CLIENT spent drawing its own surface (outside the compositor)
 // Snapshot of the PREVIOUS frame's complete timings, taken at the end of wm_compose_dirty().
 // The HUD is built in the middle of a frame, so it must read these, not the live counters
@@ -156,6 +159,13 @@ struct WinEvent {
 
 #define WIN_EVENT_QUEUE_SIZE 64
 
+struct PublishedPixels {
+    void* allocation;
+    uint32_t* pixels;
+    uint64_t capacity, retired_frame;
+    int width, height;
+};
+static uint64_t g_compositor_frame = 1;
 struct Window {
     int id;
     char title[64];
@@ -163,6 +173,8 @@ struct Window {
     int32_t x, y, w, h;
     uint32_t* buffer;
     uint32_t buffer_pitch;
+    PublishedPixels published[2];
+    unsigned published_slot;
     uint64_t buffer_phys;   // physical base address of surface
     uint64_t buffer_pages;  // number of 4K pages
     uint64_t user_va;       // virtual address mapped into user space
@@ -1284,6 +1296,7 @@ static inline void wm_draw_window_chrome(int32_t x, int32_t y, int32_t w, int32_
 
 // Currently live on VRAM beyond master_backbuffer:
 static OverlayFrame g_presented_overlay{{-999,-999,0,0},{},0};
+static bool g_gpu_present_pending=false;
 static uint32_t wm_cursor_color(unsigned edges,int x,int y,uint8_t buttons);
 static const uint32_t* wm_cursor_sprite(const OverlayCursor& cursor);
 static void wm_capture_overlay(OverlayFrame* frame,const OverlayCursor& cursor) {
@@ -1579,10 +1592,18 @@ static Window* g_retired_windows=nullptr;
 // have a pointer into the previous surface, even on a single-core machine.
 static void wm_collect_retired_surfaces() {
     TtyIrqGuard guard;
+    ++g_compositor_frame;
+    // Failed reset may leave a DMA read in flight. Pin retired client backing
+    // as well as the quarantined destination until reboot, never recycle it.
+    if(g_gpu_quarantine_sources)return;
+    // Invalidate cached GGTT bindings before any backing pages can be reused,
+    // including a new window reusing an identical pointer and allocation size.
+    if(g_retired_surface_count || g_retired_windows)++g_gpu_surface_epoch;
     for(unsigned i=0;i<g_retired_surface_count;++i)
         for(uint64_t p=0;p<g_retired_surfaces[i].pages;++p)free_phys_page(g_retired_surfaces[i].physical+p*PAGE_SIZE);
     g_retired_surface_count=0;
     while(g_retired_windows){Window* win=g_retired_windows;g_retired_windows=win->retired_next;
+        for(auto& slot:win->published)if(slot.allocation)kfree(slot.allocation);
         if(win->buffer_phys){for(uint64_t p=0;p<win->buffer_pages;++p)free_phys_page(win->buffer_phys+p*PAGE_SIZE);}
         else kfree(win->buffer);kfree(win);}
 }
@@ -1754,13 +1775,16 @@ static bool wm_client_rect_exposed(Window* win,int x,int y,int w,int h) {
 
 static uint64_t g_rain_render_count = 0;
 static uint64_t g_rain_damage_pixels = 0;
+static bool g_rain_surface_current = false;
 
 // Keep a complete backing surface whenever exposed, but only request repaint
 // for pixels people can see. The compositor remains independent of client type.
 static inline void wm_rain_render(Window* win, const VisibleRegion& region) {
     if (!win || !win->buffer || !region.count) return;
     uint64_t t0 = rdtsc_val();
-    rainbow_render_surface(win->buffer, (uint32_t)win->w, (uint32_t)win->h, win->buffer_pitch, rain_scroll, g_rainbow_wide);
+    g_rain_surface_current = !g_gpu_compose_hook;
+    if (g_rain_surface_current)
+        rainbow_render_surface(win->buffer, (uint32_t)win->w, (uint32_t)win->h, win->buffer_pitch, rain_scroll, g_rainbow_wide);
     g_client_render_ticks = rdtsc_val() - t0;
     ++g_rain_render_count;
     if (!win->chrome_drawn) {
@@ -1854,6 +1878,19 @@ volatile bool g_vram_lock = false;
 // =============================================================================
 static inline void wm_overlay_present_unlocked(const OverlayFrame& frame,bool scene_changed=false) {
     if(!fb||!g_master_backbuffer)return;
+    if(g_gpu_present_hook && g_desktop_ready){
+        if(!scene_changed && !g_gpu_present_pending && gpu_overlay_equal(frame,g_presented_overlay))return;
+        if(!g_gpu_present_hook(frame,wm_cursor_sprite(frame.cursor))){
+            g_gpu_present_hook=nullptr;g_gpu_present_pending=false;
+            g_dirty_min_x=0;g_dirty_min_y=0;g_dirty_max_x=fb->width-1;g_dirty_max_y=fb->height-1;
+            g_needs_refresh=true;
+            return;
+        }
+        g_gpu_present_pending=false;
+        g_presented_overlay.cursor=frame.cursor;g_presented_overlay.count=frame.count;
+        for(unsigned i=0;i<frame.count;++i)g_presented_overlay.outlines[i]=frame.outlines[i];
+        return;
+    }
     OverlayTarget target{(uint8_t*)fb->address,g_master_backbuffer,(int)fb->width,(int)fb->height,(int)fb->pitch};
     overlay_render_transition(target,g_presented_overlay,frame,wm_cursor_sprite(frame.cursor),scene_changed);
     // Remember exactly what these writes presented, never re-read live windows
@@ -1972,9 +2009,11 @@ static uint32_t g_overlay_backup[256];
 // When several rects are composed in one frame the caller passes do_overlay=true only for the LAST one:
 // each completed blit presents/tracks its own snapshot; the final call reports completion.
 static uint64_t g_scene_compose_count=0,g_scene_compose_pixels=0;
+static uint64_t g_gpu_fullscreen_fast_count=0;
 static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                                      uint32_t min_y, uint32_t max_y, bool do_overlay = true,
                                      bool present = true) {
+retry_scene:
     if (!fb || !fb->address || !g_master_backbuffer) return false;
     if (min_x>max_x || min_y>max_y || min_x>=fb->width || min_y>=fb->height) return false;
     if (max_x >= fb->width)  max_x = fb->width - 1;
@@ -1992,7 +2031,30 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
     struct Source { uint32_t* pixels;int w,h;uint32_t pitch; } sources[MAX_WINDOWS];
     {TtyIrqGuard guard;frame_count=g_window_count;
         for(int i=0;i<frame_count;++i){auto* win=g_window_list[i];frame_windows[i]=win;frame_order[i]=g_window_order[i];
-            wm_get_win_rect(win,&rects[i]);sources[i]={win->buffer,win->canvas_width,win->canvas_height,win->buffer_pitch};}}
+            wm_get_win_rect(win,&rects[i]);sources[i]={win->buffer,win->canvas_width,win->canvas_height,win->buffer_pitch};
+            const auto& slot=win->published[win->published_slot];
+            if(slot.pixels && !g_gpu_quarantine_sources)sources[i]={slot.pixels,slot.width,slot.height,(uint32_t)slot.width*4};}}
+
+    // Only this thread owns the plan; keep its bounded storage off the kernel
+    // stack. Match the existing full-width scene updates on damaged rows.
+    static GpuScenePlan gpu_plan{};
+    gpu_plan.client_count=frame_count;gpu_plan.scroll=rain_scroll;
+    gpu_plan.rainbow_colors=g_rainbow_wide;
+    gpu_plan.count=0;gpu_plan.accelerated=0;
+    bool fullscreen_fast=false;
+    if(g_gpu_compose_hook && present){
+        for(int s=0;s<frame_count;++s){
+            int index=frame_order[s];const auto& r=rects[index];auto* win=frame_windows[index];
+            const auto& source=sources[index];
+            gpu_plan.clients[s]={{r.x1,r.y1,r.x2,r.y2},{r.x1,r.y1+(int)g_title_h,r.x2,r.y2},
+                source.pixels,(uint32_t)source.w,(uint32_t)source.h,source.pitch,
+                win&&r.visible,win&&win->is_system&&win->type==WIN_TYPE_RAIN,win&&!win->maximized};
+        }
+        if(!g_menu_open && !g_clipboard_open && !g_taskbar_popup)
+            fullscreen_fast=gpu_rain_damage_plan(&gpu_plan,{(int)min_x,(int)min_y,(int)max_x+1,(int)max_y+1});
+        if(!fullscreen_fast)gpu_scene_plan(&gpu_plan,{0,(int)min_y,(int)fb->width,
+            (int)(max_y+1 < fb->height-g_taskbar_h ? max_y+1 : fb->height-g_taskbar_h)});
+    }
     
     // Metrics reset (B/W/r/L are updated DURING the frame, V is from last)
     g_time_bg_ticks   = 0;
@@ -2002,6 +2064,14 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
 
     uint64_t t0 = rdtsc_val();
     uint64_t t1, t2, t3;
+
+    if(fullscreen_fast){
+        if(!g_gpu_compose_hook(gpu_plan)){
+            g_gpu_compose_hook=nullptr;g_rain_surface_current=false;
+            min_x=0;min_y=0;max_x=fb->width-1;max_y=fb->height-1;goto retry_scene;
+        }
+        ++g_gpu_fullscreen_fast_count;t1=t0;t2=rdtsc_val();g_time_win_ticks=t2-t0;
+    }else{
 
     // Stage 1: Desktop wallpaper (hole-punched)
     for (uint32_t y = min_y; y <= max_y; y++) {
@@ -2104,8 +2174,16 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         // Unified surface compositor: every window (system or user) is backed by its surface buffer
         wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, win->closable, min_y, max_y, win->id == g_focused_win_id, &wm_window_icons(win).title,win->maximized);
         if (source_surface.pixels) {
+            bool accelerated=(gpu_plan.accelerated & (uint32_t(1)<<s))!=0;
+            bool procedural_rain=win->is_system&&win->type==WIN_TYPE_RAIN&&!g_rain_surface_current;
+            if(procedural_rain && (source_surface.w!=display_w||source_surface.h!=display_h)){
+                rainbow_render_surface(source_surface.pixels,source_surface.w,source_surface.h,
+                                       source_surface.pitch,rain_scroll,g_rainbow_wide);
+                procedural_rain=false;g_rain_surface_current=true;
+            }
             for (int32_t y = dr1; y < dr2; y++) {
                 if (y < r.y1 + (int32_t)g_title_h) continue;
+                if (accelerated && y < r.y2-(gpu_plan.clients[s].resize_grip?12:0)) continue;
                 uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
                 int32_t ry = y - (r.y1 + (int32_t)g_title_h);
                 int32_t wx = r.x1; if (wx < 0) wx = 0;
@@ -2113,7 +2191,9 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                 if (wx + ww > (int32_t)fb->width) ww = (int32_t)fb->width - wx;
                 if (ww > 0) {
                     uint32_t src_off = (r.x1 < 0) ? (uint32_t)(-r.x1) : 0;
-                    if(source_surface.w==display_w&&source_surface.h==display_h)
+                    if(procedural_rain)
+                        wm_fill_rainbow_row(drow+wx,ww,rain_scroll,src_off);
+                    else if(source_surface.w==display_w&&source_surface.h==display_h)
                         memcpy_vram_sse_headless(drow + wx, (uint32_t*)((uint8_t*)source_surface.pixels + (uint64_t)ry * source_surface.pitch) + src_off, ww * 4);
                     else {
                         uint32_t sy=(uint64_t)ry*source_surface.h/display_h;
@@ -2121,12 +2201,25 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                         for(int32_t px=0;px<ww;++px)drow[wx+px]=source[(uint64_t)(src_off+px)*source_surface.w/display_w];
                     }
                     int from_bottom=r.y2-1-y;
-                    if(!win->maximized&&from_bottom>=1&&from_bottom<12)for(int right=1;right<12;++right)
+                    if((accelerated?gpu_plan.clients[s].resize_grip:!win->maximized)&&from_bottom>=1&&from_bottom<12)for(int right=1;right<12;++right)
                         if(right+from_bottom==6||right+from_bottom==10||right+from_bottom==14){int px=r.x2-1-right;
                             if(px>=wx&&px<wx+ww)drow[px]=0xff81728f;}
                 }
             }
         }
+    }
+
+    // Complete GPU writes before the CPU draws menus/HUD/cursor or reads the
+    // master buffer. On a failed batch, recompute the whole scene through the
+    // CPU path; the driver has disabled submission and quiesced or quarantined
+    // its old destination so late DMA cannot corrupt the replacement buffer.
+    if(gpu_plan.count && !g_gpu_compose_hook(gpu_plan)){
+        g_gpu_compose_hook=nullptr;
+        g_rain_surface_current=false;
+        min_x=0;min_y=0;max_x=fb->width-1;max_y=fb->height-1;
+        // Reuse this frame instead of recursively consuming a second large
+        // compositor stack frame. The backward jump releases ResourceRead.
+        goto retry_scene;
     }
 
     // ── Shared shell control: taskbar and Start menu ─────────────────────────────
@@ -2371,7 +2464,12 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
 
     // Stage 2.7: CPU display (below RAM)
     if(show_desktop_stats){
-        // ── Task Count measurement ──────────────────────────────────────────
+        static char cpu_msg[HUD_MSG_CAP];
+        static uint32_t cpu_color;
+        if(g_hud_sample_due){
+        g_hud_sample_due=false;
+        // Keep the same text and alignment across partial redraws until the
+        // compositor damages the complete HUD for its next sample.
         static uint32_t g_task_count = 0;
         static uint64_t last_count_tick = 0;
         if (g_tick_count > last_count_tick + 500) { // Update tasks every 500ms
@@ -2458,7 +2556,6 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         *sp = '\0';
 
         // ── Build HUD string ────────────────────────────────────────────────
-        char cpu_msg[HUD_MSG_CAP];
         char p1_str[8], tc_str[8], ut_str[8];
         to_str(g_cpu_usage_pct, p1_str);
         to_str(g_task_count, tc_str);
@@ -2478,8 +2575,11 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
         p = g_gpu_status; while(*p && (d - cpu_msg) < (HUD_MSG_CAP - 2)) *d++ = *p++;
         *d = '\0';
 
+        cpu_color = g_cpu_usage_pct < 50 ? 0xFF88FF88 :
+                    g_cpu_usage_pct < 80 ? 0xFFFFDD44 : 0xFFFF6644;
+        }
         uint32_t msg_len = strlen(cpu_msg);
-        uint32_t rx = fb->width - (msg_len * 8) - 20;
+        uint32_t rx = fb->width > msg_len*8+20 ? fb->width-msg_len*8-20 : 0;
         uint32_t ry = 38; 
 
         if ((uint32_t)(ry + 12) >= min_y && ry >= 4 && (ry - 4) <= max_y) {
@@ -2493,8 +2593,6 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
                 memset_32(drow + bx, 0xCC1A1F35, bw);
             }
             // Color: green when low usage, yellow when moderate, red when high
-            uint32_t cpu_color = g_cpu_usage_pct < 50 ? 0xFF88FF88 :
-                                 g_cpu_usage_pct < 80 ? 0xFFFFDD44 : 0xFFFF6644;
             wm_draw_mono_string(rx, ry, cpu_msg, cpu_color);
         }
     }
@@ -2674,10 +2772,27 @@ static inline bool wm_compose_dirty(uint32_t min_x, uint32_t max_x,
     }
     t2 = rdtsc_val();
     g_time_win_ticks = t2 - t1;
+    }
 
     // Boot keeps the splash in VRAM until every part of the desktop is ready.
     // No cursor, overlay, GPU hook, or framebuffer write may precede this gate.
     if (!present) return false;
+
+    // Present one complete scene after the final damage rectangle, including
+    // cursor/ghost-only updates. Never copy partial scenes into live scanout.
+    if(g_gpu_present_hook && g_desktop_ready){
+        g_gpu_present_pending=true;
+        if(!do_overlay)return false;
+        uint64_t started=rdtsc_val();
+        while(__sync_lock_test_and_set(&g_vram_lock,1))__asm__ volatile("pause");
+        OverlayFrame frame;wm_capture_overlay(&frame,{g_mouse_x,g_mouse_y,wm_cursor_edges(g_mouse_x,g_mouse_y),g_mouse_buttons});
+        wm_overlay_present_unlocked(frame,true);
+        bool success=g_gpu_present_hook!=nullptr;
+        __sync_lock_release(&g_vram_lock);
+        if(!success){min_x=0;min_y=0;max_x=fb->width-1;max_y=fb->height-1;goto retry_scene;}
+        g_time_vram_ticks=rdtsc_val()-started;
+        return true;
+    }
 
     // Stage 3: Blit dirty rectangle to VRAM
     if (min_x > max_x || min_y > max_y) {

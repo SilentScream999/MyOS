@@ -47,6 +47,8 @@ options; header dependencies are tracked automatically.
 |---|---|---|
 | `OPT=-O2` | `-O0` | Kernel-wide optimization; test separately on hardware |
 | `GPU=1` | `0` | Intel Gen9 bring-up/self-test/benchmark; opt-in |
+| `GPU_COMPOSE=1` | `0` | Experimental opaque GPU composition and rainbow; implies `GPU=1` |
+| `GPU_PRESENT=1` | `0` | Experimental vblank page flips; implies `GPU_COMPOSE=1` and `GPU=1` |
 | `DEBUG=1` | `0` | Fixed-size USB root policy; not a compiler debug switch |
 | `BOOT_DIAGNOSTICS=1` | `0` | Extra boot timings |
 | `CLOCK_UTC_OFFSET_MIN=-420` | `0` | Minutes added to RTC for tray display |
@@ -86,7 +88,12 @@ options; header dependencies are tracked automatically.
   local-clock timestamps and Eject with busy-drive checks.
 - USB xHCI storage/HID/hubs, descriptor-based relative pointers, PS/2 keyboard
   and Synaptics input. Hardware coverage and limitations are in the input guide.
-- An opt-in Intel Gen9 blitter path. QEMU tests the CPU path, not this GPU.
+- An opt-in Intel Gen9 blitter path, including visible opaque client composition
+  and a resident rainbow palette with `GPU_COMPOSE=1`. Chrome, image/font alpha,
+  scaled clients and resize grips remain on the CPU. `GPU_PRESENT=1` adds
+  experimental GPU copies to hidden scanout buffers and vblank page flips;
+  unsupported firmware layouts keep CPU presentation. QEMU cannot
+  validate Intel hardware or establish physical CPU savings.
 
 The shell supports `help`, `ls`, `cd`, `pwd`, `mkdir`, `rmdir`, `df`, `write`,
 `append`, `mv`, `cat`, `stat`, `rm`, `run`, `open bootlog`, `shutdown` and

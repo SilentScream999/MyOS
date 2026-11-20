@@ -65,6 +65,18 @@ Add a window-alpha contract, shadows/retained decorations and optional client
 double buffering. Runtime wallpaper/font selection can build on boot-time file
 settings. PNG icon alpha does not require a GPU.
 
-Measure tearing/flicker before hardware cursor/page-flip work. Keep Intel GPU
+The experimental `GPU_COMPOSE=1` path now uses the Gen9 blitter for supported
+opaque clients and a resident rainbow palette. Verify its boot RAM readback,
+pixel correctness, reset/fallback behavior and CPU/frame costs on the laptop.
+The owner reports about 24% CPU fullscreen versus 60% on the CPU renderer,
+and about 8% mostly covered, after coherent-cache/source-binding improvements.
+CPU chrome/alpha/scaling/overlays remain. The GPU render engine, interrupts and
+idle power management remain pending.
+
+Physically validate the new opt-in `GPU_PRESENT=1` same-mode vblank page flips:
+check the first-latch log, moving Rainbow tear, cursor/drag overlays, menus,
+frame rate and CPU usage. Host and mock integration tests do not validate Intel
+display hardware. The new retained fullscreen Rainbow damage path avoids CPU
+scene redraw when the animation owns the complete damage region. Keep Intel GPU
 bring-up opt-in until rendering, memory management and recovery are ready.
 Follow the dependency order in the [display roadmap](GPU_DESKTOP_ROADMAP.md).

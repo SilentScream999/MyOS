@@ -164,6 +164,8 @@ static inline void gpu_emit(GpuRing* r, uint32_t dw) {
 // OSDev wiki and working hardware confirm bytes).
 static bool gpu_emit_fill(GpuRing* r, uint64_t dst_gfx, uint32_t pitch,
                           uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2, uint32_t color) {
+    if ((dst_gfx & 63) || !pitch || pitch > 32767 || (pitch & 3) ||
+        x1 >= x2 || y1 >= y2 || x2 > pitch/4 || x2 > 32767 || y2 > 32767) return false;
     if (!gpu_ring_reserve(r, 8)) return false;
     gpu_emit(r, GPU_XY_COLOR_BLT_CMD | GPU_BLT_WRITE_RGBA | 5u);
     gpu_emit(r, GPU_BLT_DEPTH_32 | GPU_BLT_ROP_COLOR_COPY | (pitch & 0xFFFFu));
@@ -181,6 +183,12 @@ static bool gpu_emit_copy(GpuRing* r,
                           uint64_t src_gfx, uint32_t src_pitch, uint32_t sx, uint32_t sy,
                           uint64_t dst_gfx, uint32_t dst_pitch, uint32_t dx, uint32_t dy,
                           uint32_t w, uint32_t h) {
+    if ((src_gfx & 63) || (dst_gfx & 63) || !w || !h ||
+        !src_pitch || !dst_pitch || src_pitch > 32767 || dst_pitch > 32767 ||
+        ((src_pitch | dst_pitch) & 3) ||
+        (uint64_t)sx+w > src_pitch/4 || (uint64_t)dx+w > dst_pitch/4 ||
+        (uint64_t)dx+w > 32767 || (uint64_t)dy+h > 32767 ||
+        (uint64_t)sx+w > 32767 || (uint64_t)sy+h > 32767) return false;
     if (!gpu_ring_reserve(r, 10)) return false;
     gpu_emit(r, GPU_XY_SRC_COPY_BLT_CMD | GPU_BLT_WRITE_RGBA | 8u);
     gpu_emit(r, GPU_BLT_DEPTH_32 | GPU_BLT_ROP_SRC_COPY | (dst_pitch & 0xFFFFu));

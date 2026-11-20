@@ -139,6 +139,7 @@ static inline uint64_t rdmsr(uint32_t msr) {
 
 #define SYS_WIN_CREATE    200u
 #define SYS_WIN_SYNC      201u
+#define SYS_WIN_PUBLISH   222u // Publish a completed immutable window image.
 #define SYS_WIN_DESTROY   202u
 #define SYS_WIN_GET_BUFFER 203u
 #define SYS_WIN_DAMAGE     204u   // (win_id, x, y, w, h): part of the surface changed
@@ -733,6 +734,30 @@ static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uin
         
         case SYS_WIN_CREATE: return sys_win_create(a1, a2, a3, a4, a5, 0); // 6th arg flags omitted for now or added
         case SYS_WIN_SYNC:   return sys_win_sync(a1);
+        case SYS_WIN_PUBLISH: {
+            Window* win=wm_find_window((int)a1);
+            if(!win || !g_current_task || win->is_system || win->owner_pid!=g_current_task->pid)
+                return (uint64_t)-1;
+            if(g_gpu_quarantine_sources)return sys_win_sync(a1);
+            unsigned next=1-win->published_slot;
+            auto& slot=win->published[next];
+            if(slot.retired_frame==g_compositor_frame)return (uint64_t)-1;
+            uint64_t bytes=(uint64_t)win->buffer_pitch*win->canvas_height;
+            if(bytes>win->buffer_pages*PAGE_SIZE)return (uint64_t)-1;
+            if(bytes>slot.capacity){
+                void* allocation=kmalloc(bytes+63);
+                if(!allocation)return (uint64_t)-1;
+                if(slot.allocation){++g_gpu_surface_epoch;kfree(slot.allocation);}
+                slot.allocation=allocation;
+                slot.pixels=(uint32_t*)(((uintptr_t)allocation+63)&~uintptr_t(63));
+                slot.capacity=bytes;
+            }
+            memcpy(slot.pixels,win->buffer,bytes);
+            slot.width=win->canvas_width;slot.height=win->canvas_height;
+            win->published[win->published_slot].retired_frame=g_compositor_frame;
+            win->published_slot=next;
+            return sys_win_sync(a1);
+        }
         case SYS_WIN_DESTROY: return sys_win_destroy(a1);
         case SYS_WIN_GET_BUFFER: return sys_win_get_buffer(a1);
         case SYS_WIN_DAMAGE: return sys_win_damage(a1, a2, a3, a4, a5);
