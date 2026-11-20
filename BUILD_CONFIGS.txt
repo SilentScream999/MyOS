@@ -55,6 +55,11 @@ Resized client RCS is restored in codex/gpu-resized-composition. Client-only
 damage combines BCS/RCS copies, retains unchanged chrome, and copies uncovered
 wallpaper gaps on CPU. Physical stability and side-by-side CPU savings of this
 revision still require a laptop run; QEMU cannot execute Intel RCS.
+Follow-up: the restored revision freezes on ordinary enlargement even with
+other windows minimized; maximize still works. The current diagnostic build
+uses fixed full-client geometry and hardware scissor for damage/occlusion.
+Its hardware freeze outcome is unverified; the guarded checkpoint remains the
+known working comparison. F: in the HUD is milliseconds per frame, not CPU %.
 Fonts, icons and general alpha layers still use their CPU renderers.
 
 Force the CPU renderer, preserving saved files:

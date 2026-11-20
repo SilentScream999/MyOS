@@ -69,9 +69,13 @@ static void texture_state_test() {
     assert(buffer.words[262]==0x100000+GPU_RENDER_VERTEX_OFFSET);
     assert(buffer.words[258]==(63u<<16|95));
     const auto* v=buffer.words+GPU_RENDER_VERTEX_OFFSET/4;
-    assert(v[0]==(12u<<16|20)&&v[3]==(12u<<16)&&v[6]==0);
-    assert(floating(v[1])==.75f&&floating(v[2])==.875f);
-    assert(floating(v[4])==.125f&&floating(v[8])==.125f);
+    assert(v[0]==(14u<<16|28)&&v[3]==(14u<<16|0xFFFCu)&&v[6]==0xFFFEFFFCu);
+    assert(floating(v[1])==1.f&&floating(v[2])==1.f);
+    assert(floating(v[4])==0.f&&floating(v[8])==0.f);
+    assert(buffer.words[GPU_RENDER_RASTER_DWORD]&(1u<<1));
+    assert(buffer.words[230]==GPU_RENDER_SCISSOR_STATE);
+    assert(buffer.words[GPU_RENDER_SCISSOR_STATE/4]==0);
+    assert(buffer.words[GPU_RENDER_SCISSOR_STATE/4+1]==(11u<<16|19));
     // Independently decode the hardware blend fields, including PS_BLEND.
     uint32_t blend=buffer.words[2432/4+1],ps=buffer.words[222];
     assert((blend>>31)==1&&((blend>>26)&31)==1&&((blend>>21)&31)==0x13);
@@ -148,10 +152,12 @@ static void readback_sampling_test() {
         const auto* vertices=batch+GPU_RENDER_VERTEX_OFFSET/4;
         float left=floating(vertices[7]),right=floating(vertices[1]);
         float top=floating(vertices[8]),bottom=floating(vertices[2]);
+        int x1=(int16_t)vertices[6],y1=(int16_t)(vertices[6]>>16);
+        int x2=(int16_t)vertices[0],y2=(int16_t)(vertices[0]>>16);
         for(int y=draw.clip.y1;y<draw.clip.y2;++y)
             for(int x=draw.clip.x1;x<draw.clip.x2;++x){
-                float u=left+((x+.5f-draw.clip.x1)/(draw.clip.x2-draw.clip.x1))*(right-left);
-                float v=top+((y+.5f-draw.clip.y1)/(draw.clip.y2-draw.clip.y1))*(bottom-top);
+                float u=left+((x+.5f-x1)/(x2-x1))*(right-left);
+                float v=top+((y+.5f-y1)/(y2-y1))*(bottom-top);
                 float sx=u*draw.source.width,sy=v*draw.source.height;
                 unsigned expected_x=(2*(x-2)+1)*draw.source.width/32;
                 unsigned expected_y=(2*(y-2)+1)*draw.source.height/32;
@@ -162,6 +168,40 @@ static void readback_sampling_test() {
     }
     // The previous 16-to-12 fixture sampled y=3 exactly at texel edge 2.
     assert((3-2+.5f)*16/12==2.f);
+}
+static void scissor_geometry_test() {
+    GpuTextureDraw draw{{0x10000000,16,8,64},{0x2000000,96,64,384},
+                        {-4,-2,28,14},{0,0,28,14},false};
+    uint32_t original[1024],batch[1024];
+    assert(gpu_build_texture_batch(original,0x100000,draw));
+    const GpuRenderRect clips[]={{0,0,28,14},{1,2,19,11},{0,0,1,1},
+                                 {27,0,28,14},{0,13,28,14},{7,3,8,12}};
+    for(auto clip:clips){
+        draw.clip=clip;assert(gpu_build_texture_batch(batch,0x100000,draw));
+        const auto* vertices=batch+GPU_RENDER_VERTEX_OFFSET/4;
+        assert(!memcmp(vertices,original+GPU_RENDER_VERTEX_OFFSET/4,9*4));
+        int left=(int16_t)vertices[6],top=(int16_t)(vertices[6]>>16);
+        int right=(int16_t)vertices[0],bottom=(int16_t)(vertices[0]>>16);
+        assert(left==-4&&top==-2&&right==28&&bottom==14);
+        const auto* scissor=batch+GPU_RENDER_SCISSOR_STATE/4;
+        unsigned x1=scissor[0]&65535,y1=scissor[0]>>16;
+        unsigned x2=(scissor[1]&65535)+1,y2=(scissor[1]>>16)+1;
+        for(int y=0;y<64;++y)for(int x=0;x<96;++x){
+            bool written=x>=left&&x<right&&y>=top&&y<bottom&&
+                         (unsigned)x>=x1&&(unsigned)x<x2&&(unsigned)y>=y1&&(unsigned)y<y2;
+            bool expected=x>=clip.x1&&x<clip.x2&&y>=clip.y1&&y<clip.y2;
+            assert(written==expected);
+            if(written){
+                unsigned sx=(2*(x-left)+1)*16/(2*(right-left));
+                unsigned sy=(2*(y-top)+1)*8/(2*(bottom-top));
+                assert(sx<16&&sy<8);
+            }
+        }
+    }
+    // A cropped visible area cannot authorize unrepresentable full vertices.
+    draw.destination={0x2000000,16384,16,65536};
+    draw.client={16300,0,32768,16};draw.clip={16300,0,16301,1};
+    assert(!gpu_build_texture_batch(batch,0x100000,draw));
 }
 static void scaled_occlusion_test() {
     GpuScenePlan plan{};
@@ -254,5 +294,5 @@ static void retained_mixed_scene_test() {
     bcs.client_count=2;build(damage,true);rcs.copies[0].destination.x2=211;
     assert(!gpu_retained_damage(bcs,rcs,damage,&background));
 }
-int main(){reset_handshake_test();texture_state_test();logical_context_test();sustained_ring_test();readback_sampling_test();scaled_occlusion_test();resized_shape_test();retained_mixed_scene_test();
+int main(){reset_handshake_test();texture_state_test();logical_context_test();sustained_ring_test();readback_sampling_test();scissor_geometry_test();scaled_occlusion_test();resized_shape_test();retained_mixed_scene_test();
     puts("Gen9 texture/scaling/alpha state, logical contexts and occlusion tests passed.");}

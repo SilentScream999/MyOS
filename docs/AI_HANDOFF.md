@@ -48,6 +48,14 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
   small exposed CPU grips; chrome/unsupported clients force full CPU repaint.
   The restored geometry coverage and physical CPU savings still need a laptop
   run. Retain the reset handshake and KBL null/DC/invalidate/trailing-stall order.
+  Physical follow-up: the restored revision freezes immediately on enlarging
+  the ordinary demo, even with every other window minimized. Maximize still
+  works. This does not require other visible BCS clients. Current diagnostic
+  change keeps full-client S16 vertices and exact 0/1 UVs, clipping damage with
+  Gen9 hardware scissor instead of rebuilding geometry for each clip. It also
+  masks signed X independently of Y and bounds full vertices to S16. Host/mock
+  coverage now decodes scissor and vertices; physical freeze resolution remains
+  unverified. `F:` is frame duration in milliseconds, not CPU percentage.
 
 - `GPU=1` is now the default after owner validation. Composition follows GPU,
   presentation follows composition, and runtime discovery/readback select the

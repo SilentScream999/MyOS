@@ -24,6 +24,8 @@ static constexpr unsigned GPU_RENDER_COMMAND_BYTES=1144;
 static constexpr unsigned GPU_RENDER_VERTEX_OFFSET=2696;
 static constexpr unsigned GPU_RENDER_DST_STATE=2112;
 static constexpr unsigned GPU_RENDER_SRC_STATE=2176;
+static constexpr unsigned GPU_RENDER_SCISSOR_STATE=2688;
+static constexpr unsigned GPU_RENDER_RASTER_DWORD=188;
 
 static constexpr uint32_t GPU_RENDER_RING_BYTES=32768;
 static constexpr uint32_t GPU_RENDER_PACKET_BYTES=256;
@@ -83,6 +85,8 @@ static bool gpu_texture_draw_valid(const GpuTextureDraw& d) {
     return gpu_render_surface_valid(d.source) && gpu_render_surface_valid(d.destination) &&
         d.client.x1<d.client.x2 && d.client.y1<d.client.y2 &&
         (int64_t)d.client.x2-d.client.x1<=32767 && (int64_t)d.client.y2-d.client.y1<=32767 &&
+        d.client.x1>=-32768 && d.client.y1>=-32768 &&
+        d.client.x2<=32767 && d.client.y2<=32767 &&
         d.clip.x1>=0 && d.clip.y1>=0 && d.clip.x1<d.clip.x2 && d.clip.y1<d.clip.y2 &&
         d.clip.x1>=d.client.x1 && d.clip.y1>=d.client.y1 &&
         d.clip.x2<=d.client.x2 && d.clip.y2<=d.client.y2 &&
@@ -111,6 +115,11 @@ static bool gpu_build_texture_batch(uint32_t* words,uint64_t batch_address,
     words[24]=(uint32_t)batch_address|1;
     words[262]=(uint32_t)batch_address+GPU_RENDER_VERTEX_OFFSET;
     words[258]=(draw.destination.width-1)|((draw.destination.height-1)<<16);
+    // Gen9 3DSTATE_RASTER DW1[1]: scissor enable. SCISSOR_RECT maxima
+    // are inclusive; compositor damage uses exclusive right/bottom edges.
+    words[GPU_RENDER_RASTER_DWORD]|=1u<<1;
+    words[GPU_RENDER_SCISSOR_STATE/4]=(uint32_t)draw.clip.x1|((uint32_t)draw.clip.y1<<16);
+    words[GPU_RENDER_SCISSOR_STATE/4+1]=(uint32_t)(draw.clip.x2-1)|((uint32_t)(draw.clip.y2-1)<<16);
     words[2048/4]=GPU_RENDER_DST_STATE;words[2048/4+1]=GPU_RENDER_SRC_STATE;
     gpu_render_surface_state(words+GPU_RENDER_DST_STATE/4,draw.destination);
     gpu_render_surface_state(words+GPU_RENDER_SRC_STATE/4,draw.source);
@@ -127,13 +136,19 @@ static bool gpu_build_texture_batch(uint32_t* words,uint64_t batch_address,
         words[222]=(1u<<30)|(1u<<29)|(1u<<14)|(0x13u<<9)|
                    (1u<<24)|(0x13u<<19);
     }
-    const int x[]={draw.clip.x2,draw.clip.x1,draw.clip.x1};
-    const int y[]={draw.clip.y2,draw.clip.y2,draw.clip.y1};
+    // Keep interpolation geometry stable across damage/occlusion fragments.
+    // Only the hardware scissor changes when a different part needs repaint.
+    // This also keeps all vertex UVs at exact 0/1 for fractional resize ratios.
+    const int x[]={draw.client.x2,draw.client.x1,draw.client.x1};
+    const int y[]={draw.client.y2,draw.client.y2,draw.client.y1};
+    const float u[]={1.f,0.f,0.f},v[]={1.f,1.f,0.f};
     for(unsigned i=0;i<3;++i){
         unsigned offset=GPU_RENDER_VERTEX_OFFSET/4+i*3;
-        words[offset]=(uint32_t)x[i]|((uint32_t)y[i]<<16);
-        words[offset+1]=gpu_float_bits((float)(x[i]-draw.client.x1)/(draw.client.x2-draw.client.x1));
-        words[offset+2]=gpu_float_bits((float)(y[i]-draw.client.y1)/(draw.client.y2-draw.client.y1));
+        // X and Y are independently packed signed 16-bit positions. Mask X
+        // so a negative offscreen coordinate cannot overwrite Y's bits.
+        words[offset]=((uint32_t)x[i]&0xFFFFu)|((uint32_t)y[i]<<16);
+        words[offset+1]=gpu_float_bits(u[i]);
+        words[offset+2]=gpu_float_bits(v[i]);
     }
     words[GPU_RENDER_COMMAND_BYTES/4]=0x05000000; // MI_BATCH_BUFFER_END
     return true;

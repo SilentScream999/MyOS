@@ -243,6 +243,13 @@ requires its fixed-canvas source to reach RCS. An animation crossing the desktop
 HUD must preserve HUD pixels, retain client damage below the top band and
 present only once. The HUD band uses the complete scene renderer; maximized
 applications continue to hide desktop statistics.
+The restored revision subsequently froze on physical enlargement even with all
+other windows minimized. The current diagnostic builder uses full-client
+geometry and hardware scissor. Host tests require identical vertex bytes across
+damage clips, check signed offscreen positions and one-pixel/inclusive edges,
+and the QEMU backend decodes the actual encoded vertices/scissor for its pixels.
+The boot readback gate must pass clipped copy/scaling/alpha and border checks;
+passing host/QEMU tests does not confirm that physical enlargement is fixed.
 The render host test also checks 2,048 fixed-size ring packets across wraps.
 The demo publishes immutable snapshots and carries pending damage across a
 deferred publish; the optional publish height preserves full updates for old

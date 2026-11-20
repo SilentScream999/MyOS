@@ -330,6 +330,24 @@ presentation and accumulated timings. Host/QEMU tests cover the planner, pixels,
 occlusion, grips, undamaged pixels and failure recovery; physical restored-size
 stability and measured CPU improvements remain unverified until a laptop run.
 
+Physical feedback on the restored revision: boot `F:` about 15.9 ms, opening
+the demo about 32.9 ms; ordinary enlargement freezes immediately while maximize
+works. The freeze also occurs with every other window minimized. Other visible
+BCS clients are therefore not required to trigger it. Those `F:` values measure
+frame duration, not CPU utilization.
+
+The next isolated change uses full-client rectangle vertices and exact 0/1 UVs,
+with damage/occlusion applied through Gen9 RASTER scissor enable and an inclusive
+SCISSOR_RECT. Previously, every damage fragment changed vertices and fractional
+UV endpoints. Signed X/Y positions are packed independently and full vertices
+must fit S16. The existing boot pixel/readback gate checks clipped copy, scaling,
+premultiplied alpha and untouched borders before enabling desktop RCS. Host
+tests decode fixed vertices and scissor, cover thin/one-pixel clips and negative
+positions, and require all clip variants to preserve vertex bytes. The mock
+renderer consumes the encoded geometry/scissor rather than the requested clip.
+This is a controlled geometry/clipping change, not an established diagnosis or
+physical confirmation that enlargement is safe.
+
 1. **Finish the CPU surface contract.** Define alpha/opacity behavior for client
    windows separately from image alpha. Retain fast opaque copies, add tested
    blending, then cached decorations/shadows and optional client double buffering.

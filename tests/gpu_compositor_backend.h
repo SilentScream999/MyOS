@@ -19,13 +19,23 @@ static bool gpu_test_render(const GpuScenePlan& plan) {
             {c.client.x1,c.client.y1,c.client.x2,c.client.y2},
             {copy.destination.x1,copy.destination.y1,copy.destination.x2,copy.destination.y2},false};
         uint32_t batch[1024];if(!gpu_build_texture_batch(batch,0x100000,draw))return false;
-        auto r=copy.destination;
+        // Decode the encoded geometry and scissor rather than model the plan's
+        // clip directly, so packing or inclusive-edge mistakes affect pixels.
+        const auto* vertices=batch+GPU_RENDER_VERTEX_OFFSET/4;
+        const auto* scissor=batch+GPU_RENDER_SCISSOR_STATE/4;
+        if(!(batch[GPU_RENDER_RASTER_DWORD]&(1u<<1)))return false;
+        int left=(int16_t)vertices[6],top=(int16_t)(vertices[6]>>16);
+        int right=(int16_t)vertices[0],bottom=(int16_t)(vertices[0]>>16);
+        if(left>=right||top>=bottom)return false;
+        VisibleRect r{(int)(scissor[0]&65535),(int)(scissor[0]>>16),
+                      (int)(scissor[1]&65535)+1,(int)(scissor[1]>>16)+1};
+        r=visibility_intersect(r,{left,top,right,bottom});
         for(int y=r.y1;y<r.y2;++y){
-            unsigned sy=(uint64_t)(2*(y-c.client.y1)+1)*c.height/(2*(c.client.y2-c.client.y1));
+            unsigned sy=(uint64_t)(2*(y-top)+1)*c.height/(2*(bottom-top));
             auto* row=(const uint32_t*)((const uint8_t*)c.pixels+(uint64_t)sy*c.pitch);
             auto* to=(uint32_t*)(g_master_backbuffer+(uint64_t)y*fb->pitch);
             for(int x=r.x1;x<r.x2;++x){
-                unsigned sx=(uint64_t)(2*(x-c.client.x1)+1)*c.width/(2*(c.client.x2-c.client.x1));
+                unsigned sx=(uint64_t)(2*(x-left)+1)*c.width/(2*(right-left));
                 to[x]=row[sx];
             }
         }
