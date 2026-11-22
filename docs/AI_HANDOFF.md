@@ -37,26 +37,31 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
 
 ## Decisions and implementation constraints
 
-- The owner ran the RCS reset-handshake revision for 800 seconds without
-  freezes while interacting, including maximizing and restoring. That version
-  still guarded ordinary scaled clients onto CPU. Preserve `6baa52b` on
-  `codex/gpu-rcs-stable-800s`; hash-verified USB/ISO/kernel copies are under
-  `.storage-test/checkpoints/gpu-rcs-stable-800s-2026-11-20/`.
-  The owner explicitly authorized restoring ordinary resized-client RCS and
-  improving side-by-side composition. Work is on `codex/gpu-resized-composition`.
-  Retained damage now combines BCS/RCS client copies, CPU wallpaper gaps and
-  small exposed CPU grips; chrome/unsupported clients force full CPU repaint.
-  The restored geometry coverage and physical CPU savings still need a laptop
-  run. Retain the reset handshake and KBL null/DC/invalidate/trailing-stall order.
-  Physical follow-up: the restored revision freezes immediately on enlarging
-  the ordinary demo, even with every other window minimized. Maximize still
-  works. This does not require other visible BCS clients. Current diagnostic
-  change keeps full-client S16 vertices and exact 0/1 UVs, clipping damage with
-  Gen9 hardware scissor instead of rebuilding geometry for each clip. It also
-  masks signed X independently of Y and bounds full vertices to S16. Host/mock
-  coverage now decodes scissor and vertices; physical freeze resolution remains
-  unverified. `F:` is frame duration in milliseconds, not CPU percentage.
-
+- Gen9 RCS milestone (2026-11-21): the owner reported 900 seconds without
+  freezes on the ThinkPad E470 at its 256 MiB aperture setting, with repeated
+  resizing, overlapping windows and software restarts. Surface Laptop 1 also
+  passed hardware tests. The preserved v10 image/source/checksums are local at
+  .storage-test/checkpoints/gpu-v10-stable-800s-2026-11-21/.
+  v10 adds enabled slice/subslice steering, coherent L3 line flushing,
+  retry/credit, atomic/eviction and context/TLB workarounds from Linux Gen9.
+  Keep these after engine reset and verify the programmed values.
+  v11 restores direct clipped draws into the pinned desktop backbuffer and
+  sleeps on longer completion waits after a brief spin. The owner reports
+  smooth large-window rendering; sustained v11 validation remains ongoing.
+  Every draw waits for both its completion fence and context schedule-out.
+  Failed desktop submissions quarantine buffers and select CPU presentation.
+  GPU_RENDER remains opt-in. GPU_TRACE=1 adds stage labels, PCI power snapshots,
+  ring-wrap tests and extended isolated resize stress sweeps. GPU_TRACE=0 keeps
+  short offscreen texture/scaling/alpha readback checks. Standard test build:
+  make iso GPU_RENDER=1 GPU_TRACE=0.
+  SCORE marks scoreboard retirement before render-target cache writeback;
+  RTCLEAN marks completed render-target writeback before the DC/depth drain.
+  The workarounds resolved the reported v10 SCORE reproduction, but the exact
+  responsible setting has not been isolated. Do not attribute the stall to
+  aperture capacity or NVIDIA power state based only on the prior logs.
+  Host GPU tests, boot paths and GPU test-window interactions pass. QEMU uses
+  a CPU backend and does not validate Intel GPU execution. F: is frame time
+  in milliseconds. The standalone GPU test animation sleeps 33 ms per frame.
 - `GPU=1` is now the default after owner validation. Composition follows GPU,
   presentation follows composition, and runtime discovery/readback select the
   supported hardware path or CPU fallback. `GPU=0` forces CPU mode. Keep
@@ -97,21 +102,11 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
   Reject FBC/PSR and unsupported plane layouts; reuse a buffer only after LIVE
   and the frame counter confirm the other buffer latched. Failed flips restore
   firmware scanout or retain the pinned live private buffer for CPU fallback.
-- Experimental `GPU_RENDER=1` adds a private logical RCS context and PPGTT
-  tables. It enables desktop scaled-client draws only after fence/schedule-out
-  and offscreen textured scaling/alpha readback pass. Gen9 HDC noncoherent
-  context/operation and CACHE_MODE_1 workarounds precede TLB invalidation in
-  every RCS packet. Keep explicit pixel clflush; the no-flush probe is removed.
-  RCS recycles its idle context/ring before wrapping. Retain control-line flushing, retirement-
-  aware source-map reuse and Gen9/Kaby Lake invalidation sequencing. An RCS
-  reset failure requires destination quarantine independently of BCS reset.
-  Font/icon rasterization and general alpha-layer integration remain CPU work.
-  Gen9 state/context host tests and the mock QEMU scaled-client/failure path
-  passed. CPU, page-flip and RCS production kernels build; ISO/USB/recovery
-  boot checks pass on VGA. The owner subsequently supplied a physical log passing
-  the context fence and textured copy/scaling/premultiplied alpha readbacks,
-  followed by a page-flip latch. Scaled desktop correctness/performance still
-  need measurements. `GPU_RENDER=1` is opt-in and implies presentation.
+- Experimental GPU_RENDER=1 adds a private logical RCS context and PPGTT.
+  Scaled client draws use the pinned master buffer with explicit cache handoffs.
+  Geometry, sampling, ring reuse, reset preparation and Gen9 workaround tests
+  run on the host. Preserve source/destination lifetime through retirement and
+  keep font/icon rasterization and general alpha-layer integration on the CPU.
 - Kernel string helpers are local definitions, not a hosted C runtime.
   Compiler-generated libc calls and the ext4/codec shim need deliberate linkage.
 - Interrupt and syscall entry preserve x87/SSE state in aligned stack frames

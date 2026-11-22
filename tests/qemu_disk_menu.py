@@ -53,10 +53,12 @@ def check(storage):
         count = scalar('g_menu_app_count')
         names_raw = memory('g_menu_apps', 29 * count)
         names = [names_raw[i*29:(i+1)*29].split(b'\0')[0].decode() for i in range(count)]
-        assert {name.lower() for name in names} == {'counter', 'win_test'}, names
+        expected_names={'counter','win_test'}
+        if not storage:expected_names.add('gpu_test')
+        assert {name.lower() for name in names} == expected_names, names
         paths_raw = memory('g_menu_paths', 124 * count)
         paths = [paths_raw[i*124:(i+1)*124].split(b'\0')[0].decode() for i in range(count)]
-        expected = {'/bin/COUNTER.ELF', '/bin/WIN_TEST.ELF'} if storage else {'/bin/counter.elf', '/bin/win_test.elf'}
+        expected = {'/bin/COUNTER.ELF', '/bin/WIN_TEST.ELF'} if storage else {'/bin/counter.elf', '/bin/win_test.elf', '/bin/gpu_test.elf'}
         assert set(paths) == expected, paths
         index = next(i for i, name in enumerate(names) if name.lower() == 'counter')
         hdr, row, pad = max(44, 768*56//1080), max(26, 768*38//1080), max(10, 768*14//1080)

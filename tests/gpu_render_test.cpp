@@ -3,9 +3,53 @@
 #include <cstring>
 #include "src/drivers/gpu_render_commands.h"
 #include "src/drivers/gpu_render_reset.h"
+#include "src/drivers/gpu_gen9_workarounds.h"
 #include "src/gui/gpu_compositor.h"
 
 static float floating(uint32_t word) { float f;memcpy(&f,&word,4);return f; }
+static void gen9_workaround_test() {
+    struct IO {
+        uint32_t regs[0xC000/4]{};
+        unsigned writes=0;
+        uint32_t reject=0;
+        IO(){
+            regs[0xFDC/4]=0xDFFFFFFF;
+            regs[0xB004/4]=0x12340001;
+            regs[0xB008/4]=0x12340001;
+            regs[0xB118/4]=0x80400040;
+            regs[0xB11C/4]=0x12340100;
+            regs[0x20D4/4]=0x80;
+        }
+        uint32_t read(uint32_t reg){return regs[reg/4];}
+        void write(uint32_t reg,uint32_t value){
+            ++writes;
+            if(reg==reject)return;
+            if(reg==0x20D4){
+                uint32_t mask=value>>16;
+                regs[reg/4]=(regs[reg/4]&~mask)|(value&mask);
+            }else regs[reg/4]=value;
+        }
+    } io;
+    // Slice 1, subslice 2: steer away from fused-off instances.
+    uint32_t fuse=(1u<<26)|(3u<<20);
+    assert(gpu_apply_gen9_engine_workarounds(io,fuse));
+    assert(io.read(0xFDC)==0xD6FFFFFF);
+    assert(io.read(0xB004)==0x12340081);
+    assert(io.read(0xB008)==0x12340000);
+    assert(io.read(0xB118)==0x80200040);
+    assert(io.read(0xB11C)==0x12340004);
+    assert(io.read(0x20D4)==0x84);
+    // Reapplying after context initialization preserves the same settings.
+    assert(gpu_apply_gen9_engine_workarounds(io,fuse));
+    IO missing;
+    assert(!gpu_apply_gen9_engine_workarounds(missing,0));
+    assert(!gpu_apply_gen9_engine_workarounds(missing,UINT32_MAX));
+    assert(!gpu_apply_gen9_engine_workarounds(missing,(1u<<25)|(15u<<20)));
+    assert(missing.writes==0);
+    IO failed;failed.reject=0xB118;
+    assert(!gpu_apply_gen9_engine_workarounds(failed,fuse));
+    assert(failed.read(0x20D4)==0x80);
+}
 static void reset_handshake_test() {
     struct IO {
         bool ack=true,finish=true,requested=false,ready=false,resetting=false;
@@ -69,9 +113,13 @@ static void texture_state_test() {
     assert(buffer.words[262]==0x100000+GPU_RENDER_VERTEX_OFFSET);
     assert(buffer.words[258]==(63u<<16|95));
     const auto* v=buffer.words+GPU_RENDER_VERTEX_OFFSET/4;
-    assert(v[0]==(14u<<16|28)&&v[3]==(14u<<16|0xFFFCu)&&v[6]==0xFFFEFFFCu);
-    assert(floating(v[1])==1.f&&floating(v[2])==1.f);
-    assert(floating(v[4])==0.f&&floating(v[8])==0.f);
+    assert(buffer.words[264]==72&&buffer.words[273]==4&&buffer.words[281]==6);
+    assert((buffer.words[215]>>23)==15&&(buffer.words[215]&2));
+    assert(v[9]==v[0]&&v[12]==v[6]&&v[15]==20);
+    assert(floating(v[16])==.75f&&floating(v[17])==.125f);
+    assert(v[0]==(12u<<16|20)&&v[3]==(12u<<16)&&v[6]==0);
+    assert(floating(v[1])==.75f&&floating(v[2])==.875f);
+    assert(floating(v[4])==.125f&&floating(v[8])==.125f);
     assert(buffer.words[GPU_RENDER_RASTER_DWORD]&(1u<<1));
     assert(buffer.words[230]==GPU_RENDER_SCISSOR_STATE);
     assert(buffer.words[GPU_RENDER_SCISSOR_STATE/4]==0);
@@ -85,30 +133,60 @@ static void texture_state_test() {
     draw.blend=false;assert(gpu_build_texture_batch(buffer.words,0xFFF000,draw));
     assert(!(buffer.words[2432/4+1]&(1u<<31)));
     assert(buffer.words[GPU_RENDER_COMMAND_BYTES/4]==0x05000000);
+    assert(gpu_build_texture_batch(buffer.words,0x100000,draw,true));
+    assert(buffer.words[210]==2816&&buffer.words[736]==0x05800031);
+    assert(buffer.words[739]==0x90031000);
+    assert(buffer.words[609]==0x06200000); // Solid code preserves blend state.
     draw.clip.x1=-1;assert(!gpu_build_texture_batch(buffer.words,0x100000,draw));
     draw.clip.x1=0;draw.source.pitch=60;assert(!gpu_build_texture_batch(buffer.words,0x100000,draw));
     draw.source.pitch=64;assert(!gpu_build_texture_batch(buffer.words,0x100001,draw));
     draw.client={INT32_MIN,0,INT32_MAX,14};
     assert(!gpu_build_texture_batch(buffer.words,0x100000,draw));
+    draw={{0x10000000,480,320,1920},{0x2000000,128,128,512},
+          {-768,-640,83,66},{0,0,128,128},false};
+    assert(!gpu_build_texture_batch(buffer.words,0x100000,draw));
+    draw.padded=true;
+    assert(gpu_build_texture_batch(buffer.words,0x100000,draw));
+    const auto* tile=buffer.words+GPU_RENDER_VERTEX_OFFSET/4;
+    assert(tile[0]==(128u<<16|128)&&tile[6]==0);
+    assert(floating(tile[7])==768.f/851&&floating(tile[8])==640.f/706);
+    assert(gpu_build_texture_batch(buffer.words,0x100000,draw,true));
+    assert(floating(tile[7])==0.f&&floating(tile[8])==0.f);
+    assert(floating(tile[1])==1.f&&floating(tile[2])==1.f);
 }
 static void logical_context_test() {
-    uint32_t state[1024];gpu_init_render_context(state,0x2018000,0x123456000ULL);
+    uint32_t eu_disable[3]={0xff000001,0,0},request=0;
+    // Three subslices with 7/8/8 EUs. Ignore the disabled fourth subslice.
+    assert(gpu_render_power_request((1u<<25)|(8u<<20),eu_disable,request));
+    assert(request==0x80000088);
+    uint32_t state[1024];gpu_init_render_context(state,0x2018000,0x123456000ULL,request);
     assert(state[1]==0x1100101B&&state[0x21]==0x11001011);
     assert(state[2]==0x2244&&state[3]==0x90009);
     assert(state[8]==0x2038&&state[9]==0x2018000);
     assert(state[0x30]==0x2274&&state[0x31]==1);
     assert(state[0x32]==0x2270&&state[0x33]==0x23456000);
-    assert(state[0x42]==0x20C8&&state[0x43]==0);
+    assert(state[0x42]==0x20C8&&state[0x43]==0x80000088);
+    assert(gpu_render_power_request((3u<<25)|(8u<<20),eu_disable,request)&&request==0x80050088);
+    assert(!gpu_render_power_request(0,eu_disable,request));
+    assert(!gpu_render_power_request(UINT32_MAX,eu_disable,request));
+    assert(!gpu_render_power_request(1u<<25,eu_disable,request));
     assert(state[11]==28673&&state[17]==32);
 }
 static void sustained_ring_test() {
     struct {uint32_t before;uint32_t words[GPU_RENDER_RING_BYTES/4];uint32_t after;} ring{};
     ring.before=0x76543210;ring.after=0xABCDEF01;
+    constexpr unsigned slots=GPU_RENDER_RING_BYTES/GPU_RENDER_PACKET_BYTES-1;
+    uint32_t latest[slots]{};
     uint32_t tail=0;
     for(uint32_t sequence=1;sequence<=2048;++sequence){
         uint32_t start=tail;
         assert(gpu_render_packet(ring.words,start,0x23021000,sequence,true,&tail));
-        assert(tail==(sequence*256)%32768);
+        assert(tail==(((sequence-1)%slots)+1)*GPU_RENDER_PACKET_BYTES);
+        if(start==GPU_RENDER_RING_BYTES-GPU_RENDER_PACKET_BYTES){
+            for(unsigned i=start/4;i<GPU_RENDER_RING_BYTES/4;++i)assert(ring.words[i]==0);
+            start=0;
+        }
+        latest[start/GPU_RENDER_PACKET_BYTES]=sequence;
         const auto* packet=ring.words+start/4;
         assert(packet[0]==0&&packet[1]==0x11001003);
         assert(packet[2]==0x7300&&packet[3]==0x80308030);
@@ -121,28 +199,45 @@ static void sustained_ring_test() {
         assert(packet[18]==0x7A000004);
         assert(packet[19]==((1u<<24)|(1u<<20)|(1u<<18)|(1u<<14)|
                             (1u<<11)|(1u<<10)|(1u<<4)|(1u<<3)|(1u<<2)));
-        assert(packet[20]==0x23021008&&packet[22]==0);
+        assert(packet[20]==0x23021008&&packet[21]==0&&packet[22]==sequence&&packet[23]==0);
         assert(packet[24]==0x7A000004&&packet[25]==(1u<<20));
         assert(packet[26]==0&&packet[28]==0);
         assert(packet[30]==0x18800101&&packet[31]==0x100000);
-        assert(packet[33]==0&&packet[34]==0x7A000004);
-        assert(packet[36]==0x23021000&&packet[38]==sequence);
-        for(unsigned i=40;i<64;++i)assert(packet[i]==0);
+        assert(packet[33]==0&&packet[34]==0x10400002);
+        assert(packet[35]==0x23021010&&packet[36]==0&&packet[37]==sequence);
+        assert(packet[38]==0x7A000004);
+        assert(packet[39]==((1u<<20)|(1u<<1)));
+        assert(packet[40]==0&&packet[42]==0);
+        assert(packet[44]==0x10400002&&packet[45]==0x23021018&&packet[47]==sequence);
+        assert(packet[48]==0x7A000004&&
+               packet[49]==((1u<<20)|(1u<<12)));
+        // The cache drain has no post-sync write or address-space selector.
+        // Its retirement stamp and completion QW follow as separate commands.
+        assert(packet[50]==0&&packet[51]==0&&packet[52]==0&&packet[53]==0);
+        assert(packet[54]==0x10400002&&packet[55]==0x23021020&&packet[57]==sequence);
+        assert(packet[58]==0x7A000004&&packet[59]==((1u<<20)|(1u<<7)|(1u<<5)|1u));
+        assert(packet[60]==0&&packet[62]==0&&packet[63]==0);
+        assert(packet[64]==0x10400002&&packet[65]==0x23021014&&packet[67]==sequence);
+        assert(packet[68]==0x7A000004&&packet[69]==((1u<<24)|(1u<<20)|(1u<<14)));
+        assert(packet[70]==0x23021000&&packet[72]==sequence&&packet[73]==0);
         assert(ring.before==0x76543210&&ring.after==0xABCDEF01);
     }
-    assert(GPU_RENDER_CONTEXT_FLAGS&(1u<<2));
+    assert((GPU_RENDER_CONTEXT_FLAGS&7)==1); // Valid, without forced restores.
     assert(!gpu_render_packet(ring.words,1,0x23021000,1,true,&tail));
     assert(!gpu_render_packet(ring.words,32768,0x23021000,1,true,&tail));
-    // Production deliberately recycles the idle engine before a tail of zero
-    // can be submitted. Exercise many cycles without using hardware wrapping.
-    tail=0;unsigned recycles=0;
-    for(uint32_t sequence=1;sequence<=2048;++sequence){
-        if(gpu_render_needs_recycle(tail)){tail=0;++recycles;}
-        assert(gpu_render_packet(ring.words,tail,0x23021000,sequence,true,&tail));
-        assert(tail>0&&tail<=GPU_RENDER_RING_BYTES-GPU_RENDER_PACKET_BYTES);
-        assert(ring.before==0x76543210&&ring.after==0xABCDEF01);
-    }
-    assert(recycles==16&&tail==4096);
+    for(unsigned slot=0;slot<slots;++slot)
+        assert(ring.words[slot*GPU_RENDER_PACKET_BYTES/4+72]==latest[slot]);
+    assert(gpu_render_packet(ring.words,0,0x23021000,2049,true,&tail,false));
+    assert(!(ring.words[19]&(1u<<18)));
+    assert(ring.words[19]&(1u<<4)); // Vertex cache still invalidated.
+    assert(gpu_render_packet(ring.words,0,0x23021000,2050,true,&tail,true,0x40012000));
+    assert(ring.words[31]==0x40012000);
+    assert(!gpu_render_packet(ring.words,0,0x23021000,2051,true,&tail,true,0x40012001));
+    // Keep the entire reserved 40-byte checkpoint allocation addressable.
+    assert(!gpu_render_packet(ring.words,0,0xFFFFFFE8u,2052,true,&tail));
+    assert(!gpu_render_packet(ring.words,0,0xFFFFFFE0u,2052,true,&tail));
+    assert(gpu_render_packet(ring.words,0,0xFFFFFFD8u,2052,true,&tail));
+    assert(ring.words[50]==0);
 }
 static void readback_sampling_test() {
     uint32_t batch[1024];
@@ -172,17 +267,17 @@ static void readback_sampling_test() {
 static void scissor_geometry_test() {
     GpuTextureDraw draw{{0x10000000,16,8,64},{0x2000000,96,64,384},
                         {-4,-2,28,14},{0,0,28,14},false};
-    uint32_t original[1024],batch[1024];
-    assert(gpu_build_texture_batch(original,0x100000,draw));
+    uint32_t batch[1024];
     const GpuRenderRect clips[]={{0,0,28,14},{1,2,19,11},{0,0,1,1},
                                  {27,0,28,14},{0,13,28,14},{7,3,8,12}};
     for(auto clip:clips){
         draw.clip=clip;assert(gpu_build_texture_batch(batch,0x100000,draw));
         const auto* vertices=batch+GPU_RENDER_VERTEX_OFFSET/4;
-        assert(!memcmp(vertices,original+GPU_RENDER_VERTEX_OFFSET/4,9*4));
         int left=(int16_t)vertices[6],top=(int16_t)(vertices[6]>>16);
         int right=(int16_t)vertices[0],bottom=(int16_t)(vertices[0]>>16);
-        assert(left==-4&&top==-2&&right==28&&bottom==14);
+        assert(left==clip.x1&&top==clip.y1&&right==clip.x2&&bottom==clip.y2);
+        assert(floating(vertices[7])==(left+4.f)/32);
+        assert(floating(vertices[8])==(top+2.f)/16);
         const auto* scissor=batch+GPU_RENDER_SCISSOR_STATE/4;
         unsigned x1=scissor[0]&65535,y1=scissor[0]>>16;
         unsigned x2=(scissor[1]&65535)+1,y2=(scissor[1]>>16)+1;
@@ -294,5 +389,5 @@ static void retained_mixed_scene_test() {
     bcs.client_count=2;build(damage,true);rcs.copies[0].destination.x2=211;
     assert(!gpu_retained_damage(bcs,rcs,damage,&background));
 }
-int main(){reset_handshake_test();texture_state_test();logical_context_test();sustained_ring_test();readback_sampling_test();scissor_geometry_test();scaled_occlusion_test();resized_shape_test();retained_mixed_scene_test();
+int main(){gen9_workaround_test();reset_handshake_test();texture_state_test();logical_context_test();sustained_ring_test();readback_sampling_test();scissor_geometry_test();scaled_occlusion_test();resized_shape_test();retained_mixed_scene_test();
     puts("Gen9 texture/scaling/alpha state, logical contexts and occlusion tests passed.");}

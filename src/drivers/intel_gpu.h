@@ -36,6 +36,7 @@ static const uint64_t IGPU_MMIO_VA_BASE = 0xFFFF'8800'0000'0000ULL;
 static uint64_t IGPU_RING_GFX_ADDR, IGPU_FENCE_GFX_ADDR, BACKBUFFER_GFX_BASE;
 static const uint32_t IGPU_RING_BYTES         = 32768;
 static constexpr uint64_t GPU_SOURCE_BYTES = 64ULL*1024*1024;
+static uint64_t g_gpu_source_capacity;
 static uint64_t g_gpu_source_base, g_gpu_palette_base;
 static GpuGttSpan g_gpu_firmware_alias{};
 static GpuGttSpan g_gpu_takeover{};
@@ -439,16 +440,29 @@ static bool gpu_reserve_gtt(uint64_t framebuffer_bytes) {
     if(GPU_PRESENT)bytes+=buffer_bytes*2;
     if(GPU_RENDER)bytes+=GPU_RENDER_OWNED_BYTES;
     auto read=[](uint64_t address){return *gtt_pte_ptr(address);};
-    auto free=gpu_gtt_largest_run(0x04000000,limit,read,
+    uint64_t end=limit>=0x02000000?limit-0x02000000:0;
+    auto free=gpu_gtt_largest_run(0x04000000,end,read,
         [](uint64_t pte){return !(pte&1);},false);
     gpu_log_hex("GPU GGTT requested bytes:",bytes);
     gpu_log_hex("GPU GGTT largest non-present interval:",free.bytes);
+    if(g_igpu.ecam_start==0){
+        gpu_log_hex("GPU host bridge GGC raw:",pci_cfg_read32(g_igpu.ecam_virt_base,0,0,0,0,0x50));
+        gpu_log_hex("GPU host bridge BDSM raw:",pci_cfg_read32(g_igpu.ecam_virt_base,0,0,0,0,0xB0));
+        gpu_log_hex("GPU host bridge BGSM raw:",pci_cfg_read32(g_igpu.ecam_virt_base,0,0,0,0,0xB4));
+    }
+    uint64_t capacity=GPU_COMPOSE?GPU_SOURCE_BYTES:0;
+    if(GPU_COMPOSE && free.bytes<bytes){
+        uint64_t fixed=bytes-GPU_SOURCE_BYTES;
+        uint64_t probe_bytes=GPU_RENDER?1920ULL*1080*4:0;
+        uint64_t minimum=buffer_bytes>probe_bytes?buffer_bytes:probe_bytes;
+        uint64_t fit=gpu_source_capacity(free.bytes,fixed,minimum,GPU_SOURCE_BYTES);
+        if(fit){capacity=fit;bytes=fixed+fit;}
+    }
     uint64_t base=free.bytes>=bytes?free.base:0;
     if(!base){
         uint64_t prefix=0;
         // Leave the top 32 MiB alone as well, including the GuC reservation
         // starting at 0xFEE00000 on a full 4 GiB GGTT.
-        uint64_t end=limit>=0x02000000?limit-0x02000000:0;
         auto mmio=[](uint32_t offset){
             uint32_t value=*(volatile uint32_t*)(g_igpu.mmio_virt+offset);
             if((offset&0xFF)==0x80 && value){
@@ -497,6 +511,8 @@ static bool gpu_reserve_gtt(uint64_t framebuffer_bytes) {
         }else print((char*)"GPU: cannot establish protected firmware display ranges");
     }
     if(base){
+        g_gpu_source_capacity=capacity;
+        gpu_log_hex("GPU GGTT source window bytes:",capacity);
         IGPU_RING_GFX_ADDR=base;
         IGPU_FENCE_GFX_ADDR=IGPU_RING_GFX_ADDR+IGPU_RING_BYTES;
         BACKBUFFER_GFX_BASE=IGPU_FENCE_GFX_ADDR+4096;
@@ -644,7 +660,34 @@ static bool gpu_scene_submit() {
     return gpu_scene_wait(sequence);
 }
 
+// Hardware freeze diagnostic: bypass the compositor, its locks, and GPU MMIO.
+// During a pending flip both possible display surfaces need the same marker.
+#if GPU_TRACE
+static const char* g_gpu_trace_failure=nullptr;
+static void gpu_trace_stage(const char* label,uint8_t* next=nullptr) {
+    if(!g_desktop_ready||!fb||!fb->address||fb->bpp!=32||fb->width<136||fb->height<24)return;
+    if(g_gpu_trace_failure)label=g_gpu_trace_failure;
+    uint8_t* targets[]={(uint8_t*)fb->address,next};
+    for(auto* target:targets){
+        if(!target)continue;
+        const char* p=label;
+        for(unsigned i=0;i<8;++i){
+            unsigned ch=*p?(unsigned char)*p++:' ';
+            for(unsigned y=0;y<16;++y){
+                auto* row=(volatile uint32_t*)(target+(8+y)*fb->pitch)+8+i*16;
+                for(unsigned x=0;x<16;++x)
+                    row[x]=(font8x8_basic[ch][y/2]&(1u<<(x/2)))?0xFFFFFFFF:0xFF241238;
+            }
+        }
+    }
+    vram_fence();
+}
+#else
+#define gpu_trace_stage(...) ((void)0)
+#endif
+
 static bool gpu_compose_scene(const GpuScenePlan& plan) {
+    gpu_trace_stage("BLIT");
     if(!g_gpu_compose_ready || !g_gpu_ready || g_gpu.hung || g_gpu_fw_released)
         return false;
     if(plan.client_count>GpuScenePlan::max_clients || plan.count>GpuScenePlan::capacity)
@@ -664,8 +707,9 @@ static bool gpu_compose_scene(const GpuScenePlan& plan) {
         const auto& c=plan.clients[i];
         uint64_t address=(uint64_t)c.pixels,offset=address&4095;
         uint64_t bytes=((uint64_t)c.pitch*c.height+offset+4095)&~4095ULL;
-        if(bytes>GPU_SOURCE_BYTES-used)
-            return gpu_scene_abort("GPU: source mapping failed");
+        // No blits have been submitted. Let the compositor paint this scene
+        // in software and keep acceleration available for the next frame.
+        if(bytes>g_gpu_source_capacity-used)return false;
         mapping_keys[mapping_count++]={address-offset,bytes};
         sources[i]=g_gpu_source_base+used+offset;used+=bytes;
     }
@@ -938,6 +982,7 @@ static void gpu_present_stop() {
 }
 
 static bool gpu_present_frame(const OverlayFrame& frame,const uint32_t* sprite) {
+    gpu_trace_stage("PRESENT");
     if(!g_gpu_present_ready || !g_gpu_scanout_uncached || !g_gpu_ready || !g_desktop_ready)return false;
     int back=g_gpu_display_flip.writable();
     uint32_t ctl=*(volatile uint32_t*)(g_igpu.mmio_virt+g_gpu_display_plane.control);
@@ -953,16 +998,19 @@ static bool gpu_present_frame(const OverlayFrame& frame,const uint32_t* sprite) 
         gpu_present_stop();gpu_status_set("GPU:flip state changed -> CPU present");return false;
     }
     gpu_mfence();
+    gpu_trace_stage("COPY");
     bool ok=gpu_emit_copy(&g_gpu,g_backbuffer_gfx_addr,fb->pitch,0,0,
                          g_gpu_scanout_gfx[back],fb->pitch,0,0,fb->width,fb->height)
             && gpu_scene_submit();
     if(!ok){gpu_scene_abort("GPU: hidden scanout copy failed");return false;}
     OverlayTarget target{g_gpu_scanout_cpu[back],g_master_backbuffer,(int)fb->width,(int)fb->height,(int)fb->pitch};
     const OverlayFrame empty{{-999,-999,0,0},{},0};
+    gpu_trace_stage("OVERLAY");
     overlay_render_transition(target,empty,frame,sprite,true);
     gpu_mfence(); // WC overlay stores must reach RAM before the display reads.
     uint32_t before=*(volatile uint32_t*)(g_igpu.mmio_virt+g_gpu_display_plane.frame_count);
     if(!g_gpu_display_flip.arm(back,before)){gpu_present_stop();return false;}
+    gpu_trace_stage("FLIP",g_gpu_scanout_cpu[back]);
     gpu_display_arm(g_gpu_display_flip.surfaces[back],g_gpu_scanout_cpu[back]);
     if(!gpu_display_wait(g_gpu_display_flip.surfaces[back],true,before)){
         gpu_present_stop();gpu_status_set("GPU:flip timeout -> CPU present");return false;
@@ -971,6 +1019,7 @@ static bool gpu_present_frame(const OverlayFrame& frame,const uint32_t* sprite) 
     if(!g_gpu_display_flip.observe(g_gpu_display_flip.surfaces[back],now)){gpu_present_stop();return false;}
     if(!g_gpu_present_count)print((char*)"GPU: first vblank page flip latched");
     ++g_gpu_present_count;
+    gpu_trace_stage("LATCHED");
     return true;
 }
 

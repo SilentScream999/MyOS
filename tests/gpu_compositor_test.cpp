@@ -187,6 +187,13 @@ static void memory_and_capacity_test(){
 }
 
 static void firmware_layout_test(){
+    constexpr uint64_t maximum=64ULL<<20, fixed=0x5805000-maximum;
+    constexpr uint64_t minimum=1920*1080*4;
+    assert(gpu_source_capacity(0x3829000,fixed,minimum,maximum)==0x2024000);
+    assert(gpu_source_capacity(fixed-1,fixed,minimum,maximum)==0);
+    assert(gpu_source_capacity(fixed+minimum-1,fixed,minimum,maximum)==0);
+    assert(gpu_source_capacity(fixed+minimum,fixed,minimum,maximum)==minimum);
+    assert(gpu_source_capacity(fixed+maximum+4096,fixed,minimum,maximum)==maximum);
     assert(gpu_takeover_base(0x20000000,0xFE000000,0x57C5000)==0x20001000);
     assert(!gpu_takeover_base(0x20000000,0x20002000,4096));
     assert(!gpu_takeover_base(0x20000001,0xFE000000,4096));

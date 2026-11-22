@@ -91,7 +91,7 @@ def install_ext4_file(volume, root, create=False, sectors=EXT4_SECTORS):
             source.write_bytes(content)
             lines.append(f'{"seed" if default else "put"} /{target} {source}')
 
-        for program in ('init.elf', 'counter.elf', 'win_test.elf'):
+        for program in ('init.elf', 'counter.elf', 'win_test.elf', 'gpu_test.elf'):
             put('bin/' + program, (root / program).read_bytes())
         if (root / 'build/console.elf').exists():
             put('share/system/console.elf', (root / 'build/console.elf').read_bytes())

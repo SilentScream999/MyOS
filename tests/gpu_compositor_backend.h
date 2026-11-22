@@ -7,7 +7,7 @@ static uint8_t* g_gpu_test_recovery;
 #ifdef GPU_RENDER_TEST
 static uint64_t g_gpu_test_render_calls=0;
 static uint64_t g_gpu_test_demo_render_calls=0;
-static bool g_gpu_test_render_fail=false;
+static uint8_t g_gpu_test_render_fail=0;
 static uint32_t g_gpu_test_scaled_sample[3]{};
 static bool gpu_test_render(const GpuScenePlan& plan) {
     ++g_gpu_test_render_calls;
@@ -27,15 +27,20 @@ static bool gpu_test_render(const GpuScenePlan& plan) {
         int left=(int16_t)vertices[6],top=(int16_t)(vertices[6]>>16);
         int right=(int16_t)vertices[0],bottom=(int16_t)(vertices[0]>>16);
         if(left>=right||top>=bottom)return false;
+        float u1,u2,v1,v2;
+        memcpy(&u1,vertices+7,4);memcpy(&u2,vertices+1,4);
+        memcpy(&v1,vertices+8,4);memcpy(&v2,vertices+2,4);
         VisibleRect r{(int)(scissor[0]&65535),(int)(scissor[0]>>16),
                       (int)(scissor[1]&65535)+1,(int)(scissor[1]>>16)+1};
         r=visibility_intersect(r,{left,top,right,bottom});
         for(int y=r.y1;y<r.y2;++y){
-            unsigned sy=(uint64_t)(2*(y-top)+1)*c.height/(2*(bottom-top));
+            unsigned sy=(v1+(y+.5f-top)*(v2-v1)/(bottom-top))*c.height;
+            if(sy>=c.height)sy=c.height-1;
             auto* row=(const uint32_t*)((const uint8_t*)c.pixels+(uint64_t)sy*c.pitch);
             auto* to=(uint32_t*)(g_master_backbuffer+(uint64_t)y*fb->pitch);
             for(int x=r.x1;x<r.x2;++x){
-                unsigned sx=(uint64_t)(2*(x-left)+1)*c.width/(2*(right-left));
+                unsigned sx=(u1+(x+.5f-left)*(u2-u1)/(right-left))*c.width;
+                if(sx>=c.width)sx=c.width-1;
                 to[x]=row[sx];
             }
         }
@@ -44,6 +49,11 @@ static bool gpu_test_render(const GpuScenePlan& plan) {
         unsigned sy=(uint64_t)(2*(y-c.client.y1)+1)*c.height/(2*(c.client.y2-c.client.y1));
         g_gpu_test_scaled_sample[0]=x;g_gpu_test_scaled_sample[1]=y;
         g_gpu_test_scaled_sample[2]=*(const uint32_t*)((const uint8_t*)c.pixels+(uint64_t)sy*c.pitch+sx*4);
+        if(g_gpu_test_render_fail==2){
+            g_gpu_recovery_buffer=g_gpu_test_recovery;
+            g_render_ready=true;
+            return render_stop("Injected RCS timeout","PREDRAW");
+        }
         if(g_gpu_test_render_fail)return false;
     }
     return true;

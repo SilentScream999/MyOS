@@ -7,6 +7,7 @@ partial-batch failure with a replacement master buffer through the GDB stub.
 """
 from pathlib import Path
 import struct
+import argparse
 import subprocess
 import time
 import qemu_storage_smoke as smoke
@@ -15,6 +16,9 @@ from qemu_debug_memory import DebugMemory
 ROOT=Path(__file__).resolve().parents[1]
 
 def main():
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--rcs-timeout',action='store_true')
+    rcs_timeout=parser.parse_args().rcs_timeout
     symbols=subprocess.check_output(['nm','-n','-C',str(ROOT/'wyzar')],text=True).splitlines()
     def address(name):
         return next(int(line.split()[0],16) for line in symbols if line.split()[-1]==name)
@@ -23,6 +27,7 @@ def main():
     address('g_gpu_test_calls')
     present_test=any(line.split()[-1]=='g_gpu_test_present_calls' for line in symbols)
     render_test=any(line.split()[-1]=='g_gpu_test_render_calls' for line in symbols)
+    assert not rcs_timeout or render_test
     smoke.BOOT_ISO=True
     q=smoke.Qemu(storage=False,resolution=(1280,800),extra_args=('-no-shutdown','-gdb','tcp:127.0.0.1:45456'))
     debug=None
@@ -180,7 +185,7 @@ def main():
             sx,sy,pixel=struct.unpack('<III',debug.read(address('g_gpu_test_scaled_sample'),12))
             assert int.from_bytes(debug.read(master+sy*pitch+sx*4,4),'little')==pixel
             calls=value('g_gpu_test_render_calls')
-            debug.write(address('g_gpu_test_render_fail'),b'\1')
+            debug.write(address('g_gpu_test_render_fail'),bytes([2 if rcs_timeout else 1]))
             for name,number in [('g_dirty_min_x',0),('g_dirty_min_y',0),
                                 ('g_dirty_max_x',1279),('g_dirty_max_y',799)]:
                 debug.write(address(name),number.to_bytes(4,'little'))
@@ -188,6 +193,16 @@ def main():
             for _ in range(4):frame()
             assert value('g_gpu_test_render_calls')==calls+1
             assert value('g_gpu_render_hook')==0
+            if rcs_timeout:
+                assert value('g_gpu_compose_hook')==value('g_gpu_present_hook')==value('g_gpu_flip_hook')==0
+                assert value('g_master_backbuffer')!=master and value('g_gpu_quarantine_sources',1)
+                assert b'CPU fallback PREDRAW' in debug.read(address('g_gpu_status'),64)
+                debug.close();debug=None;q.command('cont')
+                before=running_value('g_mouse_x')
+                q.monitor('mouse_move 4 0');time.sleep(.3)
+                assert running_value('g_mouse_x')>before
+                print('RCS desktop timeout: replacement buffer, CPU frames and pointer input passed.',flush=True)
+                return
             assert value('g_gpu_compose_hook')!=0 and value('g_master_backbuffer')==master
             wx=int.from_bytes(debug.read(window_pointer+x_offset,4),'little',signed=True)
             wy=int.from_bytes(debug.read(window_pointer+y_offset,4),'little',signed=True)

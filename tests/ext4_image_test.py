@@ -26,7 +26,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='wyzar-ext4-test-') as directory:
         work = Path(directory)
         root = work / 'build'; root.mkdir()
-        for name in ('init.elf', 'counter.elf', 'win_test.elf'):
+        for name in ('init.elf', 'counter.elf', 'win_test.elf', 'gpu_test.elf'):
             (root / name).write_bytes(b'first-' + name.encode())
         (root / 'wallpaper.raw').write_bytes(b'original wallpaper')
         partition = work / 'partition.img'

@@ -20,6 +20,9 @@ CFLAGS = $(OPT) -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
 # disables acceleration; GPU=1 GPU_COMPOSE=0 runs the visible blitter diagnostics.
 # Logical RCS bring-up remains opt-in until physical readback is confirmed.
 GPU_RENDER ?= 0
+# Extended hardware stress sweeps and on-screen tracing. Normal RCS startup
+# retains the short texture/scaling/alpha readback checks.
+GPU_TRACE ?= 0
 GPU ?= 1
 GPU_COMPOSE ?= $(GPU)
 GPU_PRESENT ?= $(GPU_COMPOSE)
@@ -53,6 +56,7 @@ CXXFLAGS = $(CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -mno-red-zone -DGPU_BR
            -DGPU_COMPOSE=$(GPU_COMPOSE) \
            -DGPU_PRESENT=$(GPU_PRESENT) \
            -DGPU_RENDER=$(GPU_RENDER) \
+           -DGPU_TRACE=$(GPU_TRACE) \
            -DCLOCK_UTC_OFFSET_MIN=$(CLOCK_UTC_OFFSET_MIN) -DCLOCK_SHOW_SECONDS=$(CLOCK_SHOW_SECONDS) \
            -DBOOT_DIAGNOSTICS=$(BOOT_DIAGNOSTICS)
 
@@ -82,8 +86,10 @@ test-gpu-render:
 	mkdir -p .storage-test
 	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. tests/gpu_render_test.cpp -o .storage-test/gpu-render-test
 	.storage-test/gpu-render-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/gpu_pci_power_trace_test.cpp -o .storage-test/gpu-pci-power-test
+	.storage-test/gpu-pci-power-test
 
-all: wyzar init.elf counter.elf win_test.elf initrd.tar
+all: wyzar init.elf counter.elf win_test.elf gpu_test.elf initrd.tar
 
 # Backward compatibility alias
 myos: wyzar
@@ -229,6 +235,12 @@ counter.elf: user/counter.o
 user/win_test.o: user/win_test.c
 	$(CC) $(USER_CFLAGS) -I. -c $< -o $@
 
+user/gpu_test.o: user/gpu_test.cpp user/native_ui.h src/gui/ui_font.h src/gui/ui_font_data.h
+	$(CXX) $(USER_CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -I. -c $< -o $@
+
+gpu_test.elf: user/gpu_test.o
+	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
+
 user/bundle_demo.o: user/bundle_demo.c user/wizlib.h src/core/wiz.h
 	$(CC) $(USER_CFLAGS) -I. -c $< -o $@
 
@@ -289,12 +301,13 @@ build/console.elf: user/console.o
 win_test.elf: user/win_test.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
-initrd.tar: init.elf counter.elf win_test.elf build/console.elf $(PACKAGES) assets/fonts/selawik/LICENSE.txt assets/fonts/selawik/selawk.ttf $(wildcard assets/icons/hicolor/*/apps/*.png) third_party/stb/LICENSE Makefile
+initrd.tar: init.elf counter.elf win_test.elf gpu_test.elf build/console.elf $(PACKAGES) assets/fonts/selawik/LICENSE.txt assets/fonts/selawik/selawk.ttf $(wildcard assets/icons/hicolor/*/apps/*.png) third_party/stb/LICENSE Makefile
 	rm -rf initrd_root
 	mkdir -p initrd_root/bin
 	cp init.elf initrd_root/bin/
 	cp counter.elf initrd_root/bin/
 	cp win_test.elf initrd_root/bin/
+	cp gpu_test.elf initrd_root/bin/
 	mkdir -p initrd_root/share/samples
 	cp $(PACKAGES) initrd_root/share/samples/
 	cp $(PACKAGE_DIR)/explorer.wiz initrd_root/bin/
@@ -370,6 +383,7 @@ run: iso
 
 
 clean:
+	rm -f user/gpu_test.o gpu_test.elf
 	rm -f user/image_viewer.o user/image_codec.o image_viewer.elf image_viewer.wiz
 	rm -rf iso_root initrd_root $(PACKAGE_DIR) build/console.elf $(OBJ) $(OBJ:.o=.d) $(EXT4_OBJ) $(EXT4_OBJ:.o=.d) user/init.o user/counter.o user/win_test.o user/bundle_demo.o user/explorer.o user/notepad.o user/task_manager.o user/console.o wyzar wyzar.iso myos myos.iso init.elf counter.elf win_test.elf bundle_demo.elf explorer.elf notepad.elf task_manager.elf counter.wiz win_test.wiz bundle_demo.wiz initrd.tar
 

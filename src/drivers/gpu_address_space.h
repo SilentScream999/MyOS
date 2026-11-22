@@ -4,6 +4,16 @@
 
 struct GpuGttSpan { uint64_t base,bytes,pte; };
 
+// The blitter's source window is remapped per scene. Only its minimum
+// working set needs a boot-time reservation alongside the fixed objects.
+static inline uint64_t gpu_source_capacity(uint64_t available,uint64_t fixed,
+                                           uint64_t minimum,uint64_t maximum) {
+    if(available<fixed)return 0;
+    uint64_t room=(available-fixed)&~4095ULL;
+    if(room>maximum)room=maximum;
+    return room>=minimum?room:0;
+}
+
 // A boot takeover may claim a dedicated interval only above all reconstructed
 // display/aperture mappings, with guard pages and the top reservation preserved.
 static inline uint64_t gpu_takeover_base(uint64_t prefix,uint64_t end,uint64_t bytes) {

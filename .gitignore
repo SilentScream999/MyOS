@@ -1,4 +1,7 @@
 .storage-test/
+/user/gpu_test.o
+/gpu_test.elf
+/initrd_root/bin/gpu_test.elf
 /build/packages/
 /build/console.elf
 wyzar-usb.img*

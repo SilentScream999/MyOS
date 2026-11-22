@@ -30,6 +30,9 @@ extern "C" void wyzar_ext4_free(void* p) { kfree(p); }
 #include "gui/graphics.h"
 #include "gui/wm.h"
 #include "drivers/intel_gpu.h"
+#if GPU_RENDER && GPU_TRACE
+#include "drivers/gpu_pci_power_trace.h"
+#endif
 #include "drivers/intel_render.h"
 #ifdef GPU_COMPOSITOR_TEST
 #include "../tests/gpu_compositor_backend.h"
@@ -762,6 +765,7 @@ void compositor_thread_main() {
 			// Compose each damaged region separately (HUD strip, animation, cursor ... are not
 			// merged into one giant box). The legacy box counts as one more rect when something wrote to it.
 			uint64_t t_start = rdtsc();
+            gpu_trace_stage("COMPOSE");
 			if (!g_pause_compositor) {
 				bool box_valid = (fx1 <= fx2 && fy1 <= fy2);
 				uint32_t total = frame_dmg.n + (box_valid ? 1u : 0u);
@@ -1025,6 +1029,9 @@ extern "C" void kmain(void) {
 		uint64_t ecam_size = (uint64_t)(end - start + 1) * 0x100000ULL;
 		uint64_t virt_base = PCI_ECAM_VA_BASE + (uint64_t)seg * PCI_ECAM_SEG_STRIDE;
 		map_ecam_region(phys_base, virt_base, ecam_size);
+#if GPU_RENDER && GPU_TRACE
+        memset(trace_bus_parent,0,sizeof(trace_bus_parent));
+#endif
         find_intel_gpu(virt_base, start, start, end);
         if (g_igpu.found) map_intel_gpu_mmio();
         print((char*)"Mapped...");
@@ -1041,6 +1048,9 @@ extern "C" void kmain(void) {
 					uint32_t id = pci_cfg_read32(virt_base, start, bus, dev, fn, 0x00);
 					if (id == 0xFFFFFFFF) continue;
 					uint32_t class_reg = pci_cfg_read32(virt_base, start, bus, dev, fn, 0x08);
+#if GPU_RENDER && GPU_TRACE
+                    trace_pci_discover({virt_base,id,seg,start,(uint8_t)bus,dev,fn},class_reg);
+#endif
 					if (((class_reg >> 24) & 0xFF) == 0x0C &&
 					    ((class_reg >> 16) & 0xFF) == 0x03) {
 						
@@ -1064,6 +1074,9 @@ extern "C" void kmain(void) {
 			}
 		}
 	}
+#if GPU_RENDER && GPU_TRACE
+    trace_nvidia_power("GPU PCI power snapshot: boot");
+#endif
 	if (g_igpu.found) {
 		// Full bring-up + self-test (fill, copy, 64x backbuffer flip). Never halts: on any
 		// failure the compositor simply keeps using the CPU copy path.

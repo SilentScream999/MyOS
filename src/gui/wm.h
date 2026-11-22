@@ -2015,6 +2015,7 @@ static uint64_t g_gpu_retained_fast_count=0;
 static inline bool wm_compose_dirty_band(uint32_t min_x, uint32_t max_x,
                                      uint32_t min_y, uint32_t max_y, bool do_overlay = true,
                                      bool present = true) {
+    bool skip_gpu_scene=false;
 retry_scene:
     if (!fb || !fb->address || !g_master_backbuffer) return false;
     if (min_x>max_x || min_y>max_y || min_x>=fb->width || min_y>=fb->height) return false;
@@ -2052,7 +2053,7 @@ retry_scene:
     bool fullscreen_fast=false;
     bool scaled_fast=false;
     bool retained_fast=false;
-    if(g_gpu_compose_hook && present){
+    if(g_gpu_compose_hook && present && !skip_gpu_scene){
         for(int s=0;s<frame_count;++s){
             int index=frame_order[s];const auto& r=rects[index];auto* win=frame_windows[index];
             const auto& source=sources[index];
@@ -2112,7 +2113,7 @@ retry_scene:
         }
         t1=rdtsc_val();g_time_bg_ticks=t1-t0;
         if(gpu_plan.count&&!g_gpu_compose_hook(gpu_plan)){
-            g_gpu_compose_hook=nullptr;g_rain_surface_current=false;
+            skip_gpu_scene=true;g_rain_surface_current=false;
             min_x=0;min_y=0;max_x=fb->width-1;max_y=fb->height-1;goto retry_scene;
         }
         if(render_plan.count&&(!g_gpu_render_hook||!g_gpu_render_hook(render_plan))){
@@ -2136,7 +2137,7 @@ retry_scene:
         bool complete=scaled_fast?g_gpu_render_hook(render_plan):g_gpu_compose_hook(gpu_plan);
         if(!complete){
             if(scaled_fast)g_gpu_render_hook=nullptr;
-            else {g_gpu_compose_hook=nullptr;g_rain_surface_current=false;}
+            else {skip_gpu_scene=true;g_rain_surface_current=false;}
             min_x=0;min_y=0;max_x=fb->width-1;max_y=fb->height-1;goto retry_scene;
         }
         if(scaled_fast)++g_gpu_scaled_fast_count;else ++g_gpu_fullscreen_fast_count;
@@ -2284,7 +2285,7 @@ retry_scene:
     // CPU path; the driver has disabled submission and quiesced or quarantined
     // its old destination so late DMA cannot corrupt the replacement buffer.
     if(gpu_plan.count && !g_gpu_compose_hook(gpu_plan)){
-        g_gpu_compose_hook=nullptr;
+        skip_gpu_scene=true;
         g_rain_surface_current=false;
         min_x=0;min_y=0;max_x=fb->width-1;max_y=fb->height-1;
         // Reuse this frame instead of recursively consuming a second large
