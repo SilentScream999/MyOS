@@ -99,6 +99,22 @@ old handles are never rebound to a reconnected device. Shutdown/restart attempts
 to close the journal, reports failure if the disk is gone, and continues the
 requested power action.
 
+Newly formatted journals are cleared in full before an expanded root is
+published. Reusing journal blocks while restarting transaction IDs could replay
+metadata from a previous filesystem after an abrupt removal, even after an idle
+boot. The formatter regression reproduces this sequence on a file-backed disk
+and verifies repeated recovery with independent filesystem checks.
+This initialization fix prevents stale-record replay on newly formatted roots.
+It does not reconstruct files already damaged by an earlier replay.
+Clean journal shutdown also preserves the last committed transaction ID.
+Resetting that ID to zero could make records from an older mount session
+match the IDs of a later session.
+Checkpoint callbacks retain their dirty buffers and committed journal records
+when a device write fails. Journal shutdown reports the pending error instead
+of advancing past failed writes or marking that session clean. The native
+failure-injection suite checks allocation metadata after recovery at each
+interrupted file-exchange boundary.
+
 ## Update ownership
 
 The updater replaces bundled `/bin/init.elf`, `/bin/counter.elf`,

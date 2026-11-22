@@ -84,6 +84,9 @@ def main():
                     visibility.append((pointer,debug.read(pointer+visible_offset,1)))
                     debug.write(pointer+visible_offset,b'\0')
                 else:fixtures.append(pointer)
+            # Retire damage queued by boot and the windows hidden above before
+            # injecting a sentinel outside this test's explicit damage region.
+            for _ in range(4):frame()
             before=value('g_gpu_retained_fast_count')
             rcs_before=value('g_gpu_test_render_calls');bcs_before=value('g_gpu_test_calls')
             sentinel=0xFF2468AC
@@ -92,7 +95,7 @@ def main():
                                 ('g_dirty_max_x',1275),('g_dirty_max_y',275)]:
                 debug.write(address(name),number.to_bytes(4,'little'))
             debug.write(address('g_needs_refresh'),b'\1')
-            for _ in range(4):frame()
+            frame()
             assert value('g_gpu_retained_fast_count')>before,'Mixed clients repainted the CPU scene'
             assert value('g_gpu_test_render_calls')>rcs_before and value('g_gpu_test_calls')>bcs_before
             for px,py,color in [(1084,228,pixel),(1200,200,0xFF113355),

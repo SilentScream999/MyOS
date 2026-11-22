@@ -97,6 +97,7 @@ static bool gpu_test_compose(const GpuScenePlan& plan) {
         if(g_gpu_test_fail){
             // Simulate late-DMA quarantine after a partially executed batch.
             g_master_backbuffer=g_gpu_test_recovery;
+            g_gpu_compose_hook=nullptr; // Match gpu_scene_abort's submission shutdown.
             g_gpu_present_hook=nullptr;
             g_gpu_quarantine_sources=true;
             g_gpu_test_recovery=nullptr;

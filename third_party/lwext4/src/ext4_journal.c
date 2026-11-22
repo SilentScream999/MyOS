@@ -1371,6 +1371,9 @@ jbd_journal_purge_cp_trans(struct jbd_journal *journal,
 {
 	struct jbd_trans *trans;
 	while ((trans = TAILQ_FIRST(&journal->cp_queue))) {
+		/* Failed checkpoint writes must retain their committed log. */
+		if (trans->error != EOK)
+			break;
 		if (!trans->data_cnt) {
 			TAILQ_REMOVE(&journal->cp_queue,
 					trans,
@@ -1422,6 +1425,10 @@ int jbd_journal_stop(struct jbd_journal *journal)
 	/* Make sure that journalled content have reached
 	 * the disk.*/
 	jbd_journal_purge_cp_trans(journal, true, false);
+	if (!TAILQ_EMPTY(&journal->cp_queue)) {
+		struct jbd_trans *trans = TAILQ_FIRST(&journal->cp_queue);
+		return trans->error != EOK ? trans->error : EIO;
+	}
 
 	/* There should be no block record in this journal
 	 * session. */
@@ -1443,7 +1450,11 @@ int jbd_journal_stop(struct jbd_journal *journal)
 		return r;
 
 	journal->start = 0;
-	journal->trans_id = 0;
+	/* Preserve the last committed ID across clean sessions. Restarting at
+	 * zero lets a later short session accept stale records from the tail
+	 * of an earlier, longer session after an abrupt removal. Start adds
+	 * one to this checkpoint ID when it allocates the next transaction. */
+	journal->trans_id = journal->alloc_trans_id - 1;
 	jbd_journal_write_sb(journal);
 	return jbd_write_sb(journal->jbd_fs);
 }
@@ -2108,8 +2119,13 @@ static void jbd_trans_end_write(struct ext4_bcache *bc __unused,
 	struct jbd_journal *journal = trans->journal;
 	bool first_in_queue =
 		trans == TAILQ_FIRST(&journal->cp_queue);
-	if (res != EOK)
+	if (res != EOK) {
 		trans->error = res;
+		/* The buffer remains dirty and owns its callback. A failed
+		 * device write is not a completed checkpoint: releasing this
+		 * record could advance the journal past metadata not on disk. */
+		return;
+	}
 
 	TAILQ_REMOVE(&trans->buf_queue, jbd_buf, buf_node);
 	TAILQ_REMOVE(&block_rec->dirty_buf_queue,

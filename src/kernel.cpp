@@ -304,6 +304,8 @@ static void storage_report_line(const char* line) {
     g_storage_report_offset += g_storage_report->ops->write(g_storage_report, "\n", 1, g_storage_report_offset);
 }
 static void storage_record_recovery(vnode* runtime_run, const char* reason) {
+    print((char*)"[storage] Recovery reason:");
+    print((char*)reason);
     // Write directly to the runtime RAM node, never to the failing USB device.
     if (!runtime_run || runtime_run->type != VnodeType::DIRECTORY || runtime_run->ops != &ramfs_ops) return;
     g_storage_report = ramfs_lookup(runtime_run, "storage.txt");
@@ -1167,7 +1169,7 @@ extern "C" void kmain(void) {
         if (candidates == 1) {
             int setup = wy_usb_autogrow(&ext4_candidate, storage_setup_progress);
             if (setup >= 0) candidate = wy_ext4_mount(&ext4_candidate);
-            recovery_reason = candidate ? "System-root marker could not be read or has an invalid signature." :
+            recovery_reason = candidate ? "System-root marker /etc/root.cfg could not be opened." :
                 (setup < 0 ? "Automatic storage setup failed; seed preserved. Reboot to retry." :
                 "System partition recognized, but ext4 mount/journal initialization failed.");
             if (candidate) vfs_mount_root(candidate);
@@ -1175,8 +1177,26 @@ extern "C" void kmain(void) {
             char signature[12] = {};
             bool valid = candidate && vfs_open("/etc/root.cfg", 0, &marker) == 0;
             if (valid) {
-                valid = vfs_read(&marker, signature, 11) == 11 &&
-                        strncmp(signature, "WYZARROOT1\n", 11) == 0;
+                uint64_t read_bytes=vfs_read(&marker, signature, 11);
+                recovery_reason=read_bytes==11 ?
+                    "System-root marker /etc/root.cfg has an invalid signature." :
+                    "System-root marker /etc/root.cfg returned a short or failed read.";
+                valid = read_bytes == 11 && strncmp(signature, "WYZARROOT1\n", 11) == 0;
+                if(!valid){
+                    char count_text[32];
+                    print((char*)"[storage] Root marker file size:");
+                    to_str(marker.vn->size,count_text);print(count_text);
+                    print((char*)"[storage] Root marker bytes read:");
+                    to_str(read_bytes,count_text);print(count_text);
+                    char hex[23]{};
+                    const char* digits="0123456789ABCDEF";
+                    for(unsigned i=0;i<read_bytes && i<11;++i){
+                        unsigned byte=(uint8_t)signature[i];
+                        hex[i*2]=digits[byte>>4];hex[i*2+1]=digits[byte&15];
+                    }
+                    print((char*)"[storage] Root marker bytes (hex):");
+                    print(hex);
+                }
                 vfs_close(&marker);
             }
             vnode* shell = vfs_namei("/bin/init.elf");
@@ -1220,6 +1240,7 @@ extern "C" void kmain(void) {
         print((char*)"[font] Load/bake milliseconds:"); print(asset_elapsed);
 #endif
         if (disk_root_active) wm_load_disk_wallpaper();
+        else print((char*)"[wallpaper] RAM recovery root active; using generated wallpaper.");
         g_resources_requested=false;
         wm_resources_reload();
         scheduler_add_task(task_create(wm_resource_worker,16,"Desktop resources"));

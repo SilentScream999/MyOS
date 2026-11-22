@@ -664,24 +664,26 @@ static int create_journal_inode(struct ext4_fs *fs,
 		if (ret != EOK)
 			goto Finish;
 
-		if (iblock != 0)
-			continue;
-
-		ret = ext4_block_get(fs->bdev, &blk, fblock);
+		ret = ext4_block_get_noread(fs->bdev, &blk, fblock);
 		if (ret != EOK)
 			goto Finish;
 
-
-		struct jbd_sb * jbd_sb = (struct jbd_sb * )blk.data;
-		memset(jbd_sb, 0, sizeof(struct jbd_sb));
-
-		jbd_sb->header.magic = to_be32(JBD_MAGIC_NUMBER);
-		jbd_sb->header.blocktype = to_be32(JBD_SUPERBLOCK_V2);
-		jbd_sb->blocksize = to_be32(info->block_size);
-		jbd_sb->maxlen = to_be32(info->journal_blocks);
-		jbd_sb->nr_users = to_be32(1);
-		jbd_sb->first = to_be32(1);
-		jbd_sb->sequence = to_be32(1);
+		/* A new journal restarts its transaction sequence. Reused media
+		 * can still contain committed records with those same IDs. Clear
+		 * every journal block before publishing the filesystem, otherwise
+		 * an interrupted idle mount can replay the previous filesystem's
+		 * metadata into this one. */
+		memset(blk.data, 0, info->block_size);
+		if (iblock == 0) {
+			struct jbd_sb *jbd_sb = (struct jbd_sb *)blk.data;
+			jbd_sb->header.magic = to_be32(JBD_MAGIC_NUMBER);
+			jbd_sb->header.blocktype = to_be32(JBD_SUPERBLOCK_V2);
+			jbd_sb->blocksize = to_be32(info->block_size);
+			jbd_sb->maxlen = to_be32(info->journal_blocks);
+			jbd_sb->nr_users = to_be32(1);
+			jbd_sb->first = to_be32(1);
+			jbd_sb->sequence = to_be32(1);
+		}
 
 		ext4_bcache_set_dirty(blk.buf);
 		ret = ext4_block_set(fs->bdev, &blk);

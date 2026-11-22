@@ -18,8 +18,9 @@ CFLAGS = $(OPT) -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
 # Probe supported Intel hardware and use validated composition/page flips by
 # default. Unsupported devices and failed bring-up keep the CPU path. GPU=0
 # disables acceleration; GPU=1 GPU_COMPOSE=0 runs the visible blitter diagnostics.
-# Logical RCS bring-up remains opt-in until physical readback is confirmed.
-GPU_RENDER ?= 0
+# RCS follows composition by default. Supported Gen9 hardware must pass
+# offscreen readback before enabling it; GPU_RENDER=0 keeps blitter composition.
+GPU_RENDER ?= $(GPU_COMPOSE)
 # Extended hardware stress sweeps and on-screen tracing. Normal RCS startup
 # retains the short texture/scaling/alpha readback checks.
 GPU_TRACE ?= 0
@@ -138,6 +139,9 @@ test-exfat: .storage-test/fat32-test
 	./.storage-test/fat32-test exfat
 
 .storage-test/autogrow-test: tests/autogrow_test.cpp src/fs/usb_autogrow.h src/fs/storage_policy.h src/fs/ext4_vfs.h src/fs/vfs.h src/drivers/block.h Makefile $(patsubst third_party/lwext4/src/%.c,.storage-test/ext4-host/%.o,$(EXT4_SRC))
+	$(CXX) -O1 -g -std=c++20 -no-pie -fsanitize=address,undefined $(EXT4_CONFIG) $(EXT4_INC) -Isrc/fs -Isrc/drivers $< $(filter %.o,$^) -o $@
+
+.storage-test/journal-reformat-test: tests/journal_reformat_test.cpp src/fs/ext4_vfs.h Makefile $(patsubst third_party/lwext4/src/%.c,.storage-test/ext4-host/%.o,$(EXT4_SRC))
 	$(CXX) -O1 -g -std=c++20 -no-pie -fsanitize=address,undefined $(EXT4_CONFIG) $(EXT4_INC) -Isrc/fs -Isrc/drivers $< $(filter %.o,$^) -o $@
 
 # Track header dependencies (wm.h, intel_gpu.h, ...) so editing a header rebuilds the kernel.

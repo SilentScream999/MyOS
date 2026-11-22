@@ -24,7 +24,7 @@ target is a GPU-composited desktop with installable applications.
 | Fonts | Runtime TTF selection with built-in fallback; printable ASCII UI | [Fonts](FONTS.md) |
 | Storage | Journaled ext4 USB root, persistent apps/settings/files, atomic saves, automatic capacity setup | [ext4](EXT4.md) |
 | Input | xHCI HID, USB hubs, descriptor-based pointers, PS/2 keyboard/Synaptics | [USB/input](USB_INPUT.md) |
-| GPU | Intel Gen9 bring-up; experimental opaque composition and resident rainbow palette; opt-in | [Display roadmap](GPU_DESKTOP_ROADMAP.md) |
+| GPU | Intel Gen9 composition, page flips and RCS scaling enabled by runtime validation; CPU fallback | [Display roadmap](GPU_DESKTOP_ROADMAP.md) |
 
 Normal new images contain a 256 MiB ext4 seed and occupy 385 MiB overall.
 First boot can provision a larger root on a larger stick. This disk seed reserve
@@ -50,10 +50,10 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
   smooth large-window rendering; sustained v11 validation remains ongoing.
   Every draw waits for both its completion fence and context schedule-out.
   Failed desktop submissions quarantine buffers and select CPU presentation.
-  GPU_RENDER remains opt-in. GPU_TRACE=1 adds stage labels, PCI power snapshots,
+  GPU_RENDER follows GPU_COMPOSE by default. GPU_TRACE=1 adds stage labels, PCI power snapshots,
   ring-wrap tests and extended isolated resize stress sweeps. GPU_TRACE=0 keeps
   short offscreen texture/scaling/alpha readback checks. Standard test build:
-  make iso GPU_RENDER=1 GPU_TRACE=0.
+  make iso FRESH=1.
   SCORE marks scoreboard retirement before render-target cache writeback;
   RTCLEAN marks completed render-target writeback before the DC/depth drain.
   The workarounds resolved the reported v10 SCORE reproduction, but the exact
@@ -65,7 +65,7 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
 - `GPU=1` is now the default after owner validation. Composition follows GPU,
   presentation follows composition, and runtime discovery/readback select the
   supported hardware path or CPU fallback. `GPU=0` forces CPU mode. Keep
-  `GPU_RENDER=0` and kernel `OPT=-O0` as defaults. The image codec and isolated
+  RCS enabled with composition and kernel `OPT=-O0` as defaults. The image codec and isolated
   overlay pixel renderer have their own optimized rules. Test kernel-wide
   optimization changes separately.
 - QEMU does not emulate our Intel Gen9 GPU. Keep CPU fallbacks and bounded
@@ -102,7 +102,7 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
   Reject FBC/PSR and unsupported plane layouts; reuse a buffer only after LIVE
   and the frame counter confirm the other buffer latched. Failed flips restore
   firmware scanout or retain the pinned live private buffer for CPU fallback.
-- Experimental GPU_RENDER=1 adds a private logical RCS context and PPGTT.
+- Default GPU rendering adds a private logical RCS context and PPGTT.
   Scaled client draws use the pinned master buffer with explicit cache handoffs.
   Geometry, sampling, ring reuse, reset preparation and Gen9 workaround tests
   run on the host. Preserve source/destination lifetime through retirement and

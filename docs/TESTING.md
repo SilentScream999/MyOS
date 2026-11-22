@@ -4,6 +4,13 @@ Updated 2026-11-17. Run commands from the repository root in WSL/Linux.
 Use current build artifacts, clang sanitizers, QEMU, OVMF and e2fsprogs as needed.
 Build/setup instructions are in [README](../README.md).
 
+For journal initialization on reused media, run
+`python3 tests/journal_reformat_test.py`. It creates an older journaled
+filesystem, reformats the same blocks, provisions new files without journaling
+as automatic expansion does, and repeatedly interrupts otherwise idle mounts.
+Fresh processes must recover the new marker and document unchanged. Independent
+`e2fsck -fn` checks validate the final metadata. Fixtures are disposable files.
+
 ## Image Viewer and retained Start icons
 
 ```sh
@@ -212,7 +219,9 @@ For the render-engine state/context regression, run `make test-gpu-render`.
 The ASan/UBSan test decodes Gen9 texture/alpha fields, checks clipped texture
 coordinates and sentinels, validates logical-context register slots, and checks
 foreground subtraction for scaled clients. It does not execute GPU shaders.
-Build with `make iso GPU_RENDER=1` for the physical offscreen RCS readback gate.
+Build with `make iso` for the default physical offscreen RCS readback gate.
+`GPU_RENDER=0` selects blitter composition and `GPU=0` selects CPU rendering.
+`GPU_TRACE=1` adds extended boot stress sweeps; normal builds use short checks.
 Keep its failed RCS register diagnostics if the hook is rejected.
 On the laptop, launch `run /bin/win_test.elf` and resize or maximize its fixed
 480x320 canvas to exercise RCS scaling. The owner ran the reset-handshake

@@ -11,7 +11,11 @@ OUT = ROOT / '.storage-test'
 
 def main():
     subprocess.run(['make', '-s', '.storage-test/ext4-test'], cwd=ROOT, check=True)
-    original = OUT / 'ext4-usb.img'
+    # Build with the current formatter/journal code. A cached fixture can carry
+    # transaction IDs and log records produced by an older implementation.
+    original = OUT / 'ext4-fresh-fixture.img'
+    subprocess.run(['python3', 'tools/make_usb_image.py', '--output', str(original),
+                    '--fresh', '--root-mib', '64'], cwd=ROOT, check=True)
     disk = OUT / 'ext4-test-run.img'
     shutil.copyfile(original, disk)
     env = dict(os.environ, ASAN_OPTIONS='detect_leaks=0', UBSAN_OPTIONS='halt_on_error=1')
@@ -29,6 +33,7 @@ def main():
     # Model power loss at each write boundary in the package publication
     # transaction. Recovery must expose a complete old or complete new app.
     for budget in (*range(24), 1000):
+        print(f'Exchange crash boundary {budget}', flush=True)
         shutil.copyfile(original, disk)
         subprocess.run([str(OUT / 'ext4-test'), str(disk), 'exchange-fault', str(budget)],
                        cwd=ROOT, env=env, check=True)

@@ -65,7 +65,7 @@ static bool gpu_prepare_display();
 #define GPU_PRESENT 0
 #endif
 #ifndef GPU_RENDER
-#define GPU_RENDER 0
+#define GPU_RENDER GPU_COMPOSE
 #endif
 static uint64_t g_gpu_render_gfx=0;
 static constexpr uint64_t GPU_RENDER_OWNED_BYTES=256*1024;

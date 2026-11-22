@@ -44,23 +44,16 @@ GPU: first vblank page flip latched. Unsupported layouts retain CPU presentation
 The rest of GUI rasterization (fonts, icons, alpha, general scaling) is still CPU.
 For the previously tested presenter, rebuild with GPU_COMPOSE=1 GPU_PRESENT=0.
 
-Experimental render-engine bring-up and scaled client composition:
-make iso GPU_RENDER=1
-This implies GPU_PRESENT=1, GPU_COMPOSE=1 and GPU=1. The driver checks a logical
-context fence, texture/scaling pixels and premultiplied alpha in offscreen RAM
-before enabling scaled client draws. Look for RCS readback PASSED and HUD RCS.
-The owner ran the reset-handshake revision for 800 seconds without a freeze;
-that source baseline is saved on codex/gpu-rcs-stable-800s at 6baa52b.
-Resized client RCS is restored in codex/gpu-resized-composition. Client-only
-damage combines BCS/RCS copies, retains unchanged chrome, and copies uncovered
-wallpaper gaps on CPU. Physical stability and side-by-side CPU savings of this
-revision still require a laptop run; QEMU cannot execute Intel RCS.
-Follow-up: the restored revision freezes on ordinary enlargement even with
-other windows minimized; maximize still works. The current diagnostic build
-uses fixed full-client geometry and hardware scissor for damage/occlusion.
-Its hardware freeze outcome is unverified; the guarded checkpoint remains the
-known working comparison. F: in the HUD is milliseconds per frame, not CPU %.
-Fonts, icons and general alpha layers still use their CPU renderers.
+Gen9 render-engine scaling (enabled by default on validated hardware):
+make iso
+RCS follows GPU_COMPOSE. Runtime discovery and short offscreen readback checks
+select acceleration or CPU fallback. GPU_RENDER=0 keeps blitter composition.
+GPU=0 disables GPU paths, including RCS, without requiring additional flags.
+GPU_TRACE=1 enables stage tracing and lengthy ring/resize startup stress sweeps.
+Normal builds use GPU_TRACE=0. Fonts, icons and general alpha layers use CPU.
+The owner reported a 900-second stable v10 run on the ThinkPad at 256 MiB,
+with resizing, overlapping and restarts, and smooth direct rendering on v11.
+QEMU fallback tests exercise CPU recovery; Intel execution needs hardware.
 
 Force the CPU renderer, preserving saved files:
 make clean && make iso GPU=0

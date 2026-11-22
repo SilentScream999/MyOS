@@ -25,6 +25,8 @@ def main():
     smoke.OUT.mkdir(exist_ok=True)
     symbols=subprocess.check_output(['nm','-n','-C',str(ROOT/'wyzar')],text=True).splitlines()
     retired=next(int(line.split()[0],16) for line in symbols if line.split()[-1]=='g_recovery_retired')
+    hooks={name:next(int(line.split()[0],16) for line in symbols if line.split()[-1]==name)
+           for name in ('g_gpu_render_hook','g_gpu_compose_hook','g_gpu_present_hook','g_gpu_flip_hook')}
     with tempfile.TemporaryDirectory(prefix='wyzar-framebuffer-') as directory:
         image=Path(directory)/'usb.img'
         for label,iso,storage,resolution in (
@@ -54,11 +56,18 @@ def main():
                 state=smoke.OUT/f'{label}-retired.bin'
                 assert not q.monitor(f'memsave 0x{retired:x} 1 "{state}"')
                 assert state.read_bytes()==(b'\1' if storage else b'\0')
+                # Default QEMU VGA is unsupported by the Intel driver. Even
+                # with RCS enabled by default, all GPU hooks must stay absent
+                # while shell input and CPU composition continue.
+                for name,address in hooks.items():
+                    hook=smoke.OUT/f'{label}-{name}.bin'
+                    assert not q.monitor(f'memsave 0x{address:x} 8 "{hook}"')
+                    assert hook.read_bytes()==bytes(8),(label,name)
                 q.type('write /tmp/fbtest alive\n',pause=.2)
                 q.type('cat /tmp/fbtest\n',pause=.3)
                 assert q.command('query-status')['running']
                 q.capture(label+'-working')
-                print(label+': boot, shell I/O and recovery lifetime passed.',flush=True)
+                print(label+': CPU fallback, boot, shell I/O and recovery lifetime passed.',flush=True)
             finally:
                 q.close()
     smoke.BOOT_ISO=False

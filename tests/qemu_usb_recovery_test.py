@@ -19,7 +19,7 @@ def main():
         source.seek(offset)
         partition.write_bytes(source.read())
     marker = OUT / 'bad-root-marker'
-    marker.write_bytes(b'INVALID\n')
+    marker.write_bytes(b'INVALIDROOT')
     manifest = OUT / 'bad-root-manifest'
     manifest.write_text(f'put /etc/root.cfg {marker}\n')
     subprocess.run([str(OUT / 'ext4-image-tool'), str(partition), str(manifest)], check=True)
@@ -46,6 +46,9 @@ def main():
         else:
             raise AssertionError(log[-6000:])
         assert '[storage] No unique valid system volume; RAM recovery mode.' in log
+        assert '[storage] Recovery reason:\nSystem-root marker /etc/root.cfg has an invalid signature.' in log
+        assert '[storage] Root marker bytes (hex):\n494E56414C4944524F4F54' in log
+        assert '[wallpaper] RAM recovery root active; using generated wallpaper.' in log
         assert '[storage] Discovery: controllers=1 hubs=2 disks=1 online=1 keyboards=1' in log, log[-6000:]
         assert log.count('[storage] Hub:') == 2 and log.count('[storage] Disk:') == 1
         assert 'vid:pid=' in log and 'milliseconds:' not in log

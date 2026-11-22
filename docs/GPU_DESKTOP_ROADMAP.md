@@ -1,7 +1,7 @@
 # GPU and display roadmap
 
-Updated 2026-11-19. Supported Intel composition/page flips now probe by default
-after owner validation. Render-engine bring-up remains opt-in. Preserve CPU fallback.
+Updated 2026-11-22. Supported Intel composition, page flips and RCS scaling
+probe by default after owner validation. GPU_RENDER=0 selects blitter composition.
 General platform priorities are in [NEXT_STEPS](NEXT_STEPS.md).
 
 ## Current renderer
