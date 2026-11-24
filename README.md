@@ -63,7 +63,9 @@ options; header dependencies are tracked automatically.
 - Native `.wiz` packages (icons/metadata inside, portable or installed) and `.elf` programs, spawn/wait/exit, foreground Ctrl+C and mapped
   user-window surfaces/events. Both extensions currently contain WyzarOS ELFs.
 - Surface-backed desktop windows, damage tracking, taskbar, Start menu and
-  CPU/SSE presentation. Terminals use independent userspace console hosts.
+  CPU/SSE presentation fallback. Normal windows have cached shadows and opt-in
+  client transparency; title-bar text, icons and controls are cached.
+  Terminals use independent userspace console hosts.
   Open more from Start or with Ctrl+Alt+T. Shift+Up/Down scrolls terminal history.
   Taskbar buttons group windows by application. Select a group to pick a window,
   or use the overflow menu for applications beyond the available taskbar space.
@@ -128,8 +130,9 @@ console app; `run /bin/win_test.elf` demonstrates mapped GUI surfaces.
 
 Key gaps: ELF/user-pointer/window-ownership hardening, loader failure cleanup,
 runtime timezone/DST, stable drive identity and recovery, internal-drive installation,
-translucent client windows and hardware page flipping. PNG/font alpha already
-works; general window surfaces are still composed opaque.
+client present acknowledgments and hardware cursor support. Gen9 page flipping and RCS
+scaling are enabled after runtime checks. Window surfaces default to opaque;
+applications can opt into premultiplied source-over alpha.
 
 ## Source layout
 

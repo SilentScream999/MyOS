@@ -140,6 +140,7 @@ static inline uint64_t rdmsr(uint32_t msr) {
 #define SYS_WIN_CREATE    200u
 #define SYS_WIN_SYNC      201u
 #define SYS_WIN_PUBLISH   222u // (id, top-damage height or 0=full): publish an immutable image.
+#define SYS_WIN_ALPHA     223u // (owned id, 0=opaque, 1=premultiplied source-over)
 #define SYS_WIN_DESTROY   202u
 #define SYS_WIN_GET_BUFFER 203u
 #define SYS_WIN_DAMAGE     204u   // (win_id, x, y, w, h): part of the surface changed
@@ -376,7 +377,7 @@ static uint64_t sys_win_create(uint64_t title_va, uint64_t x, uint64_t y, uint64
 // told WHICH part of the screen to recompose.)
 static uint64_t sys_win_sync(uint64_t win_id) {
     Window* win = wm_find_window((int)win_id);
-    if (win) wm_surface_damage_all(win);
+    if (win) {gpu_launch_paint(win->id);wm_surface_damage_all(win);}
     g_needs_refresh = true;
     return 0;
 }
@@ -387,6 +388,7 @@ static uint64_t sys_win_damage(uint64_t win_id, uint64_t x, uint64_t y, uint64_t
     if (x > 0x7FFFFFFFu || y > 0x7FFFFFFFu || w > 0x7FFFFFFFu || h > 0x7FFFFFFFu) return (uint64_t)-1;
     Window* win = wm_find_window((int)win_id);
     if (!win) return (uint64_t)-1;
+    gpu_launch_paint(win->id);
     wm_surface_damage(win, (int32_t)x, (int32_t)y,
                       (int32_t)((x + w > 0x7FFFFFFFu) ? 0x7FFFFFFFu : x + w),
                       (int32_t)((y + h > 0x7FFFFFFFu) ? 0x7FFFFFFFu : y + h));
@@ -734,6 +736,17 @@ static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uin
         
         case SYS_WIN_CREATE: return sys_win_create(a1, a2, a3, a4, a5, 0); // 6th arg flags omitted for now or added
         case SYS_WIN_SYNC:   return sys_win_sync(a1);
+        case SYS_WIN_ALPHA: {
+            TtyIrqGuard guard;
+            Window* win=wm_find_window((int)a1);
+            if(a1>0x7fffffffu||!win||!g_current_task||win->is_system||win->owner_pid!=g_current_task->pid||
+               a2>WIN_ALPHA_PREMULTIPLIED)return (uint64_t)-1;
+            bool alpha=a2==WIN_ALPHA_PREMULTIPLIED;
+            if(win->premultiplied!=alpha){
+                win->premultiplied=alpha;wm_damage_window_full(win);g_needs_refresh=true;
+            }
+            return 0;
+        }
         case SYS_WIN_PUBLISH: {
             Window* win=wm_find_window((int)a1);
             if(!win || !g_current_task || win->is_system || win->owner_pid!=g_current_task->pid)
@@ -762,8 +775,11 @@ static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uin
                 // compositor frame. Preemption between them could let the
                 // next publish reuse a snapshot still sampled by that frame.
                 TtyIrqGuard guard;
+                if(!++g_surface_publication)++g_surface_publication;
+                slot.revision=g_surface_publication;
                 win->published[win->published_slot].retired_frame=g_compositor_frame;
                 win->published_slot=next;
+                gpu_launch_paint(win->id);
             }
             if(a2){
                 wm_surface_damage(win,0,0,win->canvas_width,(int32_t)a2);

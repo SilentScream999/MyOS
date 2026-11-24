@@ -101,6 +101,10 @@ static inline void heap_check(HeapBlock* b, const char* ctx) {
     if (b->magic != HEAP_MAGIC) {
         print((char*)"[heap] CORRUPTION in:");
         print((char*)ctx);
+        char detail[32];
+        print((char*)"[heap] Header address:");to_hex((uint64_t)b,detail);print(detail);
+        print((char*)"[heap] Header magic:");to_hex(b->magic,detail);print(detail);
+        print((char*)"[heap] Header size:");to_hex(b->size,detail);print(detail);
         hcf();
     }
 }

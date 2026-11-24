@@ -118,6 +118,17 @@ static int       pmm_cur_region     = 0;
 static uint64_t max_hhdm_size      = 0;
 static uint64_t total_usable_ram   = 0;
 
+// Syscalls and GPU mapping allocate pages with interrupts enabled. Reserve an
+// extent atomically with respect to the single-core scheduler, including when
+// the heap grows in another task. Zeroing the reserved memory stays preemptible.
+#ifndef PMM_HOST_TEST
+struct PmmGuard {
+    uint64_t flags;
+    PmmGuard() { asm volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory"); }
+    ~PmmGuard() { if(flags&(1u<<9))asm volatile("sti" ::: "memory"); }
+};
+#endif
+
 // ── init_physical_allocator ───────────────────────────────────────────────────
 // Parse the Limine memory map.  Register every USABLE region with the bump
 // allocator and compute max_hhdm_size.
@@ -180,29 +191,29 @@ void init_physical_allocator() {
 // Drains the freelist before touching the bump pointer.
 
 uint64_t alloc_phys_page() {
-    // 1. Check freelist first (recycled pages).
-    if (pmm_free_head) {
-        PhysFreeNode* node  = pmm_free_head;
-        pmm_free_head       = node->next;
-        pmm_free_count--;
-        uint64_t phys = (uint64_t)node - HHDM;
-        // Zero the recycled page so callers see clean memory.
-        uint8_t* va = (uint8_t*)node;
-        for (int i = 0; i < (int)PAGE_SIZE; i++) va[i] = 0;
+    uint64_t phys=0;
+    {
+        PmmGuard guard;
+        if (pmm_free_head) {
+            PhysFreeNode* node = pmm_free_head;
+            pmm_free_head = node->next;
+            pmm_free_count--;
+            phys = (uint64_t)node - HHDM;
+        } else {
+            while (pmm_cur_region < pmm_region_count) {
+                PMMRegion& r = pmm_regions[pmm_cur_region];
+                if (r.bump<=r.end && PAGE_SIZE<=r.end-r.bump) {
+                    phys=r.bump;r.bump+=PAGE_SIZE;break;
+                }
+                pmm_cur_region++;
+            }
+        }
+    }
+    if(phys){
+        auto* va=(uint8_t*)(HHDM+phys);
+        for(uint64_t i=0;i<PAGE_SIZE;++i)va[i]=0;
         return phys;
     }
-
-    // 2. Bump from the current region; advance to next region if exhausted.
-    while (pmm_cur_region < pmm_region_count) {
-        PMMRegion& r = pmm_regions[pmm_cur_region];
-        if (r.bump + PAGE_SIZE <= r.end) {
-            uint64_t addr = r.bump;
-            r.bump += PAGE_SIZE;
-            return addr;
-        }
-        pmm_cur_region++;
-    }
-
     print((char*)"PMM: OUT OF MEMORY!");
     hcf();
     return 0;   // unreachable
@@ -216,17 +227,24 @@ uint64_t alloc_phys_pages(uint64_t count) {
     if (count == 0) return 0;
     if (count == 1) return alloc_phys_page();
 
-    uint64_t size = count * PAGE_SIZE;
-    while (pmm_cur_region < pmm_region_count) {
-        PMMRegion& r = pmm_regions[pmm_cur_region];
-        if (r.bump + size <= r.end) {
-            uint64_t addr = r.bump;
-            r.bump += size;
-            uint8_t* va = (uint8_t*)(HHDM + addr);
-            for (uint64_t i = 0; i < size; i++) va[i] = 0;
-            return addr;
+    if(count>UINT64_MAX/PAGE_SIZE){print((char*)"PMM: invalid page count");hcf();return 0;}
+    uint64_t size = count * PAGE_SIZE,addr=0;
+    {
+        PmmGuard guard;
+        while (pmm_cur_region < pmm_region_count) {
+            PMMRegion& r = pmm_regions[pmm_cur_region];
+            if (r.bump<=r.end && size<=r.end-r.bump) {
+                addr = r.bump;
+                r.bump += size;
+                break;
+            }
+            pmm_cur_region++;
         }
-        pmm_cur_region++;
+    }
+    if(addr){
+        uint8_t* va=(uint8_t*)(HHDM+addr);
+        for(uint64_t i=0;i<size;++i)va[i]=0;
+        return addr;
     }
 
     print((char*)"PMM: OUT OF CONTIGUOUS MEMORY!");
@@ -241,6 +259,7 @@ uint64_t alloc_phys_pages(uint64_t count) {
 // time of the call (or the caller must have unmapped it first).
 
 void free_phys_page(uint64_t phys) {
+    PmmGuard guard;
     PhysFreeNode* node = (PhysFreeNode*)(HHDM + phys);
     node->next         = pmm_free_head;
     pmm_free_head      = node;
@@ -250,6 +269,7 @@ void free_phys_page(uint64_t phys) {
 // ── Memory Usage Helpers ─────────────────────────────────────────────────────
 
 static inline uint64_t get_free_ram_count() {
+    PmmGuard guard;
     uint64_t free = (uint64_t)pmm_free_count * PAGE_SIZE;
     for (int i = pmm_cur_region; i < pmm_region_count; i++) {
         free += (pmm_regions[i].end - pmm_regions[i].bump);

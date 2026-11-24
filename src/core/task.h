@@ -53,6 +53,7 @@ using pid_t = uint32_t;
 // 4 pages = 16 KiB.  Enough for several levels of nested kernel calls.
 
 #define TASK_DEFAULT_STACK_PAGES  4u
+static constexpr uint64_t TASK_STACK_CANARY=0x57595a415253544bULL;
 
 // ── Per-task kernel stack tracking for syscalls ──────────────────────────────
 extern uint64_t g_current_kstack_top;
@@ -232,6 +233,7 @@ static Task* task_create(void (*entry)(), uint32_t stack_pages = 0, const char* 
 
     // Zero the stack so uninitialised reads give predictable results.
     for (uint64_t i = 0; i < t->stack_size; i++) t->stack_base[i] = 0;
+    *(uint64_t*)t->stack_base=TASK_STACK_CANARY;
 
     task_setup_stack(t, entry);
 
@@ -240,6 +242,13 @@ static Task* task_create(void (*entry)(), uint32_t stack_pages = 0, const char* 
     to_str(t->pid, str); print(str);
 
     return t;
+}
+
+static void task_check_stack(Task* task) {
+    if(!task||!task->stack_base||!task->stack_size)return;
+    if(*(const uint64_t*)task->stack_base==TASK_STACK_CANARY)return;
+    print((char*)"[task] Kernel stack overflow:");print(task->executable);
+    char digits[32];to_str(task->pid,digits);print(digits);hcf();
 }
 
 // ── task_create_user ──────────────────────────────────────────────────────────

@@ -3,6 +3,8 @@
 #include "gpu_render_commands.h"
 #include "gpu_render_reset.h"
 #include "gpu_gen9_workarounds.h"
+#include "gpu_upload_cache.h"
+#include "gpu_alpha_coverage.h"
 
 // One kernel-owned logical RCS context. All allocations stay pinned until
 // reboot, so neither a delayed context save nor a late GPU write can hit freed
@@ -13,8 +15,23 @@ static unsigned g_render_tail=0;
 static uint32_t g_render_sequence=0;
 static uint32_t g_render_power_request=0;
 static bool g_render_ready=false,g_render_busy=false;
-static uint8_t* g_render_upload=nullptr;
-static uint64_t g_render_upload_capacity=0;
+static bool g_render_cached_sources=false;
+static bool g_render_source_cache_rejected=false;
+static unsigned g_render_ps_threads=16;
+static uint64_t g_render_timestamp_hz=0;
+static bool g_render_timestamp_ready=false;
+static GpuExecutionTiming g_render_timing_probe{};
+struct RenderUpload {
+    uint8_t* pixels=nullptr;
+    uint64_t capacity=0,last_used=0;
+    GpuUploadCache cache{};
+    GpuAlphaCoverage coverage{};
+    unsigned width=0,height=0,pitch=0;
+};
+static RenderUpload g_render_uploads[4]{};
+static unsigned g_render_upload_slot=0;
+static uint64_t g_render_upload_clock=0;
+static uint32_t render_source_address(unsigned slot){return 0x40000000u+slot*0x04000000u;}
 static uint64_t g_render_map_updates=0,g_render_map_reuses=0;
 static uint64_t g_render_draws=0;
 static GpuTextureDraw g_render_current_draw{};
@@ -28,6 +45,7 @@ static_assert(RENDER_SCRATCH_OFFSET+128*128*4<=GPU_RENDER_OWNED_BYTES);
 static constexpr uint32_t RENDER_BATCH_VA=0x100000;
 static constexpr uint32_t RENDER_MASTER_VA=0x2000000;
 static constexpr uint32_t RENDER_SOURCE_VA=0x10000000;
+static constexpr uint32_t RENDER_SCANOUT_VA[2]={0x20000000,0x24000000};
 
 static uint32_t render_read(uint32_t offset) {
     return *(volatile uint32_t*)(g_igpu.mmio_virt+offset);
@@ -110,13 +128,14 @@ static bool render_map(uint64_t address,const uint8_t* cpu,uint64_t bytes) {
             table=(uint64_t*)(HHDM+(table[index]&0x0000FFFFFFFFF000ULL));
         }
         // Gen8 PPGTT leaf: present + writable, PAT index zero. Surface
-        // accesses use the explicit UC MOCS entry programmed below.
+        // accesses use the explicit surface MOCS policies programmed below.
         table[(va>>12)&511]=physical|3;
         gpu_clflush_nofence(table+((va>>12)&511),8);
     }
     gpu_mfence();return true;
 }
 static bool render_stop(const char* reason,const char* code="RCSFAIL") {
+    gpu_direct_end();
     if(g_render_isolated_probe){
         // This probe writes only dedicated pinned RAM before the first display
         // flip. Leave the stalled context pinned and boot the CPU desktop.
@@ -124,14 +143,14 @@ static bool render_stop(const char* reason,const char* code="RCSFAIL") {
         g_gpu_ready=false;g_gpu_compose_ready=false;g_gpu_present_ready=false;
         g_gpu_render_hook=nullptr;g_gpu_compose_hook=nullptr;
         g_gpu_present_hook=nullptr;g_gpu_flip_hook=nullptr;
-        gpu_status_set("GPU:resize probe -> CPU");
-        print((char*)reason);print((char*)"GPU: isolated resize probe FAILED; CPU desktop selected");
+        gpu_status_set("GPU:offscreen probe -> CPU");
+        print((char*)reason);print((char*)"GPU: isolated offscreen probe FAILED; CPU desktop selected");
         return false;
     }
     if(g_render_ready && g_gpu_recovery_buffer){
         // Desktop RCS runs after all BCS submissions retire and before a new
-        // flip is armed. Its only write target for client draws is the old
-        // master. Leave that target, its sources and the context pinned.
+        // flip is armed. The target is either the old master or a hidden
+        // scanout. Leave that target, its sources and the context pinned.
         // CPU presentation can keep using the currently latched framebuffer.
 #if GPU_TRACE
         g_gpu_trace_failure=code;
@@ -226,6 +245,15 @@ static bool render_program_context() {
     render_write(0xC800,9);
     render_write(0xB020,(render_read(0xB020)&0xFFFF0000u)|0x10);
     if(render_read(0xC800)!=9 || (render_read(0xB020)&0xFFFF)!=0x10)return false;
+    // Read-only texture cache policy, separate from the UC render destination.
+    // Match skl_mocs_table's LLC/eLLC WB + LRU3 and L3 WB, without skip caching.
+    // https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/gt/intel_mocs.c.html
+    // MOCS index one occupies the upper half of the packed L3 register.
+    if(GPU_RCS_ALPHA&&!g_render_source_cache_rejected){
+        render_write(0xC804,0x3B);
+        render_write(0xB020,(render_read(0xB020)&0xFFFFu)|0x00300000u);
+        g_render_cached_sources=render_read(0xC804)==0x3B&&(render_read(0xB020)>>16)==0x30;
+    }else g_render_cached_sources=false;
     // Gen9 hardware uses MOCS[63] for L3 evictions, independently of the
     // surface's MOCS index. Match i915 skl_mocs_table[63]: LLC WB, LRU=3,
     // L3 UC. Preserve entry 62 in the shared packed L3 register.
@@ -243,7 +271,7 @@ static bool render_program_context() {
     render_write(0x209C,0x01000000);
     return (render_read(0x229C)&0x8000)!=0;
 }
-static bool render_submit(bool texture) {
+static bool render_submit(bool texture,bool timing_probe=false) {
     gpu_trace_stage("RING");
     if(g_render_busy || !g_render_storage)return false;
     g_render_busy=true;
@@ -261,10 +289,18 @@ static bool render_submit(bool texture) {
         return render_stop("GPU: RCS ring did not retire to the submitted tail","HEAD");
     }
     auto* fence=(volatile uint32_t*)(g_render_storage+RENDER_FENCE_OFFSET);
+    bool timed=g_render_timestamp_hz&&(timing_probe||
+        (g_gpu_timeline.begin&&g_gpu_timeline.measure&&g_render_timestamp_ready));
+    if(timed){
+        uint32_t sentinel=render_read(0x2358)-(uint32_t)g_render_timestamp_hz;
+        for(unsigned i=16;i<32;++i)fence[i]=sentinel;
+        gpu_clflush_nofence(fence+16,64);gpu_mfence();
+    }
     uint32_t sequence=++g_render_sequence;
     unsigned start=g_render_tail;
     if(!gpu_render_packet(ring,start,(uint32_t)g_gpu_render_gfx+RENDER_FENCE_OFFSET,
-                          sequence,texture,&g_render_tail,g_render_tlb_dirty,RENDER_BATCH_VA))
+                          sequence,texture,&g_render_tail,g_render_tlb_dirty,RENDER_BATCH_VA,
+                          timed?(uint32_t)g_gpu_render_gfx+RENDER_FENCE_OFFSET+64:0))
         return render_stop("GPU: invalid RCS ring packet","PACKET");
     gpu_clflush_nofence(ring+start/4,GPU_RENDER_PACKET_BYTES);
     if(start==GPU_RENDER_RING_BYTES-GPU_RENDER_PACKET_BYTES)
@@ -280,12 +316,20 @@ static bool render_submit(bool texture) {
     // i915's RCS descriptor. Force-restore on every reuse bypasses the normal
     // idle/lite restore path; the updated context image supplies the new tail.
     uint64_t descriptor=g_gpu_render_gfx|GPU_RENDER_CONTEXT_FLAGS;
+    bool trace_alpha=g_rain_trace.update && texture && g_render_current_draw.blend;
     gpu_trace_stage("SUBMIT");
+    gpu_timeline_submit(gpu_tsc());
+    uint32_t submitted=0;uint64_t timing_cpu_first=0;
     {
         TtyIrqGuard guard;
         // ELSP is a write-only four-dword submission port. Do not post reads
         // from it between descriptor words; post via EXECLIST_STATUS instead.
         auto* elsp=(volatile uint32_t*)(g_igpu.mmio_virt+0x2230);
+        if(trace_alpha){
+            if(!g_rain_trace.alpha_draws)g_rain_trace.alpha_submit=gpu_tsc();
+            ++g_rain_trace.alpha_draws;
+        }
+        if(timed){timing_cpu_first=gpu_tsc();submitted=render_read(0x2358);}
         *elsp=0;*elsp=0;*elsp=1;*elsp=(uint32_t)descriptor;
         (void)render_read(0x2234);
     }
@@ -314,8 +358,18 @@ static bool render_submit(bool texture) {
             fenced=(*fence==sequence);
         }
         if(fenced && retired){
+            gpu_timeline_ready(gpu_tsc());
             if(fence[2]!=sequence||fence[4]!=sequence||fence[5]!=sequence||fence[6]!=sequence||fence[8]!=sequence)
                 return render_stop("GPU: RCS command checkpoint mismatch","BADSTAMP");
+            if(trace_alpha)g_rain_trace.alpha_done=gpu_tsc();
+            if(timed){
+                uint32_t observed=render_read(0x2358);uint64_t cpu_last=gpu_tsc();
+                gpu_clflush_nofence(fence+16,64);gpu_mfence();
+                uint32_t stamps[5];for(unsigned i=0;i<5;++i)stamps[i]=fence[16+i];
+                auto& result=timing_probe?g_render_timing_probe:g_gpu_timeline.rcs_gpu;
+                gpu_execution_record(result,g_render_timestamp_hz,submitted,stamps,observed,
+                    cpu_last-timing_cpu_first,tsc_hz);
+            }
             g_render_tlb_dirty=false;g_render_busy=false;return true;
         }
         // Always sample completion after waking, even if scheduling delayed
@@ -325,7 +379,7 @@ static bool render_submit(bool texture) {
         // yields the compositor CPU while preserving both retirement checks.
         if(g_render_ready && !g_render_isolated_probe &&
            gpu_tsc()-started>spin && (wait_flags&(1u<<9)) && g_current_task)
-            task_sleep_ms(1);
+            gpu_perf_sleep_one(g_gpu_perf.rcs_sleep,tsc_hz,[](uint64_t ms){task_sleep_ms(ms);});
         else __asm__ volatile("pause");
     }
     const char* missing=fenced?"NOEXIT":retired?"NOFENCE":
@@ -387,14 +441,24 @@ static bool render_submit(bool texture) {
     gpu_log_hex("GPU RCS clip right/bottom:",((uint64_t)(uint32_t)draw.clip.x2<<32)|(uint32_t)draw.clip.y2);
     return result;
 }
-static bool render_texture(const GpuTextureDraw& draw,bool solid_probe=false) {
-    g_render_current_draw=draw;
+static bool render_texture(const GpuTextureDraw& draw,bool solid_probe=false,
+                           const GpuRenderRect* rects=nullptr,unsigned count=1) {
+    GpuPerfTimer timer(g_gpu_perf.rcs_wait);++g_gpu_perf.rcs_draws;
+    auto submitted=draw;
+    submitted.cache_source=g_render_cached_sources;
+    submitted.threads=g_render_ps_threads;
+    g_render_current_draw=submitted;
     auto* batch=(uint32_t*)(g_render_storage+RENDER_BATCH_OFFSET);
     // The page stays pinned at the address installed during initialization.
     // Its contents can change after retirement without changing its PTE.
-    if(!gpu_build_texture_batch(batch,RENDER_BATCH_VA,draw,solid_probe))return false;
+    if(!gpu_build_texture_batch(batch,RENDER_BATCH_VA,submitted,solid_probe,rects,count))return false;
     gpu_clflush_nofence(batch,4096);gpu_mfence();
     if(!render_submit(true))return false;
+#if GPU_WORKLOAD
+    if(g_gpu_timeline.begin){
+        gpu_workload_render(g_gpu_timeline.workload,rects?rects:&draw.clip,count,draw.blend);
+    }
+#endif
     ++g_render_draws;return true;
 }
 static bool render_staged_texture(const GpuTextureDraw& draw,uint64_t destination_gfx,bool solid=false) {
@@ -412,21 +476,36 @@ static bool render_staged_texture(const GpuTextureDraw& draw,uint64_t destinatio
         return render_stop("GPU: staged render copy failed","TILECOPY");
     return true;
 }
-static bool render_upload_source(const void* source,uint64_t bytes) {
+static bool render_upload_source(const void* source,uint64_t bytes,uint64_t revision=0) {
+    GpuPerfTimer timer(g_gpu_perf.upload_ticks);
     if(!source||!bytes||bytes>GPU_SOURCE_BYTES)
         return render_stop("GPU: invalid RCS upload size","SIZE");
-    if(bytes>g_render_upload_capacity){
+    unsigned slot=0;
+    for(unsigned i=0;i<4;++i){
+        if(g_render_uploads[i].cache.source==source){slot=i;break;}
+        if(g_render_uploads[i].last_used<g_render_uploads[slot].last_used)slot=i;
+    }
+    g_render_upload_slot=slot;
+    auto& upload=g_render_uploads[slot];
+    upload.last_used=++g_render_upload_clock;
+    if(upload.cache.matches(source,bytes,revision,g_gpu_surface_epoch)){
+        ++g_gpu_perf.upload_reuses;return true;
+    }
+    if(bytes>upload.capacity){
         uint64_t capacity=1024*1024;
         while(capacity<bytes)capacity*=2;
-        auto* upload=gpu_alloc_aligned(capacity);
-        if(!upload||!render_map(RENDER_SOURCE_VA,upload,capacity))
+        auto* pixels=gpu_alloc_aligned(capacity);
+        if(!pixels||!render_map(render_source_address(slot),pixels,capacity))
             return render_stop("GPU: RCS upload allocation/mapping failed","UPLOAD");
         // Old allocations remain pinned, as with the private context itself.
-        g_render_upload=upload;g_render_upload_capacity=capacity;
+        upload.pixels=pixels;upload.capacity=capacity;
         ++g_render_map_updates;
     }else ++g_render_map_reuses;
-    memcpy(g_render_upload,source,bytes);
-    gpu_clflush_nofence(g_render_upload,bytes);gpu_mfence();
+    memcpy(upload.pixels,source,bytes);
+    upload.width=0;
+    gpu_clflush_nofence(upload.pixels,bytes);gpu_mfence();
+    upload.cache.record(source,bytes,revision,g_gpu_surface_epoch);
+    ++g_gpu_perf.uploads;g_gpu_perf.upload_bytes+=bytes;
     return true;
 }
 
@@ -441,33 +520,84 @@ static bool gpu_render_scene(const GpuScenePlan& plan) {
         gpu_trace_stage("MAP");
         uint64_t bytes=(uint64_t)c.pitch*c.height;
         if(uploaded_source!=copy.source){
-            if(!render_upload_source(c.pixels,bytes))return false;
+            if(!render_upload_source(c.pixels,bytes,c.revision))return false;
             uploaded_source=copy.source;
         }
-        // Explicit ownership handoff for RCS's UC surfaces. The BCS coherent
-        // sharing probe alone does not establish RCS/CPU cache coherence.
-        // Explicit pixel handoffs during sustained-stability investigation.
-        // Keep rectangle-sized flushing and the retained partial scene path.
-        gpu_trace_stage("FLUSH");
-        for(int y=copy.destination.y1;y<copy.destination.y2;++y)
-            gpu_clflush_nofence(g_master_backbuffer+(uint64_t)y*fb->pitch+copy.destination.x1*4,
-                               (copy.destination.x2-copy.destination.x1)*4);
-        gpu_mfence();
-        GpuTextureDraw draw{{RENDER_SOURCE_VA,c.width,c.height,c.pitch},
-            {RENDER_MASTER_VA,(uint32_t)fb->width,(uint32_t)fb->height,(uint32_t)fb->pitch},
+        auto& upload=g_render_uploads[g_render_upload_slot];
+        GpuTextureDraw draw{{render_source_address(g_render_upload_slot),c.width,c.height,c.pitch},
+            {g_gpu_direct_back<0?RENDER_MASTER_VA:RENDER_SCANOUT_VA[g_gpu_direct_back],
+             (uint32_t)fb->width,(uint32_t)fb->height,(uint32_t)fb->pitch},
             {c.client.x1,c.client.y1,c.client.x2,c.client.y2},
-            {copy.destination.x1,copy.destination.y1,copy.destination.x2,copy.destination.y2},false};
+            {copy.destination.x1,copy.destination.y1,copy.destination.x2,copy.destination.y2},c.premultiplied};
+        if(!gpu_texture_draw_valid(draw))return render_stop("GPU: invalid RCS draw","DRAW");
+        GpuRenderRect rects[GPU_RENDER_MAX_RECTS]{draw.clip};
+        unsigned count=1;
+        if(!draw.blend){
+            // Occlusion splits one scaled client into disjoint rectangles.
+            // Keep their sampling coordinates, but retire one draw for the
+            // group instead of scheduling the same context for each piece.
+            while(i+1<plan.count && count<GPU_RENDER_MAX_RECTS &&
+                  plan.copies[i+1].source==copy.source){
+                const auto& r=plan.copies[++i].destination;
+                rects[count++]={r.x1,r.y1,r.x2,r.y2};
+                if(r.x1<draw.clip.x1)draw.clip.x1=r.x1;
+                if(r.y1<draw.clip.y1)draw.clip.y1=r.y1;
+                if(r.x2>draw.clip.x2)draw.clip.x2=r.x2;
+                if(r.y2>draw.clip.y2)draw.clip.y2=r.y2;
+            }
+        }
+        if(draw.blend){
+            if(upload.width!=c.width||upload.height!=c.height||upload.pitch!=c.pitch){
+                GpuPerfTimer timer(g_gpu_perf.upload_ticks);
+                upload.coverage.scan(upload.pixels,c.width,c.height,c.pitch);
+                upload.width=c.width;upload.height=c.height;upload.pitch=c.pitch;
+            }
+            count=upload.coverage.clips(draw,rects,GPU_ALPHA_MERGE);
+            uint64_t area=(uint64_t)(draw.clip.x2-draw.clip.x1)*(draw.clip.y2-draw.clip.y1);
+            while(i+1<plan.count && plan.copies[i+1].source==copy.source){
+                const auto& r=plan.copies[i+1].destination;
+                GpuTextureDraw next=draw;next.clip={r.x1,r.y1,r.x2,r.y2};
+                if(!gpu_texture_draw_valid(next))return render_stop("GPU: invalid RCS alpha fragment","DRAW");
+                if(!upload.coverage.append_clips(next,rects,count,GPU_ALPHA_MERGE))break;
+                ++i;
+                area+=(uint64_t)(r.x2-r.x1)*(r.y2-r.y1);
+                if(r.x1<draw.clip.x1)draw.clip.x1=r.x1;
+                if(r.y1<draw.clip.y1)draw.clip.y1=r.y1;
+                if(r.x2>draw.clip.x2)draw.clip.x2=r.x2;
+                if(r.y2>draw.clip.y2)draw.clip.y2=r.y2;
+            }
+            uint64_t pixels=0;
+            for(unsigned j=0;j<count;++j)
+                pixels+=(uint64_t)(rects[j].x2-rects[j].x1)*(rects[j].y2-rects[j].y1);
+            g_gpu_perf.rcs_alpha_pixels+=pixels;
+            g_gpu_perf.rcs_alpha_skipped+=area-pixels;
+            if(!count)continue;
+        }
+        // Give the UC render target ownership only of the lines touched by
+        // the submitted geometry, including cache-line rounding at the edges.
+        auto handoff=[&](){
+            GpuPerfTimer timer(g_gpu_perf.handoff_ticks);
+            // Direct targets have a single WC CPU mapping and explicit UC
+            // GPU surface policy. They cannot hold dirty CPU cache lines.
+            // The hidden-scanout boot readback checks this ownership sequence.
+            // Keep the full cache handoff for the WB retained master.
+            for(unsigned j=0;g_gpu_direct_back<0 && j<count;++j){
+                const auto& r=rects[j];
+                for(int y=r.y1;y<r.y2;++y)
+                    gpu_clflush_nofence(g_master_backbuffer+(uint64_t)y*fb->pitch+r.x1*4,(r.x2-r.x1)*4);
+            }
+            gpu_mfence();
+        };
+        gpu_trace_stage("FLUSH");
+        handoff();
         gpu_trace_stage("BATCH");
         // Render the clipped region directly into the pinned master buffer.
         // Retirement still precedes CPU overlays and presentation. This
         // removes per-tile context submissions and scratch-to-master copies.
-        if(!render_texture(draw))
+        if(!render_texture(draw,false,rects,count))
             return g_render_ready?render_stop("GPU: RCS texture draw failed","DRAW"):false;
         gpu_trace_stage("READBACK");
-        for(int y=copy.destination.y1;y<copy.destination.y2;++y)
-            gpu_clflush_nofence(g_master_backbuffer+(uint64_t)y*fb->pitch+copy.destination.x1*4,
-                               (copy.destination.x2-copy.destination.x1)*4);
-        gpu_mfence();
+        handoff();
     }
     return true;
 }
@@ -564,6 +694,149 @@ static bool render_resize_probe() {
     return true;
 }
 
+static bool render_source_cache_probe(uint32_t* source,uint32_t* destination){
+    if(!g_render_cached_sources)return true;
+    // Reuse the same source address with new premultiplied pixels. This tests
+    // texture invalidation as well as sampling, scaling and source-over.
+    for(unsigned frame=0;frame<8;++frame){
+        for(unsigned y=0;y<16;++y)for(unsigned x=0;x<16;++x){
+            unsigned alpha=(x+frame)%3==0?0:(x+frame)%3==1?128:255;
+            unsigned red=((x*17+frame*13)&255)*alpha/255;
+            unsigned green=((y*11+frame*7)&255)*alpha/255;
+            source[y*16+x]=(alpha<<24)|(red<<16)|(green<<8)|(alpha/2);
+        }
+        uint32_t background=0xff204060+frame*0x010203;
+        for(unsigned i=0;i<32*32;++i)destination[i]=background;
+        gpu_clflush_nofence(source,4096);gpu_clflush_nofence(destination,4096);gpu_mfence();
+        auto draw=gpu_render_probe_draw(2,RENDER_SOURCE_VA,RENDER_MASTER_VA);
+        if(frame&1){draw.client={2,2,34,34};draw.clip={3,3,31,31};} // exact 2x scaling
+        if(!render_texture(draw))return false;
+        gpu_clflush_nofence(destination,4096);gpu_mfence();
+        for(unsigned y=0;y<32;++y)for(unsigned x=0;x<32;++x){
+            uint32_t expected=background;
+            if(x>=(unsigned)draw.clip.x1&&x<(unsigned)draw.clip.x2&&
+               y>=(unsigned)draw.clip.y1&&y<(unsigned)draw.clip.y2){
+                unsigned width=draw.client.x2-draw.client.x1,height=draw.client.y2-draw.client.y1;
+                unsigned sx=(2*(x-draw.client.x1)+1)*16/(2*width);
+                unsigned sy=(2*(y-draw.client.y1)+1)*16/(2*height);
+                expected=window_source_over(source[sy*16+sx],background);
+            }
+            if(((volatile uint32_t*)destination)[y*32+x]!=expected){
+                g_render_cached_sources=false;g_render_source_cache_rejected=true;
+                print((char*)"GPU: RCS cached source readback mismatch; UC sampling selected");
+                return true; // Ordinary UC readback tests still must pass.
+            }
+        }
+    }
+    print((char*)"GPU: RCS cached texture source readback PASSED (8 updates)");
+    return true;
+}
+static bool render_dispatch_probe(uint32_t* source){
+    if(!GPU_RCS_ALPHA||!tsc_hz)return true;
+    unsigned width=fb->width<1920?fb->width:1920;
+    unsigned height=fb->height<1080?fb->height:1080;
+    if(width<64||height<64)return true;
+    unsigned pitch=(width*4+63)&~63u;
+    uint64_t bytes=(uint64_t)pitch*height;
+    auto* destination=(uint32_t*)gpu_alloc_aligned(bytes);
+    if(!destination){
+        print((char*)"GPU: dispatch probe allocation unavailable; retaining 16 threads");
+        return true;
+    }
+    if(!render_map(RENDER_MASTER_VA,(uint8_t*)destination,bytes))
+        return render_stop("GPU: dispatch probe mapping failed","DISPATCH");
+    GpuTextureDraw draw{{RENDER_SOURCE_VA,16,16,64},{RENDER_MASTER_VA,width,height,pitch},
+        {0,0,(int)width,(int)height},{2,2,(int)width-2,(int)height-2},true};
+    const unsigned choices[]={16,32,63,16};
+    unsigned selected=16;uint64_t times[3]{};bool higher_rejected=false;
+    auto report=[&](unsigned threads,uint64_t average,bool verified){
+        char line[192];char* end=line;
+        auto text=[&](const char* value){while(*value&&end<line+sizeof(line)-1)*end++=*value++;};
+        auto number=[&](uint64_t value){char digits[24];to_str(value,digits);text(digits);};
+        text("GPU dispatch: threads=");number(threads);
+        text(" averageUs=");number(average*1000000/tsc_hz);
+        text(" verified=");number(verified);
+        text(" width=");number(width);text(" height=");number(height);
+        *end=0;print(line);
+    };
+    for(unsigned profile=0;profile<4;++profile){
+        unsigned choice=choices[profile];
+        g_render_ps_threads=choice;
+        uint64_t total=0;bool verified=true;
+        // Warm the pipeline once, then measure three completed submissions.
+        // CPU filling/flush/readback is outside the measured draw interval.
+        for(unsigned repeat=0;repeat<4;++repeat){
+            uint32_t foreground=0x80201008u+repeat*0x00010301u;
+            uint32_t background=0xff204060u;
+            for(unsigned i=0;i<256;++i)source[i]=foreground;
+            for(uint64_t i=0;i<bytes/4;++i)destination[i]=background;
+            gpu_clflush_nofence(source,4096);gpu_clflush_nofence(destination,bytes);gpu_mfence();
+            uint64_t started=gpu_tsc();
+            if(!render_texture(draw))return false; // Preserve timeout/retirement fallback.
+            uint64_t elapsed=gpu_tsc()-started;
+            if(repeat)total+=elapsed;
+            gpu_clflush_nofence(destination,bytes);gpu_mfence();
+            uint32_t blended=window_source_over(foreground,background);
+            for(unsigned y=0;y<height&&verified;++y)for(unsigned x=0;x<pitch/4;++x){
+                bool inside=x>=2&&x<width-2&&y>=2&&y<height-2;
+                if(((volatile uint32_t*)destination)[(uint64_t)y*(pitch/4)+x]!=(inside?blended:background)){
+                    verified=false;break;
+                }
+            }
+            if(!verified)break;
+        }
+        uint64_t average=verified?total/3:0;
+        report(choice,average,verified);
+        if(!verified){
+            g_render_ps_threads=selected;
+            if(choice==16)return render_stop("GPU: conservative dispatch readback failed","DISPATCH");
+            higher_rejected=true;
+            print((char*)"GPU: higher dispatch readback rejected; retaining verified limit");
+            break;
+        }
+        if(profile<3)times[profile]=average;
+        else if(average<times[0])times[0]=average;
+    }
+    // Recheck the baseline after the sweep so clock warmup alone cannot make
+    // a higher limit appear faster. Compare against the better baseline run.
+    uint64_t best=times[0];
+    if(!higher_rejected)for(unsigned profile=1;profile<3;++profile)
+        if(gpu_render_dispatch_faster(best,times[profile])){selected=choices[profile];best=times[profile];}
+    g_render_ps_threads=selected;
+    print((char*)"GPU: selected RCS pixel-shader threads:");
+    char count[24];to_str(selected,count);print(count);
+    return true;
+}
+static bool render_timestamp_probe(){
+    if(!GPU_RCS_ALPHA)return true;
+    g_bcs_timestamp_hz=gpu_calibrate_timestamp_clock(GPU_BCS_BASE);
+    g_render_timestamp_hz=gpu_calibrate_timestamp_clock(0x2000);
+    // These batches write only the already pinned fence pages. Unknown clock
+    // behavior disables timing; a command timeout uses isolated CPU fallback.
+    g_render_isolated_probe=true;
+    bool ok=true;
+    if(g_bcs_timestamp_hz){
+        g_bcs_timing_probe={};
+        if(!gpu_scene_timing_begin(true)||!gpu_scene_submit()){
+            render_stop("GPU: BCS timestamp probe failed","TIMING");ok=false;
+        }else g_bcs_timestamp_ready=g_bcs_timing_probe.samples==1&&!g_bcs_timing_probe.invalid;
+    }
+    if(ok&&g_render_timestamp_hz){
+        g_render_timing_probe={};
+        ok=render_submit(false,true);
+        if(ok)g_render_timestamp_ready=g_render_timing_probe.samples==1&&!g_render_timing_probe.invalid;
+    }
+    g_render_isolated_probe=false;
+    if(!ok)return false;
+    char line[192];char* end=line;
+    auto text=[&](const char* value){while(*value&&end<line+sizeof(line)-1)*end++=*value++;};
+    auto number=[&](uint64_t value){char digits[24];to_str(value,digits);text(digits);};
+    text("GPU timestamp clocks: bcsHz=");number(g_bcs_timestamp_hz);
+    text(" bcsVerified=");number(g_bcs_timestamp_ready);
+    text(" rcsHz=");number(g_render_timestamp_hz);
+    text(" rcsVerified=");number(g_render_timestamp_ready);*end=0;print(line);
+    return true;
+}
 static bool gpu_render_initialize() {
     if(!GPU_RENDER || !g_gpu_render_gfx ||
        (uint64_t)fb->pitch*fb->height>RENDER_SOURCE_VA-RENDER_MASTER_VA)return false;
@@ -612,8 +885,8 @@ static bool gpu_render_initialize() {
        !render_map(RENDER_MASTER_VA,g_master_backbuffer,(uint64_t)fb->pitch*fb->height))
         return render_stop("GPU: RCS page table setup failed");
     gpu_clflush_nofence(g_render_storage,GPU_RENDER_OWNED_BYTES);gpu_mfence();
-    // Explicit UC cache policy for this private render context. Preserve the
-    // adjacent L3 MOCS entry and leave the blitter/display cache policy alone.
+    // Explicit UC destination policy plus an optional read-only texture cache
+    // entry. Leave the blitter/display cache policy alone.
     if(!render_program_context())return render_stop("GPU: RCS context programming failed");
     gpu_log_hex("GPU RCS initial L3 allocation:",render_read(0x7034));
     if(!render_submit(false))return false;
@@ -629,24 +902,44 @@ static bool gpu_render_initialize() {
     if(!source||!destination||!render_map(RENDER_SOURCE_VA,(uint8_t*)source,4096)||
        !render_map(RENDER_MASTER_VA,(uint8_t*)destination,4096))
         return render_stop("GPU: RCS readback allocation failed");
-    for(unsigned test=0;test<3;++test){
+    if(!render_source_cache_probe(source,destination))return false;
+    if(GPU_RCS_ALPHA){
+        g_render_isolated_probe=true;
+        bool dispatch_ok=render_dispatch_probe(source);
+        g_render_isolated_probe=false;
+        if(!dispatch_ok)return false;
+        // Restore the small fixture after calibration, then run all normal
+        // pixel/alpha/scanout tests at the chosen limit.
+        if(!render_map(RENDER_MASTER_VA,(uint8_t*)destination,4096))
+            return render_stop("GPU: dispatch probe restore failed","DISPATCH");
+    }
+    for(unsigned test=0;test<(GPU_RCS_ALPHA?4u:3u);++test){
         for(unsigned y=0;y<16;++y)for(unsigned x=0;x<16;++x)
-            source[y*16+x]=test==2?0x80402010u:0xFF000000u|(x*13u<<16)|(y*11u<<8)|((x+y)*7u);
+            source[y*16+x]=test==3?(x>=2&&x<(y<8?10u:8u)?0:0x80402010u):
+                test==2?0x80402010u:0xFF000000u|(x*13u<<16)|(y*11u<<8)|((x+y)*7u);
         for(unsigned i=0;i<32*32;++i)destination[i]=0xFF204060;
         gpu_clflush_nofence(source,4096);gpu_clflush_nofence(destination,4096);gpu_mfence();
         // 1:1 copy and exact 2x enlargement sample texel centers or quarter
         // positions. Fractional 16-to-12 scaling put samples exactly on texel
         // boundaries, where interpolation roundoff can legitimately pick either
         // neighbor. Keep exact comparisons, using unambiguous sample positions.
-        GpuTextureDraw draw=gpu_render_probe_draw(test,RENDER_SOURCE_VA,RENDER_MASTER_VA);
-        if(!render_texture(draw))return false;
+        GpuTextureDraw draw=gpu_render_probe_draw(test==3?2:test,RENDER_SOURCE_VA,RENDER_MASTER_VA);
+        if(test==3){
+            GpuAlphaCoverage coverage;
+            coverage.scan(reinterpret_cast<const uint8_t*>(source),16,16,64);
+            GpuRenderRect rects[GPU_RENDER_MAX_RECTS];
+            unsigned count=coverage.clips(draw,rects);
+            if(count<2)return render_stop("GPU: RCS alpha coverage probe missing bands");
+            if(!render_texture(draw,false,rects,count))return false;
+        }else if(!render_texture(draw))return false;
         gpu_clflush_nofence(destination,4096);gpu_mfence();
         for(unsigned y=0;y<32;++y)for(unsigned x=0;x<32;++x){
             uint32_t expected=0xFF204060;
             if(x>=3&&y>=3&&x<(unsigned)draw.clip.x2&&y<(unsigned)draw.clip.y2){
                 unsigned sx=(2*(x-2)+1)*draw.source.width/32;
                 unsigned sy=(2*(y-2)+1)*draw.source.height/32;
-                expected=test==2?0xFF504040u:source[sy*16+sx];
+                if(test>=2)expected=source[sy*16+sx]?0xFF504040u:0xFF204060u;
+                else expected=source[sy*16+sx];
             }
             uint32_t actual=((volatile uint32_t*)destination)[y*32+x];
             if(actual!=expected){
@@ -672,8 +965,51 @@ static bool gpu_render_initialize() {
     print((char*)"GPU: Gen9 RCS hang workarounds enabled; explicit pixel handoffs");
     if(!render_map(RENDER_MASTER_VA,g_master_backbuffer,(uint64_t)fb->pitch*fb->height))
         return render_stop("GPU: RCS desktop mapping failed");
+    // Both scanouts are still hidden. Check the actual desktop pitch, the
+    // BCS -> RCS -> CPU ownership sequence and independent PPGTT bindings.
+    uint64_t scanout_bytes=(uint64_t)fb->pitch*fb->height;
+    if(GPU_RCS_ALPHA && g_gpu_present_ready && fb->width>=32 && fb->height>=32 &&
+       scanout_bytes<=RENDER_SCANOUT_VA[1]-RENDER_SCANOUT_VA[0]){
+        for(unsigned i=0;i<256;++i)source[i]=0x80402010u;
+        gpu_clflush_nofence(source,1024);gpu_mfence();
+        bool matches=render_map(RENDER_SOURCE_VA,(uint8_t*)source,4096);
+        for(unsigned i=0;i<2 && matches;++i){
+            matches=render_map(RENDER_SCANOUT_VA[i],g_gpu_scanout_cpu[i],scanout_bytes);
+            if(!matches)break;
+            uint32_t background=i?0xff204020:0xff204060;
+            if(!gpu_emit_fill(&g_gpu,g_gpu_scanout_gfx[i],fb->pitch,0,0,32,32,0xff000000) ||
+               !gpu_scene_submit())return gpu_scene_abort("GPU: hidden scanout fill probe failed");
+            // RCS must observe these WC CPU stores without CLFLUSH, including
+            // destination reads for blending. Readback then checks RCS -> CPU.
+            for(unsigned y=0;y<32;++y){
+                auto* row=(volatile uint32_t*)(g_gpu_scanout_cpu[i]+y*fb->pitch);
+                for(unsigned x=0;x<32;++x)row[x]=background;
+            }
+            gpu_mfence();
+            auto draw=gpu_render_probe_draw(2,RENDER_SOURCE_VA,RENDER_SCANOUT_VA[i]);
+            draw.destination={(uint64_t)RENDER_SCANOUT_VA[i],(uint32_t)fb->width,
+                              (uint32_t)fb->height,(uint32_t)fb->pitch};
+            if(!render_texture(draw))return false;
+            for(unsigned j=0;j<=i;++j)for(unsigned y=0;y<32;++y){
+                auto* row=(volatile uint32_t*)(g_gpu_scanout_cpu[j]+y*fb->pitch);
+                for(unsigned x=0;x<32;++x){
+                    bool inside=x>=3 && x<17 && y>=3 && y<17;
+                    uint32_t expected=inside?(j?0xff504020:0xff504040):(j?0xff204020:0xff204060);
+                    if(row[x]!=expected)matches=false;
+                }
+            }
+        }
+        g_gpu_direct_verified=matches;
+        print((char*)(matches?"GPU: direct scanout BCS/RCS readback PASSED":
+                              "GPU: direct scanout readback unavailable; using master copy"));
+    }
+    if(!render_timestamp_probe())return false;
     g_render_ready=true;
     print((char*)"GPU: RCS textured copy, scaling and premultiplied alpha readback PASSED");
+    if(GPU_RCS_ALPHA)print((char*)"GPU: RCS interior alpha gap readback PASSED");
+    if(GPU_RCS_ALPHA)print((char*)(g_render_cached_sources?
+        "GPU: RCS texture sampling selected L3+LLC WB; destination UC":
+        "GPU: RCS texture sampling selected UC; destination UC"));
     gpu_status_set(g_gpu_present_ready?"GPU:rainbow+RCS flip UC":"GPU:rainbow+RCS LLC");
     return true;
 }

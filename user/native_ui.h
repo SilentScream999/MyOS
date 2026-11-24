@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include "src/fs/fileinfo.h"
 #include "src/gui/ui_font.h"
+#include "src/gui/window_alpha.h"
 
 struct NativeEvent { uint32_t type; int32_t x, y; uint32_t key, mods; int32_t delta; };
 #ifndef NATIVE_HOST_TEST
@@ -24,6 +25,9 @@ extern "C" void* memset(void* dst, int value, unsigned long n) {
 #else
 static uint64_t native_call(uint64_t, uint64_t=0, uint64_t=0, uint64_t=0, uint64_t=0, uint64_t=0);
 #endif
+static bool native_window_alpha(uint64_t window,uint32_t mode) {
+    return (int64_t)native_call(223,window,mode)==0;
+}
 static uint64_t sys_open(const char* p,uint64_t f) { return native_call(2,(uint64_t)p,f); }
 static void sys_close(uint64_t f) { native_call(3,f); }
 static uint64_t sys_read(uint64_t f,char* b,uint64_t n) { return native_call(0,f,(uint64_t)b,n); }

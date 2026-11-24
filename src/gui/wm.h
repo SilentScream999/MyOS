@@ -12,7 +12,14 @@
 #include "surface.h"
 #include "visibility.h"
 #include "gpu_compositor.h"
+#include "gpu_deferred_alpha.h"
+#include "gpu_occlusion_metrics.h"
+#include "window_alpha.h"
+#include "alpha_renderer.h"
+#include "window_shadow.h"
+#include "title_bar.h"
 #include "gpu_presentation.h"
+#include "../core/frame_gap_trace.h"
 
 #include "font8x8_basic.h"
 #include "ui_font.h"
@@ -32,6 +39,7 @@ void image_deallocate(void* pointer) { kfree(pointer); }
 
 static resources::Catalog g_empty_catalog{};
 static resources::Catalog* g_resources_catalog = &g_empty_catalog;
+static uint64_t g_decoration_epoch=1;
 static volatile bool g_resources_requested = true;
 static volatile bool g_resources_refresh = true;
 static uint64_t g_resource_demand_generation = 0;
@@ -43,8 +51,19 @@ struct ResourceRead {
     ~ResourceRead() { __atomic_sub_fetch(&g_resource_readers, 1u, __ATOMIC_RELEASE); }
 };
 static inline uint64_t rdtsc_val();
+extern uint64_t tsc_hz;
+static bool g_resource_cooperative=false;
+static uint64_t g_resource_slice_started=0;
+static void wm_resource_checkpoint(){
+    if(!g_resource_cooperative || !tsc_hz)return;
+    uint64_t now=rdtsc_val();
+    if(now-g_resource_slice_started<tsc_hz/2000)return;
+    task_sleep_ms(1);
+    g_resource_slice_started=rdtsc_val();
+}
 
 static uint8_t* wm_resource_read(const char* path, uint64_t limit, uint64_t* size) {
+    wm_resource_checkpoint();
     file f{}; *size=0;
     if (vfs_open(path,0,&f)!=0) return nullptr;
     uint64_t count=f.vn->size;
@@ -54,6 +73,7 @@ static uint8_t* wm_resource_read(const char* path, uint64_t limit, uint64_t* siz
         uint64_t chunk=count-loaded; if (chunk>65536) chunk=65536;
         if (vfs_read(&f,data+loaded,chunk)!=chunk) break;
         loaded+=chunk;
+        wm_resource_checkpoint();
     }
     vfs_close(&f);
     if (!data || loaded!=count) { kfree(data); return nullptr; }
@@ -63,6 +83,7 @@ static uint8_t* wm_resource_read(const char* path, uint64_t limit, uint64_t* siz
 // desktop can read a name and icon from a package without loading all of it.
 // len == 0 just reports the file size.
 static bool wm_resource_range(const char* path, uint64_t offset, void* buffer, uint64_t len, uint64_t* total) {
+    wm_resource_checkpoint();
     file f{};
     if (vfs_open(path,0,&f)!=0) return false;
     bool ok=f.vn->type==VnodeType::FILE;
@@ -75,11 +96,13 @@ static bool wm_resource_range(const char* path, uint64_t offset, void* buffer, u
             uint64_t chunk=len-done; if (chunk>65536) chunk=65536;
             if (vfs_read(&f,(uint8_t*)buffer+done,chunk)!=chunk || rdtsc_val()-started>_usb_tsc_hz()*15) ok=false;
             else done+=chunk;
+            wm_resource_checkpoint();
         }
     }
     vfs_close(&f); return ok;
 }
 static int wm_resource_list(const char* path, uint64_t index, char* name, bool* directory) {
+    wm_resource_checkpoint();
     uint64_t size=0; VnodeType type=VnodeType::FILE;
     int result=vfs_readdir(path,index,name,&size,&type);
     *directory=type==VnodeType::DIRECTORY; return result;
@@ -93,7 +116,6 @@ static inline uint64_t rdtsc_val() {
 }
 
 // Kernel globals defined in kernel.cpp / scheduler.h
-extern uint64_t tsc_hz;
 extern volatile uint64_t g_idle_tsc_accum;
 extern uint64_t g_last_frame_ticks;
 
@@ -164,7 +186,9 @@ struct PublishedPixels {
     uint32_t* pixels;
     uint64_t capacity, retired_frame;
     int width, height;
+    uint64_t revision;
 };
+static uint64_t g_surface_publication=0;
 static uint64_t g_compositor_frame = 1;
 struct Window {
     int id;
@@ -198,6 +222,8 @@ struct Window {
     uint32_t event_tail;
     int32_t canvas_width,canvas_height,min_w,min_h;
     bool native_resize,resize_pending;
+    bool premultiplied; // owner opt-in; legacy client alpha is ignored
+    bool shadow_enabled;
     unsigned resize_edges;
     int32_t ghost_w,ghost_h,resize_mouse_x,resize_mouse_y;
     ResizeRect resize_original;
@@ -205,6 +231,7 @@ struct Window {
     bool minimized,maximized;
     ResizeRect restore_rect;
     uint32_t role; // Semantic window role; ownership/executable remain those of the caller.
+    struct TitleBarCache* titlebar_cache;
 };
 
 #define USER_WIN_BASE   0x0000600000000000ULL
@@ -303,6 +330,10 @@ static inline void wm_damage_window_full(Window* win) {
     int32_t y1 = win->y - (int32_t)g_title_h;
     int32_t x2 = win->x + win->w;
     int32_t y2 = win->y + win->h;
+    if(win->shadow_enabled&&!win->maximized){
+        auto r=window_shadow_bounds({x1,y1,x2,y2});
+        x1=r.x1;y1=r.y1;x2=r.x2;y2=r.y2;
+    }
     if (x1 < 0) x1 = 0;
     if (y1 < 0) y1 = 0;
     if (x2 > (int32_t)fb->width) x2 = (int32_t)fb->width;
@@ -311,6 +342,21 @@ static inline void wm_damage_window_full(Window* win) {
         wm_dirty_add((uint32_t)x1, (uint32_t)(x2 - 1), (uint32_t)y1, (uint32_t)(y2 - 1));
         g_needs_refresh = true;
     }
+}
+
+static void wm_damage_window_title(const Window* win) {
+    if(!fb||!win||!win->visible||win->minimized)return;
+    const auto title=visibility_clip(win->x,win->y,win->w,0,g_title_h,fb->width,fb->height);
+    if(visibility_valid(title))wm_dirty_add(title.x1,title.x2-1,title.y1,title.y2-1);
+}
+
+// Call with interrupts disabled while examining the live window stack.
+static bool wm_desktop_stats_visible() {
+    for(int i=0;i<g_window_count;++i){
+        const auto* win=g_window_list[i];
+        if(win&&win->visible&&!win->minimized&&win->maximized)return false;
+    }
+    return true;
 }
 
 static inline void wm_surface_damage_all(Window* win) {
@@ -336,7 +382,18 @@ static uint32_t g_wbtn_w = 124;
 // ── Start Menu (taskbar popup) ────────────────────────────────
 #define g_menu_app_count ((int)g_resources_catalog->count)
 static bool  g_menu_open = false;
+struct MenuPixelCache { uint8_t* pixels=nullptr;uint64_t capacity=0,key=0; };
+static MenuPixelCache g_menu_pixel_cache{};
+static void wm_prepare_menu_cache(){
+    uint64_t bytes=(uint64_t)fb->pitch*fb->height;
+    if(bytes>64*1024*1024 || g_menu_pixel_cache.capacity>=bytes)return;
+    auto* pixels=(uint8_t*)kmalloc(bytes);
+    if(!pixels)return;
+    kfree(g_menu_pixel_cache.pixels);
+    g_menu_pixel_cache={pixels,bytes,0};
+}
 static void wm_taskbar_close();
+static bool wm_taskbar_popup_open();
 static bool wm_taskbar_escape(char c,uint32_t mods);
 // Action IDs never overlap catalog indices.
 static constexpr int MENU_RESTART = -2, MENU_SHUTDOWN = -3;
@@ -418,29 +475,54 @@ static inline void wm_menu_dirty_rect() {
 }
 
 static inline void wm_menu_open() {
+    gpu_menu_begin();
     wm_taskbar_close();
     g_menu_open = true;
     // Rapid reopenings reuse the complete snapshot. Refresh at the next open
     // after five seconds, preserving discovery of externally replaced assets.
     uint64_t now=rdtsc_val();
-    if (!g_resource_refresh_ticks || !tsc_hz || now-g_resource_refresh_ticks>=tsc_hz*5)
+    const bool refresh=!g_resource_refresh_ticks||!tsc_hz||now-g_resource_refresh_ticks>=tsc_hz*5;
+#if GPU_FRAME_DIAGNOSTICS
+    GpuGapScope opening(GpuGapActivity::StartOpen,refresh?"refresh":"cached");
+#endif
+    if(auto* trace=gpu_menu_open_trace()){
+        trace->requested=now;
+        trace->refresh=refresh;
+    }
+    if (refresh)
         wm_menu_refresh();
-    else { ++g_resource_demand_generation; g_resources_requested=true; }
+    // Menu icons are already part of the resident catalog demand.
     wm_menu_dirty_rect();
 }
 
 static inline void wm_menu_close() {
     if (!g_menu_open) return;
+#if GPU_FRAME_DIAGNOSTICS
+    GpuGapScope closing(GpuGapActivity::StartClose);
+#endif
     g_menu_open = false;
-    ++g_resource_demand_generation;
-    g_resources_requested = true;
     wm_menu_dirty_rect(); // geometry unchanged: the list stays cached until next open
 }
 
-// Pointer moved over an open menu: repaint so hover highlights follow.
-static inline void wm_menu_hover_dirty() {
-    if (!g_menu_open) return;
-    wm_menu_dirty_rect();
+static inline void wm_menu_hover_dirty(int previous,int current){
+    if(previous==current||!g_menu_open)return;
+    int x,y,w,h;wm_menu_geom(&x,&y,&w,&h);
+    int pad=wm_menu_pad();
+    auto damage_item=[&](int item){
+        if(item==-1)return;
+        int left=x+pad,right=x+w-pad,top,bottom;
+        if(item>=0){
+            top=y+wm_menu_header()+pad+item*wm_menu_row();
+            bottom=top+wm_menu_row()-3;
+        }else{
+            int width=(w-3*pad)/2;
+            if(item==MENU_SHUTDOWN)left+=width+pad;
+            right=left+width;
+            top=y+h-wm_menu_footer()+pad;bottom=y+h-pad;
+        }
+        if(right>left&&bottom>top)wm_dirty_add(left,right-1,top,bottom-1);
+    };
+    damage_item(previous);damage_item(current);g_needs_refresh=true;
 }
 
 static TextClipboard g_text_clipboard;
@@ -596,8 +678,20 @@ static bool wm_clipboard_key(char c,uint32_t key,uint32_t mods,bool repeat){
 static uint32_t wm_icon_size(uint32_t value, uint32_t minimum, uint32_t maximum) {
     return value<minimum ? minimum : value>maximum ? maximum : value;
 }
-static resources::Store g_resource_store{{wm_resource_read,wm_resource_list,wm_resource_range}};
+static resources::Store g_resource_store{{wm_resource_read,wm_resource_list,wm_resource_range,wm_resource_checkpoint}};
+static uint64_t wm_trace_cpu_cycles(){
+    TtyIrqGuard guard;
+    scheduler_account_cpu(rdtsc_val());
+    return g_current_task?g_current_task->cpu_cycles:0;
+}
+static void wm_damage_catalog_ui();
 static void wm_resources_reload() {
+    auto* menu_trace=gpu_menu_open_trace();
+    uint64_t resource_started=rdtsc_val();
+    uint64_t trace_cpu=GPU_RCS_ALPHA?wm_trace_cpu_cycles():0;
+    if(menu_trace){
+        if(!menu_trace->resource_start)menu_trace->resource_start=resource_started;
+    }
     uint32_t row=wm_icon_size(fb->height*38/1080,26,256);
     resources::Demand demand{};
     uint64_t flags,generation;
@@ -605,7 +699,7 @@ static void wm_resources_reload() {
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
     generation=g_resource_demand_generation;
     refresh=g_resources_refresh; g_resources_refresh=false;
-    if (g_menu_open) {
+    {
         int32_t header=wm_menu_header(), pad=wm_menu_pad();
         int32_t room=(int32_t)(fb->height*740/1080)-header-pad*2-wm_menu_footer();
         if (room>0) demand.menu_rows=(room+row-1)/row;
@@ -627,9 +721,22 @@ static void wm_resources_reload() {
         }
     }
     if (flags&(1u<<9)) __asm__ volatile("sti" ::: "memory");
-    auto* next=resources::build(g_resource_store,wm_icon_size(row-10,14,128),
+    resources::Catalog* next;
+    {
+#if GPU_FRAME_DIAGNOSTICS
+        GpuGapScope loading(GpuGapActivity::Resources,refresh?"rescan":"window icons");
+#endif
+        next=resources::build(g_resource_store,wm_icon_size(row-10,14,128),
                                 wm_icon_size(g_title_h-8,12,64),wm_icon_size(g_taskbar_h-16,16,64),
                                 demand,refresh ? nullptr : g_resources_catalog);
+    }
+    // An open request may arrive while the worker is already loading.
+    if(!menu_trace)menu_trace=gpu_menu_open_trace();
+    if(menu_trace){
+        if(!menu_trace->resource_start)menu_trace->resource_start=resource_started;
+        menu_trace->resource_done=rdtsc_val();
+        menu_trace->resource_cpu+=wm_trace_cpu_cycles()-trace_cpu;
+    }
     if (!next) { if (refresh) g_resources_refresh=true; return; }
     resources::Catalog* previous;
     // The compositor can be preempted halfway through a draw; never free its
@@ -644,10 +751,16 @@ static void wm_resources_reload() {
             resources::release(next); return;
         }
         if (!__atomic_load_n(&g_resource_readers,__ATOMIC_ACQUIRE)) {
-            if (g_menu_open) wm_menu_dirty_rect();
-            previous=g_resources_catalog; g_resources_catalog=next;
-            if (refresh) g_resource_refresh_ticks=rdtsc_val();
-            wm_dirty_add(0,fb->width-1,0,fb->height-1); g_needs_refresh=true;
+            {
+#if GPU_FRAME_DIAGNOSTICS
+                GpuGapScope publishing(GpuGapActivity::CatalogPublish);
+#endif
+                if (g_menu_open) wm_menu_dirty_rect();
+                previous=g_resources_catalog; g_resources_catalog=next;++g_decoration_epoch;
+                if(menu_trace)menu_trace->resource_commit=rdtsc_val();
+                if (refresh) g_resource_refresh_ticks=rdtsc_val();
+                wm_damage_catalog_ui();
+            }
             if (flags&(1u<<9)) __asm__ volatile("sti" ::: "memory");
             break;
         }
@@ -660,7 +773,9 @@ static void wm_resource_worker() {
     for (;;) {
         if (g_resources_requested) {
             g_resources_requested=false;
+            g_resource_cooperative=true;g_resource_slice_started=rdtsc_val();
             wm_resources_reload();
+            g_resource_cooperative=false;
         }
         task_sleep_ms(50);
     }
@@ -890,7 +1005,7 @@ static void wm_load_disk_font() {
     kfree(scratch); kfree(data);
     if (!ok) { kfree(atlas); print((char*)"[font] Invalid/unreadable font; using built-in Selawik."); return; }
     g_desktop_font = atlas;
-    ui_active_fonts = atlas->fonts; ui_active_font_count = 8;
+    ui_active_fonts = atlas->fonts; ui_active_font_count = 8;++g_decoration_epoch;
     print((char*)"[font] Loaded desktop font:"); print(path);
 }
 
@@ -1220,11 +1335,18 @@ static uint32_t wm_clock_scale() { return g_font_scale_100 * 85 / 100; }
 // ─── Taskbar clock (tray) ────────────────────────────────────────────────────
 // The time comes from rtc.h (g_clock, refreshed by the compositor thread). Drawing only reads that cache.
 // Tray width follows the font scale; the widest line is "10:59:59 PM" (11 chars) or the date "2026-11-06" (10).
-static inline int32_t wm_tray_w() {
+static unsigned g_desktop_fps=0;
+static inline int32_t wm_clock_width() {
     uint32_t scale = wm_clock_scale();
     int32_t time_width = wm_text_width(CLOCK_SHOW_SECONDS ? "88:88:88 PM" : "88:88 PM", scale);
     int32_t date_width = wm_text_width("8888-88-88", scale);
     return (time_width > date_width ? time_width : date_width) + 20;
+}
+static inline int32_t wm_fps_width() {
+    return wm_text_width("888 FPS",wm_clock_scale())+16;
+}
+static inline int32_t wm_tray_w() {
+    return wm_clock_width()+wm_fps_width();
 }
 
 // Mark the tray (plus the 2px separator left of it) dirty so the compositor repaints the clock.
@@ -1238,52 +1360,37 @@ static inline void wm_clock_damage() {
     g_needs_refresh = true;
 }
 
-static inline void wm_draw_window_chrome(int32_t x, int32_t y, int32_t w, int32_t h, const char* title, bool closable, int32_t min_y, int32_t max_y, bool focused = false, const Image* icon = nullptr,bool maximized=false) {
-    if (!g_master_backbuffer) return;
-    uint32_t bar_clr  = focused ? 0xFF352A49 : 0xFF25232E;
-    uint32_t bar_line = focused ? 0xFF77608F : 0xFF3D374A;
-    for (int32_t ty = y; ty < y + (int32_t)g_title_h; ty++) {
-        if (ty < 0 || (uint32_t)ty >= fb->height) continue;
-        if (ty < min_y || ty > max_y) continue; // Respect dirty rect
-        uint32_t* row = (uint32_t*)(g_master_backbuffer + (uint64_t)ty * fb->pitch);
-        int32_t start_x = x; if (start_x < 0) start_x = 0;
-        int32_t end_x = x + w; if (end_x > (int32_t)fb->width) end_x = fb->width;
-        if (end_x > start_x) {
-            uint32_t c = (ty == y) ? bar_line : bar_clr;
-            memset_32(row + start_x, c, end_x - start_x);
-        }
+static uint64_t g_titlebar_cache_renders=0,g_titlebar_cache_hits=0,g_titlebar_cache_bytes=0;
+static int g_titlebar_hover_win=0,g_titlebar_hover_control=WINDOW_NO_CONTROL;
+static void wm_draw_window_chrome(Window* win,int x,int y,int width,int min_y,int max_y,const Image& icon) {
+    if(!fb||!g_master_backbuffer)return;
+    VisibleRect clip{g_ui_clip_left,min_y,g_ui_clip_right,max_y+1};
+    if(!visibility_valid(visibility_intersect({x,y,x+width,y+(int)g_title_h},clip)))return;
+    TitleBarKey key{};key.width=width;key.height=g_title_h;key.font=wm_ui_font(g_font_scale_100);
+    key.icon=icon;key.resource_epoch=g_decoration_epoch;key.focused=win->id==g_focused_win_id;
+    key.closable=win->closable;key.maximized=win->maximized;
+    key.hover=win->id==g_titlebar_hover_win?g_titlebar_hover_control:WINDOW_NO_CONTROL;
+    for(unsigned i=0;i<sizeof(key.title);++i){key.title[i]=win->title[i];if(!win->title[i])break;}
+    TitleBarTarget target{(uint32_t*)g_master_backbuffer,(int)fb->width,(int)fb->height,(int)fb->pitch/4};
+    uint64_t bytes=(uint64_t)width*g_title_h*4;
+    if(width<=0||g_title_h>256||bytes>2*1024*1024){title_bar_render(key,target,x,y,clip);return;}
+    auto* cache=win->titlebar_cache;
+    if(!cache){
+        cache=(TitleBarCache*)kmalloc(sizeof(TitleBarCache));
+        if(cache){memset(cache,0,sizeof(*cache));win->titlebar_cache=cache;}
     }
-    // Title text (Vertically centered)
-    uint32_t char_h = wm_text_height(g_font_scale_100);
-    int32_t text_y = y + (int32_t)(g_title_h - char_h) / 2;
-    uint32_t text_clr = focused ? 0xFFFFFFFF : 0xFF9094A0;
-    int32_t text_x=x+10;
-    if (icon && icon->pixels) {
-        wm_draw_icon(*icon,x+6,y+((int32_t)g_title_h-(int32_t)icon->height)/2,
-                     x,min_y,x+w-(int32_t)g_title_h,max_y+1);
-        text_x=x+12+icon->width;
+    if(!cache){title_bar_render(key,target,x,y,clip);return;}
+    if(cache->capacity<bytes){
+        auto* pixels=(uint32_t*)kmalloc(bytes);
+        if(!pixels){title_bar_render(key,target,x,y,clip);return;}
+        g_titlebar_cache_bytes-=cache->capacity;kfree(cache->pixels);
+        cache->pixels=pixels;cache->capacity=bytes;cache->valid=false;g_titlebar_cache_bytes+=bytes;
     }
-    auto first_control=window_control_rect(x,y,w,g_title_h,WINDOW_MINIMIZE);
-    int32_t title_space=first_control.x-text_x-10;
-    if (title_space>0 && text_y + (int32_t)char_h >= min_y && text_y <= max_y)
-        wm_draw_string(text_x, text_y, title, text_clr, g_font_scale_100, title_space);
-    
-    for(int control=0;control<3;++control){
-        auto r=window_control_rect(x,y,w,g_title_h,control);
-        bool disabled=control==WINDOW_CLOSE&&!closable;
-        bool hover=!disabled&&g_mouse_x>=r.x&&g_mouse_x<r.x+r.w&&g_mouse_y>=r.y&&g_mouse_y<r.y+r.h;
-        uint32_t background=hover?(control==WINDOW_CLOSE?0xFF9A405D:0xFF665078):bar_clr;
-        uint32_t ink=disabled?0xFF625C6D:hover?0xFFFFFFFF:focused?0xFFE9D7B0:0xFFADA2BD;
-        for(int py=r.y;py<r.y+r.h;++py){
-            if(py<0||py>=(int)fb->height||py<min_y||py>max_y)continue;
-            auto* pixels=(uint32_t*)(g_master_backbuffer+(uint64_t)py*fb->pitch);
-            for(int px=r.x;px<r.x+r.w;++px){
-                if(px<0||px>=(int)fb->width)continue;
-                bool corner=(px==r.x||px==r.x+r.w-1)&&(py==r.y||py==r.y+r.h-1);
-                pixels[px]=window_control_ink(control,maximized,px-(r.x+r.w/2),py-(r.y+r.h/2))?ink:corner?bar_clr:background;
-            }
-        }
-    }
+    if(!cache->valid||!title_bar_equal(cache->key,key)){
+        title_bar_render(key,{cache->pixels,width,(int)g_title_h,width},0,0,{0,0,width,(int)g_title_h});
+        cache->key=key;cache->valid=true;++g_titlebar_cache_renders;
+    }else ++g_titlebar_cache_hits;
+    title_bar_blit(cache->pixels,width,g_title_h,target,x,y,clip);
 }
 
 // =============================================================================
@@ -1439,11 +1546,38 @@ static inline int wm_find_top_window(int32_t mx, int32_t my) {
     return -1;
 }
 
+// Hover changes require scene damage even when only the pointer moved. Cache
+// keys ignore absolute position, so moving a window reuses its title bitmap.
+static void wm_titlebar_hover_damage() {
+    static WindowControlRect previous{};
+    TtyIrqGuard guard;
+    int id=0,control=WINDOW_NO_CONTROL;WindowControlRect current{};
+    int index=wm_find_top_window(g_mouse_x,g_mouse_y);
+    if(index>=0){
+        auto* win=g_window_list[index];
+        control=window_control_hit(win->x,win->y-g_title_h,win->w,g_title_h,g_mouse_x,g_mouse_y);
+        if(control==WINDOW_CLOSE&&!win->closable)control=WINDOW_NO_CONTROL;
+        if(control!=WINDOW_NO_CONTROL){id=win->id;current=window_control_rect(win->x,win->y-g_title_h,win->w,g_title_h,control);}
+    }
+    if(id==g_titlebar_hover_win&&control==g_titlebar_hover_control&&
+       current.x==previous.x&&current.y==previous.y&&current.w==previous.w&&current.h==previous.h)return;
+    auto damage=[](WindowControlRect r){
+        if(!fb||r.w<=0||r.h<=0)return;
+        auto clipped=visibility_intersect({r.x,r.y,r.x+r.w,r.y+r.h},{0,0,(int)fb->width,(int)fb->height});
+        if(visibility_valid(clipped))wm_dirty_add(clipped.x1,clipped.x2-1,clipped.y1,clipped.y2-1);
+    };
+    damage(previous);damage(current);previous=current;
+    g_titlebar_hover_win=id;g_titlebar_hover_control=control;g_needs_refresh=true;
+}
+
 static inline void wm_raise_window(int idx) {
+    TtyIrqGuard guard;
     if (idx < 0 || idx >= g_window_count) return;
     Window* win = g_window_list[idx];
     if (win && !win->minimized && g_focused_win_id == win->id &&
         g_window_order[g_window_count - 1] == idx) return;
+    const int previous_focus=g_focused_win_id;
+    const bool stats_visible=wm_desktop_stats_visible();
     if (win) { win->minimized=false;g_focused_win_id = win->id; }
     int old_pos = -1;
     for (int i = 0; i < g_window_count; i++) if (g_window_order[i] == idx) old_pos = i;
@@ -1451,9 +1585,22 @@ static inline void wm_raise_window(int idx) {
         for (int i = old_pos; i < g_window_count - 1; i++) g_window_order[i] = g_window_order[i+1];
         g_window_order[g_window_count - 1] = idx;
     }
-    if (fb) {
-        g_dirty_min_x = 0; g_dirty_max_x = fb->width - 1;
-        g_dirty_min_y = 0; g_dirty_max_y = fb->height - 1;
+    if(fb){
+        if(wm_taskbar_popup_open()){
+            wm_dirty_add(0,fb->width-1,0,fb->height-1);
+        }else{
+            wm_damage_window_full(win);
+            for(int i=0;i<g_window_count;++i){
+                const auto* previous=g_window_list[i];
+                if(previous&&previous!=win&&previous->id==previous_focus){
+                    wm_damage_window_title(previous);
+                    break;
+                }
+            }
+            if(stats_visible!=wm_desktop_stats_visible())
+                wm_dirty_add(0,fb->width-1,0,59);
+            wm_dirty_add(0,fb->width-1,fb->height-g_taskbar_h,fb->height-1);
+        }
     }
     g_needs_refresh = true;
 }
@@ -1533,6 +1680,7 @@ static inline Window* wm_create_window(const char* title, int32_t x, int32_t y, 
     win->x = x; win->y = y; win->w = w; win->h = h;
     win->closable = closable;
     win->visible = true;
+    win->shadow_enabled = true;
     win->is_system = is_system;
     win->type = type;
     win->owner_pid = owner;
@@ -1572,6 +1720,7 @@ static inline Window* wm_create_window(const char* title, int32_t x, int32_t y, 
     ++g_resource_demand_generation; g_resources_requested=true;
     
     wm_damage_window_full(win);
+    gpu_launch_window(owner,win->id);
     return win;
 }
 
@@ -1603,6 +1752,10 @@ static void wm_collect_retired_surfaces() {
         for(uint64_t p=0;p<g_retired_surfaces[i].pages;++p)free_phys_page(g_retired_surfaces[i].physical+p*PAGE_SIZE);
     g_retired_surface_count=0;
     while(g_retired_windows){Window* win=g_retired_windows;g_retired_windows=win->retired_next;
+        if(win->titlebar_cache){
+            g_titlebar_cache_bytes-=win->titlebar_cache->capacity;
+            kfree(win->titlebar_cache->pixels);kfree(win->titlebar_cache);
+        }
         for(auto& slot:win->published)if(slot.allocation)kfree(slot.allocation);
         if(win->buffer_phys){for(uint64_t p=0;p<win->buffer_pages;++p)free_phys_page(win->buffer_phys+p*PAGE_SIZE);}
         else kfree(win->buffer);kfree(win);}
@@ -1740,8 +1893,20 @@ static inline void wm_dispatch_key(char c, uint32_t scancode, bool is_down, uint
 
 #include "taskbar.h"
 
-// Current client surfaces are opaque. Only windows above this client can hide
-// its animation; ghost outlines are overlays and must not count as occluders.
+static bool wm_taskbar_popup_open(){return g_taskbar_popup!=0;}
+
+// Called at catalog publication. Only the shell and window decorations use
+// catalog assets. The old menu bounds were already damaged before the swap.
+static void wm_damage_catalog_ui(){
+    if(g_menu_open)wm_menu_dirty_rect();
+    if(g_taskbar_popup)wm_taskbar_damage(false);
+    wm_dirty_add(0,fb->width-1,fb->height-g_taskbar_h,fb->height-1);
+    for(int i=0;i<g_window_count;++i)wm_damage_window_title(g_window_list[i]);
+    g_needs_refresh=true;
+}
+
+// Translucent clients keep underlying animation exposed. Their title bars
+// remain opaque; ghost outlines are overlays and never count as occluders.
 static inline void wm_visible_client(Window* win, VisibleRegion* region) {
     region->count = 0;
     if (!win || !win->visible || win->minimized || !win->buffer || !fb) return;
@@ -1757,6 +1922,7 @@ static inline void wm_visible_client(Window* win, VisibleRegion* region) {
         if (!above || !other || !other->visible || other->minimized || !other->buffer) continue;
         VisibleRect cover = visibility_clip(other->x,other->y,other->w,other->h,
                                              (int32_t)g_title_h,width,height);
+        if(other->premultiplied && cover.y2>other->y)cover.y2=other->y;
         if (!visibility_subtract(region,cover)) {
             region->count = 1; region->rects[0] = client;
             return; // Conservative fallback for pathological fragmentation.
@@ -1779,7 +1945,7 @@ static bool g_rain_surface_current = false;
 
 // Keep a complete backing surface whenever exposed, but only request repaint
 // for pixels people can see. The compositor remains independent of client type.
-static inline void wm_rain_render(Window* win, const VisibleRegion& region) {
+static inline void wm_rain_render(Window* win, const VisibleRegion& region,bool retained=false) {
     if (!win || !win->buffer || !region.count) return;
     uint64_t t0 = rdtsc_val();
     g_rain_surface_current = !g_gpu_compose_hook;
@@ -1787,9 +1953,18 @@ static inline void wm_rain_render(Window* win, const VisibleRegion& region) {
         rainbow_render_surface(win->buffer, (uint32_t)win->w, (uint32_t)win->h, win->buffer_pitch, rain_scroll, g_rainbow_wide);
     g_client_render_ticks = rdtsc_val() - t0;
     ++g_rain_render_count;
+    if(retained)return; // A later single batch updates only exposed client pixels.
     if (!win->chrome_drawn) {
         wm_surface_damage_all(win);
         return;
+    }
+    if(g_gpu_compose_hook){
+        VisibleRect bounds;
+        if(gpu_animation_damage_bounds(region,&bounds)){
+            wm_dirty_add(bounds.x1,bounds.x2-1,bounds.y1,bounds.y2-1);
+            g_rain_damage_pixels+=(uint64_t)(bounds.x2-bounds.x1)*(bounds.y2-bounds.y1);
+            return;
+        }
     }
     for (unsigned i = 0; i < region.count; ++i) {
         VisibleRect r = region.rects[i];
@@ -1899,6 +2074,7 @@ static inline void wm_overlay_present_unlocked(const OverlayFrame& frame,bool sc
     g_presented_overlay.count=frame.count;
     for(unsigned i=0;i<frame.count;++i)g_presented_overlay.outlines[i]=frame.outlines[i];
     vram_fence();
+    gpu_menu_present(rdtsc_val(),false);
 }
 static inline void wm_overlay_update_unlocked(int32_t x,int32_t y,uint8_t buttons) {
     OverlayFrame frame;wm_capture_overlay(&frame,{x,y,wm_cursor_edges(x,y),buttons});
@@ -2008,20 +2184,885 @@ static uint32_t g_overlay_backup[256];
 // With present=false, prepare the backbuffer only (boot's first desktop frame).
 // When several rects are composed in one frame the caller passes do_overlay=true only for the LAST one:
 // each completed blit presents/tracks its own snapshot; the final call reports completion.
+static uint64_t wm_menu_pixel_key(int px,int py,int pw,int ph,int hover){
+    uint64_t key=1469598103934665603ULL;
+    auto hash=[&](uint64_t value){key=(key^value)*1099511628211ULL;};
+    hash(fb->width);hash(fb->height);hash(fb->pitch);
+    hash((uint32_t)px);hash((uint32_t)py);hash(pw);hash(ph);
+    hash((uint32_t)hover);hash(g_font_scale_100);hash(g_decoration_epoch);
+    return key;
+}
+static uint64_t wm_menu_pixel_key(){
+    int px,py,pw,ph;wm_menu_geom(&px,&py,&pw,&ph);
+    return wm_menu_pixel_key(px,py,pw,ph,wm_menu_hit_test(g_mouse_x,g_mouse_y));
+}
+// top_c/bot_c are the gradient endpoints; edge_c is the 1px border;
+// shine=true draws a bright highlight row on top (glass effect).
+static void wm_draw_button(uint32_t min_y,uint32_t max_y,int32_t bx, int32_t by, int32_t bw, int32_t bh,
+                    uint32_t top_c, uint32_t bot_c,
+                    uint32_t edge_c, bool shine) {
+    for (int32_t y = by; y < by + bh; y++) {
+        if (y < (int32_t)min_y || y > (int32_t)max_y) continue;
+        if (y < 0 || (uint32_t)y >= fb->height) continue;
+        uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
+        uint32_t t = (uint32_t)(y - by) * 255 / (bh > 1 ? (uint32_t)(bh - 1) : 1u);
+        uint8_t rr  = (uint8_t)(((top_c>>16)&0xFF) + (int32_t)(((int32_t)((bot_c>>16)&0xFF)-(int32_t)((top_c>>16)&0xFF))*(int32_t)t/255));
+        uint8_t gg  = (uint8_t)(((top_c>> 8)&0xFF) + (int32_t)(((int32_t)((bot_c>> 8)&0xFF)-(int32_t)((top_c>> 8)&0xFF))*(int32_t)t/255));
+        uint8_t bb  = (uint8_t)(((top_c    )&0xFF) + (int32_t)(((int32_t)((bot_c    )&0xFF)-(int32_t)((top_c    )&0xFF))*(int32_t)t/255));
+        uint32_t row_clr = 0xFF000000 | ((uint32_t)rr<<16) | ((uint32_t)gg<<8) | bb;
+        if (shine && y == by) row_clr = 0xFFAABBEE;  // top shine row
+
+        int32_t sx = bx < 0 ? 0 : bx;
+        int32_t ex = bx + bw; if (ex > (int32_t)fb->width) ex = (int32_t)fb->width;
+        if (ex > sx) memset_32(drow + sx, row_clr, (uint32_t)(ex - sx));
+
+        // Left/right 1px edges
+        if (bx >= 0 && (uint32_t)bx < fb->width)           drow[bx]       = edge_c;
+        if (bx+bw-1 >= 0 && (uint32_t)(bx+bw-1) < fb->width) drow[bx+bw-1] = edge_c;
+    }
+    // Top / bottom edge lines
+    for (int32_t px = bx; px < bx + bw; px++) {
+        if (px < 0 || (uint32_t)px >= fb->width) continue;
+        auto edge_px = [&](int32_t ey, uint32_t ec) {
+            if (ey < (int32_t)min_y || ey > (int32_t)max_y) return;
+            if (ey < 0 || (uint32_t)ey >= fb->height) return;
+            ((uint32_t*)(g_master_backbuffer + (uint64_t)ey * fb->pitch))[px] = ec;
+        };
+        edge_px(by,        edge_c);
+        edge_px(by + bh - 1, 0xFF101828);
+    }
+}
+// Stage 2.8: Start menu popup (topmost scene layer, below the cursor overlay)
+static void wm_draw_start_menu(uint32_t min_y,uint32_t max_y,bool cache_only=false) {
+    if(!g_menu_open||!fb)return;
+    ResourceRead resources;
+    int32_t px, py, pw, ph;
+    wm_menu_geom(&px, &py, &pw, &ph);
+    int32_t pad=wm_menu_pad(), header=wm_menu_header(), row_h=wm_menu_row();
+    int32_t footer_top=py+ph-wm_menu_footer(), list_top=py+header+pad;
+    int32_t char_h=(int32_t)wm_text_height(g_font_scale_100);
+    int hover=wm_menu_hit_test(g_mouse_x,g_mouse_y);
+    GpuPerfTimer menu_timer(g_gpu_perf.menu_ticks);
+    auto render_menu=[&](){
+        // Every primitive respects the current damage band and framebuffer bounds.
+        auto rect=[&](int32_t x,int32_t y,int32_t w,int32_t h,uint32_t color,int radius=0) {
+            for(int32_t yy=y;yy<y+h;++yy) {
+                if(yy<(int32_t)min_y||yy>(int32_t)max_y||yy<0||yy>=(int32_t)fb->height)continue;
+                int inset=0,edge=yy-y<h/2?yy-y:y+h-1-yy;
+                if(edge<radius)inset=radius-edge;
+                int32_t left=x+inset,right=x+w-inset;
+                if(left<0)left=0;if(right>(int32_t)fb->width)right=fb->width;
+                if(right>left)memset_32((uint32_t*)(g_master_backbuffer+(uint64_t)yy*fb->pitch)+left,color,right-left);
+            }
+        };
+        auto text=[&](int32_t x,int32_t y,const char* label,uint32_t color,int32_t width) {
+            if(y>=py&&y+char_h<=py+ph&&y+char_h>(int32_t)min_y&&y<=(int32_t)max_y)
+                wm_draw_string(x,y,label,color,g_font_scale_100,width);
+        };
+        // Use the taskbar's navy surfaces, borders, and active-control gradient.
+        wm_draw_button(min_y,max_y,px,py,pw,ph,0xFF23283D,0xFF181C30,0xFF303560,false);
+        wm_draw_button(min_y,max_y,px+1,py+1,pw-2,header,0xFF3D4D80,0xFF28366A,0xFF5568B0,true);
+        int32_t section_y=py+(header-char_h)/2;
+        text(px+pad+8,section_y,"All apps",0xFFEEEEFF,pw-pad*2-8);
+        char count[16];to_str((uint64_t)g_menu_app_count,count);
+        int32_t count_w=wm_text_width(count,g_font_scale_100);
+        text(px+pw-pad-8-count_w,section_y,count,0xFFB9C5EE,count_w);
+
+        for(int i=0;i<g_menu_app_count;++i) {
+            int32_t ry=list_top+i*row_h;
+            if(ry+row_h>footer_top-pad)break;
+            const auto& entry=g_resources_catalog->apps[i];
+            bool hov=hover==i;
+            if(hov)wm_draw_button(min_y,max_y,px+pad,ry,pw-pad*2,row_h-3,
+                            0xFF3D4D80,0xFF28366A,0xFF5568B0,false);
+            int32_t isz=wm_icon_size(row_h-10,14,128);
+            int32_t ix=px+pad+8,iy=ry+(row_h-3-isz)/2;
+            if(entry.icons.menu.pixels) {
+                const Image& icon=entry.icons.menu;
+                wm_draw_icon(icon,ix+(isz-(int32_t)icon.width)/2,iy+(isz-(int32_t)icon.height)/2,
+                             px+pad,min_y,px+pw-pad,max_y+1);
+            } else {
+                uint32_t hash=0;for(const char* q=entry.app.id;*q;++q)hash=hash*31u+(uint8_t)*q;
+                rect(ix,iy,isz,isz,g_rainbow_lut[hash%360],3);
+            }
+            int32_t ty=ry+(row_h-3-char_h)/2;
+            text(ix+isz+10,ty,entry.app.name,entry.app.available?0xFFE6E8FF:0xFF8888AA,
+                 pw-pad*2-isz-26);
+        }
+        if(!g_menu_app_count)
+            text(px+pad+8,list_top+(row_h-char_h)/2,"No installed apps",0xFF9FA6CC,pw-pad*2-16);
+
+        wm_draw_button(min_y,max_y,px+1,footer_top,pw-2,wm_menu_footer()-1,
+                 0xFF252A42,0xFF1A1F35,0xFF303560,false);
+        int32_t button_w=(pw-pad*3)/2,button_h=wm_menu_footer()-pad*2;
+        for(int i=0;i<2;++i) {
+            int action=i?MENU_SHUTDOWN:MENU_RESTART;
+            int32_t bx=px+pad+i*(button_w+pad),by=footer_top+pad;
+            bool hov=hover==action;
+            wm_draw_button(min_y,max_y,bx,by,button_w,button_h,
+                     hov?0xFF3D4D80:0xFF23283D,hov?0xFF28366A:0xFF181C30,
+                     hov?0xFF5568B0:0xFF2C3258,hov);
+            int32_t icon_size=wm_menu_scale(20,16),ix=bx+10,iy=by+(button_h-icon_size)/2;
+            for(int y=0;y<icon_size;++y)for(int x=0;x<icon_size;++x) {
+                int yy=iy+y,xx=ix+x;
+                if(yy<(int32_t)min_y||yy>(int32_t)max_y||yy<0||yy>=(int32_t)fb->height||
+                   xx<0||xx>=(int32_t)fb->width)continue;
+                unsigned alpha=power_icon_coverage(i!=0,x,y,icon_size);
+                if(!alpha)continue;
+                uint32_t* pixel=(uint32_t*)(g_master_backbuffer+(uint64_t)yy*fb->pitch)+xx;
+                uint32_t color=0xFF000000;
+                for(unsigned shift=0;shift<24;shift+=8)
+                    color|=(((((*pixel>>shift)&255)*(16-alpha)+0xEE*alpha+8)/16)<<shift);
+                *pixel=color;
+            }
+            int32_t label_x=ix+icon_size+6;
+            text(label_x,by+(button_h-char_h)/2,i?"Shut down":"Restart",0xFFE6E8FF,bx+button_w-label_x-6);
+        }
+    };
+    // Absolute screen coordinates are shared with the existing text/icon
+    // renderers. A reusable WB scratch surface keeps cache construction
+    // independent of the WC scanout that will receive the finished menu.
+    auto& cache=g_menu_pixel_cache;
+    uint64_t bytes=(uint64_t)fb->pitch*fb->height;
+    uint64_t current=wm_menu_pixel_key(px,py,pw,ph,hover);
+    if(!cache.pixels || cache.capacity<bytes){
+        if(cache_only)return;
+        render_menu();
+        ++g_gpu_perf.menu_renders;
+    }else{
+        if(cache.key!=current){
+#if GPU_FRAME_DIAGNOSTICS
+            GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::MenuBuild),wm_trace_cpu_cycles);
+#endif
+            uint64_t build_started=rdtsc_val();
+            auto* menu_trace=gpu_menu_open_trace();
+            if(menu_trace && !menu_trace->cache_start)menu_trace->cache_start=build_started;
+            auto* destination=g_master_backbuffer;
+            uint32_t saved_min=min_y,saved_max=max_y;
+            int left=g_ui_clip_left,right=g_ui_clip_right,top=g_ui_clip_top,bottom=g_ui_clip_bottom;
+            g_master_backbuffer=cache.pixels;
+            min_y=py<0?0:py;max_y=py+ph-1;
+            if(max_y>=fb->height)max_y=fb->height-1;
+            g_ui_clip_left=px;g_ui_clip_right=px+pw;
+            g_ui_clip_top=min_y;g_ui_clip_bottom=max_y+1;
+            render_menu();
+            if(menu_trace){
+                menu_trace->cache_done=rdtsc_val();
+                menu_trace->build_ticks+=menu_trace->cache_done-build_started;
+            }
+            g_master_backbuffer=destination;min_y=saved_min;max_y=saved_max;
+            g_ui_clip_left=left;g_ui_clip_right=right;g_ui_clip_top=top;g_ui_clip_bottom=bottom;
+            cache.key=current;++g_gpu_perf.menu_renders;
+        }else ++g_gpu_perf.menu_reuses;
+        if(cache_only)return;
+        int left=px<0?0:px,right=px+pw;
+        if(right>(int)fb->width)right=fb->width;
+        int top=py>(int)min_y?py:min_y,bottom=py+ph;
+        if(bottom>(int)max_y+1)bottom=max_y+1;
+        for(int y=top;y<bottom && right>left;++y){
+            uint64_t offset=(uint64_t)y*fb->pitch+left*4;
+            memcpy_vram_sse_headless(g_master_backbuffer+offset,cache.pixels+offset,(right-left)*4);
+        }
+    }
+}
+
+static bool wm_retained_menu_ready(){
+#if GPU_RETAINED_MENU
+    return fb&&g_menu_open&&!g_clipboard_open&&!g_taskbar_popup&&g_menu_pixel_cache.pixels&&
+        g_menu_pixel_cache.capacity>=(uint64_t)fb->pitch*fb->height&&
+        g_menu_pixel_cache.key==wm_menu_pixel_key();
+#else
+    return false;
+#endif
+}
 static uint64_t g_scene_compose_count=0,g_scene_compose_pixels=0;
+static GpuScenePlan g_retained_animation_plan{};
+struct RetainedAnimationLayer {GpuSceneClient client;bool shadow;int id;};
+static RetainedAnimationLayer g_retained_animation_layers[MAX_WINDOWS];
+static unsigned g_retained_animation_layer_count=0;
+static uint64_t g_retained_animation_layout=0;
+static bool g_retained_animation_alpha=false;
+static uint64_t g_retained_animation_opaque_pixels=0;
+#if GPU_ALPHA_REPAIR_BATCH && GPU_OPAQUE_RETAIN
+static VisibleRect g_top_alpha_opaque[GpuOpaqueCoverage::capacity];
+static unsigned g_top_alpha_opaque_count=0;
+#endif
+static uint64_t g_retained_menu_key=0;
+static VisibleRect g_retained_menu_panel{};
+static bool g_retained_scene_invalidated=false;
+static uint64_t wm_retained_animation_layout(){
+    uint64_t value=1469598103934665603ULL;
+    auto hash=[&](uint64_t part){value=(value^part)*1099511628211ULL;};
+    hash(g_menu_open);hash(g_clipboard_open);hash(g_taskbar_popup);
+#if GPU_RETAINED_MENU
+    if(g_menu_open){int x,y,w,h;wm_menu_geom(&x,&y,&w,&h);hash(x);hash(y);hash(w);hash(h);
+        hash(g_decoration_epoch);hash(g_font_scale_100);}
+#endif
+    hash(g_title_h);hash(g_taskbar_h);hash(fb->width);hash(fb->height);
+    for(int s=0;s<g_window_count;++s){
+        const auto* win=g_window_list[g_window_order[s]];
+        if(!win){hash(0);continue;}
+        hash(win->id);hash(win->visible);hash(win->minimized);
+        hash((uint32_t)win->x);hash((uint32_t)win->y);hash(win->w);hash(win->h);
+        hash(win->premultiplied);hash(win->shadow_enabled);hash(win->maximized);
+    }
+    return value;
+}
+static bool wm_prepare_retained_animation(Window* animation){
+#if GPU_RETAINED_MENU
+    if(g_menu_open&&!wm_retained_menu_ready()&&!g_clipboard_open&&!g_taskbar_popup)
+        wm_draw_start_menu(0,0,true);
+#endif
+    if(!animation||!animation->buffer||!animation->visible||animation->minimized||
+       !animation->chrome_drawn||animation->premultiplied||
+       animation->canvas_width!=animation->w||animation->canvas_height!=animation->h||
+       (g_menu_open&&!wm_retained_menu_ready())||g_clipboard_open||g_taskbar_popup||!g_gpu_compose_hook)return false;
+    bool above=false,found=false,maximized=false;
+    VisibleRect covers[MAX_WINDOWS];unsigned count=0;
+    GpuSceneClient client{};
+    g_retained_animation_layer_count=0;g_retained_animation_alpha=false;
+    g_retained_animation_opaque_pixels=0;
+    {
+    TtyIrqGuard guard;
+    if(g_menu_open&&!wm_retained_menu_ready())return false;
+    g_retained_menu_key=g_menu_open?wm_menu_pixel_key():0;
+    if(g_menu_open){int x,y,w,h;wm_menu_geom(&x,&y,&w,&h);
+        g_retained_menu_panel=visibility_intersect({x,y,x+w,y+h},{0,0,(int)fb->width,(int)fb->height});}
+    for(int s=0;s<g_window_count;++s){
+        auto* win=g_window_list[g_window_order[s]];
+        if(!win||!win->visible||win->minimized)continue;
+        if(win->maximized)maximized=true;
+        if(win==animation){above=true;found=true;continue;}
+        if(!above)continue;
+        WinRect r;wm_get_win_rect(win,&r);
+        if(!r.visible)continue;
+        auto outer=VisibleRect{r.x1,r.y1,r.x2,r.y2};
+        covers[count++]=win->premultiplied?VisibleRect{r.x1,r.y1,r.x2,r.y1+(int)g_title_h}:outer;
+        auto& layer=g_retained_animation_layers[g_retained_animation_layer_count++];
+        layer.id=win->id;
+        layer.client={outer,{r.x1,r.y1+(int)g_title_h,r.x2,r.y2},win->buffer,
+            (uint32_t)win->canvas_width,(uint32_t)win->canvas_height,win->buffer_pitch,
+            true,false,!win->maximized,win->premultiplied,0};
+        const auto& published=win->published[win->published_slot];
+        if(published.pixels&&!g_gpu_quarantine_sources){
+            layer.client.pixels=published.pixels;layer.client.width=published.width;
+            layer.client.height=published.height;layer.client.pitch=published.width*4;
+            layer.client.revision=published.revision;
+        }
+        layer.shadow=win->shadow_enabled&&!win->maximized;
+        if(win->premultiplied){
+            if(!g_gpu_render_hook)return false;
+            g_retained_animation_alpha=true;
+        }
+    }
+    // The ordinary HUD path may paint over a nonmaximized client in these rows.
+    if(!found||(!maximized&&animation->y<60))return false;
+    WinRect r;wm_get_win_rect(animation,&r);
+    client={{r.x1,r.y1,r.x2,r.y2},
+        {r.x1,r.y1+(int)g_title_h,r.x2,r.y2},animation->buffer,
+        (uint32_t)animation->w,(uint32_t)animation->h,(uint32_t)animation->w*4,
+        true,true,!animation->maximized,false,0};
+    g_retained_animation_layout=wm_retained_animation_layout();
+    }
+    g_retained_animation_plan.scroll=rain_scroll;
+    g_retained_animation_plan.rainbow_colors=g_rainbow_wide;
+    if(!gpu_retained_animation_plan(&g_retained_animation_plan,client,
+        {0,0,(int)fb->width,(int)(fb->height-g_taskbar_h)},covers,count))return false;
+#if GPU_OPAQUE_RETAIN
+    // Published sources cannot be reused during this compositor frame. Scan
+    // outside the IRQ guard; mutable/unpublished sources prove no coverage.
+    static GpuOpaqueCoverage opaque_cache[MAX_WINDOWS];
+    static VisibleRect opaque_covers[MAX_WINDOWS*GpuOpaqueCoverage::capacity];
+    unsigned opaque_count=0;
+#if GPU_ALPHA_REPAIR_BATCH
+    g_top_alpha_opaque_count=0;
+#endif
+    for(unsigned s=0;s<g_retained_animation_layer_count;++s){
+        const auto& c=g_retained_animation_layers[s].client;
+        if(!c.premultiplied)continue;
+        auto& coverage=opaque_cache[s];
+        uint64_t started=GpuPerfTimer::now();
+        if(coverage.update(c.pixels,c.width,c.height,c.pitch,c.revision)){
+            ++g_gpu_perf.opaque_scans;g_gpu_perf.opaque_scan_ticks+=GpuPerfTimer::now()-started;
+        }
+        unsigned added=coverage.mapped(c.client,c.resize_grip?12:0,opaque_covers+opaque_count);
+#if GPU_ALPHA_REPAIR_BATCH
+        if(s+1==g_retained_animation_layer_count){
+            g_top_alpha_opaque_count=added;
+            for(unsigned i=0;i<added;++i)g_top_alpha_opaque[i]=opaque_covers[opaque_count+i];
+        }
+#endif
+        opaque_count+=added;
+    }
+    if(opaque_count){
+        uint64_t before=0,after=0;
+        for(unsigned i=0;i<g_retained_animation_plan.count;++i){auto r=g_retained_animation_plan.copies[i].destination;
+            before+=(uint64_t)(r.x2-r.x1)*(r.y2-r.y1);}
+        if(!gpu_retained_opaque_cutouts(&g_retained_animation_plan,opaque_covers,opaque_count))return false;
+        for(unsigned i=0;i<g_retained_animation_plan.count;++i){auto r=g_retained_animation_plan.copies[i].destination;
+            after+=(uint64_t)(r.x2-r.x1)*(r.y2-r.y1);}
+        g_retained_animation_opaque_pixels=before-after;
+    }
+    // A publication can change coverage while normal repairs block. The
+    // second preparation must detect changed cutouts and repaint the scene.
+    auto hash=[&](uint64_t part){g_retained_animation_layout=(g_retained_animation_layout^part)*1099511628211ULL;};
+    hash(opaque_count);
+    for(unsigned i=0;i<opaque_count;++i){const auto& r=opaque_covers[i];
+        hash((uint32_t)r.x1);hash((uint32_t)r.y1);hash((uint32_t)r.x2);hash((uint32_t)r.y2);}
+#endif
+    static GpuScenePlan alpha_plan{};
+    for(unsigned s=0;s<g_retained_animation_layer_count;++s){
+        const auto& c=g_retained_animation_layers[s].client;
+        if(c.premultiplied&&!gpu_retained_alpha_plan(&alpha_plan,c,g_retained_animation_plan))return false;
+    }
+    return true;
+}
+static void wm_retained_animation_grip(const GpuSceneClient& client,VisibleRect clip){
+    if(!client.resize_grip)return;
+    for(int bottom=1;bottom<12;++bottom){
+        int y=client.client.y2-1-bottom;
+        if(y<clip.y1||y>=clip.y2)continue;
+        auto* row=(uint32_t*)(g_master_backbuffer+(uint64_t)y*fb->pitch);
+        for(int right=1;right<12;++right){
+            int x=client.client.x2-1-right;
+            if(x>=clip.x1&&x<clip.x2&&(right+bottom==6||right+bottom==10||right+bottom==14))row[x]=0xff81728f;
+        }
+    }
+}
+#if GPU_ALPHA_REPAIR_BATCH
+static GpuDeferredAlpha g_deferred_alpha{};
+static int g_deferred_alpha_id=0;
+static void wm_begin_alpha_repairs(bool retained){
+    g_deferred_alpha.clear();g_deferred_alpha_id=0;
+    if(!retained||!g_retained_animation_layer_count)return;
+    const auto& top=g_retained_animation_layers[g_retained_animation_layer_count-1];
+    g_deferred_alpha_id=top.id;g_deferred_alpha.begin(top.client,true);
+}
+static bool wm_alpha_repairs_ready(){
+    if(!g_deferred_alpha.count)return !g_deferred_alpha.failed;
+    if(!g_retained_animation_layer_count)return false;
+    const auto& top=g_retained_animation_layers[g_retained_animation_layer_count-1];
+    return top.id==g_deferred_alpha_id&&g_deferred_alpha.ready(top.client,g_retained_animation_plan);
+}
+static void wm_cancel_alpha_repairs(){
+    if(g_deferred_alpha.count)++g_gpu_perf.alpha_repair_cancels;
+    g_deferred_alpha.clear();
+}
+#endif
+static void wm_copy_cached_menu(VisibleRect r){
+    for(int row=r.y1;row<r.y2;++row){
+        uint64_t offset=(uint64_t)row*fb->pitch+r.x1*4;
+        memcpy_vram_sse_headless(g_master_backbuffer+offset,g_menu_pixel_cache.pixels+offset,(r.x2-r.x1)*4);
+    }
+}
+
+static bool wm_repair_retained_foreground(VisibleRect r){
+    // Shell bands can contain other decorations with wider repaint rules.
+    if(r.y1<60||r.y2>(int)(fb->height-g_taskbar_h))return false;
+#if GPU_RETAINED_MENU
+    const auto panel=g_retained_menu_panel;
+    if(g_retained_menu_key&&wm_retained_menu_ready()&&g_menu_pixel_cache.key==g_retained_menu_key&&
+       panel.x1<=r.x1&&panel.x2>=r.x2&&panel.y1<=r.y1&&panel.y2>=r.y2){
+        wm_copy_cached_menu(r);
+        ++g_gpu_perf.menu_cache_repairs;
+        return true;
+    }
+#endif
+#if GPU_ALPHA_REPAIR_BATCH && GPU_OPAQUE_RETAIN
+    // Closing the menu can expose a proven fully opaque patch of an alpha
+    // window. The destination underneath contributes zero to its final color.
+    if(!g_retained_menu_key&&!g_menu_open&&g_deferred_alpha.active&&
+       g_deferred_alpha.append_opaque(r,g_top_alpha_opaque,g_top_alpha_opaque_count,g_retained_animation_plan)){
+        ++g_gpu_perf.opaque_repair_rects;
+        return true;
+    }
+#endif
+    return false;
+}
+static bool wm_draw_retained_animation([[maybe_unused]] uint64_t repair_menu_key){
+    g_retained_scene_invalidated=false;
+    const auto& plan=g_retained_animation_plan;
+    if(!g_gpu_compose_hook||!g_gpu_compose_hook(plan))return false;
+    const auto& client=plan.clients[0];
+    // The first layer's shadow sees exactly the just-rendered procedural
+    // background. Supply WB pixels instead of reading them back from WC RAM.
+    static uint32_t background_row[8192];
+    bool row_available=fb->width<=8192;
+    if(row_available){
+        int64_t phase=((int64_t)plan.scroll-client.client.x1)%720;
+        if(phase<0)phase+=720;
+        for(unsigned x=0;x<fb->width;++x){
+            background_row[x]=0xff000000u|plan.rainbow_colors[phase];
+            if(++phase==720)phase=0;
+        }
+    }
+    for(unsigned i=0;i<plan.count;++i){
+        auto clip=plan.copies[i].destination;
+        g_gpu_perf.retained_animation_pixels+=(uint64_t)(clip.x2-clip.x1)*(clip.y2-clip.y1);
+        wm_retained_animation_grip(client,clip);
+    }
+    static GpuScenePlan alpha_plan{};
+    bool clean_background=row_available,used_background_row=false;
+    for(unsigned s=0;s<g_retained_animation_layer_count;++s){
+        const auto& layer=g_retained_animation_layers[s];
+        const auto& c=layer.client;
+        for(unsigned i=0;i<plan.count;++i){
+            auto clip=plan.copies[i].destination;
+            if(layer.shadow){
+                auto plain=clip;
+                if(clean_background){
+                    // CPU grip ink differs from the palette in the last rows.
+                    if(client.resize_grip&&plain.y2>client.client.y2-12)plain.y2=client.client.y2-12;
+                    if(visibility_valid(plain)){
+                        window_shadow_draw(
+                            {g_master_backbuffer,(int)fb->width,(int)(fb->height-g_taskbar_h),(int)fb->pitch,background_row},
+                            c.outer,plain);
+                        used_background_row=true;
+                    }
+                    if(clip.y1<plain.y2)clip.y1=plain.y2;
+                }
+                if(visibility_valid(clip))window_shadow_draw(
+                    {g_master_backbuffer,(int)fb->width,(int)(fb->height-g_taskbar_h),(int)fb->pitch},
+                    c.outer,clip);
+            }
+        }
+        if(layer.shadow||c.premultiplied)clean_background=false;
+        if(c.premultiplied){
+            if(!gpu_retained_alpha_plan(&alpha_plan,c,plan))return false;
+#if GPU_ALPHA_REPAIR_BATCH
+            if(layer.id==g_deferred_alpha_id&&!g_deferred_alpha.combine(&alpha_plan))return false;
+#endif
+            if(alpha_plan.count&&(!g_gpu_render_hook||!g_gpu_render_hook(alpha_plan)))return false;
+            for(unsigned i=0;i<plan.count;++i){
+                auto clip=visibility_intersect(plan.copies[i].destination,c.client);
+                if(!visibility_valid(clip))continue;
+                wm_retained_animation_grip(c,clip);
+            }
+        }
+    }
+#if GPU_RETAINED_MENU
+    auto menu_stable=[&](){TtyIrqGuard guard;
+        return g_retained_menu_key?(wm_retained_menu_ready()&&wm_menu_pixel_key()==g_retained_menu_key):!g_menu_open;};
+    auto finish_with_closing_menu=[&](){
+        const auto panel=g_retained_menu_panel;
+        {
+            TtyIrqGuard guard;
+            if(!g_retained_menu_key||g_menu_open||g_clipboard_open||g_taskbar_popup||
+               g_menu_pixel_cache.key!=g_retained_menu_key||!visibility_valid(panel))return false;
+            // Keep the in-flight frame complete. Repair the exposed area on the
+            // next frame, even if this frame already took the close damage.
+            wm_dirty_add(panel.x1,panel.x2-1,panel.y1,panel.y2-1);
+            g_needs_refresh=true;
+        }
+#if GPU_FRAME_DIAGNOSTICS
+        GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::MenuReplay),wm_trace_cpu_cycles);
+#endif
+        GpuPerfTimer timer(g_gpu_perf.menu_ticks);
+        wm_copy_cached_menu(panel);
+        g_gpu_perf.retained_menu_pixels+=(uint64_t)(panel.x2-panel.x1)*(panel.y2-panel.y1);
+        ++g_gpu_perf.retained_menu_close_deferrals;
+        return true;
+    };
+    bool repaint_panel=repair_menu_key!=g_retained_menu_key;
+    bool closing_menu_replayed=false;
+    if(!menu_stable()){
+        // A new opaque panel can cover the finished frame. Moving or closing
+        // the old one exposes pixels that may need a complete scene repair.
+        if(g_menu_open&&!g_clipboard_open&&!g_taskbar_popup){
+            wm_draw_start_menu(0,0,true);
+            TtyIrqGuard guard;
+            int x,y,w,h;wm_menu_geom(&x,&y,&w,&h);
+            auto panel=visibility_intersect({x,y,x+w,y+h},{0,0,(int)fb->width,(int)fb->height});
+            const auto& old=g_retained_menu_panel;
+            bool compatible=!g_retained_menu_key||(panel.x1==old.x1&&panel.y1==old.y1&&panel.x2==old.x2&&panel.y2==old.y2);
+            if(compatible&&wm_retained_menu_ready()){
+                g_retained_menu_key=g_menu_pixel_cache.key;
+                g_retained_menu_panel=panel;
+                repaint_panel=true;
+            }
+        }
+        if(!menu_stable()){
+            closing_menu_replayed=finish_with_closing_menu();
+            if(!closing_menu_replayed){g_retained_scene_invalidated=true;return true;}
+        }
+    }
+    if(g_retained_menu_key&&!closing_menu_replayed){
+#if GPU_FRAME_DIAGNOSTICS
+        GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::MenuReplay),wm_trace_cpu_cycles);
+#endif
+        GpuPerfTimer timer(g_gpu_perf.menu_ticks);
+        if(repaint_panel){
+            auto panel=g_retained_menu_panel;
+            wm_copy_cached_menu(panel);
+            g_gpu_perf.retained_menu_pixels+=(uint64_t)(panel.x2-panel.x1)*(panel.y2-panel.y1);
+        }else g_gpu_perf.retained_menu_pixels+=gpu_retained_overlay_replay(plan,g_retained_menu_panel,wm_copy_cached_menu);
+        ++g_gpu_perf.retained_menu_frames;++g_gpu_perf.menu_reuses;
+    }
+    if(!closing_menu_replayed&&!menu_stable()&&!finish_with_closing_menu()){
+        g_retained_scene_invalidated=true;
+        return true;
+    }
+#endif
+    ++g_gpu_perf.retained_animation_frames;
+#if GPU_ALPHA_REPAIR_BATCH
+    if(g_deferred_alpha.count){++g_gpu_perf.alpha_repair_frames;g_gpu_perf.alpha_repair_rects+=g_deferred_alpha.count;}
+    g_deferred_alpha.clear();
+#endif
+    g_gpu_perf.opaque_retained_pixels+=g_retained_animation_opaque_pixels;
+    if(g_retained_animation_alpha)++g_gpu_perf.retained_alpha_frames;
+    if(used_background_row)++g_gpu_perf.shadow_row_frames;
+    g_gpu_present_pending=true;
+    return true;
+}
 static uint64_t g_gpu_fullscreen_fast_count=0;
 static uint64_t g_gpu_scaled_fast_count=0;
 static uint64_t g_gpu_retained_fast_count=0;
+static uint64_t g_gpu_ordered_scene_count=0;
+// Keep translucency on SIMD at every supported size: the former size-triggered
+// switch to UC RCS blending caused a visible latency cliff. Opaque scaling
+// remains on RCS. Mutable only for explicit driver regression fixtures.
+static uint64_t g_cpu_alpha_pixel_limit=GPU_RCS_ALPHA?0:UINT64_MAX;
+static uint64_t wm_gpu_perf_layout_signature(){
+    TtyIrqGuard guard;
+    uint64_t current=1469598103934665603ULL;
+    auto hash=[&](uint64_t value){current=(current^value)*1099511628211ULL;};
+    hash(g_menu_open);hash(g_clipboard_open);hash(g_taskbar_popup);hash(g_focused_win_id);
+    for(int s=0;s<g_window_count;++s){
+        auto* win=g_window_list[g_window_order[s]];
+        hash(win->id);hash(win->visible&&!win->minimized);
+        hash((uint32_t)win->x);hash((uint32_t)win->y);hash(win->w);hash(win->h);
+        hash(win->premultiplied);hash(win->maximized);
+    }
+    return current;
+}
+#if GPU_WORKLOAD
+// At most once per stable-layout observation; never print while holding IRQs.
+static void wm_gpu_geometry_sample(uint64_t signature){
+    struct Entry {
+        int id;char title[40];GpuOcclusionLayer layer;
+        unsigned width,height;bool rainbow,maximized;
+    };
+    static Entry entries[MAX_WINDOWS]{};unsigned count=0,rainbow=MAX_WINDOWS;
+    {
+        TtyIrqGuard guard;
+        if(wm_gpu_perf_layout_signature()!=signature)return;
+        for(int s=0;s<g_window_count&&count<MAX_WINDOWS;++s){
+            auto* win=g_window_list[g_window_order[s]];
+            if(!win||!win->visible||win->minimized)continue;
+            WinRect r;wm_get_win_rect(win,&r);if(!r.visible)continue;
+            auto& e=entries[count];e.id=win->id;
+            unsigned n=0;for(;n<sizeof(e.title)-1&&win->title[n];++n)e.title[n]=win->title[n];e.title[n]=0;
+            e.layer={{r.x1,r.y1,r.x2,r.y2},{r.x1,r.y1+(int)g_title_h,r.x2,r.y2},win->premultiplied};
+            e.width=win->canvas_width;e.height=win->canvas_height;
+            const auto& published=win->published[win->published_slot];
+            if(published.pixels&&!g_gpu_quarantine_sources){e.width=published.width;e.height=published.height;}
+            e.maximized=win->maximized;e.rainbow=win->is_system&&win->type==WIN_TYPE_RAIN;
+            if(e.rainbow)rainbow=count;
+            ++count;
+        }
+    }
+    if(rainbow==MAX_WINDOWS)return;
+    static GpuOcclusionLayer layers[MAX_WINDOWS]{};
+    static GpuOcclusionMetric metrics[MAX_WINDOWS]{};
+    unsigned above=count-rainbow-1;
+    for(unsigned i=0;i<above;++i)layers[i]=entries[rainbow+1+i].layer;
+    bool valid=gpu_occlusion_metrics(entries[rainbow].layer.client,
+        {0,0,(int)fb->width,(int)(fb->height-g_taskbar_h)},layers,above,metrics);
+    for(unsigned i=rainbow;i<count;++i){
+        const auto& e=entries[i];char line[512];char* end=line;
+        auto text=[&](const char* value){while(*value&&end<line+sizeof(line)-1)*end++=*value++;};
+        auto number=[&](uint64_t value){char digits[24];to_str(value,digits);text(digits);};
+        auto coordinate=[&](int value){if(value<0){text("-");number(-(int64_t)value);}else number(value);};
+        auto rect=[&](const char* label,VisibleRect r){text(label);coordinate(r.x1);text(",");coordinate(r.y1);
+            text(",");coordinate(r.x2);text(",");coordinate(r.y2);};
+        text("GPU geometry: layout=");number(signature);text(" order=");number(i-rainbow);
+        text(" id=");number(e.id);text(" title=");text(e.title);
+        rect(" outer=",e.layer.outer);rect(" client=",e.layer.client);
+        text(" source=");number(e.width);text("x");number(e.height);
+        text(" alpha=");number(e.layer.alpha);text(" maximized=");number(e.maximized);
+        text(" metricsValid=");number(valid);
+        if(i>rainbow&&valid){const auto& m=metrics[i-rainbow-1];
+            text(" coverPx=");number(m.cover_pixels);text(" newlyHiddenPx=");number(m.newly_hidden_pixels);
+            text(" lowerAlphaClientPx=");number(m.lower_alpha_client_pixels);}
+        *end=0;print(line);
+    }
+}
+#endif
+// Bounded, coarse samples after layout/alpha changes. Phase times include GPU
+// sleeps; these are elapsed milliseconds, not CPU utilization measurements.
+static void wm_gpu_perf_sample(uint64_t now) {
+    if((!GPU_RCS_ALPHA && !g_gpu_compose_hook)||!g_desktop_ready||!tsc_hz)return;
+    static uint64_t signature=0,started=0,frames=0;
+    static GpuPerfCounters previous{};
+    static unsigned remaining=0,printed=0;
+    if(printed>=32)return;
+    uint64_t current=wm_gpu_perf_layout_signature();
+    if(current!=signature||!started){
+        signature=current;started=now;frames=g_compositor_frame;previous=g_gpu_perf;remaining=2;
+        if(GPU_RCS_ALPHA){
+            g_cpu_alpha_pixel_limit=0;
+            for(auto& rejection:g_scanout_rejections)rejection={};
+        }
+        g_rain_slowest={};g_gpu_timeline_slowest={};g_gpu_execution_slowest={};g_gpu_timeline_last_latch=0;
+        if(GPU_RCS_ALPHA)g_gpu_flip_cadence.last_tick=0;
+        g_gpu_flip_cadence.reset_sample();
+        return;
+    }
+    if(!remaining||now-started<tsc_hz*2)return;
+    auto stats=g_gpu_perf;
+#if GPU_WORKLOAD
+    if(remaining==2)wm_gpu_geometry_sample(signature);
+#endif
+    char line[512];char* end=line;
+    auto text=[&](const char* value){while(*value&&end<line+sizeof(line)-1)*end++=*value++;};
+    auto number=[&](uint64_t value){char digits[24];to_str(value,digits);text(digits);};
+    auto ms=[&](uint64_t value){number(value*1000/tsc_hz);};
+    text("GPU perf: window=");ms(now-started);text("ms loops=");number(g_compositor_frame-frames);
+    text(" bcs=");number(stats.bcs_batches-previous.bcs_batches);
+    text(" rcs=");number(stats.rcs_draws-previous.rcs_draws);
+    text(" uploadKiB=");number((stats.upload_bytes-previous.upload_bytes)/1024);
+    text(" reused=");number(stats.upload_reuses-previous.upload_reuses);
+    text(" elapsed-ms scene=");ms(stats.scene_ticks-previous.scene_ticks);
+    text(" present=");ms(stats.present_ticks-previous.present_ticks);
+    text(" bcs=");ms(stats.bcs_wait-previous.bcs_wait);
+    text(" rcs=");ms(stats.rcs_wait-previous.rcs_wait);
+    text(" source=");ms(stats.upload_ticks-previous.upload_ticks);
+    text(" handoff=");ms(stats.handoff_ticks-previous.handoff_ticks);
+    text(" cpuAlpha=");number(stats.cpu_alpha_draws-previous.cpu_alpha_draws);
+    text(" alphaKiPx=");number((stats.cpu_alpha_pixels-previous.cpu_alpha_pixels)/1024);
+    text(" alphaMs=");ms(stats.cpu_alpha_ticks-previous.cpu_alpha_ticks);
+    text(" rcsAlphaKiPx=");number((stats.rcs_alpha_pixels-previous.rcs_alpha_pixels)/1024);
+    text(" alphaSavedKiPx=");number((stats.rcs_alpha_skipped-previous.rcs_alpha_skipped)/1024);
+    *end=0;print(line);
+    // Companion records share the window duration; keep each line bounded.
+    end=line;text("GPU present: window=");ms(now-started);text("ms calls=");
+    number(stats.present_calls-previous.present_calls);
+    text(" elapsed-ms copy=");ms(stats.scanout_copy_ticks-previous.scanout_copy_ticks);
+    text(" overlay=");ms(stats.overlay_ticks-previous.overlay_ticks);
+    text(" flip=");ms(stats.flip_ticks-previous.flip_ticks);
+    const auto cadence=g_gpu_flip_cadence;
+    text(" intervals=");number(cadence.intervals);
+    text(" avgFlipMs=");ms(cadence.intervals?cadence.total_ticks/cadence.intervals:0);
+    text(" maxFlipMs=");ms(cadence.max_ticks);
+    text(" skippedRefresh=");number(cadence.intervening_refreshes);
+    text(" over2Refresh=");number(cadence.over_two_refreshes);
+    text(" cpuCopies=");number(stats.scanout_cpu_copies-previous.scanout_cpu_copies);
+    *end=0;print(line);
+    end=line;text("GPU sleep: window=");ms(now-started);text("ms");
+    auto sleeps=[&](const char* label,const GpuPerfSleep& value,const GpuPerfSleep& old){
+        text(label);number(value.calls-old.calls);text("/");ms(value.ticks-old.ticks);
+        text("/");number(value.at_least_2ms-old.at_least_2ms);
+        text("/");number(value.at_least_10ms-old.at_least_10ms);
+    };
+    sleeps(" bcs=",stats.bcs_sleep,previous.bcs_sleep);
+    sleeps(" rcs=",stats.rcs_sleep,previous.rcs_sleep);
+    sleeps(" flip=",stats.flip_sleep,previous.flip_sleep);
+    *end=0;print(line);
+    if(GPU_RCS_ALPHA){
+        end=line;text("GPU frame: layout=");number(signature);
+        text(" menu=");number(g_menu_open);
+        text(" clipboard=");number(g_clipboard_open);
+        text(" taskbarPopup=");number(g_taskbar_popup);
+        text(" directFlips=");number(stats.direct_flips-previous.direct_flips);
+#if GPU_CURSOR_SAVE
+        text(" cursorRestores=");number(stats.cursor_restores-previous.cursor_restores);
+#endif
+        text(" repairRects=");number(stats.repair_rects-previous.repair_rects);
+        text(" repairKiPx=");number((stats.repair_pixels-previous.repair_pixels)/1024);
+        text(" seedKiB=");number((stats.scanout_seed_bytes-previous.scanout_seed_bytes)/1024);
+        text(" menuMs=");ms(stats.menu_ticks-previous.menu_ticks);
+        text(" menuRenders=");number(stats.menu_renders-previous.menu_renders);
+        text(" menuReuses=");number(stats.menu_reuses-previous.menu_reuses);
+          text(" animationFrames=");number(stats.retained_animation_frames-previous.retained_animation_frames);
+          text(" animationKiPx=");number((stats.retained_animation_pixels-previous.retained_animation_pixels)/1024);
+          text(" alphaFrames=");number(stats.retained_alpha_frames-previous.retained_alpha_frames);
+          text(" shadowRowFrames=");number(stats.shadow_row_frames-previous.shadow_row_frames);
+          text(" opaqueRetainedKiPx=");number((stats.opaque_retained_pixels-previous.opaque_retained_pixels)/1024);
+          text(" opaqueScans=");number(stats.opaque_scans-previous.opaque_scans);
+          text(" opaqueScanUs=");number((stats.opaque_scan_ticks-previous.opaque_scan_ticks)*1000000/tsc_hz);
+        *end=0;print(line);
+#if GPU_ALPHA_REPAIR_BATCH
+          end=line;text("GPU alpha repair: layout=");number(signature);
+          text(" frames=");number(stats.alpha_repair_frames-previous.alpha_repair_frames);
+          text(" rects=");number(stats.alpha_repair_rects-previous.alpha_repair_rects);
+          text(" cancels=");number(stats.alpha_repair_cancels-previous.alpha_repair_cancels);
+          *end=0;print(line);
+#endif
+#if GPU_RETAINED_MENU || GPU_EXACT_REPAIRS
+          end=line;text("GPU repair plan: layout=");number(signature);
+          text(" cachedMenuRects=");number(stats.menu_cache_repairs-previous.menu_cache_repairs);
+          text(" opaqueRepairRects=");number(stats.opaque_repair_rects-previous.opaque_repair_rects);
+          text(" exactFrames=");number(stats.exact_repair_frames-previous.exact_repair_frames);
+          text(" exactKiPx=");number((stats.exact_repair_pixels-previous.exact_repair_pixels)/1024);
+          text(" menuFrames=");number(stats.retained_menu_frames-previous.retained_menu_frames);
+          text(" menuKiPx=");number((stats.retained_menu_pixels-previous.retained_menu_pixels)/1024);
+          text(" menuCloseDeferred=");number(stats.retained_menu_close_deferrals-previous.retained_menu_close_deferrals);
+          *end=0;print(line);
+#endif
+          const auto& timeline=g_gpu_timeline_slowest;
+          end=line;text("GPU timeline: layout=");number(signature);
+          auto duration=[&](const char* label,uint64_t ticks){text(label);number(ticks*1000000/tsc_hz);};
+          auto phase=[&](const char* label,uint64_t tick){
+              text(label);
+              if(tick&&timeline.begin&&tick>=timeline.begin)number((tick-timeline.begin)*1000000/tsc_hz);
+              else text("-");
+          };
+          duration(" intervalUs=",timeline.interval());
+          duration(" startGapUs=",timeline.previous_latch&&timeline.begin>=timeline.previous_latch?
+                   timeline.begin-timeline.previous_latch:0);
+          phase(" composeUs=",timeline.compose);phase(" submitUs=",timeline.first_submit);
+          phase(" readyUs=",timeline.last_ready);phase(" armUs=",timeline.arm);
+          phase(" latchUs=",timeline.latch);phase(" finishUs=",timeline.finish);
+          duration(" cpuUs=",timeline.cpu);duration(" bcsUs=",timeline.bcs);
+          duration(" rcsUs=",timeline.rcs);duration(" sleepUs=",timeline.sleep);
+          text(" bcsBatches=");number(timeline.bcs_batches);
+          text(" rcsDraws=");number(timeline.rcs_draws);
+          text(" refreshes=");number(timeline.refreshes);
+          text(" flipPolls=");number(timeline.flip_polls);
+          duration(" maxFlipSleepUs=",timeline.max_flip_sleep);
+          phase(" refreshSeenUs=",timeline.first_refresh);
+          phase(" surfaceSeenUs=",timeline.first_live);
+          *end=0;print(line);
+          const auto& execution=g_gpu_execution_slowest;
+#if GPU_FRAME_DIAGNOSTICS
+          if(timeline.max_flip_sleep){
+              end=line;text("GPU flip wake: layout=");number(signature);
+              duration(" maxSleepUs=",timeline.max_flip_sleep);
+              duration(" sleepToReadyUs=",timeline.sleep_to_ready);
+              duration(" readyToResumeUs=",timeline.ready_to_resume);
+              text(" readyLateTicks=");number(timeline.ready_late_ticks);
+              text(" resumeLateTicks=");number(timeline.resume_late_ticks);
+              text(" readyPid=");if(timeline.sleep_ready_pid<0)text("-");else number(timeline.sleep_ready_pid);
+              *end=0;print(line);
+          }
+          auto frame_diagnostics=[&](const char* sample,const GpuFrameTimeline& trace){
+              end=line;text("GPU planning: layout=");number(signature);text(" sample=");text(sample);
+              text(" intervalUs=");number(trace.interval()*1000000/tsc_hz);
+              const char* labels[]={" prepare="," direct="," merge="," pack="," regions="," repairs=",
+                                    " revalidate="," menuBuild="," menuReplay="," fallback="};
+              uint64_t invalid=0;
+              for(unsigned i=0;i<GpuFrameTimeline::PhaseCount;++i){text(labels[i]);
+                  number(trace.planning[i].wall*1000000/tsc_hz);text("/");
+                  number(trace.planning[i].cpu*1000000/tsc_hz);invalid+=trace.planning[i].invalid;}
+              text(" invalid=");number(invalid);*end=0;print(line);
+              end=line;text("GPU phase: layout=");number(signature);text(" sample=");text(sample);
+              text(" intervalUs=");number(trace.interval()*1000000/tsc_hz);
+              uint64_t span=0;
+              auto point=[&](const char* label,const GpuDisplayPhase& p){text(label);number(p.valid);text("/");
+                  number(p.frame);text("/");number(p.line());text("/");number(p.live&0xfffff000u);
+                  if(p.valid&&p.last-p.first>span)span=p.last-p.first;};
+              point(" prev=",trace.display_previous);point(" start=",trace.display_start);
+              point(" before=",trace.display_before);point(" after=",trace.display_after);
+              point(" observed=",trace.display_latch);
+              text(" armWindowUs=");number(trace.display_after.first>=trace.display_before.last?
+                  (trace.display_after.first-trace.display_before.last)*1000000/tsc_hz:0);
+              text(" maxReadUs=");number(span*1000000/tsc_hz);*end=0;print(line);
+          };
+          frame_diagnostics("worst",timeline);frame_diagnostics("gpu",execution);
+#endif
+          auto engine_timing=[&](const char* engine,const GpuExecutionTiming& timing,bool blitter){
+              end=line;text("GPU execution: layout=");number(signature);
+              text(" engine=");text(engine);text(" samples=");number(timing.samples);
+              text(" invalid=");number(timing.invalid);
+              text(" frameIntervalUs=");number(execution.interval()*1000000/tsc_hz);
+              text(" observedUs=");number(timing.observed_us);
+              text(" queueUs=");number(timing.queue_us);text(" setupUs=");number(timing.setup_us);
+              text(blitter?" workUs=":" parseUs=");number(timing.parse_us);text(" rtUs=");number(timing.rt_us);
+              text(" drainUs=");number(timing.drain_us);text(" tailUs=");number(timing.tail_us);
+              *end=0;print(line);
+          };
+          engine_timing("BCS",execution.bcs_gpu,true);engine_timing("RCS",execution.rcs_gpu,false);
+#if GPU_WORKLOAD
+          // Work and hardware timings are from the same sampled frame.
+          const auto& work=execution.workload;
+          end=line;text("GPU workload: layout=");number(signature);
+          text(" frameIntervalUs=");number(execution.interval()*1000000/tsc_hz);
+          text(" bcsSamples=");number(execution.bcs_gpu.samples);
+          text(" rcsSamples=");number(execution.rcs_gpu.samples);
+          text(" bcsBatches=");number(execution.bcs_batches);
+          const char* kinds[]={" other="," rainbow="," client="," scanout="};
+          for(unsigned i=0;i<(unsigned)GpuCopyKind::Count;++i){
+              text(kinds[i]);number(work.copies[i].ops);text("/");number(work.copies[i].bytes);
+          }
+          text(" fill=");number(work.fill_ops);text("/");number(work.fill_bytes);
+          text(" fences=");number(work.fences);
+          text(" rcsDraws=");number(work.rcs_draws);text(" rcsRects=");number(work.rcs_rects);
+          text(" blendPx=");number(work.blend_pixels);text(" opaquePx=");number(work.opaque_pixels);
+          *end=0;print(line);
+#endif
+        const auto& trace=g_rain_slowest;
+        end=line;text("GPU Rainbow: policy=");text(g_cpu_alpha_pixel_limit?"SIMD":"RCS");
+        text(" layout=");number(signature);
+        text(" directFlips=");number(stats.direct_flips-previous.direct_flips);
+        text(" intervalUs=");number(trace.interval*1000000/tsc_hz);
+        text(" alphaDraws=");number(trace.alpha_draws);
+        auto offset=[&](const char* label,uint64_t tick){
+            text(label);
+            if(tick)number((tick-trace.update)*1000000/tsc_hz);
+            else text("-");
+        };
+        offset(" submitUs=",trace.alpha_submit);offset(" retiredUs=",trace.alpha_done);
+        offset(" simdStartUs=",trace.simd_start);offset(" simdDoneUs=",trace.simd_done);
+        offset(" copySubmitUs=",trace.copy_submit);offset(" copyDoneUs=",trace.copy_done);
+        offset(" armUs=",trace.arm);offset(" latchUs=",trace.latch);
+        *end=0;print(line);
+        for(const auto& window:trace.windows){
+            if(!window.passes)continue;
+            end=line;text("GPU window: layout=");number(signature);
+            text(" id=");number(window.id);text(" title=");text(window.title);
+            text(" alpha=");number(window.alpha);text(" passes=");number(window.passes);
+            auto us=[&](const char* label,uint64_t ticks){text(label);number(ticks*1000000/tsc_hz);};
+            us(" startUs=",window.start-trace.update);us(" endUs=",window.end-trace.update);
+            us(" shadowUs=",window.shadow);us(" chromeUs=",window.chrome);
+            us(" gpuUs=",window.gpu);us(" clientUs=",window.client);
+            us(" bcsUs=",window.bcs);us(" rcsUs=",window.rcs);
+            *end=0;print(line);
+        }
+        auto signed_number=[&](int64_t value){
+            if(value<0)text("-");
+            number(value<0?0-(uint64_t)value:(uint64_t)value);
+        };
+        for(unsigned i=0;i<scanout_check_count;++i){
+            auto& rejection=g_scanout_rejections[i];
+            if(!rejection.count)continue;
+            end=line;text("GPU direct: layout=");number(signature);
+            text(" policy=");text(g_cpu_alpha_pixel_limit?"SIMD":"RCS");
+            text(" blockedBy=");text(scanout_check_names[i]);
+            text(" attempts=");number(rejection.count);
+            text(" lastActual=");signed_number(rejection.actual);
+            text(" expected=");signed_number(rejection.expected);
+            *end=0;print(line);
+            rejection={};
+        }
+        g_rain_slowest={};
+        // Exclude the interval crossing a log write from the next sample.
+        g_gpu_timeline_slowest={};
+        g_gpu_execution_slowest={};
+        g_gpu_timeline_last_latch=0;
+        g_gpu_flip_cadence.last_tick=0;
+    }
+    --remaining;++printed;started=rdtsc_val();frames=g_compositor_frame;previous=stats;
+    g_gpu_flip_cadence.reset_sample();
+}
+static void gpu_direct_end();
+static bool gpu_direct_active();
 static inline bool wm_compose_dirty_band(uint32_t min_x, uint32_t max_x,
                                      uint32_t min_y, uint32_t max_y, bool do_overlay = true,
                                      bool present = true) {
-    bool skip_gpu_scene=false;
+    bool skip_gpu_scene=false,first_attempt=true;
 retry_scene:
+    if(!first_attempt)gpu_direct_end();
+    first_attempt=false;
     if (!fb || !fb->address || !g_master_backbuffer) return false;
     if (min_x>max_x || min_y>max_y || min_x>=fb->width || min_y>=fb->height) return false;
     if (max_x >= fb->width)  max_x = fb->width - 1;
     if (max_y >= fb->height) max_y = fb->height - 1;
     if (min_y > max_y || min_x > max_x) return false;
+    VisibleRect menu_cover{};
+    if(g_menu_open){
+        int x,y,w,h;wm_menu_geom(&x,&y,&w,&h);
+        menu_cover={x,y,x+w,y+h};
+    }
     ++g_scene_compose_count;g_scene_compose_pixels+=(uint64_t)(max_x-min_x+1)*(max_y-min_y+1);
     ResourceRead resource_read;
 
@@ -2030,13 +3071,42 @@ retry_scene:
     // antialiasing twice onto rows whose backgrounds were not recomposed.
     g_ui_clip_left = 0; g_ui_clip_top = min_y;
     g_ui_clip_right = fb->width; g_ui_clip_bottom = max_y + 1;
-    WinRect rects[MAX_WINDOWS];Window* frame_windows[MAX_WINDOWS];int frame_order[MAX_WINDOWS],frame_count;
-    struct Source { uint32_t* pixels;int w,h;uint32_t pitch; } sources[MAX_WINDOWS];
+    // Only the compositor calls this function. Keep frame snapshots off its
+    // stack; nested visibility, GPU waits and timer interrupts need headroom.
+    static WinRect rects[MAX_WINDOWS];static Window* frame_windows[MAX_WINDOWS];
+    static int frame_order[MAX_WINDOWS];int frame_count;
+    struct Source { uint32_t* pixels;int w,h;uint32_t pitch;bool alpha;uint64_t revision; };
+    static Source sources[MAX_WINDOWS];
+    bool alpha_scene=false;
     {TtyIrqGuard guard;frame_count=g_window_count;
         for(int i=0;i<frame_count;++i){auto* win=g_window_list[i];frame_windows[i]=win;frame_order[i]=g_window_order[i];
-            wm_get_win_rect(win,&rects[i]);sources[i]={win->buffer,win->canvas_width,win->canvas_height,win->buffer_pitch};
+            wm_get_win_rect(win,&rects[i]);sources[i]={win->buffer,win->canvas_width,win->canvas_height,win->buffer_pitch,win->premultiplied};
+            if(rects[i].visible&&win->premultiplied)alpha_scene=true;
+            if(rects[i].visible)gpu_launch_sample(win->id,g_compositor_frame);
             const auto& slot=win->published[win->published_slot];
-            if(slot.pixels && !g_gpu_quarantine_sources)sources[i]={slot.pixels,slot.width,slot.height,(uint32_t)slot.width*4};}}
+            if(slot.pixels && !g_gpu_quarantine_sources)sources[i]={slot.pixels,slot.width,slot.height,(uint32_t)slot.width*4,win->premultiplied,slot.revision};}}
+    // Ignore shadow areas hidden by higher opaque windows. This preserves the
+    // fullscreen fast paths and retained client updates away from shadow edges.
+    auto exposed_shadow=[&](VisibleRect damage){
+        for(int s=0;s<frame_count;++s){
+            int i=frame_order[s];const auto& r=rects[i];auto* win=frame_windows[i];
+            if(!r.visible||!win->shadow_enabled||win->maximized)continue;
+            VisibleRect outer{r.x1,r.y1,r.x2,r.y2};
+            auto hit=visibility_intersect(window_shadow_bounds(outer),damage);
+            if(!visibility_valid(hit))continue;
+            VisibleRegion region{};region.count=1;region.rects[0]=hit;
+            if(!visibility_subtract(&region,outer))return true;
+            for(int t=s+1;t<frame_count&&region.count;++t){
+                int j=frame_order[t];if(!rects[j].visible)continue;
+                auto cover=VisibleRect{rects[j].x1,rects[j].y1,rects[j].x2,rects[j].y2};
+                if(sources[j].alpha)cover.y2=cover.y1+(int)g_title_h;
+                if(!visibility_subtract(&region,cover))return true;
+            }
+            if(region.count)return true;
+        }
+        return false;
+    };
+    bool shadow_damage=exposed_shadow({(int)min_x,(int)min_y,(int)max_x+1,(int)max_y+1});
     bool show_desktop_stats=true;
     for(int i=0;i<frame_count;++i)
         if(rects[i].visible&&frame_windows[i]->maximized){show_desktop_stats=false;break;}
@@ -2053,13 +3123,14 @@ retry_scene:
     bool fullscreen_fast=false;
     bool scaled_fast=false;
     bool retained_fast=false;
-    if(g_gpu_compose_hook && present && !skip_gpu_scene){
+    bool direct=gpu_direct_active();
+    if(g_gpu_compose_hook && present && !skip_gpu_scene && !direct && !alpha_scene && !shadow_damage){
         for(int s=0;s<frame_count;++s){
             int index=frame_order[s];const auto& r=rects[index];auto* win=frame_windows[index];
             const auto& source=sources[index];
             gpu_plan.clients[s]={{r.x1,r.y1,r.x2,r.y2},{r.x1,r.y1+(int)g_title_h,r.x2,r.y2},
                 source.pixels,(uint32_t)source.w,(uint32_t)source.h,source.pitch,
-                win&&r.visible,win&&win->is_system&&win->type==WIN_TYPE_RAIN,win&&!win->maximized};
+                win&&r.visible,win&&win->is_system&&win->type==WIN_TYPE_RAIN,win&&!win->maximized,source.alpha,source.revision};
         }
         if(!g_menu_open && !g_clipboard_open && !g_taskbar_popup)
             fullscreen_fast=gpu_rain_damage_plan(&gpu_plan,{(int)min_x,(int)min_y,(int)max_x+1,(int)max_y+1});
@@ -2086,6 +3157,18 @@ retry_scene:
                 (int)(max_y+1<fb->height-g_taskbar_h?max_y+1:fb->height-g_taskbar_h)});
             gpu_plan.accelerated|=render_plan.accelerated;
         }
+    }
+    bool ordered_scene=direct||alpha_scene||(!fullscreen_fast&&!scaled_fast&&!retained_fast&&
+        exposed_shadow({0,(int)min_y,(int)fb->width,(int)max_y+1}));
+    bool bounded_scene=ordered_scene&&(!g_menu_open||wm_retained_menu_ready())&&!g_clipboard_open&&!g_taskbar_popup&&
+        (min_y>=60||(GPU_EXACT_REPAIRS&&direct&&!show_desktop_stats))&&max_y<fb->height-g_taskbar_h;
+    if(ordered_scene){
+        // Shell/HUD paths still paint full rows. Ordinary client updates clip
+        // background, cached chrome, shadows and clients to the real damage.
+        if(!bounded_scene){min_x=0;max_x=fb->width-1;}
+        g_ui_clip_left=min_x;g_ui_clip_right=max_x+1;
+        gpu_plan.count=0;gpu_plan.accelerated=0;
+        render_plan.count=0;render_plan.accelerated=0;
     }
     
     // Metrics reset (B/W/r/L are updated DURING the frame, V is from last)
@@ -2144,6 +3227,8 @@ retry_scene:
         t1=t0;t2=rdtsc_val();g_time_win_ticks=t2-t0;
     }else{
 
+    if(ordered_scene)++g_gpu_ordered_scene_count;
+
     // Stage 1: Desktop wallpaper (hole-punched)
     for (uint32_t y = min_y; y <= max_y; y++) {
         uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
@@ -2155,11 +3240,12 @@ retry_scene:
 
         // Collect opaque spans for this scanline
         struct Span { int32_t x1, x2; };
-        Span spans[MAX_WINDOWS];
+        Span spans[MAX_WINDOWS+1];
         int num_spans = 0;
         
         for (int i = 0; i < frame_count; i++) {
-            if (frame_windows[i] && rects[i].visible && (int32_t)y >= rects[i].y1 && (int32_t)y < rects[i].y2) {
+            if (frame_windows[i] && rects[i].visible && (int32_t)y >= rects[i].y1 && (int32_t)y < rects[i].y2 &&
+                (!sources[i].alpha || (int32_t)y<rects[i].y1+(int32_t)g_title_h)) {
                 // Intersects this scanline
                 int32_t sx1 = rects[i].x1; if (sx1 < (int32_t)min_x) sx1 = min_x;
                 int32_t sx2 = rects[i].x2; if (sx2 > (int32_t)max_x + 1) sx2 = max_x + 1;
@@ -2169,6 +3255,11 @@ retry_scene:
                     num_spans++;
                 }
             }
+        }
+        if((int)y>=menu_cover.y1 && (int)y<menu_cover.y2){
+            int left=menu_cover.x1>(int)min_x?menu_cover.x1:min_x;
+            int right=menu_cover.x2<(int)max_x+1?menu_cover.x2:max_x+1;
+            if(left<right)spans[num_spans++]={left,right};
         }
         
         // Sort spans by x1
@@ -2225,12 +3316,36 @@ retry_scene:
     g_time_bg_ticks = t1 - t0;
 
     // Stage 2: Windows in stack order
-    for (int s = 0; s < frame_count; s++) {
+    int first_window=0;
+    if(direct){
+        // Any opaque client covering this damage makes lower layers hidden.
+        for(int s=0;s<frame_count;++s){
+            int i=frame_order[s];const auto& r=rects[i];
+            if(r.visible && sources[i].pixels &&
+               !sources[i].alpha && r.x1<=(int)min_x && r.x2>(int)max_x &&
+               r.y1+(int)g_title_h<=(int)min_y && r.y2>(int)max_y)first_window=s;
+        }
+    }
+    for (int s = first_window; s < frame_count; s++) {
         int idx = frame_order[s];
         Window* win = frame_windows[idx];
         if (!win || !rects[idx].visible) continue;
+        RainbowWindowTimer window_timer(idx,win->id,win->title,sources[idx].alpha);
         WinRect r = rects[idx];
         Source source_surface=sources[idx];int display_w=r.x2-r.x1,display_h=r.y2-r.y1-g_title_h;
+
+        if(win->shadow_enabled&&!win->maximized){
+            VisibleRect covers[MAX_WINDOWS+1];unsigned cover_count=0;
+            if(visibility_valid(menu_cover))covers[cover_count++]=menu_cover;
+            for(int t=s+1;t<frame_count;++t){
+                int higher=frame_order[t];if(!rects[higher].visible)continue;
+                const auto& cover=rects[higher];
+                covers[cover_count++]={cover.x1,cover.y1,cover.x2,
+                    sources[higher].alpha?cover.y1+(int)g_title_h:cover.y2};
+            }
+            window_shadow_draw({g_master_backbuffer,(int)fb->width,(int)(fb->height-g_taskbar_h),(int)fb->pitch},
+                {r.x1,r.y1,r.x2,r.y2},{(int)min_x,(int)min_y,(int)max_x+1,(int)max_y+1},covers,cover_count);
+        }
 
         int32_t dr1 = (r.y1 > (int32_t)min_y) ? r.y1 : (int32_t)min_y;
         // Window bounds and row loops are half-open; damage max_y is inclusive.
@@ -2243,26 +3358,94 @@ retry_scene:
         if (dr1 >= dr2) continue;
 
         // Unified surface compositor: every window (system or user) is backed by its surface buffer
-        wm_draw_window_chrome(r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1, win->title, win->closable, min_y, max_y, win->id == g_focused_win_id, &wm_window_icons(win).title,win->maximized);
+        window_timer.next(&RainbowWindowTrace::chrome);
+        wm_draw_window_chrome(win,r.x1,r.y1,r.x2-r.x1,min_y,max_y,wm_window_icons(win).title);
+        window_timer.next(&RainbowWindowTrace::gpu);
         if (source_surface.pixels) {
             bool accelerated=(gpu_plan.accelerated & (uint32_t(1)<<s))!=0;
+            bool ordered_accelerated=false;
+            if(ordered_scene && present && !skip_gpu_scene &&
+               !(source_surface.alpha&&alpha_cpu_eligible(
+                   {r.x1,r.y1+(int)g_title_h,r.x2,r.y2},
+                   {(int)min_x,dr1,(int)max_x+1,dr2},g_cpu_alpha_pixel_limit))){
+                static GpuScenePlan ordered_plan{};
+                GpuSceneClient client{{r.x1,r.y1,r.x2,r.y2},
+                    {r.x1,r.y1+(int)g_title_h,r.x2,r.y2},source_surface.pixels,
+                    (uint32_t)source_surface.w,(uint32_t)source_surface.h,source_surface.pitch,
+                    true,win->is_system&&win->type==WIN_TYPE_RAIN,!win->maximized,source_surface.alpha,source_surface.revision};
+                ordered_plan.scroll=rain_scroll;ordered_plan.rainbow_colors=g_rainbow_wide;
+                unsigned engine=gpu_ordered_scene_plan(&ordered_plan,client,{(int)min_x,(int)min_y,(int)max_x+1,dr2});
+                VisibleRect opaque[MAX_WINDOWS+1];unsigned opaque_count=0;
+                if(visibility_valid(menu_cover))opaque[opaque_count++]=menu_cover;
+                for(int t=s+1;t<frame_count;++t){
+                    int higher=frame_order[t];if(!rects[higher].visible)continue;
+                    const auto& cover=rects[higher];
+                    opaque[opaque_count++]={cover.x1,cover.y1,cover.x2,
+                        sources[higher].alpha?cover.y1+(int)g_title_h:cover.y2};
+                }
+                gpu_ordered_occlude(&ordered_plan,opaque,opaque_count);
+                auto hook=engine==1?g_gpu_compose_hook:engine==2?g_gpu_render_hook:nullptr;
+                if(hook){
+                    bool deferred=false;
+#if GPU_ALPHA_REPAIR_BATCH
+                    if(engine==2&&bounded_scene&&!do_overlay&&gpu_direct_active()&&win->id==g_deferred_alpha_id){
+                        bool topmost=true;
+                        for(int t=s+1;t<frame_count;++t)if(rects[frame_order[t]].visible){topmost=false;break;}
+                        if(topmost)deferred=g_deferred_alpha.append(ordered_plan,g_retained_animation_plan);
+                    }
+#endif
+                    if(!deferred&&ordered_plan.count&&!hook(ordered_plan)){
+                        if(engine==2)g_gpu_render_hook=nullptr;
+                        skip_gpu_scene=true;g_rain_surface_current=false;
+                        min_x=0;min_y=0;max_x=fb->width-1;max_y=fb->height-1;goto retry_scene;
+                    }
+                    ordered_accelerated=true;
+                }
+            }
+            window_timer.next(&RainbowWindowTrace::client);
             bool procedural_rain=win->is_system&&win->type==WIN_TYPE_RAIN&&!g_rain_surface_current;
             if(procedural_rain && (source_surface.w!=display_w||source_surface.h!=display_h)){
                 rainbow_render_surface(source_surface.pixels,source_surface.w,source_surface.h,
                                        source_surface.pitch,rain_scroll,g_rainbow_wide);
                 procedural_rain=false;g_rain_surface_current=true;
             }
+            if(source_surface.alpha){
+                int alpha_top=dr1;
+                if(ordered_accelerated&&alpha_top<r.y2-(win->maximized?0:12))
+                    alpha_top=r.y2-(win->maximized?0:12);
+                GpuPerfTimer timer(g_gpu_perf.cpu_alpha_ticks);
+                uint64_t pixels=alpha_render(
+                    {(uint32_t*)g_master_backbuffer,(int)fb->width,(int)fb->height,(int)fb->pitch},
+                    {source_surface.pixels,source_surface.w,source_surface.h,(int)source_surface.pitch},
+                    {r.x1,r.y1+(int)g_title_h,r.x2,r.y2},
+                    {(int)min_x,alpha_top,(int)max_x+1,dr2});
+                if(pixels){
+                    ++g_gpu_perf.cpu_alpha_draws;g_gpu_perf.cpu_alpha_pixels+=pixels;
+                    if(g_rain_trace.update){
+                        if(!g_rain_trace.simd_start)g_rain_trace.simd_start=timer.started;
+                        g_rain_trace.simd_done=rdtsc_val();
+                    }
+                }
+            }
             for (int32_t y = dr1; y < dr2; y++) {
                 if (y < r.y1 + (int32_t)g_title_h) continue;
                 if (accelerated && y < r.y2-(gpu_plan.clients[s].resize_grip?12:0)) continue;
+                if (ordered_accelerated && y < r.y2-(win->maximized?0:12)) continue;
                 uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
                 int32_t ry = y - (r.y1 + (int32_t)g_title_h);
                 int32_t wx = r.x1; if (wx < 0) wx = 0;
                 int32_t ww = (r.x2 - r.x1); if (r.x1 < 0) ww += r.x1;
                 if (wx + ww > (int32_t)fb->width) ww = (int32_t)fb->width - wx;
+                if(bounded_scene){
+                    int right=wx+ww;if(right>(int)max_x+1)right=max_x+1;
+                    if(wx<(int)min_x)wx=min_x;
+                    ww=right-wx;
+                }
                 if (ww > 0) {
-                    uint32_t src_off = (r.x1 < 0) ? (uint32_t)(-r.x1) : 0;
-                    if(procedural_rain)
+                    uint32_t src_off = (uint32_t)(wx-r.x1);
+                    if(source_surface.alpha){
+                        // Optimized clipped blend above; retain the CPU grip.
+                    }else if(procedural_rain)
                         wm_fill_rainbow_row(drow+wx,ww,rain_scroll,src_off);
                     else if(source_surface.w==display_w&&source_surface.h==display_h)
                         memcpy_vram_sse_headless(drow + wx, (uint32_t*)((uint8_t*)source_surface.pixels + (uint64_t)ry * source_surface.pitch) + src_off, ww * 4);
@@ -2299,43 +3482,6 @@ retry_scene:
         min_x=0;min_y=0;max_x=fb->width-1;max_y=fb->height-1;
         goto retry_scene;
     }
-    // top_c/bot_c are the gradient endpoints; edge_c is the 1px border;
-    // shine=true draws a bright highlight row on top (glass effect).
-    auto draw_btn = [&](int32_t bx, int32_t by, int32_t bw, int32_t bh,
-                        uint32_t top_c, uint32_t bot_c,
-                        uint32_t edge_c, bool shine) {
-        for (int32_t y = by; y < by + bh; y++) {
-            if (y < (int32_t)min_y || y > (int32_t)max_y) continue;
-            if (y < 0 || (uint32_t)y >= fb->height) continue;
-            uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
-            uint32_t t = (uint32_t)(y - by) * 255 / (bh > 1 ? (uint32_t)(bh - 1) : 1u);
-            uint8_t rr  = (uint8_t)(((top_c>>16)&0xFF) + (int32_t)(((int32_t)((bot_c>>16)&0xFF)-(int32_t)((top_c>>16)&0xFF))*(int32_t)t/255));
-            uint8_t gg  = (uint8_t)(((top_c>> 8)&0xFF) + (int32_t)(((int32_t)((bot_c>> 8)&0xFF)-(int32_t)((top_c>> 8)&0xFF))*(int32_t)t/255));
-            uint8_t bb  = (uint8_t)(((top_c    )&0xFF) + (int32_t)(((int32_t)((bot_c    )&0xFF)-(int32_t)((top_c    )&0xFF))*(int32_t)t/255));
-            uint32_t row_clr = 0xFF000000 | ((uint32_t)rr<<16) | ((uint32_t)gg<<8) | bb;
-            if (shine && y == by) row_clr = 0xFFAABBEE;  // top shine row
-
-            int32_t sx = bx < 0 ? 0 : bx;
-            int32_t ex = bx + bw; if (ex > (int32_t)fb->width) ex = (int32_t)fb->width;
-            if (ex > sx) memset_32(drow + sx, row_clr, (uint32_t)(ex - sx));
-
-            // Left/right 1px edges
-            if (bx >= 0 && (uint32_t)bx < fb->width)           drow[bx]       = edge_c;
-            if (bx+bw-1 >= 0 && (uint32_t)(bx+bw-1) < fb->width) drow[bx+bw-1] = edge_c;
-        }
-        // Top / bottom edge lines
-        for (int32_t px = bx; px < bx + bw; px++) {
-            if (px < 0 || (uint32_t)px >= fb->width) continue;
-            auto edge_px = [&](int32_t ey, uint32_t ec) {
-                if (ey < (int32_t)min_y || ey > (int32_t)max_y) return;
-                if (ey < 0 || (uint32_t)ey >= fb->height) return;
-                ((uint32_t*)(g_master_backbuffer + (uint64_t)ey * fb->pitch))[px] = ec;
-            };
-            edge_px(by,        edge_c);
-            edge_px(by + bh - 1, 0xFF101828);
-        }
-    };
-
     // Stage 2.5: Task Bar — Modern dark glass style
     int32_t tb_y = (int32_t)fb->height - (int32_t)g_taskbar_h;
     int32_t tbr1 = (tb_y > (int32_t)min_y) ? tb_y : (int32_t)min_y;
@@ -2365,7 +3511,7 @@ retry_scene:
         int32_t sb_x = 6,   sb_y = tb_y + PAD;
         int32_t sb_h = (int32_t)g_taskbar_h - PAD * 2;
 
-        draw_btn(sb_x, sb_y, g_sb_w, sb_h,
+        wm_draw_button(min_y,max_y,sb_x, sb_y, g_sb_w, sb_h,
                 0xFF4a7ad8, 0xFF2a50b0,   // blue gradient
                 0xFF1a3a90,               // dark blue border
                 true);
@@ -2382,12 +3528,20 @@ retry_scene:
         int32_t tray_x = (int32_t)fb->width - TRAY_W - 6;
         int32_t tray_y = sb_y, tray_h = sb_h;
 
-        draw_btn(tray_x, tray_y, TRAY_W, tray_h,
+        wm_draw_button(min_y,max_y,tray_x, tray_y, TRAY_W, tray_h,
                 0xFF252a42, 0xFF1a1f35,
                 0xFF303560, false);
 
         // Clock: time on top, date below (like the Windows taskbar). Only reads the cached g_clock.
         {
+            uint32_t clock_scale = wm_clock_scale();
+            int32_t fps_width=wm_fps_width();
+            int32_t clock_x=tray_x+fps_width,clock_width=TRAY_W-fps_width;
+            char fps[16];to_str(g_desktop_fps,fps);
+            resources::append(fps,sizeof(fps)," FPS");
+            int32_t ch = wm_text_height(clock_scale);
+            int32_t fps_x=tray_x+(fps_width-wm_text_width(fps,clock_scale))/2;
+            wm_draw_string(fps_x,tray_y+(tray_h-ch)/2,fps,0xFFE6E8FF,clock_scale);
             char tbuf[16], dbuf[16];
             int tl, dl = 0;
             if (g_clock_valid) {
@@ -2397,15 +3551,13 @@ retry_scene:
                 tbuf[0] = '-'; tbuf[1] = '-'; tbuf[2] = ':'; tbuf[3] = '-'; tbuf[4] = '-'; tbuf[5] = 0;
                 tl = 5;
             }
-            uint32_t clock_scale = wm_clock_scale();
-            int32_t ch = wm_text_height(clock_scale);
             bool two_lines = dl > 0 && tray_h >= 2 * ch + 2;
             int32_t ty0 = two_lines ? tray_y + (tray_h - (2 * ch + 2)) / 2
                                     : tray_y + (tray_h - ch) / 2;
-            wm_draw_string((uint32_t)(tray_x + (TRAY_W - wm_text_width(tbuf, clock_scale)) / 2), (uint32_t)ty0,
+            wm_draw_string((uint32_t)(clock_x + (clock_width - wm_text_width(tbuf, clock_scale)) / 2), (uint32_t)ty0,
                            tbuf, 0xFFE6E8FF, clock_scale);
             if (two_lines)
-                wm_draw_string((uint32_t)(tray_x + (TRAY_W - wm_text_width(dbuf, clock_scale)) / 2), (uint32_t)(ty0 + ch + 2),
+                wm_draw_string((uint32_t)(clock_x + (clock_width - wm_text_width(dbuf, clock_scale)) / 2), (uint32_t)(ty0 + ch + 2),
                                dbuf, 0xFF9FA6CC, clock_scale);
         }
 
@@ -2435,7 +3587,7 @@ retry_scene:
             uint32_t bot_c  = active ? 0xFF28366a : 0xFF181c30;
             uint32_t edge_c = active ? 0xFF5568b0 : 0xFF2c3258;
 
-            draw_btn(cur_x, sb_y, button_width, sb_h, top_c, bot_c, edge_c, active);
+            wm_draw_button(min_y,max_y,cur_x, sb_y, button_width, sb_h, top_c, bot_c, edge_c, active);
 
             if(win->minimized){
                 int py=sb_y+sb_h-4;
@@ -2479,7 +3631,7 @@ retry_scene:
         }
         if(tasks.layout.overflow_width){
             int x=tasks.layout.overflow_x,w=tasks.layout.overflow_width;
-            draw_btn(x,sb_y,w,sb_h,0xff303955,0xff1c243c,0xff465475,g_taskbar_popup==1);
+            wm_draw_button(min_y,max_y,x,sb_y,w,sb_h,0xff303955,0xff1c243c,0xff465475,g_taskbar_popup==1);
             int dot=sb_h>=40?3:2;
             int spacing=dot*2;
             int center_x=x+w/2,center_y=sb_y+sb_h/2;
@@ -2645,6 +3797,11 @@ retry_scene:
         p = ut_str;   while(*p) *d++ = *p++;
         p = "s";      while(*p) *d++ = *p++;
         p = " | ";    while(*p) *d++ = *p++;
+        if(g_gpu_flip_cadence.last_interval && d-cpu_msg < HUD_MSG_CAP-32){
+            p = "Flip:"; while(*p) *d++ = *p++;
+            d = hud_put_ms1(d,g_gpu_flip_cadence.last_interval);
+            p = "ms | "; while(*p) *d++ = *p++;
+        }
         p = g_gpu_status; while(*p && (d - cpu_msg) < (HUD_MSG_CAP - 2)) *d++ = *p++;
         *d = '\0';
 
@@ -2671,89 +3828,7 @@ retry_scene:
     }
     
     wm_taskbar_render_popup(min_y,max_y);
-    // Stage 2.8: Start menu popup (topmost scene layer, below the cursor overlay)
-    if (g_menu_open && fb) {
-        int32_t px, py, pw, ph;
-        wm_menu_geom(&px, &py, &pw, &ph);
-        int32_t pad=wm_menu_pad(), header=wm_menu_header(), row_h=wm_menu_row();
-        int32_t footer_top=py+ph-wm_menu_footer(), list_top=py+header+pad;
-        int32_t char_h=(int32_t)wm_text_height(g_font_scale_100);
-        int hover=wm_menu_hit_test(g_mouse_x,g_mouse_y);
-        // Every primitive respects the current damage band and framebuffer bounds.
-        auto rect=[&](int32_t x,int32_t y,int32_t w,int32_t h,uint32_t color,int radius=0) {
-            for(int32_t yy=y;yy<y+h;++yy) {
-                if(yy<(int32_t)min_y||yy>(int32_t)max_y||yy<0||yy>=(int32_t)fb->height)continue;
-                int inset=0,edge=yy-y<h/2?yy-y:y+h-1-yy;
-                if(edge<radius)inset=radius-edge;
-                int32_t left=x+inset,right=x+w-inset;
-                if(left<0)left=0;if(right>(int32_t)fb->width)right=fb->width;
-                if(right>left)memset_32((uint32_t*)(g_master_backbuffer+(uint64_t)yy*fb->pitch)+left,color,right-left);
-            }
-        };
-        auto text=[&](int32_t x,int32_t y,const char* label,uint32_t color,int32_t width) {
-            if(y>=py&&y+char_h<=py+ph&&y+char_h>(int32_t)min_y&&y<=(int32_t)max_y)
-                wm_draw_string(x,y,label,color,g_font_scale_100,width);
-        };
-        // Use the taskbar's navy surfaces, borders, and active-control gradient.
-        draw_btn(px,py,pw,ph,0xFF23283D,0xFF181C30,0xFF303560,false);
-        draw_btn(px+1,py+1,pw-2,header,0xFF3D4D80,0xFF28366A,0xFF5568B0,true);
-        int32_t section_y=py+(header-char_h)/2;
-        text(px+pad+8,section_y,"All apps",0xFFEEEEFF,pw-pad*2-8);
-        char count[16];to_str((uint64_t)g_menu_app_count,count);
-        int32_t count_w=wm_text_width(count,g_font_scale_100);
-        text(px+pw-pad-8-count_w,section_y,count,0xFFB9C5EE,count_w);
-
-        for(int i=0;i<g_menu_app_count;++i) {
-            int32_t ry=list_top+i*row_h;
-            if(ry+row_h>footer_top-pad)break;
-            const auto& entry=g_resources_catalog->apps[i];
-            bool hov=hover==i;
-            if(hov)draw_btn(px+pad,ry,pw-pad*2,row_h-3,
-                            0xFF3D4D80,0xFF28366A,0xFF5568B0,false);
-            int32_t isz=wm_icon_size(row_h-10,14,128);
-            int32_t ix=px+pad+8,iy=ry+(row_h-3-isz)/2;
-            if(entry.icons.menu.pixels) {
-                const Image& icon=entry.icons.menu;
-                wm_draw_icon(icon,ix+(isz-(int32_t)icon.width)/2,iy+(isz-(int32_t)icon.height)/2,
-                             px+pad,min_y,px+pw-pad,max_y+1);
-            } else {
-                uint32_t hash=0;for(const char* q=entry.app.id;*q;++q)hash=hash*31u+(uint8_t)*q;
-                rect(ix,iy,isz,isz,g_rainbow_lut[hash%360],3);
-            }
-            int32_t ty=ry+(row_h-3-char_h)/2;
-            text(ix+isz+10,ty,entry.app.name,entry.app.available?0xFFE6E8FF:0xFF8888AA,
-                 pw-pad*2-isz-26);
-        }
-        if(!g_menu_app_count)
-            text(px+pad+8,list_top+(row_h-char_h)/2,"No installed apps",0xFF9FA6CC,pw-pad*2-16);
-
-        draw_btn(px+1,footer_top,pw-2,wm_menu_footer()-1,
-                 0xFF252A42,0xFF1A1F35,0xFF303560,false);
-        int32_t button_w=(pw-pad*3)/2,button_h=wm_menu_footer()-pad*2;
-        for(int i=0;i<2;++i) {
-            int action=i?MENU_SHUTDOWN:MENU_RESTART;
-            int32_t bx=px+pad+i*(button_w+pad),by=footer_top+pad;
-            bool hov=hover==action;
-            draw_btn(bx,by,button_w,button_h,
-                     hov?0xFF3D4D80:0xFF23283D,hov?0xFF28366A:0xFF181C30,
-                     hov?0xFF5568B0:0xFF2C3258,hov);
-            int32_t icon_size=wm_menu_scale(20,16),ix=bx+10,iy=by+(button_h-icon_size)/2;
-            for(int y=0;y<icon_size;++y)for(int x=0;x<icon_size;++x) {
-                int yy=iy+y,xx=ix+x;
-                if(yy<(int32_t)min_y||yy>(int32_t)max_y||yy<0||yy>=(int32_t)fb->height||
-                   xx<0||xx>=(int32_t)fb->width)continue;
-                unsigned alpha=power_icon_coverage(i!=0,x,y,icon_size);
-                if(!alpha)continue;
-                uint32_t* pixel=(uint32_t*)(g_master_backbuffer+(uint64_t)yy*fb->pitch)+xx;
-                uint32_t color=0xFF000000;
-                for(unsigned shift=0;shift<24;shift+=8)
-                    color|=(((((*pixel>>shift)&255)*(16-alpha)+0xEE*alpha+8)/16)<<shift);
-                *pixel=color;
-            }
-            int32_t label_x=ix+icon_size+6;
-            text(label_x,by+(button_h-char_h)/2,i?"Shut down":"Restart",0xFFE6E8FF,bx+button_w-label_x-6);
-        }
-    }
+    wm_draw_start_menu(min_y,max_y);
     if(g_clipboard_open){
         auto panel=wm_clipboard_panel();
         int x=panel.x,y=panel.y,w=panel.w;
@@ -2775,11 +3850,11 @@ retry_scene:
                     wm_clipboard_preview(g_text_clipboard.history(i),previews[count++],font,preview_width);
                 }
             }
-            draw_btn(x,y,w,panel.h,0xff23283d,0xff181c30,0xff303560,false);
-            draw_btn(x,y,w,CLIPBOARD_HEADER,0xff3d4d80,0xff28366a,0xff5568b0,false);
+            wm_draw_button(min_y,max_y,x,y,w,panel.h,0xff23283d,0xff181c30,0xff303560,false);
+            wm_draw_button(min_y,max_y,x,y,w,CLIPBOARD_HEADER,0xff3d4d80,0xff28366a,0xff5568b0,false);
             int line=font->height;
             wm_draw_string(x+12,y+(CLIPBOARD_HEADER-line)/2,"Clipboard history",0xffeeeeff,100,panel.clear_left()-x-20);
-            draw_btn(panel.clear_left(),y+6,CLIPBOARD_CLEAR_WIDTH,CLIPBOARD_HEADER-12,0xff263456,0xff202742,0xff6777a2,false);
+            wm_draw_button(min_y,max_y,panel.clear_left(),y+6,CLIPBOARD_CLEAR_WIDTH,CLIPBOARD_HEADER-12,0xff263456,0xff202742,0xff6777a2,false);
             const char* clear="Clear unpinned";
             wm_draw_string(panel.clear_left()+(CLIPBOARD_CLEAR_WIDTH-wm_text_width(clear))/2,
                            y+(CLIPBOARD_HEADER-line)/2,clear,0xffeeeeff,100,CLIPBOARD_CLEAR_WIDTH-8);
@@ -2791,15 +3866,15 @@ retry_scene:
                 bool active=i==selected,pointed=first+i==hover.index;
                 uint32_t fill=active?0xff344469:pointed?0xff2d3a55:0xff242b41;
                 uint32_t edge=active?0xff667aaa:pointed?0xff52617f:0xff343d55;
-                draw_btn(card_x,top,card_w,card_h,fill,fill,edge,false);
-                if(active)draw_btn(card_x+1,top+5,3,card_h-10,0xffa6b9f0,0xffa6b9f0,0xffa6b9f0,false);
+                wm_draw_button(min_y,max_y,card_x,top,card_w,card_h,fill,fill,edge,false);
+                if(active)wm_draw_button(min_y,max_y,card_x+1,top+5,3,card_h-10,0xffa6b9f0,0xffa6b9f0,0xffa6b9f0,false);
                 const auto& preview=previews[i];
                 int text_y=top+(card_h-(preview.lines[1][0]?2*line+3:line))/2;
                 wm_draw_string(card_x+10,text_y,preview.lines[0],0xffeeeeff,100,preview_width);
                 if(preview.lines[1][0])wm_draw_string(card_x+10,text_y+line+3,preview.lines[1],0xffeeeeff,100,preview_width);
                 auto action=[&](int action_y,ClipboardIcon icon,uint32_t button_fill,uint32_t border,uint32_t ink){
                     int ax=panel.action_left(),ay=top+action_y;
-                    draw_btn(ax,ay,CLIPBOARD_ACTION_WIDTH,CLIPBOARD_ACTION_HEIGHT,button_fill,button_fill,border,false);
+                    wm_draw_button(min_y,max_y,ax,ay,CLIPBOARD_ACTION_WIDTH,CLIPBOARD_ACTION_HEIGHT,button_fill,button_fill,border,false);
                     constexpr int size=19;
                     static uint8_t masks[3][size][size]{};
                     static bool rasterized[3]{};
@@ -2836,8 +3911,8 @@ retry_scene:
                 int track=panel.rows*CLIPBOARD_ROW-CLIPBOARD_GAP,thumb=track*panel.rows/total;
                 int rail_x=panel.card_right()+4,rail_y=panel.list_top();
                 int offset=(track-thumb)*first/(total-panel.rows);
-                draw_btn(rail_x,rail_y,3,track,0xff293148,0xff293148,0xff293148,false);
-                draw_btn(rail_x,rail_y+offset,3,thumb,0xff7b8cb7,0xff7b8cb7,0xff7b8cb7,false);
+                wm_draw_button(min_y,max_y,rail_x,rail_y,3,track,0xff293148,0xff293148,0xff293148,false);
+                wm_draw_button(min_y,max_y,rail_x,rail_y+offset,3,thumb,0xff7b8cb7,0xff7b8cb7,0xff7b8cb7,false);
             }
             if(count)wm_draw_string(card_x,y+panel.h-(CLIPBOARD_FOOTER+line)/2,
                                     hint,0xffb9c5ee,100,w-24);
@@ -2947,22 +4022,23 @@ retry_scene:
     return do_overlay;
 }
 
-// Keep the small desktop HUD band on the complete scene path. Client damage
-// below it can still use retained BCS/RCS composition, rather than making a
-// tall animation repaint the whole CPU scene merely because it crosses HUD.
+// Split the HUD only when the lower band can use the opaque retained path.
+// Ordered alpha/shadow scenes already need layer ordering; splitting those
+// repeats engine waits and blending without making a retained path eligible.
 // These are sequential calls, not recursion into the large compositor frame.
 static inline bool wm_compose_dirty(uint32_t min_x,uint32_t max_x,
                                     uint32_t min_y,uint32_t max_y,bool do_overlay=true,
                                     bool present=true) {
-    bool stats_visible=true;
+    bool split_hud=true;
     if(present&&g_gpu_compose_hook&&min_y<60&&max_y>=60){
         TtyIrqGuard guard;
         for(int i=0;i<g_window_count;++i){
             auto* w=g_window_list[i];
-            if(w&&w->visible&&!w->minimized&&w->maximized){stats_visible=false;break;}
+            if(w&&w->visible&&!w->minimized&&
+               (w->maximized||w->premultiplied||w->shadow_enabled)){split_hud=false;break;}
         }
-    }else stats_visible=false;
-    if(stats_visible){
+    }else split_hud=false;
+    if(split_hud){
         wm_compose_dirty_band(min_x,max_x,min_y,59,false,present);
         uint64_t bg=g_time_bg_ticks,win=g_time_win_ticks,rain=g_time_rain_ticks;
         uint64_t lock=g_time_lock_ticks,vram=g_time_vram_ticks;

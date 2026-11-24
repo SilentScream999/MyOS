@@ -1,6 +1,8 @@
 // QEMU integration fixture only. Compile with CXX='clang++ -DGPU_COMPOSITOR_TEST'.
 // This exercises the real WM hook/fallback; it does not emulate Intel hardware.
+#include "src/drivers/gpu_upload_cache.h"
 static uint64_t g_gpu_test_calls=0,g_gpu_test_rainbow_calls=0;
+static uint64_t g_gpu_test_bcs_pixels=0,g_gpu_test_rcs_pixels=0;
 static bool g_gpu_test_fail=false;
 static uint32_t g_gpu_test_sample[3]{};
 static uint8_t* g_gpu_test_recovery;
@@ -9,16 +11,42 @@ static uint64_t g_gpu_test_render_calls=0;
 static uint64_t g_gpu_test_demo_render_calls=0;
 static uint8_t g_gpu_test_render_fail=0;
 static uint32_t g_gpu_test_scaled_sample[3]{};
+static GpuUploadCache g_gpu_test_upload_cache{};
+static uint8_t* g_gpu_test_upload=nullptr;
+static uint64_t g_gpu_test_upload_capacity=0;
+static uint64_t g_gpu_test_uploads=0,g_gpu_test_upload_reuses=0;
 static bool gpu_test_render(const GpuScenePlan& plan) {
     ++g_gpu_test_render_calls;
+    unsigned uploaded_source=UINT32_MAX;
     for(unsigned i=0;i<plan.count;++i){
         const auto& copy=plan.copies[i];const auto& c=plan.clients[copy.source];
+        ++g_gpu_perf.rcs_draws;
+        uint64_t bytes=(uint64_t)c.pitch*c.height;
+        if(uploaded_source!=copy.source){
+            if(!g_gpu_test_upload_cache.matches(c.pixels,bytes,c.revision,g_gpu_surface_epoch)){
+                if(bytes>g_gpu_test_upload_capacity){
+                    auto* pixels=(uint8_t*)kmalloc(bytes);if(!pixels)return false;
+                    kfree(g_gpu_test_upload);g_gpu_test_upload=pixels;g_gpu_test_upload_capacity=bytes;
+                }
+                memcpy(g_gpu_test_upload,c.pixels,bytes);
+                g_gpu_test_upload_cache.record(c.pixels,bytes,c.revision,g_gpu_surface_epoch);
+                ++g_gpu_perf.uploads;g_gpu_perf.upload_bytes+=bytes;
+                ++g_gpu_test_uploads;
+            }else {++g_gpu_perf.upload_reuses;++g_gpu_test_upload_reuses;}
+            uploaded_source=copy.source;
+        }
+        g_gpu_test_rcs_pixels+=(uint64_t)(copy.destination.x2-copy.destination.x1)*(copy.destination.y2-copy.destination.y1);
         if(c.width==480&&c.height==320)++g_gpu_test_demo_render_calls;
         GpuTextureDraw draw{{0x10000000,c.width,c.height,c.pitch},
             {0x2000000,(uint32_t)fb->width,(uint32_t)fb->height,(uint32_t)fb->pitch},
             {c.client.x1,c.client.y1,c.client.x2,c.client.y2},
-            {copy.destination.x1,copy.destination.y1,copy.destination.x2,copy.destination.y2},false};
+            {copy.destination.x1,copy.destination.y1,copy.destination.x2,copy.destination.y2},c.premultiplied};
         uint32_t batch[1024];if(!gpu_build_texture_batch(batch,0x100000,draw))return false;
+        bool blend=(batch[2432/4+1]&(1u<<31))!=0;
+        if(blend){
+            uint32_t state=batch[2432/4+1];
+            if(((state>>26)&31)!=1||((state>>21)&31)!=0x13)return false;
+        }
         // Decode the encoded geometry and scissor rather than model the plan's
         // clip directly, so packing or inclusive-edge mistakes affect pixels.
         const auto* vertices=batch+GPU_RENDER_VERTEX_OFFSET/4;
@@ -36,12 +64,12 @@ static bool gpu_test_render(const GpuScenePlan& plan) {
         for(int y=r.y1;y<r.y2;++y){
             unsigned sy=(v1+(y+.5f-top)*(v2-v1)/(bottom-top))*c.height;
             if(sy>=c.height)sy=c.height-1;
-            auto* row=(const uint32_t*)((const uint8_t*)c.pixels+(uint64_t)sy*c.pitch);
+            auto* row=(const uint32_t*)(g_gpu_test_upload+(uint64_t)sy*c.pitch);
             auto* to=(uint32_t*)(g_master_backbuffer+(uint64_t)y*fb->pitch);
             for(int x=r.x1;x<r.x2;++x){
                 unsigned sx=(u1+(x+.5f-left)*(u2-u1)/(right-left))*c.width;
                 if(sx>=c.width)sx=c.width-1;
-                to[x]=row[sx];
+                to[x]=blend?window_source_over(row[sx],to[x]):row[sx];
             }
         }
         unsigned x=(r.x1+r.x2)/2,y=(r.y1+r.y2)/2;
@@ -66,22 +94,35 @@ static uint8_t* g_gpu_test_present_buffers[2]{};
 static unsigned g_gpu_test_present_front=1;
 static bool gpu_test_present(const OverlayFrame& frame,const uint32_t* sprite) {
     ++g_gpu_test_present_calls;
+    ++g_gpu_perf.present_calls;
     unsigned back=1-g_gpu_test_present_front;
     uint64_t bytes=(uint64_t)fb->pitch*fb->height;
-    memcpy(g_gpu_test_present_buffers[back],g_master_backbuffer,bytes);
+    {
+        GpuPerfTimer timer(g_gpu_perf.scanout_copy_ticks);
+        memcpy(g_gpu_test_present_buffers[back],g_master_backbuffer,bytes);
+    }
     if(g_gpu_test_present_fail)return false; // prepared frame did not latch
     OverlayTarget target{g_gpu_test_present_buffers[back],g_master_backbuffer,(int)fb->width,(int)fb->height,(int)fb->pitch};
     const OverlayFrame empty{{-999,-999,0,0},{},0};
-    overlay_render_transition(target,empty,frame,sprite,true);gpu_mfence();
-    memcpy_vram_sse_headless(fb->address,g_gpu_test_present_buffers[back],bytes);gpu_mfence();
-    g_gpu_test_present_front=back;
+    {
+        GpuPerfTimer timer(g_gpu_perf.overlay_ticks);
+        overlay_render_transition(target,empty,frame,sprite,true);gpu_mfence();
+    }
+    {
+        // Mock display copy, not a simulated Intel vblank measurement.
+        GpuPerfTimer timer(g_gpu_perf.flip_ticks);
+        memcpy_vram_sse_headless(fb->address,g_gpu_test_present_buffers[back],bytes);gpu_mfence();
+        g_gpu_test_present_front=back;
+    }
     return true;
 }
 #endif
 static bool gpu_test_compose(const GpuScenePlan& plan) {
     ++g_gpu_test_calls;
+    ++g_gpu_perf.bcs_batches;
     for(unsigned i=0;i<plan.count;++i){
         const auto& copy=plan.copies[i];const auto& c=plan.clients[copy.source];auto r=copy.destination;
+        g_gpu_test_bcs_pixels+=(uint64_t)(r.x2-r.x1)*(r.y2-r.y1);
         for(int y=r.y1;y<r.y2;++y){
             auto* to=(uint32_t*)(g_master_backbuffer+(uint64_t)y*fb->pitch)+r.x1;
             if(c.rainbow){
@@ -91,8 +132,24 @@ static bool gpu_test_compose(const GpuScenePlan& plan) {
         }
         if(c.rainbow){
             ++g_gpu_test_rainbow_calls;
-            g_gpu_test_sample[0]=(r.x1+r.x2)/2;g_gpu_test_sample[1]=(r.y1+r.y2)/2;
-            g_gpu_test_sample[2]=plan.rainbow_colors[((uint64_t)plan.scroll+copy.source_x+g_gpu_test_sample[0]-r.x1)%720];
+            // Ordered batches also draw pixels later covered by higher windows
+            // and shadows. Keep the frame-boundary sample in exposed content.
+            VisibleRegion exposed{};exposed.count=1;exposed.rects[0]=r;
+            bool above=false;
+            for(int s=0;s<g_window_count&&exposed.count;++s){
+                auto* win=g_window_list[g_window_order[s]];
+                if(win==g_win_rain){above=true;continue;}
+                if(!above||!win||!win->visible||win->minimized)continue;
+                WinRect bounds;wm_get_win_rect(win,&bounds);
+                VisibleRect cover{bounds.x1,bounds.y1,bounds.x2,bounds.y2};
+                if(win->shadow_enabled&&!win->maximized)cover=window_shadow_bounds(cover);
+                if(!visibility_subtract(&exposed,cover)){exposed.count=0;break;}
+            }
+            if(exposed.count){
+                auto sample=exposed.rects[0];
+                g_gpu_test_sample[0]=(sample.x1+sample.x2)/2;g_gpu_test_sample[1]=(sample.y1+sample.y2)/2;
+                g_gpu_test_sample[2]=plan.rainbow_colors[((uint64_t)plan.scroll+copy.source_x+g_gpu_test_sample[0]-r.x1)%720];
+            }
         }
         if(g_gpu_test_fail){
             // Simulate late-DMA quarantine after a partially executed batch.
@@ -107,6 +164,9 @@ static bool gpu_test_compose(const GpuScenePlan& plan) {
     return true;
 }
 static void gpu_test_install() {
+    // Isolate the existing retained/alpha fixtures; shadow coverage below
+    // explicitly enables decorations on these same windows.
+    for(int i=0;i<g_window_count;++i)g_window_list[i]->shadow_enabled=false;
     g_gpu_test_recovery=(uint8_t*)kmalloc((uint64_t)fb->pitch*fb->height);
     if(!g_gpu_test_recovery)hcf();
     memset(g_gpu_test_recovery,0,(uint64_t)fb->pitch*fb->height);
@@ -114,11 +174,13 @@ static void gpu_test_install() {
 #ifdef GPU_RENDER_TEST
     auto* fixture=wm_create_window("GPU scaled fixture",1020,180,64,48,false,false,WIN_TYPE_USER,0);
     if(!fixture)hcf();
+    fixture->shadow_enabled=false;
     for(unsigned y=0;y<48;++y)for(unsigned x=0;x<64;++x)
         fixture->buffer[y*64+x]=0xFF000000u|(x*3u<<16)|(y*5u<<8)|((x+y)*2u);
     fixture->w=128;fixture->h=96;
     auto* neighbor=wm_create_window("GPU native fixture",1148,180,128,96,false,false,WIN_TYPE_USER,0);
     if(!neighbor)hcf();
+    neighbor->shadow_enabled=false;
     for(unsigned i=0;i<128*96;++i)neighbor->buffer[i]=0xFF113355;
     g_gpu_render_hook=gpu_test_render;
 #endif

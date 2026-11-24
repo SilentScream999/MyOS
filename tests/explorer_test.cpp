@@ -26,6 +26,8 @@ static std::string ejected_path;
 static uint64_t mount_generation=0;
 static unsigned spawned=0,presents=0;
 static unsigned partial_presents=0;
+static bool publication_failure=false;
+static std::vector<uint32_t> published_pixels;
 static uint64_t damage_x,damage_y,damage_w,damage_h;
 static std::string opened_document,opened_app;
 static bool launch_failure=false;
@@ -73,6 +75,10 @@ static uint64_t native_call(uint64_t n,uint64_t a,uint64_t b,uint64_t c,uint64_t
     case 87:return unlink(resolve(a).c_str());
     case 138:{std::ofstream out(resolve(a),std::ios::binary);out.write((const char*)b,c);return out?0:-1;}
     case 201:++presents;return 0;
+    case 222:
+        if(publication_failure)return -1;
+        published_pixels.assign(surface.pixels,surface.pixels+surface.w*surface.h);
+        if(!b)++presents;return 0;
     case 204:assert(d>0&&e>0&&b+d<=(uint64_t)surface.w&&c+e<=(uint64_t)surface.h);
         damage_x=b;damage_y=c;damage_w=d;damage_h=e;++partial_presents;return 0;
     default:return -1;
@@ -313,5 +319,10 @@ int main(int argc,char** argv) {
     handle_event({1,DRIVE_TEXT_X+5,drive_sidebar_top()+DRIVE_ROW/2,1,0,0});
     assert(!strcmp(current_dir,"/mnt"));
     drive_count=1;layout_sidebar();assert(visible_drives()==1&&drive_sidebar_top()+DRIVE_ROW<=HEIGHT-36);
+    auto previous_publication=published_pixels;
+    publication_failure=true;dirty=true;render_frame();assert(dirty);
+    assert(published_pixels==previous_publication);
+    publication_failure=false;render_frame();assert(!dirty);
+    assert(published_pixels==pixels);
     puts("Explorer navigation, sorting, dialogs, copy failure, moves, detached launch, limits and rendering passed");
 }

@@ -1,7 +1,37 @@
 # Pending platform work
 
-Updated 2026-11-11. Implemented behavior belongs in the feature guides linked
+Updated 2026-11-22. Implemented behavior belongs in the feature guides linked
 from [README](../README.md); this file tracks remaining work.
+
+## Current GPU stability gate (2026-11-22)
+
+Retest opening apps while Rainbow and animated transparency run. The owner
+photograph shows heap corruption during `kmalloc scan`; the accompanying log
+predates that boot. Physical page allocation now serializes reservation/recycling
+against preemption, and the compositor has a larger stack with frame snapshots
+stored statically. Stack canaries and richer heap diagnostics are enabled.
+The photographed crash cause is still unconfirmed. Covered-window CPU use and
+alpha latency remain open; zero-upload timing samples still show large GPU
+wait/presentation costs. Validate stability first, then investigate those waits.
+The next measurement build separates scanout copying, cursor/outline drawing
+and flip-latch waiting, and records actual one-ms GPU sleep return durations.
+Compare Rainbow alone, an opaque covering window, and small/enlarged alpha;
+hold each layout for five seconds and save the three adjacent GPU log records.
+The follow-up owner run narrows the priority to alpha: the default small test
+raises CPU from about 5% to 9% even away from Rainbow; opaque overlap/shadows
+are now acceptable. All logged GPU sleep returns are below 2 ms, uploads are
+reused, and cursor/outline drawing is negligible. The slowest sample records
+40 loops/2016 ms with 43 RCS draws, 426 ms RCS elapsed and 115 ms handoffs
+(about 9.9 and 2.7 ms/draw respectively). Reduce translucent rendering and
+ownership-handoff work; do not treat these timings as a measured CPU breakdown
+or remove cache/fence/retirement checks based on this log.
+The new revision blends alpha through an optimized SSE2 CPU path at all supported
+sizes, retaining BCS underneath and avoiding RCS handoffs for translucent layers.
+The owner confirms smoothness until the previous size cutoff selected RCS; that
+default cutoff is now removed. Validate resizing across the former cutoff:
+`cpuAlpha`/`alphaKiPx` should increase while that layer's RCS and handoff costs
+disappear. Measure CPU use as well as motion, particularly for large layers.
+Opaque scaling retains RCS; no GPU shader/cache-policy change is claimed.
 
 ## Verify the combined build on hardware
 
@@ -61,22 +91,40 @@ cross-filesystem moves and trash/undo. See [Explorer](EXPLORER.md),
 
 ## Desktop and display
 
-Add a window-alpha contract, shadows/retained decorations and optional client
-double buffering. Runtime wallpaper/font selection can build on boot-time file
-settings. PNG icon alpha does not require a GPU.
+The owner confirms the current Gen9 composition, page flips and RCS scaling
+function without failures. These paths now probe by default with runtime
+readback gates and CPU fallback.
 
-The experimental `GPU_COMPOSE=1` path now uses the Gen9 blitter for supported
-opaque clients and a resident rainbow palette. Verify its boot RAM readback,
-pixel correctness, reset/fallback behavior and CPU/frame costs on the laptop.
-The owner reports about 24% CPU fullscreen versus 60% on the CPU renderer,
-and about 8% mostly covered, after coherent-cache/source-binding improvements.
-CPU chrome/alpha/scaling/overlays remain. The GPU render engine, interrupts and
-idle power management remain pending.
+Opt-in premultiplied client alpha is implemented (ABI 11, syscall 223), including
+ordered RCS blending and CPU fallback. The owner confirms it works without
+failures, but observes Rainbow slowing and CPU rising from about 5% to 24%.
+Ordered scenes now retain BCS palette/opaque rendering. The GPU Scaling Test
+toggles alpha with A. Measure the new CPU/frame costs on hardware.
 
-Physically validate the new opt-in `GPU_PRESENT=1` same-mode vblank page flips:
-check the first-latch log, moving Rainbow tear, cursor/drag overlays, menus,
-frame rate and CPU usage. Host and mock integration tests do not validate Intel
-display hardware. The new retained fullscreen Rainbow damage path avoids CPU
-scene redraw when the animation owns the complete damage region. Keep Intel GPU
-bring-up opt-in until rendering, memory management and recovery are ready.
+The owner confirms cached shadows work without failures. Partially covered
+Rainbow still runs slower/more CPU intensive than fullscreen, especially with
+transparency. Title bars now cache text/icons/controls. Ordered client damage
+uses its actual bounds, skips higher opaque coverage and preserves exposed-strip
+damage instead of expanding it into hidden bounding-box pixels. Validate title
+focus/hover/resize/resource changes and compare covered-Rainbow frame/CPU costs
+on hardware. Host and mock QEMU tests do not validate Intel execution. Next add
+optional client double buffering/present acknowledgments.
+
+The latest laptop comparison still reports ~5% Rainbow, ~12%+ under a small
+opaque test, ~2% under a large opaque test, and ~12% plus lag after A. RCS now
+reuses unchanged immutable uploads; the remaining cost needs measurement.
+Hold each layout for five seconds and inspect the bounded `GPU perf:` Boot Log
+samples. Destination cache handoffs remain conservative; do not remove them
+based on host/QEMU output alone.
+The follow-up log confirms upload reuse and large BCS/presentation wait totals.
+Compositor one-ms sleeps now wake at their timer deadlines rather than waiting
+for a normal ten-ms scheduling quantum. Validate the change on the laptop;
+GPU cache/fence/display synchronization is unchanged.
+The next log still reaches F ~50 ms beneath alpha, with zero uploads and many
+BCS submissions per loop. GPU Rainbow exposed regions now share one scene pass;
+ordered alpha/shadow scenes avoid repeated HUD-band composition. Check the new
+submission counts, F and CPU on hardware. CPU mode retains exposed rectangles.
+Hardware cursor, interrupt completion, general GPU allocation and idle power
+management remain pending. Runtime wallpaper/font selection and PNG icon alpha
+already work independently of client alpha.
 Follow the dependency order in the [display roadmap](GPU_DESKTOP_ROADMAP.md).

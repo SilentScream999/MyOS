@@ -12,6 +12,43 @@ struct OverlayFrame {
     unsigned count;
 };
 
+// One slot per private scanout. Store only inked cursor pixels. Offsets
+// belong to that exact surface and are consumed before any new scene repair.
+struct ScanoutCursorSave {
+    struct Pixel { uint64_t offset; uint32_t color,ink; };
+    Pixel pixels[CURSOR_SPRITE_SIZE*CURSOR_SPRITE_SIZE];
+    unsigned count=0;
+    uint8_t* surface=nullptr;
+    int width=0,height=0,pitch=0;
+
+    void paint(uint8_t* target,int w,int h,int stride,OverlayCursor cursor,const uint32_t* sprite){
+        count=0;surface=target;width=w;height=h;pitch=stride;
+        for(int y=0;y<CURSOR_SPRITE_SIZE;++y){
+            int64_t dy=(int64_t)cursor.y-CURSOR_SPRITE_ORIGIN+y;
+            if(dy<0||dy>=h)continue;
+            for(int x=0;x<CURSOR_SPRITE_SIZE;++x){
+                uint32_t color=sprite[y*CURSOR_SPRITE_SIZE+x];
+                int64_t dx=(int64_t)cursor.x-CURSOR_SPRITE_ORIGIN+x;
+                if(!color||dx<0||dx>=w)continue;
+                uint64_t offset=(uint64_t)dy*stride+dx*4;
+                auto* pixel=(volatile uint32_t*)(target+offset);
+                pixels[count++]={offset,*pixel,color};
+            }
+        }
+        // Complete WC reads before starting WC stores.
+        for(unsigned i=0;i<count;++i)
+            *(volatile uint32_t*)(target+pixels[i].offset)=pixels[i].ink;
+    }
+    bool restore(uint8_t* target,int w,int h,int stride){
+        bool matches=surface&&surface==target&&width==w&&height==h&&pitch==stride;
+        surface=nullptr;
+        if(matches)for(unsigned i=0;i<count;++i)
+            *(volatile uint32_t*)(target+pixels[i].offset)=pixels[i].color;
+        count=0;
+        return matches;
+    }
+};
+
 // Half-open spans of a two-pixel outline, including all four corners.
 template<class Span>
 static void overlay_outline_spans(const OverlayOutline& r,int y,Span span) {

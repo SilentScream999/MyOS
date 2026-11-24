@@ -39,19 +39,27 @@ static inline uint64_t dmg_area(const DmgRect& a) {
     return ((uint64_t)a.x2 - a.x1 + 1) * ((uint64_t)a.y2 - a.y1 + 1);
 }
 
+// Merge only when the union is itself a rectangle. Joining the touching top
+// and side strips around an occluder would otherwise damage its hidden center.
+static inline bool dmg_mergeable(const DmgRect& a,const DmgRect& b) {
+    if(a.x1<=b.x1&&a.y1<=b.y1&&a.x2>=b.x2&&a.y2>=b.y2)return true;
+    if(b.x1<=a.x1&&b.y1<=a.y1&&b.x2>=a.x2&&b.y2>=a.y2)return true;
+    return dmg_touch(a,b)&&((a.x1==b.x1&&a.x2==b.x2)||(a.y1==b.y1&&a.y2==b.y2));
+}
+
 // Add a dirty rect. Guarantees: (1) every pixel of every rect ever added stays covered by some list rect;
-// (2) n <= DAMAGE_MAX; (3) no two list rects touch (touching rects are merged). When the list is full the
+// (2) n <= DAMAGE_MAX; (3) rectangular unions merge without inflating damage. When the list is full the
 // new rect is merged into whichever existing rect it wastes the least area with.
 static inline void damage_add(DamageList* d, uint32_t min_x, uint32_t max_x, uint32_t min_y, uint32_t max_y) {
     if (min_x > max_x || min_y > max_y) return;      // empty / inverted: nothing damaged
     DmgRect cur = { min_x, min_y, max_x, max_y };
     for (;;) {
-        // absorb everything that touches cur (cur grows, so repeat until stable)
+        // Absorb rectangular unions; preserve L-shaped exposed regions.
         bool merged;
         do {
             merged = false;
             for (uint32_t i = 0; i < d->n; ) {
-                if (dmg_touch(d->r[i], cur)) {
+                if (dmg_mergeable(d->r[i], cur)) {
                     cur = dmg_union(cur, d->r[i]);
                     d->r[i] = d->r[--d->n];
                     merged = true;

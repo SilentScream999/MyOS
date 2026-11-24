@@ -14,7 +14,11 @@
 //
 // ──────────────────────────────────────────────────────────────────────────────
 
+#if defined(GPU_FRAME_DIAGNOSTICS) && GPU_FRAME_DIAGNOSTICS
+#define KLOG_BUFFER_SIZE (256 * 1024)
+#else
 #define KLOG_BUFFER_SIZE (64 * 1024)
+#endif
 extern char     g_klog_buffer[KLOG_BUFFER_SIZE];
 extern uint64_t g_klog_pos;
 extern bool     g_klog_bypass_framebuffer;

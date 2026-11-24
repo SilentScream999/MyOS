@@ -46,6 +46,7 @@
 #include "gdt.h"
 #include "helpers.h"
 #include "process_info.h"
+#include "scheduler_deadline.h"
 
 // ── Scheduler configuration ───────────────────────────────────────────────────
 
@@ -109,6 +110,21 @@ static uint64_t scheduler_cycles() {
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi<<32)|lo;
 }
+#if GPU_FRAME_DIAGNOSTICS
+struct CompositorSleepTrace {
+    uint64_t start,deadline,ready,ready_tick,resumed,resume_tick;
+    int ready_pid;
+};
+static CompositorSleepTrace* g_traced_sleep=nullptr;
+// All callers hold interrupts disabled. Record the task running when the
+// compositor became runnable, even when schedule() noticed the deadline first.
+static void scheduler_trace_compositor_ready(){
+    if(!g_traced_sleep||g_traced_sleep->ready)return;
+    g_traced_sleep->ready=scheduler_cycles();
+    g_traced_sleep->ready_tick=g_tick_count;
+    g_traced_sleep->ready_pid=g_current_task?g_current_task->pid:-1;
+}
+#endif
 // IRQs must be disabled. Charge before changing the current task or halting.
 static void scheduler_account_cpu(uint64_t now) {
     if (g_scheduler_ready && g_current_task && !g_cpu_idle_clock.halted) {
@@ -286,6 +302,8 @@ static void schedule() {
 
     KernelCpuScope cpu_scope(KCPU_SCHEDULER);
 
+    task_check_stack(g_current_task);
+
     scheduler_reap_dead();
 
     Task* pending = g_task_list;
@@ -301,6 +319,9 @@ static void schedule() {
     do {
         if (scan->state == TaskState::BLOCKED && scan->wake_at_tick > 0) {
             if (g_tick_count >= scan->wake_at_tick) {
+#if GPU_FRAME_DIAGNOSTICS
+                if(scan->pid==1)scheduler_trace_compositor_ready();
+#endif
                 scan->state = TaskState::READY;
                 scan->wake_at_tick = 0;
             }
@@ -338,6 +359,9 @@ switch_now:
 
     // Nothing to switch to.
     if (next == g_current_task || next->state != TaskState::READY) {
+        // The current stack can be halted inside task_sleep_ms with no other
+        // runnable task. A timer waking it requires no context switch.
+        if(next==g_current_task&&next->state==TaskState::READY)next->state=TaskState::RUNNING;
         if (g_current_task && g_current_task->yielded) {
              g_current_task->yielded = false;
              // Voluntary yield with no one else ready: idle until next interrupt.
@@ -383,12 +407,23 @@ static void yield() {
 // Block the current task for at least `ms` milliseconds.
 // Yields the CPU immediately.
 
-static void task_sleep_ms(uint64_t ms) {
+static void task_sleep_ms(uint64_t ms
+#if GPU_FRAME_DIAGNOSTICS
+                          ,CompositorSleepTrace* trace=nullptr
+#endif
+                          ) {
     if (!g_current_task || !ms) return;
     uint64_t flags;
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
     Task* self = g_current_task;
     self->wake_at_tick = g_tick_count + ms;
+#if GPU_FRAME_DIAGNOSTICS
+    if(trace&&self->pid==1){
+        trace->start=scheduler_cycles();
+        trace->deadline=self->wake_at_tick;
+        g_traced_sleep=trace;
+    }
+#endif
     self->state = TaskState::BLOCKED;
     while (self->state == TaskState::BLOCKED) {
         schedule();
@@ -396,6 +431,13 @@ static void task_sleep_ms(uint64_t ms) {
             scheduler_idle_halt();
         }
     }
+#if GPU_FRAME_DIAGNOSTICS
+    if(trace&&g_traced_sleep==trace){
+        trace->resumed=scheduler_cycles();
+        trace->resume_tick=g_tick_count;
+        g_traced_sleep=nullptr;
+    }
+#endif
     __asm__ volatile("pushq %0; popfq" :: "r"(flags) : "memory", "cc");
 }
 
@@ -484,7 +526,8 @@ static void task_complete(Task* exiting, uint64_t code) {
 
 // ── scheduler_tick ────────────────────────────────────────────────────────────
 // Call from your timer IRQ handler every tick (1000 Hz).
-// Triggers schedule() every SCHEDULER_TICKS ticks = 10 ms slices.
+// Ordinary time slices remain SCHEDULER_TICKS = 10 ms. A due compositor
+// timed sleep can schedule immediately at the one-ms timer boundary.
 //
 // HOW TO WIRE IT UP
 // -----------------
@@ -497,8 +540,11 @@ static void task_complete(Task* exiting, uint64_t code) {
 
 static void scheduler_tick() {
     if (!g_scheduler_ready) return;
-    if (++g_tick_counter >= SCHEDULER_TICKS) {
-        g_tick_counter = 0;
+    bool compositor_due=scheduler_wake_compositor_deadline(g_task_list,g_tick_count);
+#if GPU_FRAME_DIAGNOSTICS
+    if(compositor_due)scheduler_trace_compositor_ready();
+#endif
+    if (scheduler_tick_due(g_tick_counter,compositor_due,SCHEDULER_TICKS)) {
         schedule();
     }
 }

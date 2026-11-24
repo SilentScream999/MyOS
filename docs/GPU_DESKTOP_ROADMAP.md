@@ -4,6 +4,166 @@ Updated 2026-11-22. Supported Intel composition, page flips and RCS scaling
 probe by default after owner validation. GPU_RENDER=0 selects blitter composition.
 General platform priorities are in [NEXT_STEPS](NEXT_STEPS.md).
 
+Current status (2026-11-22): the owner considers opaque overlap/shadow cost
+acceptable. The priority is choppy animation beneath small/medium transparent
+windows; even a small alpha test away from Rainbow raises CPU from about 5%
+to 9%. A prior app-launch run ended with heap corruption in `kmalloc scan`.
+Subsequent logs contain no corruption/stack-overflow/timeout record, but the
+exact cause of that earlier crash remains unconfirmed.
+
+The current stability revision protects physical-page reservations/freelist
+updates against preemption, leaves zeroing outside the new reservation guard,
+moves compositor frame snapshots off the stack and gives the compositor a
+64 KiB stack. Task stack canaries and heap-header diagnostics distinguish future
+stack damage from other overwrites. These address concrete allocator/stack
+risks; the exact cause of the photographed crash is not proven. Retest app
+launches over animated alpha before adding more decoration work.
+
+The supplied timings show about 30 completed loops/second in covered opaque
+scenes and about 20 under heavy alpha. Large BCS/presentation waits remain even
+when immutable uploads are reused (zero upload bytes). Source caching alone
+does not solve this regression. Timing categories overlap and include sleeps;
+they are not CPU percentages. Intel DMA/cache/display behavior still needs
+physical validation; mock QEMU cannot establish a hardware fix.
+
+For the remaining slowdown, each bounded `GPU perf:` sample now has companion
+`GPU present:` and `GPU sleep:` records. Presentation separates hidden scanout
+copy, CPU cursor/outline drawing and flip-latch wait. BCS, RCS and flip waits
+measure actual elapsed returns from their existing one-ms sleeps, including
+counts above 2 and 10 ms. See [TESTING](TESTING.md) for units and nesting. The
+instrumentation does not change GPU synchronization or scheduling.
+
+The latest optimization uses an isolated `-O2` SSE2 source-over renderer for
+translucent damaged regions at every supported window size. It keeps lower
+opaque/Rainbow work on BCS, blends alpha directly on the CPU, then presents
+normally. This avoids that layer's RCS submission, staging upload and destination
+flush/retirement round trips. The owner confirmed the SIMD path is smooth until
+the earlier one-million-pixel cutoff switched it to RCS; that default cutoff is
+now removed. Opaque scaling retains RCS, including its explicit handoffs and
+both completion checks. The GPU alpha path remains available to explicit driver
+regression fixtures, not normal desktop routing. This is a CPU alpha policy,
+not a faster Gen9 alpha shader. Large-layer CPU use still needs measurement.
+Opaque composition, cache policies and Gen9 workarounds are unchanged.
+
+The renderer uses exact integer source-over and nearest texel-center scaling,
+including clipped/offscreen windows and the CPU grip rows. It allocates no
+memory per draw. CPU fallback also uses this renderer. `GPU perf:` now includes
+`cpuAlpha`, `alphaKiPx` and `alphaMs` to show the CPU draw count, destination
+pixels/1024 and elapsed milliseconds for each sample. Pixel and submission tests cannot establish
+physical smoothness; compare the medium alpha window over fullscreen Rainbow
+on the laptop before claiming the choppiness fixed.
+
+This optimization passes sanitizer pixel tests, the medium-layer/fullscreen-
+Rainbow mock regression, explicit RCS timeout recovery and an 18-window/
+19-task launch stress run with intact heap headers/canaries. Production ISO,
+USB and recovery boot checks, the native GPU app's alpha/resize/close path and
+XMM/MXCSR/x87 preservation checks pass. These checks establish pixel/lifetime
+behavior, not the physical Gen9 frame rate or CPU improvement.
+
+Validation of this stability revision: sanitizer host suites pass, including
+8,192 concurrent physical-page reservations; the unguarded control detects
+duplicate ownership. Mock compositor and RCS timeout recovery pass. Launch
+stress retains 18 windows/19 tasks with 387 intact heap headers and all task
+canaries intact. The integration run retains 51,496 bytes of unused compositor
+stack. Production ISO, USB and recovery boots plus the native GPU test's alpha,
+animation, resize and close paths pass. The rebuilt production USB image is
+`wyzar-usb.img`; no physical-drive write was performed.
+
+Desktop clients support opt-in premultiplied alpha (syscall 223,
+ABI 11). Default surfaces remain opaque. Alpha scenes rebuild damaged row
+backgrounds and compose bottom to top; translucent work uses SIMD CPU
+source-over at every supported size.
+Unsupported layouts, disabled RCS and render failure retain CPU source-over. Opaque scenes keep the
+existing retained BCS/RCS paths. The twelve resize-grip rows remain CPU blended,
+and title bars/grip marks remain opaque. Underlying animation stays exposed
+through translucent clients. Run `run /bin/gpu_test.elf` and press A to compare
+transparent, half-alpha and opaque bands, then resize and overlap windows.
+The owner confirms desktop alpha works without failures. They report Rainbow
+slowing down and CPU rising from about 5% to 24% with transparency enabled.
+Those are laptop observations, not controlled benchmarks. The original alpha
+path disabled deferred opaque GPU work and generated Rainbow rows on CPU.
+Ordered composition now submits opaque/palette clients through BCS and scaled
+or translucent clients through RCS at their stack positions. Physical CPU/frame
+costs of this revision still need measurement.
+
+Normal non-maximized windows now have cached shadows. A shared 169-byte alpha
+mask supplies reusable corners and edges (12-pixel radius, four-pixel downward
+offset); moving/resizing does not allocate or regenerate a bitmap. An isolated
+optimized CPU renderer blends only the clipped edge strips before the owning
+window. Shadow damage selects ordered composition so lower GPU clients finish
+before higher shadows blend. Client damage away from exposed shadow edges
+retains the existing fast paths, and fully occluded shadows do not prevent
+fullscreen retention. Full-window damage includes the shadow footprint;
+move/resize/minimize/close/maximize repaint their existing complete scene bounds.
+Shadows do not affect pointer hit testing. The owner confirms shadows work
+without failures. Partially covered Rainbow, especially beneath transparency,
+still runs slower and uses more CPU than fullscreen on the prior revision.
+
+Title bars now cache their opaque text/icon/control pixels per window. Repaints
+blit clipped cache rows; moving a window reuses the bitmap. Width/title height,
+title, font/icon resource epoch, focus, hover, closability and maximize state
+invalidate it. Cache growth is bounded to 2 MiB per window, allocation failure
+uses the same renderer directly, and window retirement releases its cache.
+The isolated rasterizer and blitter compile optimized independently of kernel OPT.
+
+For normal client damage below the HUD and above the taskbar, ordered scenes
+now keep their actual X/Y bounds instead of repainting full-width rows. Higher
+opaque clients/chrome are subtracted from ordered GPU draws; alpha and shadow
+backgrounds remain available. Damage coalescing preserves L-shaped exposed
+strips rather than merging their hidden center back in, except for bounded
+capacity fallback. Fullscreen retained paths remain enabled. Physical covered-
+Rainbow CPU/frame costs and title-bar interaction still need owner verification.
+
+Follow-up owner measurements: manually fullsized Rainbow is about 5% CPU;
+opening a small GPU test above it raises usage to about 12% or more; enlarging
+the opaque test drops usage to about 2%; enabling A returns to about 12% and
+Rainbow lags. These are owner observations, not controlled benchmarks. The
+previous clipping/title work did not establish that the overlap cost was solved.
+
+RCS now retains the single staged immutable source across batches when source
+address, byte size, unique publication revision and retirement epoch match.
+Every successful WIN_PUBLISH gets a new revision, including reuse of an older
+publication slot. Mutable buffers (revision zero) still upload every time.
+This removes confirmed redundant source copying/flushing beneath static alpha;
+destination CPU/GPU cache handoffs and retirement waits remain unchanged.
+The already-correct palette-only GGTT binding reuse is unchanged.
+
+Boot Log now records two `GPU perf:` samples, two seconds apart, after a stable
+layout/alpha change, capped at 32 records per boot. They report loop/submission
+counts, uploaded KiB/reuse, and aggregate scene, presentation, BCS, RCS, source
+and destination-handoff elapsed milliseconds. Times include sleeps/preemption
+and are not CPU percentages or additive independent categories. Hold each of
+the owner's comparison layouts steady for at least five seconds, then save the
+boot log to identify the remaining opaque-overlap and alpha costs on hardware.
+
+The owner's subsequent log confirms zero upload KiB with nonzero RCS reuse.
+Opaque-animation samples show about 60 compositor loops per two seconds and
+roughly 1.5-1.65 seconds in BCS submission elapsed time; the slowest alpha
+samples have about 31 loops per 2.07 seconds, with added RCS/handoff time.
+Submission/presentation dominates these samples; the categories overlap and
+do not establish CPU utilization or identify every layout by themselves.
+
+Scheduler review found compositor `task_sleep_ms(1)` deadlines were only examined
+when the ordinary ten-ms scheduling quantum expired (or another task yielded).
+The timer now checks the compositor's timed deadline every millisecond and
+schedules it immediately when due, using the existing PID-1 priority. Normal
+task time slices remain ten ms and early wakes do not restart that quantum.
+A same-stack wake also restores RUNNING state without requiring a context
+switch. No GPU packets, cache handoffs, fence/context checks or flip-latch checks
+change. Physical throughput/CPU gains still need a new run with these deadlines.
+
+The next owner log still shows F around 50 ms under transparency (~20 active
+loops/s). Uploads remain zero with reuse; the slower samples have roughly 5-9
+BCS submissions per loop, and some have two RCS draws per loop. GPU Rainbow
+animation now queues one bounding scene for its exposed regions, then clips
+opaque coverage inside that scene's GPU copy plan. This trades repeated scene
+passes/fence waits for a single ordered composition pass. Fully hidden animation
+still stops; CPU mode keeps separate exposed rectangles. General damage-list
+coalescing remains unchanged. Ordered alpha/shadow scenes no longer split again
+at the HUD band; HUD pixels are drawn after client composition. Opaque retained
+scenes can still use the existing HUD split. New physical frame/CPU costs need
+measurement; host/QEMU submission counts do not prove the hardware speedup.
+
 ## Current renderer
 
 Applications draw into off-screen surfaces and report damage. A roughly 60 Hz
@@ -14,16 +174,18 @@ Terminal, Boot Log and demos
 use the same surface composition path as user windows. Damage lists hold up to
 eight rectangles, with a full/global box used by some writers.
 
-Rainbow requests animation damage only for exposed client regions and skips
+Rainbow derives animation damage from exposed client regions and skips
 surface rendering when fully covered or off-screen. CPU mode updates its full
 backing surface when exposed. GPU mode uses a resident palette and phase instead
-of rewriting that backing each frame; CPU-only rows are generated directly from
-the same phase. Visibility subtraction relies on opaque client windows.
+of rewriting that backing each frame; its exposed regions share one GPU scene
+pass to avoid a fence wait per strip. CPU-only rows are generated directly from
+the same phase. Only opaque clients and title bars suppress underlying animation.
 
 Fonts and PNG icons already use CPU alpha blending. Icon images use
-premultiplied pixels; that does not change the client-window ABI. Window surface
-alpha is currently ignored, and the taskbar's gradient is not transparency.
-There are no retained decoration/shadow layers or client present acknowledgments.
+premultiplied pixels; that does not change the default client-window ABI. Window
+alpha is ignored unless explicitly enabled, and the taskbar's gradient is not transparency.
+Shadow masks and title-bar layers are cached; client present acknowledgments
+remain pending.
 
 The cursor is stamped into the master buffer before dirty-region presentation
 and restored afterward; cursor/drag overlays also have an update path when the
@@ -107,11 +269,11 @@ developer configuration `GPU=1 GPU_COMPOSE=0`.
   backing until reboot (intentional memory retention after failed reset). The WM
   recomposes the complete scene before resuming CPU presentation.
 
-This is an opaque blitter compositor, not the planned render-engine/shader
-desktop. Alpha blending, retained GPU decorations, GPU scaling, hardware cursor,
+The blitter remains the opaque composition path. RCS now adds scaling and
+opt-in client alpha as described above. Retained GPU decorations, hardware cursor,
 general modesetting, interrupt completion, idle forcewake management and client
-GPU APIs remain future work. Same-mode page flipping is now a separate opt-in
-experiment described below.
+GPU APIs remain future work. Same-mode page flipping is described below and
+enabled by runtime validation in normal builds.
 
 Host command/pixel tests and QEMU WM integration use separate test backends.
 They check skipped full CPU rainbow generation, current animation pixels, and
@@ -348,9 +510,10 @@ renderer consumes the encoded geometry/scissor rather than the requested clip.
 This is a controlled geometry/clipping change, not an established diagnosis or
 physical confirmation that enlargement is safe.
 
-1. **Finish the CPU surface contract.** Define alpha/opacity behavior for client
-   windows separately from image alpha. Retain fast opaque copies, add tested
-   blending, then cached decorations/shadows and optional client double buffering.
+1. **Validate title caching and covered animation costs.** Desktop alpha and
+   shadows are confirmed working. Check focus, hover, resizing and resource
+   changes, then compare partially covered Rainbow with/without transparency
+   against fullscreen. Next add optional client double buffering.
 2. **Measure presentation problems.** Earlier hardware reports included tearing,
    cursor flicker and drag-outline flicker. Recheck the current build with slow-
    motion video; distinguish live-scanout copying from overlay redraw artifacts.
@@ -362,9 +525,9 @@ physical confirmation that enlargement is safe.
    Waiting for vblank alone does not make a long live-framebuffer copy tear-free.
 5. **GPU memory and synchronization.** Replace fixed GGTT offsets with allocation,
    pinning, fences, interrupts and hang/reset recovery.
-6. **Render engine.** First blend one off-screen solid quad and read it back,
-   then a textured quad, then compositor integration. Validate commands/state
-   against CPU output before using it for the desktop.
+6. **Render engine expansion.** Scaling and opt-in client alpha now use RCS.
+   Extend retained GPU layers to decorations, fonts and icons after the alpha
+   integration is physically verified.
 7. **Client GPU API.** Add validated submissions and process isolation only after
    memory ownership and recovery are defined.
 

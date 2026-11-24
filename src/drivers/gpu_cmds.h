@@ -11,6 +11,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "gpu_workload.h"
 
 #ifndef GPU_POLL_HOOK
 #define GPU_POLL_HOOK() __asm__ volatile("pause" ::: "memory")
@@ -41,6 +42,8 @@
 // MI_INSTR(opcode, flags) = (opcode << 23) | flags   (client = 0 = MI)
 #define GPU_MI_INSTR(op, fl)        (((uint32_t)(op) << 23) | (uint32_t)(fl))
 #define GPU_MI_NOOP                 0u
+#define GPU_MI_STORE_REGISTER_MEM   GPU_MI_INSTR(0x24, (1u<<22)|2u)
+#define GPU_RING_TIMESTAMP         0x358u
 // NOTE: Linux's value is MI_INSTR(0x26,1) = 0x13000001 (0x26 << 23, NOT 0x26 << 24).
 // 0x26000001 would decode as client=1, opcode=0xC - not a valid MI_FLUSH_DW.
 #define GPU_MI_FLUSH_DW             GPU_MI_INSTR(0x26, 1)
@@ -77,6 +80,19 @@ struct GpuRing {
     uint32_t seqno = 0;
     bool ready = false;
     bool hung = false;
+#if GPU_WORKLOAD
+    GpuWorkload* workload=nullptr; // Attached only during a compositor frame.
+    GpuCopyKind copy_kind=GpuCopyKind::Other;
+#endif
+};
+struct GpuCopyScope {
+#if GPU_WORKLOAD
+    GpuRing* ring;GpuCopyKind previous;
+    GpuCopyScope(GpuRing* r,GpuCopyKind kind):ring(r),previous(r->copy_kind){r->copy_kind=kind;}
+    ~GpuCopyScope(){ring->copy_kind=previous;}
+#else
+    GpuCopyScope(GpuRing*,GpuCopyKind){}
+#endif
 };
 
 static inline uint64_t gpu_tsc() { return __builtin_ia32_rdtsc(); }
@@ -158,6 +174,12 @@ static inline void gpu_emit(GpuRing* r, uint32_t dw) {
     r->cpu[r->tail / 4u] = dw;
     r->tail = (r->tail + 4u) & (r->size - 1u);   // exact-fit at ring end wraps to 0
 }
+static bool gpu_emit_timestamp(GpuRing* ring,uint32_t reg,uint64_t destination){
+    if((reg&3)||reg>0x7ffffc||(destination&3)||destination>UINT32_MAX||!gpu_ring_reserve(ring,4))return false;
+    gpu_emit(ring,GPU_MI_STORE_REGISTER_MEM);gpu_emit(ring,reg);
+    gpu_emit(ring,(uint32_t)destination);gpu_emit(ring,(uint32_t)(destination>>32));
+    return true;
+}
 
 // XY_COLOR_BLT, Gen8+ layout (7 dwords + 1 NOOP pad = 8). Rect is x1,y1 inclusive
 // to x2,y2 exclusive. `pitch` is BYTES for a linear surface (PRM says "dwords";
@@ -175,6 +197,9 @@ static bool gpu_emit_fill(GpuRing* r, uint64_t dst_gfx, uint32_t pitch,
     gpu_emit(r, (uint32_t)(dst_gfx >> 32));
     gpu_emit(r, color);
     gpu_emit(r, GPU_MI_NOOP);
+#if GPU_WORKLOAD
+    if(r->workload){++r->workload->fill_ops;r->workload->fill_bytes+=(uint64_t)(x2-x1)*(y2-y1)*4;}
+#endif
     return true;
 }
 
@@ -200,6 +225,9 @@ static bool gpu_emit_copy(GpuRing* r,
     gpu_emit(r, src_pitch & 0xFFFFu);
     gpu_emit(r, (uint32_t)src_gfx);
     gpu_emit(r, (uint32_t)(src_gfx >> 32));
+#if GPU_WORKLOAD
+    if(r->workload){auto& work=r->workload->copies[(unsigned)r->copy_kind];++work.ops;work.bytes+=(uint64_t)w*h*4;}
+#endif
     return true;
 }
 
@@ -218,6 +246,9 @@ static bool gpu_emit_fence(GpuRing* r, uint32_t* out_seq, bool invalidate_tlb) {
     gpu_emit(r, (uint32_t)(r->fence_gfx >> 32));
     gpu_emit(r, seq);
     *out_seq = seq;
+#if GPU_WORKLOAD
+    if(r->workload)++r->workload->fences;
+#endif
     return true;
 }
 

@@ -12,6 +12,8 @@
 #include "../src/gui/resources.h"
 
 static int live=0;
+static unsigned checkpoints=0;
+static void checkpoint(){++checkpoints;}
 void* image_allocate(uint64_t size) { void* p=std::malloc(size); if(p) ++live; return p; }
 void image_deallocate(void* p) { if(p) { --live; std::free(p); } }
 static std::map<std::string,std::vector<uint8_t>> files;
@@ -34,7 +36,7 @@ static std::vector<uint8_t> read(const std::string& path) {
 }
 int main(int argc,char** argv) {
     assert(argc==3);
-    resources::Store store{{read_file,list}};
+    resources::Store store{{read_file,list,nullptr,checkpoint}};
     auto alpha=read(std::string(argv[1])+"/alpha.png"),blue=read(std::string(argv[1])+"/blue.png");
     resources::App app{};
     const char* good="name = Picture App\r\nexec=/apps/pictures/main.wiz\nicon=pictures\nfuture=okay\n";
@@ -138,5 +140,5 @@ int main(int argc,char** argv) {
     auto* dialog_again=resources::build(store,24,16,24,demand,catalog);
     assert(dialog_again&&reads.empty()&&store.decodes==decodes);
     resources::release(dialog_again);resources::release(catalog);
-    store.clear(); assert(live==0);
+    store.clear(); assert(live==0 && checkpoints>0);
 }

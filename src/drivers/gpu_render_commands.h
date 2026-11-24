@@ -12,6 +12,8 @@ struct GpuTextureDraw {
     GpuRenderRect client,clip;
     bool blend=false;
     bool padded=false; // Scratch-only draws may sample beyond client edges.
+    bool cache_source=false; // Read-only texture MOCS[1]; destination stays MOCS[0].
+    unsigned threads=16; // Boot-verified pixel shader dispatch limit.
 };
 // Hardware readback fixtures use binary-exact scaling. Their pixel centers
 // stay away from nearest-sampler selection boundaries on every covered pixel.
@@ -23,6 +25,13 @@ static GpuTextureDraw gpu_render_probe_draw(unsigned test,uint64_t source,uint64
 static constexpr unsigned GPU_RENDER_BATCH_BYTES=4096;
 static constexpr unsigned GPU_RENDER_COMMAND_BYTES=1144;
 static constexpr unsigned GPU_RENDER_VERTEX_OFFSET=2696;
+static constexpr unsigned GPU_RENDER_MAX_RECTS=16;
+// Require a material gain before changing the conservative dispatch policy.
+// Subtraction avoids overflow when comparing large timestamp intervals.
+static inline bool gpu_render_dispatch_faster(uint64_t current,uint64_t candidate){
+    return current&&candidate&&candidate<=current-current/8;
+}
+static_assert(GPU_RENDER_VERTEX_OFFSET+GPU_RENDER_MAX_RECTS*72<=GPU_RENDER_BATCH_BYTES);
 static constexpr unsigned GPU_RENDER_DST_STATE=2112;
 static constexpr unsigned GPU_RENDER_SRC_STATE=2176;
 static constexpr unsigned GPU_RENDER_SCISSOR_STATE=2688;
@@ -37,9 +46,11 @@ static_assert(GPU_RENDER_RING_BYTES%GPU_RENDER_PACKET_BYTES==0);
 // Packets occupy one aligned block, including at the ring boundary.
 static bool gpu_render_packet(uint32_t* ring,uint32_t tail,uint32_t fence,
                               uint32_t sequence,bool texture,uint32_t* next,bool invalidate_tlb=true,
-                              uint32_t batch_address=0x100000) {
+                              uint32_t batch_address=0x100000,uint32_t timestamps=0) {
     if(!ring||!next||tail>=GPU_RENDER_RING_BYTES||(tail&(GPU_RENDER_PACKET_BYTES-1))||(fence&7)||
-       fence>UINT32_MAX-39||(batch_address&4095))return false;
+       fence>UINT32_MAX-39||(batch_address&4095)||
+       (timestamps&&((timestamps&63)||timestamps>UINT32_MAX-19||
+          ((uint64_t)timestamps<(uint64_t)fence+40&&(uint64_t)fence<(uint64_t)timestamps+20))))return false;
     // Leave the final slot as NOOP padding and put the next packet at zero.
     // Submit a tail beyond that packet rather than ending at the wrap point.
     if(tail==GPU_RENDER_RING_BYTES-GPU_RENDER_PACKET_BYTES){
@@ -52,6 +63,13 @@ static bool gpu_render_packet(uint32_t* ring,uint32_t tail,uint32_t fence,
     auto control=[&](uint32_t flags,uint32_t address,uint32_t data){
         emit(0x7A000004);emit(flags);emit(address);emit(0);emit(data);emit(0);
     };
+    auto stamp=[&](unsigned index){
+        if(timestamps){
+            emit(0x12400002);emit(0x2358); // MI_STORE_REGISTER_MEM, RCS timestamp, GGTT
+            emit(timestamps+index*4);emit(0);
+        }
+    };
+    stamp(0);
     // Gen9 context workarounds, applied in the context before TLB invalidation.
     // i915 gen9_ctx_workarounds_init(): HDC force-noncoherent/context-save
     // settings avoid a known TLB-invalidation/PSD-flush system hang. Disable
@@ -73,8 +91,10 @@ static bool gpu_render_packet(uint32_t* ring,uint32_t tail,uint32_t fence,
     // without relying on a PCI stepping classification during bring-up.
     control(1u<<20,0,0);
     // Pad the 64-bit batch start so the following PIPE_CONTROL is qword aligned.
+    stamp(1);
     if(texture){emit(0x18800101);emit(batch_address);emit(0);emit(0);}
     else {emit(0);emit(0);emit(0);emit(0);}
+    stamp(2);
     // Command-stream checkpoint after returning from the draw batch.
     // MI_STORE_DWORD_IMM uses GGTT; it does not wait for raster completion.
     emit(0x10400002);emit(fence+16);emit(0);emit(sequence);
@@ -91,8 +111,10 @@ static bool gpu_render_packet(uint32_t* ring,uint32_t tail,uint32_t fence,
     // operation. Publish completion in a subsequent command, after the drain.
     // Combining a QW write here changes the operation at the SCORE stall.
     control((1u<<20)|(1u<<12),0,0);
+    stamp(3);
     emit(0x10400002);emit(fence+32);emit(0);emit(sequence);
     control((1u<<20)|(1u<<7)|(1u<<5)|1u,0,0);
+    stamp(4);
     emit(0x10400002);emit(fence+20);emit(0);emit(sequence);
     control((1u<<24)|(1u<<20)|(1u<<14),fence,sequence);
     while(count<GPU_RENDER_PACKET_BYTES/4)emit(0);
@@ -129,9 +151,21 @@ static void gpu_render_surface_state(uint32_t* words,const GpuRenderSurface& s) 
     words[8]=(uint32_t)s.address;words[9]=(uint32_t)(s.address>>32);
 }
 static bool gpu_build_texture_batch(uint32_t* words,uint64_t batch_address,
-                                    const GpuTextureDraw& draw,bool solid_probe=false) {
-    if(!words || (batch_address&4095) || batch_address>0xFFFFF000ULL ||
-       !gpu_texture_draw_valid(draw))return false;
+                                    const GpuTextureDraw& draw,bool solid_probe=false,
+                                    const GpuRenderRect* rects=nullptr,unsigned rect_count=1) {
+    if(!words || (draw.threads!=16&&draw.threads!=32&&draw.threads!=63) ||
+       (batch_address&4095) || batch_address>0xFFFFF000ULL ||
+       !gpu_texture_draw_valid(draw)||!rect_count||rect_count>GPU_RENDER_MAX_RECTS||
+       (!rects&&rect_count!=1)||(rects&&solid_probe))return false;
+    if(rects)for(unsigned i=0;i<rect_count;++i){
+        const auto& r=rects[i];
+        if(r.x1<draw.clip.x1||r.y1<draw.clip.y1||r.x2>draw.clip.x2||r.y2>draw.clip.y2||
+           r.x1>=r.x2||r.y1>=r.y2)return false;
+        for(unsigned j=0;j<i;++j){
+            const auto& other=rects[j];
+            if(r.x1<other.x2&&other.x1<r.x2&&r.y1<other.y2&&other.y1<r.y2)return false;
+        }
+    }
     for(unsigned i=0;i<1024;++i)words[i]=0;
     for(unsigned i=0;i<sizeof(gpu_gen9_pipeline)/4;++i)words[i]=gpu_gen9_pipeline[i];
     for(const auto& state:gpu_gen9_state)words[state.index]=state.value;
@@ -139,11 +173,13 @@ static bool gpu_build_texture_batch(uint32_t* words,uint64_t batch_address,
     words[18]=(uint32_t)batch_address|1;words[20]=(uint32_t)batch_address|1;
     words[24]=(uint32_t)batch_address|1;
     words[262]=(uint32_t)batch_address+GPU_RENDER_VERTEX_OFFSET;
+    words[264]=72*rect_count;
+    words[281]=6*rect_count;
     words[258]=(draw.destination.width-1)|((draw.destination.height-1)<<16);
-    // Bound simultaneous pixel-shader threads while investigating the PSD
-    // completion stall reproduced by the isolated large-geometry sweep.
+    // Start with the conservative bring-up limit; the experimental driver
+    // can select a faster limit after a full-size offscreen readback probe.
     // Gen8/9 PS DW6[31:23] encodes maximum threads minus one.
-    words[215]=(words[215]&0x007FFFFFu)|(15u<<23);
+    words[215]=(words[215]&0x007FFFFFu)|((draw.threads-1)<<23);
     // Gen9 3DSTATE_RASTER DW1[1]: scissor enable. SCISSOR_RECT maxima
     // are inclusive; compositor damage uses exclusive right/bottom edges.
     words[GPU_RENDER_RASTER_DWORD]|=1u<<1;
@@ -152,6 +188,9 @@ static bool gpu_build_texture_batch(uint32_t* words,uint64_t batch_address,
     words[2048/4]=GPU_RENDER_DST_STATE;words[2048/4+1]=GPU_RENDER_SRC_STATE;
     gpu_render_surface_state(words+GPU_RENDER_DST_STATE/4,draw.destination);
     gpu_render_surface_state(words+GPU_RENDER_SRC_STATE/4,draw.source);
+    // Gen9 surface DW1[30:24] holds MOCS, whose bits 6:1 select the entry.
+    // Entry one is explicitly programmed and readback-tested by the driver.
+    if(draw.cache_source)words[GPU_RENDER_SRC_STATE/4+1]=2u<<24;
     // IGT blit.g7a Gen9 SIMD16 sampler and render-target-write shader.
     static constexpr uint32_t shader[]={
         0x0080005A,0x2F403AE8,0x3A0000C0,0x008D0040,
@@ -184,12 +223,12 @@ static bool gpu_build_texture_batch(uint32_t* words,uint64_t batch_address,
     // same source image at the same scale.
     // Two triangles share the BR-to-TL diagonal. Explicit corners avoid
     // RECTLIST's inferred fourth vertex on the private Gen9 pipeline.
-    const int x[]={draw.clip.x2,draw.clip.x1,draw.clip.x1,
-                   draw.clip.x2,draw.clip.x1,draw.clip.x2};
-    const int y[]={draw.clip.y2,draw.clip.y2,draw.clip.y1,
-                   draw.clip.y2,draw.clip.y1,draw.clip.y1};
+    for(unsigned rect=0;rect<rect_count;++rect){
+    const auto& clip=rects?rects[rect]:draw.clip;
+    const int x[]={clip.x2,clip.x1,clip.x1,clip.x2,clip.x1,clip.x2};
+    const int y[]={clip.y2,clip.y2,clip.y1,clip.y2,clip.y1,clip.y1};
     for(unsigned i=0;i<6;++i){
-        unsigned offset=GPU_RENDER_VERTEX_OFFSET/4+i*3;
+        unsigned offset=GPU_RENDER_VERTEX_OFFSET/4+rect*18+i*3;
         // X and Y are independently packed signed 16-bit positions. Mask X
         // so a negative offscreen coordinate cannot overwrite Y's bits.
         words[offset]=((uint32_t)x[i]&0xFFFFu)|((uint32_t)y[i]<<16);
@@ -203,6 +242,7 @@ static bool gpu_build_texture_batch(uint32_t* words,uint64_t batch_address,
         }
         words[offset+1]=gpu_float_bits(u);
         words[offset+2]=gpu_float_bits(v);
+    }
     }
     words[GPU_RENDER_COMMAND_BYTES/4]=0x05000000; // MI_BATCH_BUFFER_END
     return true;

@@ -7,7 +7,8 @@
 static void* kmalloc(size_t n) { return calloc(1, n); }
 static void kfree(void* p) { free(p); }
 static void print(char*) {}
-char g_klog_buffer[65536];
+#include "../src/core/klog.h"
+char g_klog_buffer[KLOG_BUFFER_SIZE];
 uint64_t g_klog_pos;
 #include "../src/fs/ramfs.h"
 
@@ -43,4 +44,13 @@ int main() {
     assert(memcmp(text, "first log grew", 14) == 0);
     vfs_close(&f);
     assert(vfs_unlink("/alias.txt") == -1);
+    for(unsigned i=0;i<KLOG_BUFFER_SIZE+16;++i)klog_putc('x');
+    assert(g_klog_pos==KLOG_BUFFER_SIZE-1&&g_klog_buffer[g_klog_pos]==0);
+    assert(vfs_stat("/bootlog.txt",&info)==0&&info.size==KLOG_BUFFER_SIZE-1);
+    assert(vfs_open("/bootlog.txt",0,&f)==0);
+    f.offset=KLOG_BUFFER_SIZE-17;
+    assert(vfs_read(&f,text,16)==16);
+    for(unsigned i=0;i<16;++i)assert(text[i]=='x');
+    assert(vfs_read(&f,text,1)==0);
+    vfs_close(&f);
 }

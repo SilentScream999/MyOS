@@ -1,6 +1,6 @@
 # Project handoff
 
-Updated 2026-11-20. This is the current working snapshot, not a change log.
+Updated 2026-11-22. This is the current working snapshot, not a change log.
 Start with [README](../README.md), then the guide for the area being changed.
 Pending work is in [NEXT_STEPS](NEXT_STEPS.md); commands are in [TESTING](TESTING.md).
 
@@ -37,6 +37,79 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
 
 ## Decisions and implementation constraints
 
+- A prior owner run (2026-11-22) crashed with heap corruption while opening
+  an app over GPU tests. Subsequent logs contain no new crash record. Opaque
+  overlap/shadows are now acceptable; choppy animation under alpha is the priority.
+  Page allocator reservation/freelist updates now exclude preemption; zeroing
+  follows reservation. The compositor uses a 64 KiB stack and static frame
+  snapshots; task canaries and heap-header diagnostics are enabled. These are
+  stability fixes for observed code risks, not proof of the hardware crash cause.
+  Slowdown diagnostics now split presentation copy/overlay/flip elapsed time,
+  plus BCS/RCS/flip one-ms sleep counts, actual return time and 2/10-ms outliers.
+  Read the `GPU present:`/`GPU sleep:` units and nesting in [TESTING](TESTING.md).
+  Alpha draws at all supported sizes now use an isolated optimized SSE2 CPU
+  renderer. The owner confirmed smooth SIMD blending then severe lag when the
+  former size cutoff selected RCS; the default cutoff is removed. Opaque scaling
+  retains RCS. CPU grip/fallback blending shares the SIMD renderer.
+  `cpuAlpha`/`alphaKiPx`/`alphaMs` show the selected CPU work. Hardware smoothness
+  and CPU cost need validation; no GPU cache policy or workaround was relaxed.
+  Client surfaces support opt-in premultiplied alpha (ABI 11, syscall 223).
+  Opaque clients preserve their existing format and fast paths. Visible alpha
+  clients select ordered scene composition: CPU background, opaque/palette BCS
+  clients and scaled/translucent RCS draws at their stack positions, with CPU
+  fallback when an engine is unavailable. Rebuild the complete horizontal extent of damaged rows
+  before blending; never accumulate alpha onto the retained prior output.
+  Translucent clients do not hide underlying animation; their chrome remains
+  opaque. The GPU Scaling Test toggles alpha with A. The owner confirms alpha
+  works without failures, but observes Rainbow CPU rising from about 5% to 24%.
+  Ordered scenes now keep opaque/palette clients on BCS instead of CPU rows.
+- Non-maximized windows have cached shadows: shared 169-byte edge/corner alpha
+  mask, radius 12 and downward offset 4. The optimized isolated pixel renderer
+  blends strips before each window; no per-window shadow allocation or rebuild.
+  Shadow damage uses ordered GPU/CPU composition. Retained client updates remain
+  enabled away from exposed shadow edges, ignoring shadows hidden by opaque
+  foreground windows. Full-window damage includes shadows; lifecycle transitions
+  retain full-scene invalidation. The owner confirms shadows work without
+  failures, but partially covered Rainbow remains slower/more CPU intensive
+  than fullscreen, especially beneath alpha.
+- Title-bar pixels are now cached per window with width/height, title, font/icon
+  resource epoch, focus, hover, closability and maximize keys. Moves reuse the
+  cache; retirement frees it. Metadata has no borrowed resource ownership.
+  Cache allocation failure falls back to clipped direct rendering. Hover
+  transitions explicitly damage the old/new control even without client damage.
+  Normal ordered client damage now stays within its X/Y rectangle, subtracts
+  higher opaque coverage, and preserves L-shaped damage while capacity permits.
+  Keep shadow/alpha backgrounds and the fullscreen retained fast paths.
+  New title interaction and covered-Rainbow performance need hardware verification.
+- Owner follow-up: manually fullsized Rainbow ~5% CPU; small opaque GPU test
+  above it ~12%+; large opaque test ~2%; A returns to ~12% and Rainbow lags.
+  The overlap problem is not confirmed resolved by clipping/title caching.
+  RCS now reuses the staged source only for matching immutable publication
+  revision/address/size/retirement epoch. WIN_PUBLISH stamps a new unique revision
+  under the existing publication IRQ guard. Mutable sources always upload.
+  Destination flushes, fences and context retirement are preserved. Boot Log's
+  bounded GPU perf samples after layout/alpha changes report elapsed driver
+  phases (including sleeps), uploads/reuse and submission counts, not CPU usage.
+  Use new physical samples to locate the remaining cost; do not attribute it to
+  palette-only remapping, whose helper already preserves window bindings.
+- The new physical log confirms upload reuse and shows BCS/presentation elapsed
+  time dominating (~30 active compositor loops/s; slow alpha samples ~15/s).
+  Compositor one-ms GPU sleeps could previously wait for the normal ten-ms
+  quantum because timed wakeups were checked only in schedule(). The timer now
+  wakes due PID-1 timed sleeps promptly and invokes existing compositor priority.
+  Ordinary ten-ms quanta are preserved, including across early wakes. A wake on
+  the currently halted stack restores RUNNING state. GPU commands, coherence,
+  retirement and flip synchronization remain unchanged. Measure new hardware
+  loop rates/CPU usage; phase logs are elapsed rather than CPU time.
+- The subsequent owner log still reaches F ~50 ms (~20 active loops/s) with
+  zero source upload bytes, roughly 5-9 BCS submissions/loop and sometimes two
+  RCS draws/loop. GPU Rainbow now queues one exposed-region bounding scene and
+  relies on GPU-plan opaque clipping, rather than waiting once per exposed
+  strip. CPU mode retains separate rectangles; fully hidden animation stays off.
+  Ordered alpha/shadow scenes do not split into a separate HUD/top-client pass;
+  HUD overlays still draw after client composition. General damage-list behavior
+  and opaque retained HUD splitting are preserved. Verify the new batch counts
+  and F/CPU costs on hardware.
 - Gen9 RCS milestone (2026-11-21): the owner reported 900 seconds without
   freezes on the ThinkPad E470 at its 256 MiB aperture setting, with repeated
   resizing, overlapping windows and software restarts. Surface Laptop 1 also
@@ -83,11 +156,11 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
   complete snapshots only after input/compositor readers finish.
 - Surface rectangles have exclusive right/bottom edges; the dirty-region
   presenter takes inclusive bounds. Preserve conversions and cursor ordering.
-- Rainbow animation damages exposed client regions only and skips rendering
+- Rainbow animation derives damage from exposed client regions and skips rendering
   when fully covered/off-screen. CPU mode keeps a complete backing surface when
   exposed. GPU mode uses an immutable palette plus phase and generates CPU-only
   rows directly; do not read its stale full backing as the current image. The
-  visibility calculation assumes today's opaque client windows.
+  visibility calculation subtracts opaque clients and translucent-window title bars.
 - GPU composition completes before CPU menus/HUD/cursor. CPU presentation is the
   fallback; supported GPU presentation copies the clean master into a hidden GPU
   scanout, overlays its cursor/outline, then arms a synchronous plane flip.
@@ -106,7 +179,8 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
   Scaled client draws use the pinned master buffer with explicit cache handoffs.
   Geometry, sampling, ring reuse, reset preparation and Gen9 workaround tests
   run on the host. Preserve source/destination lifetime through retirement and
-  keep font/icon rasterization and general alpha-layer integration on the CPU.
+  keep font/icon rasterization on the CPU. Alpha clients use ordered RCS draws
+  with the same explicit cache handoffs and retirement waits.
 - Kernel string helpers are local definitions, not a hosted C runtime.
   Compiler-generated libc calls and the ext4/codec shim need deliberate linkage.
 - Interrupt and syscall entry preserve x87/SSE state in aligned stack frames
@@ -127,7 +201,7 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
   is for trusted programs, not a finished security boundary.
 - One foreground application per console channel; no process groups, general
   signals, argument/environment passing or dynamic linking.
-- No translucent client windows, hardware cursor plane, general modesetting or
+- No client present acknowledgments, hardware cursor plane, general modesetting or
   GPU client API. Experimental RCS support requires physical readback validation.
   PNG/font alpha works on the CPU already.
 - Stable boot-volume identity, GPT, internal-drive drivers

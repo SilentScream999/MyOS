@@ -17,6 +17,8 @@ struct IO {
     // size (buf may be null). Returns false if the file cannot be read.
     // Without it, packages are treated as ordinary executables.
     bool (*read_at)(const char*, uint64_t offset, void* buf, uint64_t len, uint64_t* total) = nullptr;
+    // Optional worker scheduling boundary. Host and boot callers may omit it.
+    void (*checkpoint)() = nullptr;
 };
 static unsigned length(const char* s) { unsigned n=0; while (s && s[n]) ++n; return n; }
 static bool equal(const char* a, const char* b) {
@@ -114,6 +116,7 @@ struct Store {
     // Takes ownership of `data` (from image_allocate). `path` is the cache key:
     // a file path, or "<package>#icons/<N>.png" for an icon inside a package.
     const Image* load_bytes(const char* path, uint8_t* data, uint64_t size) {
+        if(io.checkpoint)io.checkpoint();
         const uint8_t signature[]={137,80,78,71,13,10,26,10};
         bool png=size>=8;
         for (unsigned i=0;i<8 && png;++i) if (data[i]!=signature[i]) png=false;
@@ -128,6 +131,7 @@ struct Store {
         }
         Image decoded{};
         bool ok=image_decode(data,size,&decoded,1024*1024);
+        if(io.checkpoint)io.checkpoint();
         image_deallocate(data);
         if (!ok) return nullptr;
         ++decodes;
@@ -250,9 +254,11 @@ static void load_icons(Store& store, const char* theme, const char* name, Icons&
                        bool menu_visible, bool window_visible, const Icons* cached = nullptr,
                        const App* app = nullptr) {
     auto variant=[&](uint32_t size, Image& out, const Image* previous) {
+        if(store.io.checkpoint)store.io.checkpoint();
         if (previous && previous->pixels &&
             (previous->width==size || previous->height==size)) image_share(*previous,&out);
         else store.icon(theme,name,size,&out,app);
+        if(store.io.checkpoint)store.io.checkpoint();
     };
     // Keep previously demanded Start icons warm while the menu is closed.
     // At most max_apps small menu images survive; title/task icons stay lazy.

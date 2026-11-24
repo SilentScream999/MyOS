@@ -24,6 +24,19 @@ GPU_RENDER ?= $(GPU_COMPOSE)
 # Extended hardware stress sweeps and on-screen tracing. Normal RCS startup
 # retains the short texture/scaling/alpha readback checks.
 GPU_TRACE ?= 0
+GPU_RCS_ALPHA ?= 0
+GPU_WORKLOAD ?= 0
+GPU_OPAQUE_RETAIN ?= 0
+GPU_ALPHA_MERGE ?= 0
+GPU_ALPHA_REPAIR_BATCH ?= 0
+GPU_RETAINED_MENU ?= 0
+GPU_EXACT_REPAIRS ?= 0
+GPU_CURSOR_SAVE ?= 0
+GPU_WIDE_BLITS ?= 0
+GPU_FRAME_DIAGNOSTICS ?= 0
+# A faster streaming copy raised CPU use without improving the alpha test's
+# frame cadence on hardware. Keep automatic selection opt-in for comparisons.
+GPU_SCANOUT_COPY_AUTO ?= 0
 GPU ?= 1
 GPU_COMPOSE ?= $(GPU)
 GPU_PRESENT ?= $(GPU_COMPOSE)
@@ -58,13 +71,24 @@ CXXFLAGS = $(CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -mno-red-zone -DGPU_BR
            -DGPU_PRESENT=$(GPU_PRESENT) \
            -DGPU_RENDER=$(GPU_RENDER) \
            -DGPU_TRACE=$(GPU_TRACE) \
+           -DGPU_RCS_ALPHA=$(GPU_RCS_ALPHA) \
+           -DGPU_WORKLOAD=$(GPU_WORKLOAD) \
+           -DGPU_OPAQUE_RETAIN=$(GPU_OPAQUE_RETAIN) \
+           -DGPU_ALPHA_MERGE=$(GPU_ALPHA_MERGE) \
+           -DGPU_ALPHA_REPAIR_BATCH=$(GPU_ALPHA_REPAIR_BATCH) \
+           -DGPU_RETAINED_MENU=$(GPU_RETAINED_MENU) \
+           -DGPU_CURSOR_SAVE=$(GPU_CURSOR_SAVE) \
+           -DGPU_WIDE_BLITS=$(GPU_WIDE_BLITS) \
+           -DGPU_EXACT_REPAIRS=$(GPU_EXACT_REPAIRS) \
+           -DGPU_FRAME_DIAGNOSTICS=$(GPU_FRAME_DIAGNOSTICS) \
+           -DGPU_SCANOUT_COPY_AUTO=$(GPU_SCANOUT_COPY_AUTO) \
            -DCLOCK_UTC_OFFSET_MIN=$(CLOCK_UTC_OFFSET_MIN) -DCLOCK_SHOW_SECONDS=$(CLOCK_SHOW_SECONDS) \
            -DBOOT_DIAGNOSTICS=$(BOOT_DIAGNOSTICS)
 
 LDFLAGS=-nostdlib -z max-page-size=0x1000
 
 SRC=src/kernel.cpp
-OBJ=$(SRC:.cpp=.o) src/gui/image.o src/gui/overlay_renderer.o
+OBJ=$(SRC:.cpp=.o) src/gui/image.o src/gui/overlay_renderer.o src/gui/window_shadow.o src/gui/title_bar.o src/gui/alpha_renderer.o src/gui/gpu_opaque_coverage.o
 include src/fs/ext4_config_flags.mk
 EXT4_OBJ = $(EXT4_SRC:.c=.o) src/fs/ext4_libc.o third_party/fatfs/ff.o third_party/fatfs/ffunicode.o
 CXXFLAGS += $(EXT4_CONFIG) $(EXT4_INC) -Isrc/fs/ext4_libc
@@ -82,7 +106,18 @@ FORCE_KERNEL_CONFIG:
 
 $(OBJ) $(EXT4_OBJ): .storage-test/kernel-config
 
-.PHONY: test-gpu-render
+.PHONY: test-gpu-render test-gpu-perf
+test-gpu-perf:
+	mkdir -p .storage-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -DGPU_FRAME_DIAGNOSTICS=1 -I. tests/gpu_perf_test.cpp -o .storage-test/gpu-perf-test
+	.storage-test/gpu-perf-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -DSTORAGE_HOST_TEST=1 -I. -iquote src/core -iquote src/drivers tests/live_log_test.cpp -o .storage-test/live-log-test
+	.storage-test/live-log-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -DSTORAGE_HOST_TEST=1 -DGPU_FRAME_DIAGNOSTICS=1 -I. -iquote src/core -iquote src/drivers tests/live_log_test.cpp -o .storage-test/live-log-test-large
+	.storage-test/live-log-test-large
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -DGPU_WORKLOAD=1 -I. -Isrc/gui tests/gpu_workload_test.cpp -o .storage-test/gpu-workload-test
+	.storage-test/gpu-workload-test
+
 test-gpu-render:
 	mkdir -p .storage-test
 	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. tests/gpu_render_test.cpp -o .storage-test/gpu-render-test
@@ -109,6 +144,54 @@ src/gui/image.o: src/gui/image.cpp src/gui/image.h third_party/stb/stb_image.h
 # Keep the per-span overlay compositor optimized independently of kernel OPT.
 src/gui/overlay_renderer.o: src/gui/overlay_renderer.cpp src/gui/overlay_renderer.h src/gui/window_overlay.h src/core/string.h
 	$(CXX) $(CXXFLAGS) -O2 -MMD -MP -c $< -o $@
+
+# Cached shadow strips are pixel work; keep them optimized like cursor overlays.
+src/gui/window_shadow.o: src/gui/window_shadow.cpp src/gui/window_shadow.h src/gui/window_alpha.h
+	$(CXX) $(CXXFLAGS) -O2 -MMD -MP -c $< -o $@
+
+src/gui/title_bar.o: src/gui/title_bar.cpp src/gui/title_bar.h src/gui/window_decorations.h
+	$(CXX) $(CXXFLAGS) -O2 -MMD -MP -c $< -o $@
+
+src/gui/alpha_renderer.o: src/gui/alpha_renderer.cpp src/gui/alpha_renderer.h src/gui/window_alpha.h
+	$(CXX) $(CXXFLAGS) -O2 -MMD -MP -c $< -o $@
+
+src/gui/gpu_opaque_coverage.o: src/gui/gpu_opaque_coverage.cpp src/gui/gpu_opaque_coverage.h src/gui/visibility.h
+	$(CXX) $(CXXFLAGS) -O2 -MMD -MP -c $< -o $@
+
+.PHONY: test-alpha-renderer
+test-alpha-renderer:
+	mkdir -p .storage-test
+	$(CXX) -std=c++20 -O2 -g -no-pie -fsanitize=address,undefined -I. tests/alpha_renderer_test.cpp src/gui/alpha_renderer.cpp -o .storage-test/alpha-renderer-test
+	.storage-test/alpha-renderer-test
+
+.PHONY: test-title-bar test-physical-pages
+test-physical-pages:
+	mkdir -p .storage-test
+	$(CXX) -std=c++20 -O1 -g -pthread -no-pie -fsanitize=address,undefined -I. -iquote src/core -iquote src/arch tests/physical_pages_test.cpp -o .storage-test/physical-pages-test
+	.storage-test/physical-pages-test
+
+test-title-bar:
+	mkdir -p .storage-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. tests/title_bar_test.cpp src/gui/title_bar.cpp -o .storage-test/title-bar-test
+	.storage-test/title-bar-test
+
+.PHONY: test-damage-regions
+test-damage-regions:
+	mkdir -p .storage-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. tests/damage_regions_test.cpp -o .storage-test/damage-regions-test
+	.storage-test/damage-regions-test
+
+.PHONY: test-scheduler-deadline
+test-scheduler-deadline:
+	mkdir -p .storage-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. tests/scheduler_deadline_test.cpp -o .storage-test/scheduler-deadline-test
+	.storage-test/scheduler-deadline-test
+
+.PHONY: test-window-shadow
+test-window-shadow:
+	mkdir -p .storage-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. tests/window_shadow_test.cpp src/gui/window_shadow.cpp -o .storage-test/window-shadow-test
+	.storage-test/window-shadow-test
 
 -include $(EXT4_OBJ:.o=.d)
 
@@ -200,7 +283,7 @@ test-task-manager:
 
 test-gpu:
 	mkdir -p .storage-test
-	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. -Isrc/gui -Isrc/drivers tests/gpu_compositor_test.cpp -o .storage-test/gpu-compositor-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. -Isrc/gui -Isrc/drivers tests/gpu_compositor_test.cpp src/gui/gpu_opaque_coverage.cpp -o .storage-test/gpu-compositor-test
 	.storage-test/gpu-compositor-test
 .PHONY: test-gpu
 
@@ -239,7 +322,7 @@ counter.elf: user/counter.o
 user/win_test.o: user/win_test.c
 	$(CC) $(USER_CFLAGS) -I. -c $< -o $@
 
-user/gpu_test.o: user/gpu_test.cpp user/native_ui.h src/gui/ui_font.h src/gui/ui_font_data.h
+user/gpu_test.o: user/gpu_test.cpp user/native_ui.h src/gui/ui_font.h src/gui/ui_font_data.h src/gui/window_alpha.h
 	$(CXX) $(USER_CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -I. -c $< -o $@
 
 gpu_test.elf: user/gpu_test.o

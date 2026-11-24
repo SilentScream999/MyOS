@@ -39,6 +39,254 @@ extern "C" void wyzar_ext4_free(void* p) { kfree(p); }
 #endif
 #include "arch/apic_timer.h"
 
+// Each scanout retains a complete scene and accumulates all changes since its
+// last flip. Rebuild its pending damage before presenting it again.
+static bool begin_direct_scanout(DamageList& damage,VisibleRegion* exact_damage=nullptr){
+    if(!GPU_RCS_ALPHA)return false;
+    using Check=ScanoutCheck;
+    if(!g_gpu_direct_verified)return reject_scanout(Check::Readback);
+    if(!g_gpu_present_ready)return reject_scanout(Check::Present);
+    if(!g_gpu_ready)return reject_scanout(Check::Gpu);
+    if(!g_render_ready)return reject_scanout(Check::Render);
+    if(g_gpu_present_hook!=gpu_present_frame)return reject_scanout(Check::PresentHook);
+    if(g_gpu_compose_hook!=gpu_compose_scene)return reject_scanout(Check::ComposeHook);
+    if(g_gpu_render_hook!=gpu_render_scene)return reject_scanout(Check::RenderHook);
+    if(g_cpu_alpha_pixel_limit)return reject_scanout(Check::Policy);
+    int back=g_gpu_display_flip.writable();
+    if(back<0)return reject_scanout(Check::Back);
+    if(g_gpu_display_flip.front<0)return reject_scanout(Check::Front);
+    if(fb->address==g_gpu_scanout_cpu[back])return reject_scanout(Check::Alias);
+    uint32_t front=g_gpu_display_flip.surfaces[g_gpu_display_flip.front];
+    auto plane_base=[](uint32_t reg){
+        return *(volatile uint32_t*)(g_igpu.mmio_virt+reg)&0xfffff000u;
+    };
+    uint32_t live=plane_base(g_gpu_display_plane.live);
+    if(live!=front)return reject_scanout(Check::Live,live,front);
+    uint32_t armed=plane_base(g_gpu_display_plane.surface);
+    if(armed!=front)return reject_scanout(Check::Surface,armed,front);
+    bool popup=g_clipboard_open||g_taskbar_popup||(g_menu_open&&!wm_retained_menu_ready());
+#if GPU_EXACT_REPAIRS
+    if(exact_damage){
+#if GPU_FRAME_DIAGNOSTICS
+        GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::Merge),wm_trace_cpu_cycles);
+#endif
+        VisibleRegion changed{};
+        bool stats_visible;
+        {
+            TtyIrqGuard guard;
+            stats_visible=wm_desktop_stats_visible();
+        }
+        gpu_exact_frame_damage(changed,damage,fb->width,fb->height,g_taskbar_h,popup,stats_visible);
+        for(unsigned buffer=0;buffer<2;++buffer)for(unsigned i=0;i<changed.count;++i){
+            if(!visibility_add_exact(&g_gpu_scanout_exact_damage[buffer],changed.rects[i])){
+                g_gpu_scanout_exact_damage[buffer].count=1;
+                g_gpu_scanout_exact_damage[buffer].rects[0]={0,0,(int)fb->width,(int)fb->height};break;
+            }
+        }
+    }else
+#endif
+    {
+    DamageList changed{};
+    gpu_frame_damage(changed,damage,fb->width,fb->height,g_taskbar_h,
+                     popup);
+    for(unsigned buffer=0;buffer<2;++buffer){
+        for(unsigned i=0;i<changed.n;++i){
+            const auto& r=changed.r[i];
+            damage_add(&g_gpu_scanout_damage[buffer],r.x1,r.x2,r.y1,r.y2);
+        }
+    }
+    }
+    auto* hidden=g_gpu_scanout_cpu[back];
+    if(!g_gpu_scanout_scene_valid[back]){
+        // Seed a complete scene once. Pending damage includes every update
+        // since the retained master last presented, including other-buffer work.
+        memcpy_vram_sse_headless(hidden,g_master_backbuffer,(uint64_t)fb->pitch*fb->height);
+        g_gpu_perf.scanout_seed_bytes+=(uint64_t)fb->pitch*fb->height;
+        g_gpu_scanout_scene_valid[back]=true;
+#if GPU_CURSOR_SAVE
+    }else if(g_gpu_cursor_save[back].restore(hidden,fb->width,fb->height,fb->pitch)){
+        ++g_gpu_perf.cursor_restores;
+#endif
+    }else{
+        // Recompose the old overlay's pixels as ordinary scene damage. This
+        // also works after a window moves or closes, without reading stale
+        // pixels from the retained master or the live display surface.
+        const OverlayFrame empty{{-999,-999,0,0},{},0};
+        DamageList overlay{};
+        overlay_transition(g_gpu_scanout_overlay[back],empty,fb->height,[&](int left,int right,int y){
+            if(left<0)left=0;if(right>(int)fb->width)right=fb->width;
+            if(left<right)damage_add_clipped(&overlay,fb->width,fb->height,left,right-1,y,y);
+        },false);
+#if GPU_EXACT_REPAIRS
+        if(exact_damage){
+#if GPU_FRAME_DIAGNOSTICS
+            GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::Merge),wm_trace_cpu_cycles);
+#endif
+            bool stats_visible;
+            {
+                TtyIrqGuard guard;
+                stats_visible=wm_desktop_stats_visible();
+            }
+            gpu_exact_frame_damage(g_gpu_scanout_exact_damage[back],overlay,
+                fb->width,fb->height,g_taskbar_h,popup,stats_visible);
+        }
+        else
+#endif
+        gpu_frame_damage(g_gpu_scanout_damage[back],overlay,fb->width,fb->height,g_taskbar_h,popup);
+    }
+    // Overflow merges can grow into shell rows. Normalize the final list too.
+    damage_clear(&damage);
+#if GPU_EXACT_REPAIRS
+    if(exact_damage){
+#if GPU_FRAME_DIAGNOSTICS
+        GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::Pack),wm_trace_cpu_cycles);
+#endif
+        exact_damage->count=g_gpu_scanout_exact_damage[back].count;
+        for(unsigned i=0;i<exact_damage->count;++i){
+            auto r=g_gpu_scanout_exact_damage[back].rects[i];exact_damage->rects[i]=r;
+            damage_add(&damage,r.x1,r.x2-1,r.y1,r.y2-1);
+        }
+    }else
+#endif
+    gpu_frame_damage(damage,g_gpu_scanout_damage[back],fb->width,fb->height,g_taskbar_h,
+                     popup);
+    g_gpu_perf.repair_rects+=damage.n;
+    for(unsigned i=0;i<damage.n;++i)g_gpu_perf.repair_pixels+=dmg_area(damage.r[i]);
+    gpu_mfence();
+    g_gpu_retained_master=g_master_backbuffer;
+    g_gpu_direct_back=back;
+    g_master_backbuffer=hidden;
+    return true;
+}
+
+#if GPU_FRAME_DIAGNOSTICS
+static void log_frame_gap(const GpuFrameTimeline& frame) {
+    if(!gpu_frame_gap_due(frame.interval(),frame.refreshes,tsc_hz))return;
+    // Keep continuous deadline misses from filling the boot log. Longer
+    // interruptions have a separate budget from ordinary missed refreshes.
+    const bool long_gap=(frame.refreshes>=3&&frame.refreshes<0x80000000u)||frame.interval()>=tsc_hz/20;
+    static uint64_t last_short=0;
+    static unsigned short_count=0,long_count=0;
+    if(long_gap){
+        if(long_count>=48)return;
+        ++long_count;
+    }else{
+        if(short_count>=48||(last_short&&frame.latch-last_short<tsc_hz/4))return;
+        last_short=frame.latch;
+        ++short_count;
+    }
+    char line[512];char* end=line;
+    auto text=[&](const char* value){while(*value&&end<line+sizeof(line)-2)*end++=*value++;};
+    auto number=[&](uint64_t value){char digits[24];to_str(value,digits);text(digits);};
+    auto duration=[&](const char* label,uint64_t ticks){text(label);number(ticks*1000000/tsc_hz);};
+    auto timestamp=[&](const char* label,uint64_t tick){
+        text(label);
+        if(!tick){text("-");return;}
+        if(tick<frame.previous_latch){text("-");number((frame.previous_latch-tick)*1000000/tsc_hz);}
+        else number((tick-frame.previous_latch)*1000000/tsc_hz);
+    };
+    auto emit=[&]{
+        *end++='\n';*end=0;
+        TtyIrqGuard guard;
+        klog_print(line);
+        end=line;
+    };
+    text("GPU frame gap: frame=");number(g_compositor_frame);
+    text(" menu=");number(g_menu_open);
+    duration(" intervalUs=",frame.interval());text(" refreshes=");number(frame.refreshes);
+    timestamp(" composeAtUs=",frame.compose);timestamp(" submitAtUs=",frame.first_submit);
+    timestamp(" readyAtUs=",frame.last_ready);timestamp(" armAtUs=",frame.arm);
+    duration(" cpuUs=",frame.cpu);duration(" bcsUs=",frame.bcs);duration(" rcsUs=",frame.rcs);
+    text(" bcsBatches=");number(frame.bcs_batches);text(" rcsDraws=");number(frame.rcs_draws);
+    emit();
+    text("GPU gap costs: frame=");number(g_compositor_frame);
+    duration(" repairsUs=",frame.planning[GpuFrameTimeline::RepairPaint].wall);
+    duration(" fallbackUs=",frame.planning[GpuFrameTimeline::Fallback].wall);
+    duration(" menuBuildUs=",frame.planning[GpuFrameTimeline::MenuBuild].wall);
+    duration(" menuReplayUs=",frame.planning[GpuFrameTimeline::MenuReplay].wall);
+    duration(" maxFlipSleepUs=",frame.max_flip_sleep);
+    duration(" sleepToReadyUs=",frame.sleep_to_ready);
+    duration(" readyToResumeUs=",frame.ready_to_resume);
+    text(" readyPid=");if(frame.sleep_ready_pid<0)text("-");else number(frame.sleep_ready_pid);
+    emit();
+
+    uint64_t latest;
+    {TtyIrqGuard guard;latest=g_gpu_gap_history.latest;}
+    constexpr const char* activities[]={"load","resources","catalog-publish","start-open","start-close"};
+    unsigned reported=0;
+    for(unsigned offset=0;offset<GpuGapHistory::capacity&&offset<latest&&reported<6;++offset){
+        uint64_t serial=latest-offset;
+        GpuGapEvent event;
+        {
+            TtyIrqGuard guard;
+            event=g_gpu_gap_history.events[GpuGapHistory::slot(serial)];
+        }
+        if(event.serial!=serial||!event.overlaps(frame.previous_latch,frame.latch))continue;
+        text("GPU gap activity: frame=");number(g_compositor_frame);
+        text(" activity=");text(activities[(unsigned)event.activity]);
+        text(" pid=");if(event.pid<0)text("-");else number(event.pid);
+        timestamp(" beginAtUs=",event.begin);timestamp(" endAtUs=",event.end);
+        if(event.detail[0]){text(" detail=");text(event.detail);}
+        emit();
+        ++reported;
+    }
+}
+#endif
+
+static void log_app_launches(uint64_t now){
+    if(!GPU_RCS_ALPHA || !tsc_hz)return;
+    for(unsigned i=0;i<g_gpu_launch_count;++i){
+        auto& trace=g_gpu_launches[i];
+        if(trace.printed || now-trace.started<tsc_hz ||
+           (!trace.displayed && now-trace.started<tsc_hz*5))continue;
+        trace.printed=true;
+        char line[512];char* end=line;
+        auto text=[&](const char* value){while(*value && end<line+sizeof(line)-1)*end++=*value++;};
+        auto number=[&](uint64_t value){char digits[24];to_str(value,digits);text(digits);};
+        auto phase=[&](const char* label,uint64_t tick){
+            text(label);if(tick)number((tick-trace.started)*1000000/tsc_hz);else text("-");
+        };
+        text("GPU launch: path=");text(trace.path);text(" window=");number(trace.window);
+        phase(" readyUs=",trace.ready);phase(" createdUs=",trace.created);
+        phase(" paintedUs=",trace.painted);phase(" composedFlipUs=",trace.displayed);
+        text(" maxFlipUs=");number(trace.max_interval*1000000/tsc_hz);
+        text(" directFlips=");number(trace.direct);text(" copiedFlips=");number(trace.copied);
+        *end=0;print(line);
+    }
+}
+
+static void log_menu_opens(uint64_t now){
+    if(!GPU_RCS_ALPHA || !tsc_hz)return;
+    for(unsigned i=0;i<g_menu_open_trace_count;++i){
+        auto& trace=g_menu_open_traces[i];
+        if(trace.printed || now-trace.opened<tsc_hz)return;
+        trace.printed=true;
+        char line[512];char* end=line;
+        auto text=[&](const char* value){while(*value && end<line+sizeof(line)-1)*end++=*value++;};
+        auto number=[&](uint64_t value){char digits[24];to_str(value,digits);text(digits);};
+        auto us=[&](uint64_t ticks){number(ticks*1000000/tsc_hz);};
+        auto phase=[&](const char* label,uint64_t tick){
+            text(label);
+            if(!tick){text("-");return;}
+            if(tick<trace.opened){text("-");us(trace.opened-tick);}
+            else us(tick-trace.opened);
+        };
+        text("GPU menu-open: id=");number(i+1);text(" refresh=");number(trace.refresh);
+        phase(" requestedUs=",trace.requested);phase(" resourcesStartUs=",trace.resource_start);
+        phase(" resourcesDoneUs=",trace.resource_done);phase(" resourcesCommitUs=",trace.resource_commit);
+        phase(" cacheStartUs=",trace.cache_start);phase(" cacheDoneUs=",trace.cache_done);
+        phase(" maxBcsStartUs=",trace.bcs_start);phase(" maxBcsDoneUs=",trace.bcs_done);
+        phase(" firstPresentUs=",trace.first_present);
+        text(" gpu=");number(trace.gpu);*end=0;print(line);
+        end=line;text("GPU menu-cost: id=");number(i+1);
+        text(" allocationUs=");us(trace.allocation_ticks);
+        text(" buildUs=");us(trace.build_ticks);text(" resourcesCpuUs=");us(trace.resource_cpu);
+        text(" maxBcsWallUs=");us(trace.bcs_wall);text(" maxBcsCpuUs=");us(trace.bcs_cpu);
+        text(" maxBcsSleepUs=");us(trace.bcs_sleep);text(" maxPresentGapUs=");us(trace.max_interval);
+        *end=0;print(line);
+    }
+}
+
 static void process_exit_ui(pid_t pid) {
     bool foreground = pid == g_terminal_foreground_pid;
     wm_destroy_task_windows(pid);
@@ -448,6 +696,7 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
 
     // 1. Move cursor (clamped to screen)
     auto clipboard_hover=wm_clipboard_hit(g_mouse_x,g_mouse_y);
+    int previous_menu_item=g_menu_open?wm_menu_hit_test(g_mouse_x,g_mouse_y):-1;
     g_mouse_x += dx;
     g_mouse_y += dy;
     if (dx != 0 || dy != 0 || buttons != g_mouse_prev_buttons) g_needs_refresh = true;
@@ -459,20 +708,8 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
     if((dx||dy)&&g_clipboard_open&&clipboard_hover!=wm_clipboard_hit(g_mouse_x,g_mouse_y))
         wm_clipboard_damage();
 
-    // Repaint only when the pointer enters or leaves a title-bar control.
-    static int hover_window=-1,hover_control=WINDOW_NO_CONTROL;
-    int hover_index=wm_find_top_window(g_mouse_x,g_mouse_y);
-    Window* hover=hover_index>=0?g_window_list[hover_index]:nullptr;
-    int control=hover?window_control_hit(hover->x,hover->y-g_title_h,hover->w,g_title_h,g_mouse_x,g_mouse_y):WINDOW_NO_CONTROL;
-    int hover_id=control>=0?hover->id:-1;
-    if(hover_id!=hover_window||control!=hover_control){
-        wm_damage_window_full(wm_find_window(hover_window));
-        if(control>=0)wm_damage_window_full(hover);
-        hover_window=hover_id;hover_control=control;
-    }
-
     // Start menu hover highlight follows the pointer
-    if (g_menu_open && (dx != 0 || dy != 0)) wm_menu_hover_dirty();
+    if (g_menu_open && (dx != 0 || dy != 0)) wm_menu_hover_dirty(previous_menu_item,wm_menu_hit_test(g_mouse_x,g_mouse_y));
     if(g_taskbar_popup&&(dx!=0||dy!=0))wm_taskbar_damage(false);
 
     // 2. Start drag / Raise / Close / Taskbar: hit-test Z-stack on fresh click
@@ -690,16 +927,40 @@ void compositor_thread_main() {
 #endif
 
     uint64_t target_tsc = rdtsc(); // Start cadence from current time
+    uint64_t rainbow_epoch=target_tsc;
     static uint64_t last_hud_tick     = 0;
     static uint64_t last_clock_tick   = 0;
+    uint64_t fps_sample_begin=target_tsc;
+    uint64_t fps_presentations=0;
 
     while (true) {
+        uint64_t frame_present_count=g_gpu_present_count;
+        bool software_presented=false;
+        if(GPU_RCS_ALPHA){
+            g_gpu_timeline={};
+            g_gpu_timeline.measure=(g_compositor_frame%16)==0;
+            g_gpu_timeline.begin=rdtsc();
+#if GPU_WORKLOAD
+            g_gpu.workload=&g_gpu_timeline.workload;
+#endif
+            g_gpu_timeline.previous_latch=g_gpu_timeline_last_latch;
+#if GPU_FRAME_DIAGNOSTICS
+            if(g_gpu_timeline.previous_latch)g_gpu_timeline.display_previous=g_gpu_previous_phase;
+            if(g_gpu_present_ready&&g_gpu_direct_verified)g_gpu_timeline.display_start=gpu_display_phase();
+#endif
+            g_gpu_timeline.cpu=wm_trace_cpu_cycles();
+            g_gpu_timeline.bcs=g_gpu_perf.bcs_wait;g_gpu_timeline.rcs=g_gpu_perf.rcs_wait;
+            g_gpu_timeline.sleep=g_gpu_perf.bcs_sleep.ticks+g_gpu_perf.rcs_sleep.ticks+g_gpu_perf.flip_sleep.ticks;
+            g_gpu_timeline.bcs_batches=g_gpu_perf.bcs_batches;g_gpu_timeline.rcs_draws=g_gpu_perf.rcs_draws;
+        }
         wm_collect_retired_surfaces();
+        wm_titlebar_hover_damage();
         uint64_t frame_interval = (tsc_hz / 60);
         target_tsc += frame_interval;
 
         // Run one frame of compositor logic
         uint64_t now_refresh = rdtsc();
+        g_rain_trace = {};
         
         // Keep the animation's phase, but spend no frame work on hidden pixels.
         Window* rain_win = nullptr;
@@ -707,8 +968,9 @@ void compositor_thread_main() {
         for (int i = 0; i < g_window_count; i++) {
             if (g_window_list[i] && g_window_list[i]->visible && !g_window_list[i]->minimized && g_window_list[i]->type == WIN_TYPE_RAIN) {
                 rain_win = g_window_list[i];
-                rain_scroll += 4;
+                rain_scroll = gpu_rainbow_phase(now_refresh-rainbow_epoch,tsc_hz);
                 wm_visible_client(rain_win, &rain_region);
+                if (GPU_RCS_ALPHA && rain_region.count) g_rain_trace.update = now_refresh;
                 if (rain_region.count) g_needs_refresh = true;
                 break;
             }
@@ -718,14 +980,15 @@ void compositor_thread_main() {
         if (now_refresh - last_hud_tick > tsc_hz) {
             last_hud_tick = now_refresh;
             g_hud_sample_due=true;
-            g_needs_refresh = true;
-
-            // Explicitly 'dirty' the HUD area (top-right strip)
-            // The HUD line can be up to HUD_MSG_CAP chars wide (8px each). A fixed-width strip would cover only the
-            // right-hand end (uptime) and leave the left part (CPU %) stale until the mouse moved.
-            uint32_t hud_px   = (uint32_t)HUD_MSG_CAP * 8 + 32;
-            uint32_t hud_left = fb->width > hud_px ? fb->width - hud_px : 0;
-            wm_dirty_add(hud_left, fb->width - 1, 0, 60);   // its own rect, not unioned with whatever else is dirty
+            TtyIrqGuard guard;
+            if(wm_desktop_stats_visible()){
+                // Composition suppresses both HUD lines under a maximized window.
+                // Leave the sample due until the desktop is visible again.
+                uint32_t hud_px=(uint32_t)HUD_MSG_CAP*8+32;
+                uint32_t hud_left=fb->width>hud_px?fb->width-hud_px:0;
+                wm_dirty_add(hud_left,fb->width-1,0,59);
+                g_needs_refresh=true;
+            }
         }
 
         // Taskbar clock: poll the RTC 4x per second (cheap: a handful of port reads) so a minute change shows
@@ -739,6 +1002,19 @@ void compositor_thread_main() {
         term_cursor_tick(now_refresh/(tsc_hz/1000),tty_raw_mode&&g_term_view_offset==0&&
             cursor_window&&cursor_window->visible&&!cursor_window->minimized&&cursor_window->is_system&&cursor_window->type==WIN_TYPE_TERM&&
             wm_client_rect_exposed(cursor_window,g_term_ox+term_x*8,g_term_oy+term_y*10+8,8,2));
+        bool fps_only_refresh=false;
+        if(now_refresh-fps_sample_begin>=tsc_hz){
+            uint64_t elapsed=now_refresh-fps_sample_begin;
+            uint64_t rate=(fps_presentations*tsc_hz+elapsed/2)/elapsed;
+            unsigned fps=rate>999?999:rate;
+            fps_sample_begin=now_refresh;
+            fps_presentations=0;
+            if(fps!=g_desktop_fps){
+                g_desktop_fps=fps;
+                fps_only_refresh=!g_needs_refresh;
+                wm_clock_damage();
+            }
+        }
         if (g_needs_refresh) {
             g_needs_refresh  = false;
 
@@ -746,7 +1022,15 @@ void compositor_thread_main() {
             term_process_ring_buffer();
 
             g_client_render_ticks = 0;
-            wm_rain_render(rain_win, rain_region);
+            bool retained_animation;
+            {
+#if GPU_FRAME_DIAGNOSTICS
+                GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::Prepare),wm_trace_cpu_cycles);
+#endif
+                retained_animation=GPU_RCS_ALPHA&&g_gpu_direct_verified&&g_gpu_present_ready&&
+                    wm_prepare_retained_animation(rain_win);
+            }
+            wm_rain_render(rain_win, rain_region,retained_animation);
 
             __asm__ volatile("cli");
 			uint32_t fx1 = g_dirty_min_x, fx2 = g_dirty_max_x;
@@ -767,37 +1051,151 @@ void compositor_thread_main() {
 			// Compose each damaged region separately (HUD strip, animation, cursor ... are not
 			// merged into one giant box). The legacy box counts as one more rect when something wrote to it.
 			uint64_t t_start = rdtsc();
+            if(GPU_RCS_ALPHA)g_gpu_timeline.compose=t_start;
             gpu_trace_stage("COMPOSE");
 			if (!g_pause_compositor) {
-				bool box_valid = (fx1 <= fx2 && fy1 <= fy2);
-				uint32_t total = frame_dmg.n + (box_valid ? 1u : 0u);
+                damage_add_clipped(&frame_dmg,fb->width,fb->height,fx1,fx2,fy1,fy2);
+                bool retained_prepared=retained_animation;
+                auto add_animation_damage=[&](){
+                    VisibleRect bounds;
+                    if(gpu_animation_damage_bounds(rain_region,&bounds))
+                        damage_add_clipped(&frame_dmg,fb->width,fb->height,bounds.x1,bounds.x2-1,bounds.y1,bounds.y2-1);
+                };
+                if(retained_prepared&&!retained_animation)add_animation_damage();
+                static bool master_needs_repaint=false;
+                static VisibleRegion exact_damage{};
+                bool direct;
+                {
+#if GPU_FRAME_DIAGNOSTICS
+                    GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::Direct),wm_trace_cpu_cycles);
+#endif
+                    direct=begin_direct_scanout(frame_dmg,GPU_EXACT_REPAIRS?&exact_damage:nullptr);
+                }
+                if(retained_animation&&!direct){retained_animation=false;add_animation_damage();}
+                if(!direct && master_needs_repaint){
+                    frame_dmg.n=1;
+                    frame_dmg.r[0]={0,0,(uint32_t)fb->width-1,(uint32_t)fb->height-1};
+                }
+                master_needs_repaint=direct;
+                static VisibleRegion retained_repairs{};
+                bool repairs_ok=true;
+                if(retained_animation){
+#if GPU_FRAME_DIAGNOSTICS
+                    GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::RepairPlan),wm_trace_cpu_cycles);
+#endif
+                    if(GPU_EXACT_REPAIRS)repairs_ok=gpu_retained_repair_region(&retained_repairs,exact_damage,g_retained_animation_plan);
+                    else repairs_ok=gpu_retained_repair_region(&retained_repairs,frame_dmg,g_retained_animation_plan);
+                }
+                if(retained_animation&&!repairs_ok){
+                    retained_animation=false;add_animation_damage();
+                }
+                if(retained_animation&&GPU_EXACT_REPAIRS){
+                    ++g_gpu_perf.exact_repair_frames;
+                    for(unsigned i=0;i<retained_repairs.count;++i){auto r=retained_repairs.rects[i];
+                        g_gpu_perf.exact_repair_pixels+=(uint64_t)(r.x2-r.x1)*(r.y2-r.y1);}
+                }
+                uint32_t total = retained_animation?retained_repairs.count:frame_dmg.n;
+#if GPU_ALPHA_REPAIR_BATCH
+                wm_begin_alpha_repairs(retained_animation);
+#endif
 				bool overlay_done = false;
 				uint64_t a_bg = 0, a_win = 0, a_rain = 0, a_lock = 0, a_vram = 0;
-				if (total == 0) {
+				if (total == 0 && !retained_animation) {
                     // Pointer/outline motion changes only the VRAM overlay.
                     // Never enter scene composition with the empty damage box.
                     uint64_t overlay_started=rdtsc();
                     wm_overlay_update(g_mouse_x,g_mouse_y,g_mouse_buttons);
                     overlay_done=true;a_vram=rdtsc()-overlay_started;
 				} else {
+#if GPU_FRAME_DIAGNOSTICS
+                    GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::RepairPaint),wm_trace_cpu_cycles);
+#endif
 					uint32_t idx = 0;
-					for (uint32_t i = 0; i < frame_dmg.n; i++, idx++) {
+                    for (uint32_t i = 0; i < total; i++, idx++) {
 						bool last = (idx == total - 1);
-						if (wm_compose_dirty(frame_dmg.r[i].x1, frame_dmg.r[i].x2, frame_dmg.r[i].y1, frame_dmg.r[i].y2, last)) overlay_done = true;
-						a_bg += g_time_bg_ticks; a_win += g_time_win_ticks; a_rain += g_time_rain_ticks;
-						a_lock += g_time_lock_ticks; a_vram += g_time_vram_ticks;
-					}
-					if (box_valid) {
-						if (wm_compose_dirty(fx1, fx2, fy1, fy2, true)) overlay_done = true;   // always the last one
+                        DmgRect repair;
+                        if(retained_animation){
+                            const auto& r=retained_repairs.rects[i];
+                            if(wm_repair_retained_foreground(r))continue;
+                            repair={(uint32_t)r.x1,(uint32_t)r.y1,(uint32_t)r.x2-1,(uint32_t)r.y2-1};
+                        }else repair=frame_dmg.r[i];
+                        if (wm_compose_dirty(repair.x1,repair.x2,repair.y1,repair.y2,last&&!retained_animation)) overlay_done = true;
 						a_bg += g_time_bg_ticks; a_win += g_time_win_ticks; a_rain += g_time_rain_ticks;
 						a_lock += g_time_lock_ticks; a_vram += g_time_vram_ticks;
 					}
 				}
+#if GPU_ALPHA_REPAIR_BATCH
+                g_deferred_alpha.active=false;
+#endif
+                if(retained_animation){
+                    uint64_t animation_started=rdtsc();
+                    // Repairs can block while input changes the window stack.
+                    // Refresh source snapshots, and rebuild the complete scene
+                    // if geometry/opacity changed since the animation snapshot.
+                    uint64_t layout=g_retained_animation_layout;
+                    uint64_t repair_menu_key=g_retained_menu_key;
+                    bool stable;
+                    {
+#if GPU_FRAME_DIAGNOSTICS
+                        GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::Revalidate),wm_trace_cpu_cycles);
+#endif
+                        stable=gpu_direct_active()&&wm_prepare_retained_animation(rain_win)&&
+                            layout==g_retained_animation_layout;
+                    }
+#if GPU_ALPHA_REPAIR_BATCH
+                    stable=stable&&wm_alpha_repairs_ready();
+                    if(!stable)wm_cancel_alpha_repairs();
+#endif
+                    bool drawn=false;
+                    if(stable)drawn=wm_draw_retained_animation(repair_menu_key);
+                    else {
+#if GPU_FRAME_DIAGNOSTICS
+                        GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::Fallback),wm_trace_cpu_cycles);
+#endif
+                        retained_animation=false;
+                        overlay_done=wm_compose_dirty(0,fb->width-1,0,fb->height-1,true);
+                    }
+#if GPU_RETAINED_MENU
+                    if(stable&&drawn&&g_retained_scene_invalidated){
+#if GPU_FRAME_DIAGNOSTICS
+                        GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::Fallback),wm_trace_cpu_cycles);
+#endif
+#if GPU_ALPHA_REPAIR_BATCH
+                        wm_cancel_alpha_repairs();
+#endif
+                        retained_animation=false;
+                        overlay_done=wm_compose_dirty(0,fb->width-1,0,fb->height-1,true);
+                    }
+#endif
+                    a_win+=rdtsc()-animation_started;
+                    uint64_t present_started=rdtsc();
+                    if(retained_animation&&drawn){
+                        wm_overlay_update(g_mouse_x,g_mouse_y,g_mouse_buttons);
+                        overlay_done=g_gpu_present_hook!=nullptr;
+                    }
+                    if(retained_animation&&(!drawn||!overlay_done)){
+#if GPU_FRAME_DIAGNOSTICS
+                        GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::Fallback),wm_trace_cpu_cycles);
+#endif
+#if GPU_ALPHA_REPAIR_BATCH
+                        wm_cancel_alpha_repairs();
+#endif
+                        if(g_gpu_present_ready)gpu_scene_abort("GPU: retained animation presentation failed");
+                        g_rain_surface_current=false;
+                        overlay_done=wm_compose_dirty(0,fb->width-1,0,fb->height-1,true);
+                        master_needs_repaint=false;
+                    }
+                    a_vram+=rdtsc()-present_started;
+                }
+                gpu_direct_end();
 				// Safety net for frames with no completed scene blit (for example, pointer-only motion).
 				if (!overlay_done) wm_overlay_update(g_mouse_x, g_mouse_y, g_mouse_buttons);
+                software_presented=total&&overlay_done&&!g_gpu_present_hook;
 				// HUD shows the whole frame, not just the last rect.
 				g_snap_bg = a_bg; g_snap_win = a_win; g_snap_rain = a_rain + g_client_render_ticks;
 				g_snap_lock = a_lock; g_snap_vram = a_vram;
+					g_gpu_perf.scene_ticks+=a_bg+a_win+a_lock+a_vram;
+					g_gpu_perf.present_ticks+=a_vram;
 			}
 			uint64_t t_end = rdtsc();
 			g_last_frame_ticks = t_end - t_start;
@@ -805,9 +1203,26 @@ void compositor_thread_main() {
             term_dirty_reset();
         }
 
-        // --- DRIFT-FREE SLEEP ---
+        if(!fps_only_refresh&&(software_presented||g_gpu_present_count!=frame_present_count))
+            ++fps_presentations;
+        if(GPU_RCS_ALPHA)gpu_timeline_finish(rdtsc(),wm_trace_cpu_cycles(),g_gpu_perf);
+#if GPU_FRAME_DIAGNOSTICS
+        if(GPU_RCS_ALPHA)log_frame_gap(g_gpu_timeline);
+#endif
+#if GPU_WORKLOAD
+        g_gpu.workload=nullptr;
+#endif
+        // A confirmed synchronous flip already paced this frame to the display.
+        // Starting its successor immediately avoids adding a timer/yield delay
+        // after vblank. GPU waits still block and let other tasks run.
+        // Software presentation and idle loops retain the timed cadence below.
+        wm_gpu_perf_sample(rdtsc());
+        log_app_launches(rdtsc());
+        log_menu_opens(rdtsc());
         uint64_t final_now = rdtsc();
-        if (final_now < target_tsc) {
+        if(g_gpu_present_count!=frame_present_count){
+            target_tsc=final_now;
+        } else if (final_now < target_tsc) {
             uint64_t diff = target_tsc - final_now;
             uint32_t ms_to_sleep = (uint32_t)(diff * 1000 / tsc_hz);
             if (ms_to_sleep > 0) {
@@ -992,6 +1407,7 @@ extern "C" void kmain(void) {
     uint64_t ui_started = rdtsc();
 #endif
     wm_init();     // Initialize window manager and UI scaling first
+    wm_prepare_menu_cache();
     g_task_exit_hook = process_exit_ui;
     g_stdio_exit_hook = console_release;
     wm_log_init(); // Then initialize the log buffer with the correct scaled dimensions
@@ -1003,7 +1419,7 @@ extern "C" void kmain(void) {
     
     // Spawn compositor thread extremely early so it guarantees 60fps
     // screen refreshes regardless of whether USB enumeration blocks.
-    scheduler_add_task(task_create(compositor_thread_main,0,"Compositor"));
+    scheduler_add_task(task_create(compositor_thread_main,16,"Compositor"));
 
 
 

@@ -42,6 +42,31 @@ static inline bool visibility_subtract(VisibleRegion* region, VisibleRect cover)
     return true;
 }
 
+// Exact union: subtract existing coverage before appending. Do not introduce
+// pixels merely to fit fixed storage. Failure leaves the original unchanged.
+static inline bool visibility_add_exact(VisibleRegion* region,VisibleRect rect){
+    if(!visibility_valid(rect))return true;
+    VisibleRegion pending{};pending.rects[pending.count++]=rect;
+    for(unsigned i=0;i<region->count;++i)
+        if(!visibility_subtract(&pending,region->rects[i]))return false;
+    if(region->count+pending.count>VisibleRegion::capacity)return false;
+    for(unsigned i=0;i<pending.count;++i)region->rects[region->count++]=pending.rects[i];
+    bool changed;
+    do{changed=false;
+        for(unsigned i=0;i<region->count&&!changed;++i)for(unsigned j=i+1;j<region->count;++j){
+            auto a=region->rects[i],b=region->rects[j];
+            bool vertical=a.x1==b.x1&&a.x2==b.x2&&(a.y2==b.y1||b.y2==a.y1);
+            bool horizontal=a.y1==b.y1&&a.y2==b.y2&&(a.x2==b.x1||b.x2==a.x1);
+            if(!vertical&&!horizontal)continue;
+            region->rects[i]={a.x1<b.x1?a.x1:b.x1,a.y1<b.y1?a.y1:b.y1,
+                              a.x2>b.x2?a.x2:b.x2,a.y2>b.y2?a.y2:b.y2};
+            for(unsigned k=j+1;k<region->count;++k)region->rects[k-1]=region->rects[k];
+            --region->count;changed=true;break;
+        }
+    }while(changed);
+    return true;
+}
+
 // Clamp in 64 bits before converting back to screen coordinates.
 static inline VisibleRect visibility_clip(int32_t x, int32_t y, int32_t w, int32_t h,
                                           int32_t top, int32_t screen_w, int32_t screen_h) {

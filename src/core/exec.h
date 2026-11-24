@@ -1,5 +1,6 @@
 #ifndef exec_h
 #define exec_h
+#include "../drivers/gpu_launch_trace.h"
 
 // ── exec.h ────────────────────────────────────────────────────────────────────
 //
@@ -13,6 +14,8 @@
 #include "helpers.h"
 #include "syscall.h" // For enter_usermode
 #include "wiz.h"
+
+#include "frame_gap_trace.h"
 
 // ── exec_trampoline ───────────────────────────────────────────────────────────
 // This is the kernel-level stub that the scheduler jumps to when it first
@@ -197,6 +200,10 @@ static Task* exec_console_host(const char* path) {
     return host;
 }
 static int64_t launch_program(const char* path,bool desktop,bool* gui,const char* document) {
+#if GPU_FRAME_DIAGNOSTICS
+    GpuGapScope load(GpuGapActivity::Launch,path);
+#endif
+    auto* trace=gpu_launch_begin(path);
     if(app_path_is_shell(path)&&!desktop)return -1;
     *gui=exec_is_gui(path);bool host=desktop&&!*gui;
     if(document&&*document&&!*gui)return -1; // Document handlers currently require a GUI package.
@@ -212,6 +219,7 @@ static int64_t launch_program(const char* path,bool desktop,bool* gui,const char
         t->console=c;++c->refs;c->foreground=t->pid;
     }
     if(!t->console&&!desktop&&!*gui&&t->parent_pid==g_terminal_shell_pid)g_terminal_foreground_pid=t->pid;
+    if(trace){trace->pid=t->pid;trace->ready=gpu_launch_now();}
     scheduler_add_task(t);return t->pid;
 }
 #endif // exec_h

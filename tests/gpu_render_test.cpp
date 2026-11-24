@@ -1,10 +1,15 @@
 #include <cassert>
+#include <initializer_list>
 #include <cstdio>
 #include <cstring>
 #include "src/drivers/gpu_render_commands.h"
 #include "src/drivers/gpu_render_reset.h"
 #include "src/drivers/gpu_gen9_workarounds.h"
 #include "src/gui/gpu_compositor.h"
+#include "src/gui/window_alpha.h"
+#include "src/drivers/gpu_upload_cache.h"
+#include "src/drivers/gpu_alpha_coverage.h"
+#include "src/gui/gpu_deferred_alpha.h"
 
 static float floating(uint32_t word) { float f;memcpy(&f,&word,4);return f; }
 static void gen9_workaround_test() {
@@ -109,12 +114,34 @@ static void texture_state_test() {
     assert(source[2]==(7u<<16|15)&&source[3]==63);
     assert(source[8]==draw.source.address&&source[9]==0);
     assert(source[7]==(4u<<25|5u<<22|6u<<19|7u<<16));
+    assert(source[1]==0&&buffer.words[GPU_RENDER_DST_STATE/4+1]==0);
+    draw.cache_source=true;
+    assert(gpu_build_texture_batch(buffer.words,0x100000,draw));
+    assert(buffer.words[GPU_RENDER_SRC_STATE/4+1]==(2u<<24));
+    assert(buffer.words[GPU_RENDER_DST_STATE/4+1]==0); // No cached destination.
+    draw.cache_source=false;
+    assert(gpu_build_texture_batch(buffer.words,0x100000,draw));
     assert(buffer.words[18]==0x100001&&buffer.words[20]==0x100001&&buffer.words[24]==0x100001);
     assert(buffer.words[262]==0x100000+GPU_RENDER_VERTEX_OFFSET);
     assert(buffer.words[258]==(63u<<16|95));
     const auto* v=buffer.words+GPU_RENDER_VERTEX_OFFSET/4;
     assert(buffer.words[264]==72&&buffer.words[273]==4&&buffer.words[281]==6);
     assert((buffer.words[215]>>23)==15&&(buffer.words[215]&2));
+    uint32_t dispatch_flags=buffer.words[215]&0x007fffffu;
+    for(unsigned threads:{16u,32u,63u}){
+        draw.threads=threads;assert(gpu_build_texture_batch(buffer.words,0x100000,draw));
+        assert((buffer.words[215]>>23)==threads-1);
+        assert((buffer.words[215]&0x007fffffu)==dispatch_flags);
+        assert(buffer.words[GPU_RENDER_DST_STATE/4+1]==0);
+    }
+    for(unsigned threads:{0u,15u,64u}){
+        draw.threads=threads;assert(!gpu_build_texture_batch(buffer.words,0x100000,draw));
+    }
+    draw.threads=16;assert(gpu_build_texture_batch(buffer.words,0x100000,draw));
+    assert(gpu_render_dispatch_faster(800,700));
+    assert(!gpu_render_dispatch_faster(800,701));
+    assert(!gpu_render_dispatch_faster(0,100)&&!gpu_render_dispatch_faster(800,0));
+    assert(gpu_render_dispatch_faster(UINT64_MAX,UINT64_MAX/2));
     assert(v[9]==v[0]&&v[12]==v[6]&&v[15]==20);
     assert(floating(v[16])==.75f&&floating(v[17])==.125f);
     assert(v[0]==(12u<<16|20)&&v[3]==(12u<<16)&&v[6]==0);
@@ -238,6 +265,20 @@ static void sustained_ring_test() {
     assert(!gpu_render_packet(ring.words,0,0xFFFFFFE0u,2052,true,&tail));
     assert(gpu_render_packet(ring.words,0,0xFFFFFFD8u,2052,true,&tail));
     assert(ring.words[50]==0);
+    uint32_t baseline[GPU_RENDER_PACKET_BYTES/4]{},instrumented[GPU_RENDER_PACKET_BYTES/4]{};
+    assert(gpu_render_packet(baseline,0,0x23021000,0x1234,true,&tail));
+    assert(gpu_render_packet(instrumented,0,0x23021000,0x1234,true,&tail,true,0x100000,0x23021040));
+    unsigned stamp_count=0,plain_index=0;
+    for(unsigned i=0;i<GPU_RENDER_PACKET_BYTES/4;){
+        if(instrumented[i]==0x12400002){
+            assert(i+3<GPU_RENDER_PACKET_BYTES/4&&instrumented[i+1]==0x2358);
+            assert(instrumented[i+2]==0x23021040+stamp_count*4&&instrumented[i+3]==0);
+            ++stamp_count;i+=4;
+        }else assert(instrumented[i++]==baseline[plain_index++]);
+    }
+    assert(stamp_count==5&&plain_index==GPU_RENDER_PACKET_BYTES/4-20);
+    assert(!gpu_render_packet(instrumented,0,0x23021000,0x1234,true,&tail,true,0x100000,0x23021000));
+    assert(!gpu_render_packet(instrumented,0,0x23021000,0x1234,true,&tail,true,0x100000,0x23021044));
 }
 static void readback_sampling_test() {
     uint32_t batch[1024];
@@ -389,5 +430,291 @@ static void retained_mixed_scene_test() {
     bcs.client_count=2;build(damage,true);rcs.copies[0].destination.x2=211;
     assert(!gpu_retained_damage(bcs,rcs,damage,&background));
 }
-int main(){gen9_workaround_test();reset_handshake_test();texture_state_test();logical_context_test();sustained_ring_test();readback_sampling_test();scissor_geometry_test();scaled_occlusion_test();resized_shape_test();retained_mixed_scene_test();
+static void window_alpha_test() {
+    // Every alpha and destination byte, including exact transparent/opaque
+    // endpoints. Expected channels are evaluated independently in double.
+    for(unsigned a=0;a<256;++a)for(unsigned d=0;d<256;++d){
+        unsigned s=(a*73+127)/255;
+        uint32_t source=(a<<24)|(s<<16)|(s<<8)|s;
+        unsigned expected=(unsigned)(s+d*(1.0-a/255.0)+0.5);
+        uint32_t background=0xff000000|(d<<16)|(d<<8)|d;
+        assert(window_source_over(source,background)==(0xff000000|(expected<<16)|(expected<<8)|expected));
+    }
+    assert(window_source_over(0x80402010,0xff204080)==0xff504050);
+    assert(window_source_over(0,0xff123456)==0xff123456);
+    assert(window_source_over(0xffabcdef,0xff123456)==0xffabcdef);
+    // Reconstruct the background for each repaint; repeated blending onto
+    // yesterday's output would accumulate opacity and produce a different pixel.
+    uint32_t background=0xff2468ac;
+    auto expected=window_source_over(0x80402010,background);
+    assert(window_source_over(0x80402010,expected)!=expected);
+
+    alignas(64) uint32_t pixels[64*64]{};
+    GpuSceneClient client{{-12,-8,116,136},{-12,8,116,136},pixels,64,64,256,true,false,true,true};
+    GpuScenePlan alpha{};
+    assert(gpu_alpha_scene_plan(&alpha,client,{0,20,100,136}));
+    assert(alpha.count==1&&alpha.clients[0].premultiplied);
+    auto clip=alpha.copies[0].destination;
+    assert(clip.x1==0&&clip.x2==100&&clip.y1==20&&clip.y2==124);
+    client.resize_grip=false;
+    assert(gpu_alpha_scene_plan(&alpha,client,{0,20,100,136}));
+    assert(alpha.copies[0].destination.y2==136);
+    client.client={0,8,64,72}; // 1:1 alpha must still use the render engine
+    assert(gpu_alpha_scene_plan(&alpha,client,{0,8,64,72}));
+    client.pixels=pixels+1;assert(!gpu_alpha_scene_plan(&alpha,client,{0,8,64,72}));
+    client.pixels=pixels;client.premultiplied=false;
+    assert(!gpu_alpha_scene_plan(&alpha,client,{0,8,64,72}));
+    client.premultiplied=true;
+    assert(!gpu_alpha_scene_plan(&alpha,client,{64,8,65,72}));
+
+    GpuScenePlan bcs{},rcs{};bcs.client_count=2;
+    bcs.clients[0]={{0,0,64,80},{0,16,64,80},pixels,64,64,256,true,true,false,false};
+    bcs.clients[1]=client;
+    VisibleRect damage{0,20,64,64};
+    gpu_scene_plan(&bcs,damage);assert(!bcs.count&&!bcs.accelerated);
+    rcs=bcs;gpu_scaled_scene_plan(&rcs,damage);assert(!rcs.count&&!rcs.accelerated);
+    assert(!gpu_scaled_damage_plan(&rcs,damage));
+    assert(!gpu_rain_damage_plan(&bcs,damage));
+    VisibleRegion gaps{};assert(!gpu_retained_damage(bcs,rcs,damage,&gaps));
+    bcs.clients[1].visible=false;
+    gpu_scene_plan(&bcs,damage);assert(bcs.count&&bcs.accelerated==1);
+    // Transparent/shadow scenes retain opaque blits and the resident rainbow
+    // palette instead of regenerating those pixels on the CPU.
+    GpuScenePlan ordered{};client.visible=true;client.premultiplied=false;
+    assert(gpu_ordered_scene_plan(&ordered,client,{0,8,64,72})==1);
+    client.rainbow=true;
+    assert(gpu_ordered_scene_plan(&ordered,client,{0,8,64,72})==1);
+    client.rainbow=false;client.client.x2=128;
+    assert(gpu_ordered_scene_plan(&ordered,client,{0,8,128,72})==2);
+    client.premultiplied=true;
+    assert(gpu_ordered_scene_plan(&ordered,client,{0,8,128,72})==2);
+    // Keep only visible opaque-client pixels, while preserving source offsets
+    // and leaving the background beneath higher shadows/alpha available.
+    client.premultiplied=false;client.client={10,8,74,72};
+    assert(gpu_ordered_scene_plan(&ordered,client,{20,18,70,62})==1);
+    VisibleRect covers[]={{35,18,50,62},{20,30,70,40}};
+    gpu_ordered_occlude(&ordered,covers,2);
+    assert(ordered.count==4);
+    unsigned area=0;
+    for(unsigned i=0;i<ordered.count;++i){
+        const auto& copy=ordered.copies[i];auto r=copy.destination;
+        assert(copy.source_x==(unsigned)(r.x1-10)&&copy.source_y==(unsigned)(r.y1-8));
+        area+=(r.x2-r.x1)*(r.y2-r.y1);
+        for(auto cover:covers)assert(!visibility_valid(visibility_intersect(r,cover)));
+    }
+    assert(area==35*34);
+    VisibleRect full{0,0,128,100};
+    assert(gpu_ordered_scene_plan(&ordered,client,{20,18,70,62})==1);
+    gpu_ordered_occlude(&ordered,&full,1);assert(ordered.count==0);
+}
+static void immutable_upload_test() {
+    GpuUploadCache cache;
+    uint32_t source=0xff112233,staged=0;
+    unsigned uploads=0;
+    auto upload=[&](uint64_t revision,uint64_t epoch){
+        if(!cache.matches(&source,sizeof(source),revision,epoch)){
+            staged=source;++uploads;cache.record(&source,sizeof(source),revision,epoch);
+        }
+    };
+    upload(1,0);assert(staged==source&&uploads==1);
+    for(unsigned frame=0;frame<10000;++frame)upload(1,0);
+    assert(uploads==1);
+    // The same publication slot may be overwritten later at the same address.
+    source=0xff445566;upload(3,0);assert(staged==source&&uploads==2);
+    upload(3,1);assert(uploads==3); // retired backing invalidates reuse
+    source=0xff778899;upload(0,1);assert(staged==source&&uploads==4);
+    source=0xffaabbcc;upload(0,1);assert(staged==source&&uploads==5);
+    assert(!cache.matches(&staged,sizeof(source),3,1));
+    assert(!cache.matches(&source,sizeof(source)+4,3,1));
+}
+static void animation_batch_test() {
+    VisibleRegion exposed{};VisibleRect bounds;
+    assert(!gpu_animation_damage_bounds(exposed,&bounds));
+    exposed.count=3;
+    exposed.rects[0]={10,30,200,50};exposed.rects[1]={10,50,60,160};exposed.rects[2]={150,50,200,160};
+    assert(gpu_animation_damage_bounds(exposed,&bounds));
+    assert(bounds.x1==10&&bounds.y1==30&&bounds.x2==200&&bounds.y2==160);
+    // The bounding scene does not reintroduce opaque covered GPU pixels.
+    alignas(64) uint32_t pixels[190*130]{};
+    GpuSceneClient rain{{10,10,200,160},{10,30,200,160},pixels,190,130,760,true,true,false};
+    GpuScenePlan plan{};assert(gpu_ordered_scene_plan(&plan,rain,bounds)==1);
+    VisibleRect cover{60,50,150,160};gpu_ordered_occlude(&plan,&cover,1);
+    unsigned area=0;for(unsigned i=0;i<plan.count;++i){auto r=plan.copies[i].destination;
+        assert(!visibility_valid(visibility_intersect(r,cover)));area+=(r.x2-r.x1)*(r.y2-r.y1);}
+    assert(area==190*20+100*110);
+    exposed.count=VisibleRegion::capacity+1;assert(!gpu_animation_damage_bounds(exposed,&bounds));
+}
+static void alpha_coverage_test() {
+    constexpr unsigned width=64,height=64,pitch=68;
+    uint32_t pixels[height][pitch]{};
+    GpuAlphaCoverage coverage;
+    GpuTextureDraw draw{{0x10000000,width,height,pitch*4},{0x2000000,192,128,192*4},
+                        {-3,-6,181,121},{0,0,171,111},true};
+    GpuRenderRect clips[GPU_RENDER_MAX_RECTS];
+    auto scan=[&]{coverage.scan(reinterpret_cast<const uint8_t*>(pixels),width,height,pitch*4);};
+    scan();
+    assert(coverage.clips(draw,clips)==0);
+    for(unsigned y=0;y<height;++y)
+        for(unsigned x=y<44?21:0;x<width;++x)pixels[y][x]=0x80402010;
+    for(unsigned y=0;y<height;++y)pixels[y][1]=0xff000000; // opaque border encloses the gap
+    pixels[3][2]=1; // malformed zero alpha still affects the GPU blend
+    scan();
+    unsigned n=coverage.clips(draw,clips);
+    assert(n>1&&n<=GPU_RENDER_MAX_RECTS);
+    unsigned skipped=0;
+    for(int y=draw.clip.y1;y<draw.clip.y2;++y)for(int x=draw.clip.x1;x<draw.clip.x2;++x){
+        unsigned sx=(2*(x-draw.client.x1)+1)*width/(2*(draw.client.x2-draw.client.x1));
+        unsigned sy=(2*(y-draw.client.y1)+1)*height/(2*(draw.client.y2-draw.client.y1));
+        unsigned covered=0;
+        for(unsigned i=0;i<n;++i)
+            covered+=x>=clips[i].x1&&x<clips[i].x2&&y>=clips[i].y1&&y<clips[i].y2;
+        assert(covered<=1);
+        if(pixels[sy][sx])assert(covered==1);
+        if(!covered)++skipped;
+    }
+    assert(skipped>2000);
+    uint32_t batch[1024];
+    assert(gpu_build_texture_batch(batch,0x100000,draw,false,clips,n));
+    assert(batch[264]==n*72&&batch[281]==n*6);
+    for(unsigned i=0;i<n;++i)
+        assert(batch[GPU_RENDER_VERTEX_OFFSET/4+18*i]==((unsigned)clips[i].x2|((unsigned)clips[i].y2<<16)));
+    clips[1]=clips[0];
+    assert(!gpu_build_texture_batch(batch,0x100000,draw,false,clips,n));
+    for(auto& row:pixels)for(auto& pixel:row)pixel=0x80402010;
+    scan();
+    auto upper=draw,lower=draw;
+    upper.clip.y2=55;lower.clip.y1=55;
+    n=0;
+    assert(coverage.append_clips(upper,clips,n));
+    assert(coverage.append_clips(lower,clips,n));
+    assert(gpu_build_texture_batch(batch,0x100000,draw,false,clips,n));
+    for(int y=0;y<111;++y)for(int x=0;x<171;++x){
+        unsigned hits=0;
+        for(unsigned i=0;i<n;++i)
+            hits+=x>=clips[i].x1&&x<clips[i].x2&&y>=clips[i].y1&&y<clips[i].y2;
+        assert(hits==1); // merged fragments blend each destination once
+    }
+    unsigned full=GPU_RENDER_MAX_RECTS;
+    auto first=clips[0];
+    assert(!coverage.append_clips(draw,clips,full));
+    assert(full==GPU_RENDER_MAX_RECTS && clips[0].x1==first.x1 && clips[0].y2==first.y2);
+}
+static void alpha_merge_test(){
+    // A ring-shaped union must retain its hole; a partial shared edge cannot
+    // be expanded into a bounding box. Check every pixel, including overlap.
+    GpuRenderRect original[]={{2,2,18,5},{2,5,5,15},{15,5,18,15},{2,15,18,18},
+                             {22,2,25,5},{25,2,28,5},{28,2,31,5}};
+    GpuRenderRect merged[32];memcpy(merged,original,sizeof(original));
+    unsigned n=gpu_alpha_merge_rects(merged,7);assert(n==5);
+    for(int y=0;y<32;++y)for(int x=0;x<32;++x){
+        unsigned before=0,after=0;
+        for(auto r:original)before+=x>=r.x1&&x<r.x2&&y>=r.y1&&y<r.y2;
+        for(unsigned i=0;i<n;++i){auto r=merged[i];after+=x>=r.x1&&x<r.x2&&y>=r.y1&&y<r.y2;}
+        assert(before==after&&after<=1);
+    }
+    GpuRenderRect bridge[]={{0,0,5,5},{10,0,15,5},{5,0,10,5},{0,5,15,10}};
+    assert(gpu_alpha_merge_rects(bridge,4)==1);
+    assert(bridge[0].x1==0&&bridge[0].y1==0&&bridge[0].x2==15&&bridge[0].y2==10);
+
+    constexpr unsigned W=192,H=128;
+    uint32_t pixels[64*64];for(auto& pixel:pixels)pixel=0x80402010;
+    GpuAlphaCoverage coverage;coverage.scan((const uint8_t*)pixels,64,64,256);
+    GpuTextureDraw draw{{0x10000000,64,64,256},{0x2000000,W,H,W*4},
+                         {0,0,W,H},{0,0,W,H},true};
+    GpuRenderRect full[16];for(unsigned i=0;i<16;++i)full[i]={(int)i*10,0,(int)i*10+5,10};
+    auto next=draw;next.clip={5,0,10,10};n=16;
+    assert(coverage.append_clips(next,full,n,true)&&n==15);
+    uint32_t batch[1024];assert(gpu_build_texture_batch(batch,0x100000,draw,false,full,n));
+    for(unsigned i=0;i<16;++i)full[i]={(int)i*10,0,(int)i*10+5,10};
+    GpuRenderRect saved[16];memcpy(saved,full,sizeof(saved));n=16;
+    next.clip={180,30,185,40};
+    assert(!coverage.append_clips(next,full,n,true));
+    assert(n==16&&!memcmp(saved,full,sizeof(saved)));
+
+    // Model opaque retention inside the mixed-alpha test. The legacy band
+    // clipping must generate exactly the same pixels after coalescing, with
+    // fewer context submissions and no extra vertex/batch storage.
+    for(unsigned y=0;y<64;++y)for(unsigned x=0;x<64;++x)
+        pixels[y*64+x]=x<16?0:x<42?0x80402010:0xff123456;
+    coverage.scan((const uint8_t*)pixels,64,64,256);
+    GpuRenderRect fragments[]={{0,0,192,4},{0,124,192,128},{0,4,130,124},{188,4,192,124}};
+    uint8_t hits[2][W*H]{};unsigned batches[2]{},rectangles[2]{};
+    for(unsigned mode=0;mode<2;++mode){
+        GpuRenderRect group[16];unsigned count=0;
+        auto flush=[&](){if(!count)return;
+            assert(gpu_build_texture_batch(batch,0x100000,draw,false,group,count));
+            ++batches[mode];rectangles[mode]+=count;
+            for(unsigned i=0;i<count;++i){auto r=group[i];
+                const auto* v=batch+GPU_RENDER_VERTEX_OFFSET/4+i*18;
+                assert(floating(v[1])==(float)r.x2/W&&floating(v[2])==(float)r.y2/H);
+                for(int y=r.y1;y<r.y2;++y)for(int x=r.x1;x<r.x2;++x)++hits[mode][y*W+x];
+            }
+            count=0;
+        };
+        for(auto r:fragments){auto part=draw;part.clip=r;
+            if(!coverage.append_clips(part,group,count,mode!=0)){
+                flush();assert(coverage.append_clips(part,group,count,mode!=0));
+            }
+        }
+        flush();
+    }
+    assert(!memcmp(hits[0],hits[1],W*H));
+    for(auto hit:hits[1])assert(hit<=1);
+    assert(batches[1]<batches[0]&&rectangles[1]<rectangles[0]);
+    printf("Alpha merge fixture: batches %u -> %u, rectangles %u -> %u, identical pixel coverage.\n",
+           batches[0],batches[1],rectangles[0],rectangles[1]);
+}
+static void deferred_alpha_test(){
+    alignas(64) uint32_t pixels[64*64];for(auto& p:pixels)p=0x80402010;
+    GpuSceneClient client{{0,0,64,64},{0,0,64,64},pixels,64,64,256,true,false,false,true,17};
+    GpuScenePlan animation{};animation.count=1;animation.copies[0]={0,{0,20,64,64},0,0};
+    GpuScenePlan repair{};repair.client_count=1;repair.clients[0]=client;
+    repair.count=1;repair.copies[0]={0,{0,0,64,20},0,0};
+    GpuDeferredAlpha deferred;deferred.begin(client,true);
+    assert(deferred.append(repair,animation));deferred.active=false;
+    assert(deferred.ready(client,animation));
+    GpuScenePlan alpha{};assert(gpu_retained_alpha_plan(&alpha,client,animation));
+    assert(deferred.combine(&alpha)&&alpha.count==2);
+    GpuAlphaCoverage coverage;coverage.scan((const uint8_t*)pixels,64,64,256);
+    GpuTextureDraw draw{{0x10000000,64,64,256},{0x2000000,64,64,256},
+                        {0,0,64,64},{0,0,64,64},true};
+    GpuRenderRect rects[16];unsigned count=0;
+    for(unsigned i=0;i<alpha.count;++i){auto part=draw;auto r=alpha.copies[i].destination;
+        part.clip={r.x1,r.y1,r.x2,r.y2};assert(coverage.append_clips(part,rects,count,true));}
+    assert(count==1&&rects[0].y1==0&&rects[0].y2==64);
+    uint32_t batch[1024];assert(gpu_build_texture_batch(batch,0x100000,draw,false,rects,count));
+    auto changed=client;++changed.revision;
+    assert(!deferred.ready(changed,animation));
+    changed=client;++changed.client.x1;assert(!deferred.ready(changed,animation));
+    auto collision=animation;collision.copies[0].destination={0,10,64,64};
+    assert(!deferred.ready(client,collision));
+    deferred.begin(client,true);assert(deferred.append(repair,animation));
+    assert(!deferred.append(repair,animation)&&deferred.failed&&deferred.count==1);
+    assert(!deferred.ready(client,animation));
+    deferred.begin(client,false);assert(!deferred.active&&!deferred.append(repair,animation));
+    changed=client;changed.revision=0;deferred.begin(changed,true);assert(!deferred.active);
+    changed=client;changed.resize_grip=true;changed.client.y1=changed.client.y2-8;
+    deferred.begin(changed,true);assert(!deferred.active);
+    deferred.begin(client,true);repair.copies[0].destination={0,10,64,30};
+    assert(!deferred.append(repair,animation)&&!deferred.count);
+    changed=client;changed.resize_grip=true;deferred.begin(changed,true);
+    repair.clients[0]=changed;repair.copies[0].destination={0,50,64,60};animation.count=0;
+    assert(!deferred.append(repair,animation));
+    deferred.begin(client,true);repair.clients[0]=client;repair.count=64;
+    for(unsigned i=0;i<64;++i)repair.copies[i]={0,{(int)(i%8)*4,(int)(i/8)*4,(int)(i%8)*4+1,(int)(i/8)*4+1},0,0};
+    assert(deferred.append(repair,animation)&&deferred.count==64);
+    repair.count=1;repair.copies[0]={0,{40,40,41,41},0,0};
+    assert(!deferred.append(repair,animation)&&deferred.failed&&deferred.count==64);
+    assert(!deferred.ready(client,animation));
+    deferred.clear();assert(!deferred.active&&!deferred.failed&&!deferred.count);
+    VisibleRect opaque{10,10,40,40};
+    deferred.begin(client,true);animation.count=0;
+    assert(!deferred.append_opaque({9,12,20,20},&opaque,1,animation));
+    assert(deferred.append_opaque({10,10,40,40},&opaque,1,animation)&&deferred.count==1);
+    assert(!deferred.ready(changed,animation));
+    deferred.begin(client,true);animation.count=1;animation.copies[0].destination={20,20,30,30};
+    assert(!deferred.append_opaque(opaque,&opaque,1,animation)&&!deferred.count);
+    puts("Deferred alpha: repair + animation fit one existing batch; source/layout/overlap/grip guards passed.");
+}
+int main(){gen9_workaround_test();reset_handshake_test();texture_state_test();logical_context_test();sustained_ring_test();readback_sampling_test();scissor_geometry_test();scaled_occlusion_test();resized_shape_test();retained_mixed_scene_test();window_alpha_test();immutable_upload_test();animation_batch_test();alpha_coverage_test();alpha_merge_test();deferred_alpha_test();
     puts("Gen9 texture/scaling/alpha state, logical contexts and occlusion tests passed.");}

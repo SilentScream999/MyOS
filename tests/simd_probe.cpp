@@ -2,8 +2,9 @@
 #include <stdint.h>
 struct alignas(16) FxState { uint8_t bytes[512]; };
 static FxState expected,observed;
-static uint64_t call(uint64_t nr,uint64_t a=0,uint64_t b=0,uint64_t c=0){uint64_t result;
-    __asm__ volatile("syscall":"=a"(result):"a"(nr),"D"(a),"S"(b),"d"(c):"rcx","r11","memory");return result;}
+static uint64_t call(uint64_t nr,uint64_t a=0,uint64_t b=0,uint64_t c=0,uint64_t d=0,uint64_t e=0){uint64_t result;
+    register uint64_t r10 __asm__("r10")=d,r8 __asm__("r8")=e;
+    __asm__ volatile("syscall":"=a"(result):"a"(nr),"D"(a),"S"(b),"d"(c),"r"(r10),"r"(r8):"rcx","r11","memory");return result;}
 static bool same(){
     // Defined control/status fields and the entire XMM0-15 register bank.
     for(unsigned i=0;i<5;++i)if(expected.bytes[i]!=observed.bytes[i])return false;
@@ -39,5 +40,9 @@ extern "C" void _start(){
     bool syscall_ok=syscalls(),irq_ok=preemption();
     const char* result=syscall_ok?(irq_ok?"SIMD PASS\n":"SIMD FAIL IRQ\n"):(irq_ok?"SIMD FAIL SYSCALL\n":"SIMD FAIL BOTH\n");
     unsigned n=0;while(result[n])++n;call(1,1,(uint64_t)result,n);
+    // Report independently of the terminal frontend's private text storage.
+    // The result is computed above, before these reporting-only syscalls.
+    call(200,(uint64_t)result,160,160,320,100);
+    call(35,2000);
     call(60,!(syscall_ok&&irq_ok));for(;;){}
 }

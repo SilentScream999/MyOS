@@ -31,7 +31,10 @@ def main():
     with image.open('r+b') as target,partition.open('rb') as source:
         target.seek(start*512);copy_sparse(source,target,sectors*512)
     symbols=subprocess.check_output(['nm','-n','-C',str(ROOT/'wyzar')],text=True).splitlines()
-    matrix=next(int(l.split()[0],16) for l in symbols if l.split()[-1]=='g_term_matrix')
+    def symbol(name):return next(int(l.split()[0],16) for l in symbols if l.split()[-1]==name)
+    def memory(address,size):
+        path=OUT/'simd-state.bin';assert not q.monitor(f'memsave 0x{address:x} {size} "{path}"')
+        return path.read_bytes()
     smoke.IMAGE=image;smoke.BOOT_ISO=True;q=smoke.Qemu(resolution=(1280,800))
     try:
         for _ in range(100):
@@ -43,10 +46,14 @@ def main():
         q.type('run /bin/simd_probe.elf\n',pause=.5)
         deadline=time.monotonic()+30
         while time.monotonic()<deadline:
-            path=OUT/'simd-terminal.bin';assert not q.monitor(f'memsave 0x{matrix:x} 640000 "{path}"')
-            terminal=path.read_bytes()[::8].replace(b'\0',b' ').decode(errors='replace')
-            if 'SIMD PASS' in terminal:print('SIMD PASS: XMM0-15, MXCSR and x87 preserved across syscalls and timer preemption.',flush=True);return
-            if 'SIMD FAIL' in terminal:raise AssertionError(terminal.strip())
+            count=int.from_bytes(memory(symbol('g_window_count'),4),'little')
+            pointers=struct.unpack('<'+'Q'*count,memory(symbol('g_window_list'),count*8))
+            for pointer in pointers:
+                # Window's stable prefix is id followed by title[64].
+                result=memory(pointer+4,64).split(b'\0')[0].decode(errors='replace').strip()
+                if result=='SIMD PASS':
+                    print('SIMD PASS: XMM0-15, MXCSR and x87 preserved across syscalls and timer preemption.',flush=True);return
+                if result.startswith('SIMD FAIL'):raise AssertionError(result)
             time.sleep(.2)
         raise AssertionError('SIMD probe timed out')
     finally:q.close()

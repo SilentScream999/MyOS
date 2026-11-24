@@ -1,6 +1,6 @@
 # WyzarOS Window Management API
 
-Updated 2026-11-14. Mapped user surfaces, resizing, owner tracking, input events and exit
+Updated 2026-11-22. Mapped user surfaces, resizing, alpha, owner tracking, input events and exit
 cleanup are implemented. The remaining authorization/mapping limitations apply.
 
 The built `win_test.elf` exercises this API from ring 3. GUI packages declare
@@ -28,6 +28,8 @@ General calls are listed in [Syscalls](Syscalls.md).
 | 206 | `SYS_WIN_RESIZABLE` | `id`, `min_width`, `min_height` | surface pointer, or `0` on failure | ABI 4. Owner-only opt-in to native resize events; reserves backing for desktop-sized surfaces. Minimums must fit the current desktop. Call before drawing. |
 | 207 | `SYS_WIN_ACCEPT_RESIZE` | `id` | surface pointer, or `0` on failure | ABI 4. Owner-only; adopts the latest client dimensions and pitch. Redraw the whole surface afterwards. |
 | 208 | `SYS_WIN_INFO` | `id`, `WindowInfo*` | `0`, or `-1` | ABI 4. Owner-only; returns the current drawing surface dimensions, pitch and user pointer. |
+| 223 | `SYS_WIN_ALPHA` | owned `id`, mode | `0`, or `-1` | ABI 11. Mode 0 preserves opaque composition; mode 1 enables premultiplied source-over. Rejects other modes, system windows and another process's windows. Changing mode damages the full window. |
+| 222 | `SYS_WIN_PUBLISH` | owned `id`, top source damage height or 0 for full | `0`, or `-1` | Copies a complete immutable snapshot, publishes it atomically and reports damage. Returns -1 for invalid requests or deferred publication; retry later. Unchanged immutable snapshots can reuse their staged RCS source. SYNC/DAMAGE buffers remain mutable and upload afresh. |
 | 209 | `SYS_WIN_ROLE` | `id`, `role` | `0`, or `-1` | ABI 6. Owner-only; 0=ordinary app window, 1=common file dialog. File dialogs use the Explorer theme icon in the title bar and taskbar, independent of the caller. Other role values and system windows are refused. |
 
 Native apps can reuse `user/native_file_dialog.h` for Open and Save As windows.
@@ -90,9 +92,27 @@ helpers. See `user/explorer.cpp` and `user/console.cpp` for complete clients.
 ## Surface format
 
 32-bit **ARGB8888**, `buffer_pitch = w * 4` bytes, row-major. `0xFFFF0000` is
-solid red. Window surfaces are composed opaque: their alpha byte is ignored.
-The desktop's PNG/font blending does not change this ABI. A future window-alpha
-contract must define straight/premultiplied semantics explicitly; see the
+solid red. Window surfaces default to opaque: their alpha byte is ignored.
+Opt in with `native_window_alpha(win, WIN_ALPHA_PREMULTIPLIED)` or syscall 223
+with mode 1. Pixels then use premultiplied `0xAARRGGBB`: each RGB component
+must be at most alpha. For example, half-opacity red is `0x80800000`, and
+fully transparent black is `0x00000000`. The compositor blends source-over
+onto the desktop using nearest sampling when resized. Mode 0 restores legacy
+opaque copies. Draw and publish a complete image when changing pixel formats;
+the mode applies to the currently published image as well as future images.
+Title bars and resize-grip marks remain opaque. Pointer hit testing uses the
+whole client rectangle, including transparent pixels. CPU fallback supports
+the same pixel contract. Translucent scenes currently rebuild damaged row
+backgrounds in stack order; the opaque retained fast paths remain available
+when no translucent client is visible. Normal non-maximized windows receive a
+cached shadow outside the outer frame. Shadows do not enlarge the client,
+change its pixels or receive pointer events. Shadow edges and alpha scenes use
+ordered composition while eligible opaque clients remain GPU blitted.
+Title bars cache their text, icons and controls independently of client pixels.
+Changing focus, hover, size, title or resources invalidates that cache; moving
+the window reuses it. This adds no client ABI requirement.
+
+The desktop's PNG/font blending does not change the default client ABI. See the
 [display roadmap](../docs/GPU_DESKTOP_ROADMAP.md).
 
 ## Lifecycle (as implemented)

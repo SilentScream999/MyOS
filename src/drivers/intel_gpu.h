@@ -50,12 +50,33 @@ static GpuMappingCache g_gpu_mapping_cache;
 static uint64_t g_gpu_map_updates=0,g_gpu_map_reuses=0;
 static uint64_t g_gpu_scanout_gfx[2]{};
 static uint8_t* g_gpu_scanout_cpu[2]{};
+static bool g_gpu_scanout_scene_valid[2]{};
+static DamageList g_gpu_scanout_damage[2]{};
+#if GPU_EXACT_REPAIRS
+static VisibleRegion g_gpu_scanout_exact_damage[2]{};
+#endif
+#if GPU_CURSOR_SAVE
+static ScanoutCursorSave g_gpu_cursor_save[2]{};
+#endif
+static OverlayFrame g_gpu_scanout_overlay[2]={
+    {{-999,-999,0,0},{},0},{{-999,-999,0,0},{},0}};
+static bool g_gpu_direct_verified=false;
+static int g_gpu_direct_back=-1;
+static uint8_t* g_gpu_retained_master=nullptr;
+static bool gpu_direct_active(){return g_gpu_direct_back>=0;}
+static void gpu_direct_end(){
+    if(g_gpu_direct_back<0)return;
+    g_master_backbuffer=g_gpu_retained_master;
+    g_gpu_direct_back=-1;
+}
 static GpuDisplayPlane g_gpu_display_plane;
 static GpuFlipState g_gpu_display_flip;
 static uint8_t* g_gpu_firmware_scanout=nullptr;
 static bool g_gpu_present_prepared=false,g_gpu_present_ready=false,g_gpu_scanout_uncached=false;
+static bool g_gpu_scanout_streaming_copy=false;
 static uint64_t g_gpu_present_count=0,g_gpu_present_sleeps=0;
 static void gpu_present_stop();
+static bool gpu_probe_scanout_copy();
 static bool gpu_prepare_display();
 
 #ifndef GPU_COMPOSE
@@ -436,7 +457,7 @@ static bool gpu_reserve_gtt(uint64_t framebuffer_bytes) {
     if(limit>0x100000000ULL)limit=0x100000000ULL;
     uint64_t buffer_bytes=(framebuffer_bytes+4095)&~4095ULL;
     uint64_t bytes=IGPU_RING_BYTES+4096+buffer_bytes;
-    if(GPU_COMPOSE)bytes+=4096+GPU_SOURCE_BYTES;
+    if(GPU_COMPOSE)bytes+=GPU_RAIN_TILE_BYTES+GPU_SOURCE_BYTES;
     if(GPU_PRESENT)bytes+=buffer_bytes*2;
     if(GPU_RENDER)bytes+=GPU_RENDER_OWNED_BYTES;
     auto read=[](uint64_t address){return *gtt_pte_ptr(address);};
@@ -517,7 +538,7 @@ static bool gpu_reserve_gtt(uint64_t framebuffer_bytes) {
         IGPU_FENCE_GFX_ADDR=IGPU_RING_GFX_ADDR+IGPU_RING_BYTES;
         BACKBUFFER_GFX_BASE=IGPU_FENCE_GFX_ADDR+4096;
         g_gpu_palette_base=BACKBUFFER_GFX_BASE+buffer_bytes;
-        g_gpu_source_base=g_gpu_palette_base+4096;
+        g_gpu_source_base=g_gpu_palette_base+GPU_RAIN_TILE_BYTES;
         if(GPU_PRESENT){
             g_gpu_scanout_gfx[0]=g_gpu_source_base;g_gpu_scanout_gfx[1]=g_gpu_source_base+buffer_bytes;
             g_gpu_source_base+=buffer_bytes*2;
@@ -615,9 +636,8 @@ static void gpu_dump_state(const char* why) {
 }
 
 // ─── Public operations ──────────────────────────────────────────────────────
-// Composition never submits writes to scanout. If reset fails, quarantine its
-// old RAM destination permanently and rebuild the desktop in a preallocated CPU
-// buffer. A late completion can then affect neither live pixels nor freed RAM.
+// Direct composition can write only the unarmed back surface. Stop flips and
+// release the target binding before rollback. All GPU destinations stay pinned.
 static bool gpu_scene_abort(const char* reason) {
     gpu_present_stop();
     g_gpu_compose_ready=false;g_gpu_ready=false;
@@ -638,26 +658,87 @@ static bool gpu_scene_abort(const char* reason) {
 // Poll briefly for fast batches, then block this compositor task. Timer wakeups
 // work before GPU interrupts exist and avoid charging GPU execution to CPU busy
 // time. Boot tests with IF clear keep their bounded polling behavior.
+struct MenuBcsTimer {
+    MenuOpenTrace* trace=gpu_menu_open_trace();
+    uint64_t started=0,cpu=0,sleep=0;
+    MenuBcsTimer(){
+        if(GPU_RCS_ALPHA){started=gpu_tsc();cpu=wm_trace_cpu_cycles();sleep=g_gpu_perf.bcs_sleep.ticks;}
+    }
+    ~MenuBcsTimer(){
+        if(!trace)trace=gpu_menu_open_trace();
+        if(!trace)return;
+        uint64_t done=gpu_tsc(),wall=done-started;
+        if(wall>trace->bcs_wall){
+            trace->bcs_start=started;trace->bcs_done=done;
+            trace->bcs_wall=wall;trace->bcs_cpu=wm_trace_cpu_cycles()-cpu;
+            trace->bcs_sleep=g_gpu_perf.bcs_sleep.ticks-sleep;
+        }
+    }
+};
+static uint64_t g_bcs_timestamp_hz=0;
+static bool g_bcs_timestamp_ready=false,g_bcs_timing_active=false;
+static GpuExecutionTiming g_bcs_timing_probe{};
+static uint64_t gpu_calibrate_timestamp_clock(uint32_t base){
+    if(!tsc_hz)return 0;
+    auto* clock=(volatile uint32_t*)(g_igpu.mmio_virt+base+GPU_RING_TIMESTAMP);
+    uint64_t rates[2]{};
+    for(unsigned i=0;i<2;++i){
+        uint64_t cpu_first=gpu_tsc();uint32_t first=*clock;
+        while(gpu_tsc()-cpu_first<tsc_hz/500)__asm__ volatile("pause");
+        uint32_t last=*clock;uint64_t cpu_last=gpu_tsc();
+        rates[i]=gpu_timestamp_frequency(first,last,cpu_last-cpu_first,tsc_hz);
+    }
+    return gpu_timestamp_clock_agreement(rates[0],rates[1]);
+}
+static bool gpu_scene_timing_begin(bool probe=false){
+    if(!g_bcs_timestamp_hz||(!probe&&(!g_gpu_timeline.begin||!g_gpu_timeline.measure||!g_bcs_timestamp_ready)))return true;
+    uint32_t sentinel=g_gpu.regs[GPU_RING_TIMESTAMP/4]-(uint32_t)g_bcs_timestamp_hz;
+    for(unsigned i=16;i<32;++i)g_gpu.fence_cpu[i]=sentinel;
+    gpu_clflush_nofence(g_gpu.fence_cpu+16,64);gpu_mfence();
+    if(!gpu_emit_timestamp(&g_gpu,GPU_BCS_BASE+GPU_RING_TIMESTAMP,g_gpu.fence_gfx+64))return false;
+    g_bcs_timing_active=true;return true;
+}
 static bool gpu_scene_wait(uint32_t sequence) {
+    MenuBcsTimer menu_timer;
     uint64_t started=gpu_tsc(),spin=tsc_hz?tsc_hz/20000:150000;
     uint64_t timeout=tsc_hz?tsc_hz/5:GPU_TIMEOUT_TSC;
     uint64_t flags;__asm__ volatile("pushfq; pop %0":"=r"(flags));
     for(;;){
         gpu_clflush_nofence(g_gpu.fence_cpu,4);gpu_mfence();
-        if((int32_t)(*g_gpu.fence_cpu-sequence)>=0)return true;
+        if((int32_t)(*g_gpu.fence_cpu-sequence)>=0){gpu_timeline_ready(gpu_tsc());return true;}
         uint64_t elapsed=gpu_tsc()-started;
         if(elapsed>timeout){g_gpu.hung=true;return false;}
         if(elapsed>spin && (flags&(1u<<9)) && g_current_task){
-            ++g_gpu_scene_sleeps;task_sleep_ms(1);
+            ++g_gpu_scene_sleeps;
+            gpu_perf_sleep_one(g_gpu_perf.bcs_sleep,tsc_hz,[](uint64_t ms){task_sleep_ms(ms);});
         }else __asm__ volatile("pause");
     }
 }
 
-static bool gpu_scene_submit() {
+static bool gpu_scene_submit(bool scanout=false) {
+    GpuPerfTimer timer(g_gpu_perf.bcs_wait);++g_gpu_perf.bcs_batches;
+    bool timed=g_bcs_timing_active;g_bcs_timing_active=false;
     uint32_t sequence;
+    // Only diagnostic batches add this drain+stamp before the unchanged final
+    // completion fence. Unmeasured batches keep the original command stream.
+    if(timed&&(!gpu_emit_fence(&g_gpu,&sequence,false)||
+       !gpu_emit_timestamp(&g_gpu,GPU_BCS_BASE+GPU_RING_TIMESTAMP,g_gpu.fence_gfx+68)))return false;
     if(!gpu_emit_fence(&g_gpu,&sequence,false))return false;
+    if(scanout && g_rain_trace.update)g_rain_trace.copy_submit=gpu_tsc();
+    uint64_t cpu_first=timed?gpu_tsc():0;
+    uint32_t submitted=timed?g_gpu.regs[GPU_RING_TIMESTAMP/4]:0;
     gpu_ring_commit(&g_gpu);
-    return gpu_scene_wait(sequence);
+    gpu_timeline_submit(gpu_tsc());
+    if(!gpu_scene_wait(sequence))return false;
+    if(timed){
+        uint32_t observed=g_gpu.regs[GPU_RING_TIMESTAMP/4];uint64_t cpu_last=gpu_tsc();
+        gpu_clflush_nofence(g_gpu.fence_cpu+16,64);gpu_mfence();
+        uint32_t first=g_gpu.fence_cpu[16],last=g_gpu.fence_cpu[17];
+        uint32_t stamps[5]={first,first,last,last,last};
+        auto& result=g_gpu_timeline.begin?g_gpu_timeline.bcs_gpu:g_bcs_timing_probe;
+        gpu_execution_record(result,g_bcs_timestamp_hz,submitted,stamps,observed,cpu_last-cpu_first,tsc_hz);
+    }
+    return true;
 }
 
 // Hardware freeze diagnostic: bypass the compositor, its locks, and GPU MMIO.
@@ -748,6 +829,7 @@ static bool gpu_compose_scene(const GpuScenePlan& plan) {
     }
     gpu_mfence();
     uint32_t first_tail=g_gpu.tail;
+    if(!gpu_scene_timing_begin())return gpu_scene_abort("GPU: timestamp command rejected");
     uint32_t mapping_sequence;
     if(mappings_changed && !gpu_emit_fence(&g_gpu,&mapping_sequence,true))
         return gpu_scene_abort("GPU: mapping invalidation rejected");
@@ -758,13 +840,18 @@ static bool gpu_compose_scene(const GpuScenePlan& plan) {
         if(pending>g_gpu.size-4096){
             if(!gpu_scene_submit())return gpu_scene_abort("GPU: composition batch timed out");
             first_tail=g_gpu.tail;
+            if(!gpu_scene_timing_begin())return gpu_scene_abort("GPU: timestamp command rejected");
         }
         const auto& copy=plan.copies[i];const auto& c=plan.clients[copy.source];
         const auto r=copy.destination;
+        uint64_t destination=g_gpu_direct_back<0?g_backbuffer_gfx_addr:g_gpu_scanout_gfx[g_gpu_direct_back];
+#if GPU_WORKLOAD
+        GpuCopyScope workload_scope(&g_gpu,c.rainbow?GpuCopyKind::Rainbow:GpuCopyKind::Client);
+#endif
         bool ok=c.rainbow ? gpu_emit_rainbow(&g_gpu,g_gpu_palette_base,
-                            g_backbuffer_gfx_addr,fb->pitch,copy,plan.scroll)
+                            destination,fb->pitch,copy,plan.scroll,GPU_RAIN_TILE_ROWS,GPU_WIDE_BLITS)
             : gpu_emit_copy(&g_gpu,sources[copy.source],c.pitch,copy.source_x,copy.source_y,
-                            g_backbuffer_gfx_addr,fb->pitch,r.x1,r.y1,r.x2-r.x1,r.y2-r.y1);
+                            destination,fb->pitch,r.x1,r.y1,r.x2-r.x1,r.y2-r.y1);
         if(!ok)return gpu_scene_abort("GPU: composition command rejected");
     }
     if(!gpu_scene_submit())return gpu_scene_abort("GPU: composition fence timed out");
@@ -782,26 +869,28 @@ static bool gpu_scene_initialize(const uint32_t* colors) {
     if(!colors)return false;
     uint64_t bytes=(uint64_t)fb->pitch*fb->height;
     g_gpu_recovery_buffer=gpu_alloc_aligned(bytes);
-    g_gpu_palette=(uint32_t*)gpu_alloc_aligned(4096);
+    g_gpu_palette=(uint32_t*)gpu_alloc_aligned(GPU_RAIN_TILE_BYTES);
     if(!g_gpu_recovery_buffer || !g_gpu_palette ||
-       !gtt_map_range(g_gpu_palette_base,(uint8_t*)g_gpu_palette,4096))return false;
-    for(unsigned i=0;i<720;++i)g_gpu_palette[i]=colors[i];
-    gpu_clflush_nofence(g_gpu_palette,2880);gpu_mfence();gtt_flush();
+       !gtt_map_range(g_gpu_palette_base,(uint8_t*)g_gpu_palette,GPU_RAIN_TILE_BYTES))return false;
+    for(unsigned y=0;y<GPU_RAIN_TILE_ROWS;++y)
+        for(unsigned i=0;i<720;++i)g_gpu_palette[y*720+i]=colors[i];
+    gpu_clflush_nofence(g_gpu_palette,GPU_RAIN_TILE_BYTES);gpu_mfence();gtt_flush();
     // Verify GPU -> RAM visibility, shifted/replicated rainbow and a regular
     // surface copy before installing the hook. No scanout access is involved.
     static GpuScenePlan test{};
     test.client_count=2;test.count=2;test.accelerated=3;test.scroll=719;
     test.clients[0]={{},{},g_gpu_palette,720,1,2880,true,false};
-    test.clients[1]={{},{},g_gpu_palette,720,80,2880,true,true};
+    unsigned probe_bottom=fb->height<303?fb->height:303;
+    test.clients[1]={{},{},g_gpu_palette,720,probe_bottom,2880,true,true};
     test.copies[0]={0,{0,0,64,1},17,0};
-    test.copies[1]={1,{5,3,133,70},0,0};
+    test.copies[1]={1,{5,3,133,(int)probe_bottom},0,0};
     if(fb->width<133 || fb->height<70)return false;
     g_gpu_compose_ready=true;
     if(!gpu_compose_scene(test))return false;
     bool correct=true;
     for(unsigned x=0;x<64;++x)
         if(((uint32_t*)g_master_backbuffer)[x]!=colors[17+x])correct=false;
-    for(unsigned y=3;y<70;++y){
+    for(unsigned y=3;y<probe_bottom;++y){
         auto* row=(uint32_t*)(g_master_backbuffer+(uint64_t)y*fb->pitch);
         for(unsigned x=5;x<133;++x)if(row[x]!=colors[(719+x-5)%720])correct=false;
     }
@@ -862,6 +951,7 @@ static bool gpu_scene_initialize(const uint32_t* colors) {
     }
     print((char*)"GPU: dirty CPU/GPU cache coherence PASSED - bulk clflush disabled");
     g_gpu_present_ready=display_prepared && g_gpu_scanout_uncached;
+    if(GPU_SCANOUT_COPY_AUTO && g_gpu_present_ready && !gpu_probe_scanout_copy())return false;
     gpu_status_set(g_gpu_present_ready?"GPU:opaque+rainbow flip UC":"GPU:opaque+rainbow LLC");
     return true;
 }
@@ -881,14 +971,58 @@ static uint8_t* gpu_alloc_scanout(uint64_t bytes) {
     return cpu; // pinned until reboot, including failure/rollback
 }
 
+#if GPU_FRAME_DIAGNOSTICS
+static GpuDisplayPhase gpu_display_phase(){
+    if(!g_gpu_present_prepared||!g_gpu_display_plane.live||!g_igpu.mmio_virt)return {};
+    return gpu_read_display_phase([](uint32_t reg){return *(volatile uint32_t*)(g_igpu.mmio_virt+reg);},
+        [](){return gpu_tsc();},g_gpu_display_plane.frame_count,
+        0x70000+g_gpu_display_plane.pipe*0x1000,g_gpu_display_plane.live);
+}
+#endif
 static bool gpu_display_wait(uint32_t expected,bool require_frame,uint32_t before) {
     uint64_t started=gpu_tsc(),timeout=tsc_hz?tsc_hz/5:GPU_TIMEOUT_TSC;
     uint64_t flags;__asm__ volatile("pushfq; pop %0":"=r"(flags));
     auto* live=(volatile uint32_t*)(g_igpu.mmio_virt+g_gpu_display_plane.live);
     auto* frames=(volatile uint32_t*)(g_igpu.mmio_virt+g_gpu_display_plane.frame_count);
+    bool trace=g_gpu_timeline.begin&&g_gpu_timeline.arm;
     while(gpu_tsc()-started<timeout){
-        if((*live&0xFFFFF000u)==expected && (!require_frame || *frames!=before))return true;
-        if((flags&(1u<<9)) && g_current_task){++g_gpu_present_sleeps;task_sleep_ms(1);}
+        uint32_t surface=*live&0xFFFFF000u,refresh=*frames;
+        if(trace){
+            ++g_gpu_timeline.flip_polls;
+            uint64_t now=gpu_tsc();
+            if(refresh!=before&&!g_gpu_timeline.first_refresh)g_gpu_timeline.first_refresh=now;
+            if(surface==expected&&!g_gpu_timeline.first_live)g_gpu_timeline.first_live=now;
+        }
+        if(surface==expected && (!require_frame || refresh!=before)){
+#if GPU_FRAME_DIAGNOSTICS
+            if(trace)g_gpu_timeline.display_latch=gpu_display_phase();
+#endif
+            return true;
+        }
+        if((flags&(1u<<9)) && g_current_task){
+            ++g_gpu_present_sleeps;
+            uint64_t sleep_started=trace?gpu_tsc():0;
+#if GPU_FRAME_DIAGNOSTICS
+            CompositorSleepTrace wake{};
+            gpu_perf_sleep_one(g_gpu_perf.flip_sleep,tsc_hz,[&](uint64_t ms){task_sleep_ms(ms,trace?&wake:nullptr);});
+#else
+            gpu_perf_sleep_one(g_gpu_perf.flip_sleep,tsc_hz,[](uint64_t ms){task_sleep_ms(ms);});
+#endif
+            if(trace){
+                uint64_t slept=gpu_tsc()-sleep_started;
+                if(slept>g_gpu_timeline.max_flip_sleep){
+                    g_gpu_timeline.max_flip_sleep=slept;
+#if GPU_FRAME_DIAGNOSTICS
+                    bool valid=wake.ready&&wake.ready>=wake.start&&wake.resumed>=wake.ready;
+                    g_gpu_timeline.sleep_ready_pid=valid?wake.ready_pid:-1;
+                    g_gpu_timeline.sleep_to_ready=valid?wake.ready-wake.start:0;
+                    g_gpu_timeline.ready_to_resume=valid?wake.resumed-wake.ready:0;
+                    g_gpu_timeline.ready_late_ticks=valid?wake.ready_tick-wake.deadline:0;
+                    g_gpu_timeline.resume_late_ticks=valid?wake.resume_tick-wake.deadline:0;
+#endif
+                }
+            }
+        }
         else __asm__ volatile("pause");
     }
     return false;
@@ -942,20 +1076,41 @@ static bool gpu_prepare_display() {
     gtt_flush();
     g_gpu_firmware_scanout=(uint8_t*)fb->address;
     g_gpu_present_prepared=true;
+#if GPU_FRAME_DIAGNOSTICS
+    // Raw pipe/eDP timings only: eDP may use its own transcoder. Never infer
+    // an active mode or change GPU readiness from these diagnostic reads.
+    // https://codebrowser.dev/linux/linux/drivers/gpu/drm/i915/display/intel_display_regs.h.html
+    gpu_log_hex("GPU phase pipe:",g_gpu_display_plane.pipe);
+    const uint32_t timing_bases[]={0x60000u+g_gpu_display_plane.pipe*0x1000u,0x6f000u};
+    for(uint32_t base:timing_bases){
+        gpu_log_hex("GPU phase timing base:",base);
+        gpu_log_hex("GPU phase transcoder config raw:",read(base+0x10008));
+        gpu_log_hex("GPU phase HTOTAL raw:",read(base));
+        gpu_log_hex("GPU phase VTOTAL raw:",read(base+0xc));
+        gpu_log_hex("GPU phase VBLANK raw:",read(base+0x10));
+    }
+#endif
     print((char*)"GPU: double scanout buffers prepared; firmware plane unchanged until desktop presentation");
     return true;
 }
 
-static void gpu_display_arm(uint32_t surface,uint8_t* cpu) {
+static void gpu_display_arm(uint32_t surface,uint8_t* cpu,GpuDisplayPhase* before=nullptr,GpuDisplayPhase* after=nullptr) {
     // Arm only a complete hidden frame. Clear async/decrypt flags by using the
     // validated base alone. Update the panic framebuffer atomically with SURF,
     // so a fatal screen painted during a pending flip appears on that frame.
     TtyIrqGuard guard;
+#if GPU_FRAME_DIAGNOSTICS
+    if(before)*before=gpu_display_phase();
+#endif
     auto* reg=(volatile uint32_t*)(g_igpu.mmio_virt+g_gpu_display_plane.surface);
     *reg=surface;(void)*reg;fb->address=cpu;
+#if GPU_FRAME_DIAGNOSTICS
+    if(after)*after=gpu_display_phase();
+#endif
 }
 
 static void gpu_present_stop() {
+    gpu_direct_end();
     g_gpu_present_hook=nullptr;g_gpu_present_ready=false;
     if(!g_gpu_present_prepared || (g_gpu_display_flip.front<0 && g_gpu_display_flip.pending<0))return;
     // Rebuild the firmware buffer before returning to it. It is hidden while
@@ -981,6 +1136,72 @@ static void gpu_present_stop() {
     g_needs_refresh=true;
 }
 
+static bool gpu_copy_scanout(unsigned back,bool streaming) {
+#if GPU_WORKLOAD
+    GpuCopyScope workload_scope(&g_gpu,GpuCopyKind::Scanout);
+#endif
+    // Finish ordered scene stores before either engine reads the master.
+    gpu_mfence();
+    if(streaming){
+        memcpy_vram_sse_headless(g_gpu_scanout_cpu[back],g_master_backbuffer,(uint64_t)fb->pitch*fb->height);
+        gpu_mfence();
+        return true;
+    }
+    return gpu_emit_copy(&g_gpu,g_backbuffer_gfx_addr,fb->pitch,0,0,
+                         g_gpu_scanout_gfx[back],fb->pitch,0,0,fb->width,fb->height)
+        && gpu_scene_submit(true);
+}
+
+static bool gpu_probe_scanout_copy() {
+    // Neither candidate scanout is live. Compare the real copy path twice
+    // on each buffer. Check changed pixels across rows before choosing it.
+    constexpr unsigned samples=32;
+    uint64_t offsets[samples];
+    uint32_t saved[samples];
+    for(unsigned i=0;i<samples;++i){
+        const unsigned x=(fb->width-1)*i/(samples-1);
+        const unsigned y=(fb->height-1)*i/(samples-1);
+        offsets[i]=(uint64_t)y*fb->pitch+x*4;
+        saved[i]=*reinterpret_cast<uint32_t*>(g_master_backbuffer+offsets[i]);
+    }
+    uint64_t totals[2]{};
+    bool readback[2]{true,true};
+    bool submitted=true;
+    for(unsigned pass=0;pass<4 && submitted;++pass){
+        unsigned back=pass&1;
+        for(unsigned step=0;step<2;++step){
+            const unsigned path=step^(pass>>1);
+            auto pattern=[&](unsigned i){return 0xff000000u|((pass*2+path+1)<<16)|(i*257u);};
+            for(unsigned i=0;i<samples;++i)
+                *reinterpret_cast<uint32_t*>(g_master_backbuffer+offsets[i])=pattern(i);
+            const uint64_t start=gpu_tsc();
+            submitted=gpu_copy_scanout(back,path==1);
+            totals[path]+=gpu_tsc()-start;
+            if(!submitted)break;
+            for(unsigned i=0;i<samples;++i){
+                auto* pixel=reinterpret_cast<volatile uint32_t*>(g_gpu_scanout_cpu[back]+offsets[i]);
+                if(*pixel!=pattern(i))readback[path]=false;
+            }
+        }
+    }
+    if(!submitted||!readback[0])return gpu_scene_abort("GPU: hidden scanout copy probe failed");
+    for(unsigned i=0;i<samples;++i)
+        *reinterpret_cast<uint32_t*>(g_master_backbuffer+offsets[i])=saved[i];
+    g_gpu_scanout_streaming_copy=gpu_scanout_use_streaming_copy(readback[1],totals[1],totals[0]);
+    auto log_us=[](const char* label,uint64_t ticks){
+        char digits[24];
+        print((char*)label);
+        to_str(tsc_hz?ticks/4*1000000/tsc_hz:0,digits);
+        print(digits);
+    };
+    log_us("GPU scanout BCS copy average us:",totals[0]);
+    log_us("GPU scanout streaming copy average us:",totals[1]);
+    if(!readback[1])print((char*)"GPU: streaming scanout copy readback failed");
+    print((char*)(g_gpu_scanout_streaming_copy?"GPU: scanout copy selected CPU streaming":
+                                             "GPU: scanout copy selected BCS"));
+    return true;
+}
+
 static bool gpu_present_frame(const OverlayFrame& frame,const uint32_t* sprite) {
     gpu_trace_stage("PRESENT");
     if(!g_gpu_present_ready || !g_gpu_scanout_uncached || !g_gpu_ready || !g_desktop_ready)return false;
@@ -994,29 +1215,80 @@ static bool gpu_present_frame(const OverlayFrame& frame,const uint32_t* sprite) 
         uint32_t value=*(volatile uint32_t*)(g_igpu.mmio_virt+reg);
         if(value==UINT32_MAX || (value&(1u<<31)))power_safe=false;
     }
-    if(back<0 || ctl!=g_gpu_display_plane.control_value || !power_safe){
+    if(back<0 || (g_gpu_direct_back>=0 && back!=g_gpu_direct_back) ||
+       ctl!=g_gpu_display_plane.control_value || !power_safe){
         gpu_present_stop();gpu_status_set("GPU:flip state changed -> CPU present");return false;
     }
-    gpu_mfence();
     gpu_trace_stage("COPY");
-    bool ok=gpu_emit_copy(&g_gpu,g_backbuffer_gfx_addr,fb->pitch,0,0,
-                         g_gpu_scanout_gfx[back],fb->pitch,0,0,fb->width,fb->height)
-            && gpu_scene_submit();
-    if(!ok){gpu_scene_abort("GPU: hidden scanout copy failed");return false;}
+    ++g_gpu_perf.present_calls;
+    if(g_gpu_direct_back<0){
+        g_gpu_scanout_scene_valid[0]=g_gpu_scanout_scene_valid[1]=false;
+        damage_clear(&g_gpu_scanout_damage[0]);damage_clear(&g_gpu_scanout_damage[1]);
+#if GPU_EXACT_REPAIRS
+        g_gpu_scanout_exact_damage[0].count=g_gpu_scanout_exact_damage[1].count=0;
+#endif
+        GpuPerfTimer copy_timer(g_gpu_perf.scanout_copy_ticks);
+        if(!gpu_copy_scanout(back,g_gpu_scanout_streaming_copy))
+            return gpu_scene_abort("GPU: hidden scanout copy failed");
+        if(g_gpu_scanout_streaming_copy)++g_gpu_perf.scanout_cpu_copies;
+        if(g_rain_trace.update)g_rain_trace.copy_done=gpu_tsc();
+    }else gpu_mfence(); // Finish WC scene stores before the overlay reads them.
     OverlayTarget target{g_gpu_scanout_cpu[back],g_master_backbuffer,(int)fb->width,(int)fb->height,(int)fb->pitch};
     const OverlayFrame empty{{-999,-999,0,0},{},0};
     gpu_trace_stage("OVERLAY");
-    overlay_render_transition(target,empty,frame,sprite,true);
-    gpu_mfence(); // WC overlay stores must reach RAM before the display reads.
+    {
+        GpuPerfTimer overlay_timer(g_gpu_perf.overlay_ticks);
+#if GPU_CURSOR_SAVE
+        g_gpu_cursor_save[back].surface=nullptr;
+        if(g_gpu_direct_back==back&&!frame.count){
+            g_gpu_cursor_save[back].paint(target.destination,target.width,target.height,target.pitch,frame.cursor,sprite);
+        }else
+#endif
+        overlay_render_transition(target,empty,frame,sprite,true);
+        gpu_mfence(); // WC overlay stores must reach RAM before the display reads.
+    }
+    GpuPerfTimer flip_timer(g_gpu_perf.flip_ticks);
     uint32_t before=*(volatile uint32_t*)(g_igpu.mmio_virt+g_gpu_display_plane.frame_count);
     if(!g_gpu_display_flip.arm(back,before)){gpu_present_stop();return false;}
     gpu_trace_stage("FLIP",g_gpu_scanout_cpu[back]);
+    if(g_rain_trace.update)g_rain_trace.arm=gpu_tsc();
+#if GPU_FRAME_DIAGNOSTICS
+    gpu_display_arm(g_gpu_display_flip.surfaces[back],g_gpu_scanout_cpu[back],
+        g_gpu_timeline.begin?&g_gpu_timeline.display_before:nullptr,
+        g_gpu_timeline.begin?&g_gpu_timeline.display_after:nullptr);
+#else
     gpu_display_arm(g_gpu_display_flip.surfaces[back],g_gpu_scanout_cpu[back]);
+#endif
+    if(g_gpu_timeline.begin)g_gpu_timeline.arm=gpu_tsc();
     if(!gpu_display_wait(g_gpu_display_flip.surfaces[back],true,before)){
         gpu_present_stop();gpu_status_set("GPU:flip timeout -> CPU present");return false;
     }
     uint32_t now=*(volatile uint32_t*)(g_igpu.mmio_virt+g_gpu_display_plane.frame_count);
     if(!g_gpu_display_flip.observe(g_gpu_display_flip.surfaces[back],now)){gpu_present_stop();return false;}
+    g_gpu_scanout_overlay[back]=frame;
+    bool direct=g_gpu_direct_back>=0;
+    if(direct)damage_clear(&g_gpu_scanout_damage[back]);
+#if GPU_EXACT_REPAIRS
+    if(direct)g_gpu_scanout_exact_damage[back].count=0;
+#endif
+    if(direct)++g_gpu_perf.direct_flips;
+    gpu_direct_end();
+    if(g_gpu_timeline.begin){
+        g_gpu_timeline.latch=gpu_tsc();
+#if GPU_FRAME_DIAGNOSTICS
+        g_gpu_previous_phase=g_gpu_timeline.display_latch;
+#endif
+        g_gpu_timeline.refreshes=g_gpu_flip_cadence.last_tick&&
+            g_compositor_frame==g_gpu_flip_cadence.last_frame+1?now-g_gpu_flip_cadence.last_refresh:0;
+    }
+    g_gpu_flip_cadence.record(gpu_tsc(),g_compositor_frame,now);
+    gpu_menu_present(gpu_tsc(),true);
+    gpu_launch_flip(g_compositor_frame,gpu_tsc(),direct);
+    if(g_rain_trace.update && g_gpu_flip_cadence.last_interval){
+        g_rain_trace.latch=g_gpu_flip_cadence.last_tick;
+        g_rain_trace.interval=g_gpu_flip_cadence.last_interval;
+        if(g_rain_trace.interval>g_rain_slowest.interval)g_rain_slowest=g_rain_trace;
+    }
     if(!g_gpu_present_count)print((char*)"GPU: first vblank page flip latched");
     ++g_gpu_present_count;
     gpu_trace_stage("LATCHED");

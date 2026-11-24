@@ -49,14 +49,16 @@ static long call(u64 n,u64 a,u64 b,u64 c) { long r;
         task='struct Task {'+task_source.split('struct Task {',1)[1].split('\n};',1)[0]+'\n};'
         task=task.replace('pid_t','uint32_t')
         max_fds=re.search(r'#define MAX_FDS (\d+)',task_source)[1]
+        console_source=(ROOT/'src/core/app_console.h').read_text()
+        console=('struct AppConsole {'+console_source.split('struct AppConsole {',1)[1].split('\n};',1)[0]+'\n};').replace('pid_t','uint32_t')
         layout=work/'layout.cpp'
         layout.write_text('#include <cstdio>\n#include <cstddef>\n#include <cstdint>\n'
             '#include "src/gui/resources.h"\n#include "limine.h"\n'
-            f'#define MAX_FDS {max_fds}\nstruct file; enum class TaskState:uint8_t;\n'+task+
-            '\nint main(){printf("%zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu",sizeof(Task),offsetof(Task,state),offsetof(Task,next),offsetof(Task,waiting_tty_input),offsetof(Task,wait_pid),offsetof(resources::Catalog,apps),sizeof(resources::Entry),offsetof(resources::App,exec),offsetof(limine_framebuffer,height),offsetof(Task,wake_at_tick),offsetof(Task,executable));}\n')
+            f'#define MAX_FDS {max_fds}\nstruct file; enum class TaskState:uint8_t;\n'+task+console+
+            '\nint main(){printf("%zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu",sizeof(Task),offsetof(Task,state),offsetof(Task,next),offsetof(Task,waiting_tty_input),offsetof(Task,wait_pid),offsetof(resources::Catalog,apps),sizeof(resources::Entry),offsetof(resources::App,exec),offsetof(limine_framebuffer,height),offsetof(Task,wake_at_tick),offsetof(Task,executable),offsetof(Task,console),offsetof(AppConsole,foreground));}\n')
         binary=work/'layout'
         subprocess.run(['clang++','-std=c++20','-I',str(ROOT),str(layout),'-o',str(binary)],check=True)
-        size,state,next_offset,waiting,wait_pid,apps,entry_size,exec_offset,height_offset,wake,executable=map(int,subprocess.check_output([str(binary)],text=True).split())
+        size,state,next_offset,waiting,wait_pid,apps,entry_size,exec_offset,height_offset,wake,executable,console_offset,foreground_offset=map(int,subprocess.check_output([str(binary)],text=True).split())
         smoke.IMAGE=image; smoke.BOOT_ISO=True
         # Leave enough visible Start rows for the larger bundled app catalog.
         q=smoke.Qemu(resolution=(1280,1080),extra_args=('-no-shutdown',))
@@ -88,9 +90,14 @@ static long call(u64 n,u64 a,u64 b,u64 c) { long r;
                 if '[wm] Shell task started inside WM frame.' in log: break
             else: raise AssertionError(log[-4000:])
             shell=value('g_terminal_shell_pid',4)
+            def foreground():
+                data=task_data(shell)
+                channel=struct.unpack_from('<Q',data,console_offset)[0]
+                pid=int.from_bytes(memory(channel+foreground_offset,4),'little') if channel else value('g_terminal_foreground_pid',4)
+                return 0 if pid==shell else pid
             def at_prompt():
                 data=task_data(shell)
-                return data[state]==2 and data[waiting]==1 and not value('g_terminal_foreground_pid',4)
+                return data[state]==2 and data[waiting]==1 and not foreground()
             def cpu(): return struct.unpack_from('<I',memory(usage,24),16)[0]
             def samples(seconds=2):
                 result=[]
@@ -103,8 +110,8 @@ static long call(u64 n,u64 a,u64 b,u64 c) { long r;
             assert at_prompt()
 
             q.type('run /bin/counter.elf\n',pause=0)
-            wait_for(lambda:value('g_terminal_foreground_pid',4)!=0,'Counter did not start')
-            counter=value('g_terminal_foreground_pid',4)
+            wait_for(lambda:foreground()!=0,'Counter did not start')
+            counter=foreground()
             parent=task_data(shell)
             assert parent[state]==2 and parent[waiting]==0 and struct.unpack_from('<I',parent,wait_pid)[0]==counter
             during=samples(1.5)
@@ -113,21 +120,21 @@ static long call(u64 n,u64 a,u64 b,u64 c) { long r;
             print(f'HUD CPU: prompt {baseline}; Counter {during}; returned prompt {after}',flush=True)
 
             q.type('run /bin/cpureader.elf\n',pause=0)
-            wait_for(lambda:value('g_terminal_foreground_pid',4)!=0,'Reader did not start')
-            reader=value('g_terminal_foreground_pid',4)
+            wait_for(lambda:foreground()!=0,'Reader did not start')
+            reader=foreground()
             wait_for(lambda:task_data(reader)[waiting]==1,'Child stdin read did not block')
             q.monitor('sendkey a'); time.sleep(.2)
             assert task_data(reader)[state]==2 # Partial canonical line is not ready.
             q.monitor('sendkey ret')
             wait_for(at_prompt,'Completed line did not wake the child and restore prompt')
             q.type('run /bin/cpureader.elf\n',pause=0)
-            wait_for(lambda:value('g_terminal_foreground_pid',4)!=0,'Second reader did not start')
-            reader=value('g_terminal_foreground_pid',4)
+            wait_for(lambda:foreground()!=0,'Second reader did not start')
+            reader=foreground()
             wait_for(lambda:task_data(reader)[waiting]==1,'Second read did not block')
             q.monitor('sendkey ctrl-c'); wait_for(at_prompt,'Ctrl+C did not cancel blocked stdin')
 
             q.type('run /bin/cpubusy.elf\n',pause=0)
-            wait_for(lambda:value('g_terminal_foreground_pid',4)!=0,'Busy process did not start')
+            wait_for(lambda:foreground()!=0,'Busy process did not start')
             sample_start=struct.unpack_from('<Q',memory(usage,24))[0]
             frequency=value('tsc_hz')
             wait_for(lambda:struct.unpack_from('<Q',memory(usage,24))[0]-sample_start>=2*frequency,

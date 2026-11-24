@@ -578,7 +578,8 @@ static void render() {
         if(!reading)draw_button({left+366,bottom,92,30,dialog==DELETE_ITEM?"Delete":"Save"},true);
         if(!reading)surface.text(left+22,top+height-74,status_line,MUTED,left+457,12);
     }
-    native_call(201,window_id);dirty=false;field_dirty=false;painted_hovered_button=hovered_button;
+    dirty=(int64_t)native_call(222,window_id)<0;
+    field_dirty=false;painted_hovered_button=hovered_button;
 }
 static void button_action(int id) {
     address_edit=false;
@@ -681,15 +682,19 @@ static void handle_event(const NativeEvent& event) {
     }
 }
 static void render_frame(){
+    bool address_caret=address_input.cursor.visible,dialog_caret=dialog_input.cursor.visible;
     if(address_input.cursor.animate(surface,window_id,(unsigned)frame,address_edit,dirty||field_dirty))dirty=true;
     if(dialog_input.cursor.animate(surface,window_id,(unsigned)frame,editing_dialog(),dirty||field_dirty))dirty=true;
     if(dirty){render();return;}
+    bool publish=field_dirty || hovered_button!=painted_hovered_button ||
+        address_caret!=address_input.cursor.visible || dialog_caret!=dialog_input.cursor.visible;
     if(field_dirty){
         if(editing_dialog())draw_dialog_field(window_id);
         else draw_address(!address_edit||!painted_address_edit,window_id);
         field_dirty=false;
     }
     if(hovered_button!=painted_hovered_button)repaint_hover();
+    if(publish)dirty=(int64_t)native_call(222,window_id,HEIGHT)<0;
 }
 #ifndef NATIVE_HOST_TEST
 extern "C" void _start() {

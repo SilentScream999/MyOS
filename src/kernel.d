@@ -4,22 +4,29 @@ src/kernel.o: src/kernel.cpp src/core/helpers.h src/core/structures.h \
   src/arch/pagingstuff.h src/arch/user_address_space.h \
   src/drivers/usbhelpers.h src/core/scheduler.h src/core/task.h \
   src/core/heap.h src/fs/vfs.h src/fs/fileinfo.h src/arch/gdt.h \
-  src/core/process_info.h src/core/cpu_idle.h src/drivers/block.h \
-  src/drivers/xhci_port_state.h src/drivers/usb_hub_poll_policy.h \
-  src/drivers/usb_hub_transfer.h src/drivers/usb_hub_protocol.h \
-  src/drivers/usb_probe_budget.h src/drivers/usb_storage.h \
-  src/drivers/scsi_retry.h src/drivers/usb_storage_completion.h \
-  src/drivers/logitech_g502.h src/drivers/hid_pointer_setup.h \
-  src/drivers/hid_mouse_report.h src/drivers/usb_hub_watch.h \
-  src/drivers/usb_hub_async.h src/drivers/usb_root_ports.h \
-  src/drivers/usb_device_tree.h src/arch/idt.h src/arch/fp_context.h \
-  src/arch/irq.h src/arch/timer.h src/arch/rtc.h src/core/tty.h \
-  src/core/terminal.h src/arch/acpi.h src/core/syscall.h src/core/app.h \
-  src/gui/wm.h src/gui/graphics.h src/drivers/mouse.h src/gui/surface.h \
-  src/gui/visibility.h src/gui/gpu_compositor.h \
-  src/gui/gpu_presentation.h src/gui/window_overlay.h src/gui/ui_font.h \
-  src/gui/ui_font_data.h src/gui/truetype.h src/gui/resources.h \
-  src/gui/image.h src/gui/../core/app.h src/gui/../core/wiz.h \
+  src/core/process_info.h src/core/scheduler_deadline.h \
+  src/core/cpu_idle.h src/drivers/block.h src/drivers/xhci_port_state.h \
+  src/drivers/usb_hub_poll_policy.h src/drivers/usb_hub_transfer.h \
+  src/drivers/usb_hub_protocol.h src/drivers/usb_probe_budget.h \
+  src/drivers/usb_storage.h src/drivers/scsi_retry.h \
+  src/drivers/usb_storage_completion.h src/drivers/logitech_g502.h \
+  src/drivers/hid_pointer_setup.h src/drivers/hid_mouse_report.h \
+  src/drivers/usb_hub_watch.h src/drivers/usb_hub_async.h \
+  src/drivers/usb_root_ports.h src/drivers/usb_device_tree.h \
+  src/arch/idt.h src/arch/fp_context.h src/arch/irq.h src/arch/timer.h \
+  src/arch/rtc.h src/core/tty.h src/core/terminal.h src/arch/acpi.h \
+  src/core/syscall.h src/core/app.h src/gui/wm.h src/gui/graphics.h \
+  src/drivers/mouse.h src/gui/surface.h src/gui/visibility.h \
+  src/gui/gpu_compositor.h src/drivers/gpu_perf.h \
+  src/drivers/gpu_launch_trace.h src/drivers/gpu_execution_timing.h \
+  src/drivers/gpu_workload.h src/drivers/gpu_display_timing.h \
+  src/gui/gpu_opaque_coverage.h src/gui/gpu_deferred_alpha.h \
+  src/gui/gpu_occlusion_metrics.h src/gui/window_alpha.h \
+  src/gui/alpha_renderer.h src/gui/window_shadow.h src/gui/title_bar.h \
+  src/gui/ui_font.h src/gui/ui_font_data.h src/gui/image.h \
+  src/gui/gpu_presentation.h src/gui/window_overlay.h \
+  src/gui/../core/frame_gap_trace.h src/gui/truetype.h \
+  src/gui/resources.h src/gui/../core/app.h src/gui/../core/wiz.h \
   src/gui/window_resize.h src/gui/window_input.h \
   src/gui/window_decorations.h src/gui/overlay_renderer.h \
   src/gui/power_icons.h src/gui/clipboard_icons.h \
@@ -42,14 +49,17 @@ src/kernel.o: src/kernel.cpp src/core/helpers.h src/core/structures.h \
   third_party/lwext4/include/ext4_fs.h \
   third_party/lwext4/include/ext4_misc.h src/fs/fat32_vfs.h \
   src/fs/fat_time.h third_party/fatfs/ff.h third_party/fatfs/ffconf.h \
-  third_party/fatfs/diskio.h src/fs/tar.h src/core/exec.h src/core/elf.h \
-  src/core/wiz.h src/drivers/intel_gpu.h src/drivers/gpu_cmds.h \
-  src/drivers/gpu_scene_commands.h src/drivers/gpu_address_space.h \
-  src/drivers/gpu_mapping_cache.h src/drivers/gpu_display.h \
-  src/drivers/intel_render.h src/drivers/gpu_render_commands.h \
-  src/drivers/gpu_gen9_pipeline.h src/drivers/gpu_render_reset.h \
-  src/drivers/gpu_gen9_workarounds.h src/arch/apic_timer.h \
-  src/gui/boot_splash.h src/drivers/synaptics.h src/drivers/ps2kb.h
+  third_party/fatfs/diskio.h src/fs/tar.h src/core/exec.h \
+  src/core/../drivers/gpu_launch_trace.h src/core/elf.h src/core/wiz.h \
+  src/core/frame_gap_trace.h src/drivers/intel_gpu.h \
+  src/drivers/gpu_cmds.h src/drivers/gpu_scene_commands.h \
+  src/drivers/gpu_address_space.h src/drivers/gpu_mapping_cache.h \
+  src/drivers/gpu_display.h src/drivers/intel_render.h \
+  src/drivers/gpu_render_commands.h src/drivers/gpu_gen9_pipeline.h \
+  src/drivers/gpu_render_reset.h src/drivers/gpu_gen9_workarounds.h \
+  src/drivers/gpu_upload_cache.h src/drivers/gpu_alpha_coverage.h \
+  src/arch/apic_timer.h src/gui/boot_splash.h src/drivers/synaptics.h \
+  src/drivers/ps2kb.h
 
 src/core/helpers.h:
 
@@ -88,6 +98,8 @@ src/fs/fileinfo.h:
 src/arch/gdt.h:
 
 src/core/process_info.h:
+
+src/core/scheduler_deadline.h:
 
 src/core/cpu_idle.h:
 
@@ -155,19 +167,45 @@ src/gui/visibility.h:
 
 src/gui/gpu_compositor.h:
 
-src/gui/gpu_presentation.h:
+src/drivers/gpu_perf.h:
 
-src/gui/window_overlay.h:
+src/drivers/gpu_launch_trace.h:
+
+src/drivers/gpu_execution_timing.h:
+
+src/drivers/gpu_workload.h:
+
+src/drivers/gpu_display_timing.h:
+
+src/gui/gpu_opaque_coverage.h:
+
+src/gui/gpu_deferred_alpha.h:
+
+src/gui/gpu_occlusion_metrics.h:
+
+src/gui/window_alpha.h:
+
+src/gui/alpha_renderer.h:
+
+src/gui/window_shadow.h:
+
+src/gui/title_bar.h:
 
 src/gui/ui_font.h:
 
 src/gui/ui_font_data.h:
 
+src/gui/image.h:
+
+src/gui/gpu_presentation.h:
+
+src/gui/window_overlay.h:
+
+src/gui/../core/frame_gap_trace.h:
+
 src/gui/truetype.h:
 
 src/gui/resources.h:
-
-src/gui/image.h:
 
 src/gui/../core/app.h:
 
@@ -253,9 +291,13 @@ src/fs/tar.h:
 
 src/core/exec.h:
 
+src/core/../drivers/gpu_launch_trace.h:
+
 src/core/elf.h:
 
 src/core/wiz.h:
+
+src/core/frame_gap_trace.h:
 
 src/drivers/intel_gpu.h:
 
@@ -278,6 +320,10 @@ src/drivers/gpu_gen9_pipeline.h:
 src/drivers/gpu_render_reset.h:
 
 src/drivers/gpu_gen9_workarounds.h:
+
+src/drivers/gpu_upload_cache.h:
+
+src/drivers/gpu_alpha_coverage.h:
 
 src/arch/apic_timer.h:
 
