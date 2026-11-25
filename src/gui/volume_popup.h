@@ -19,20 +19,25 @@ static VolumePopupLayout volume_popup_layout(int width,int height,int taskbar,in
     int x=anchor+w>width-6?width-w-6:anchor;if(x<6)x=6;
     return {x,height-taskbar-h-4,w,h};
 }
-// 24px speaker silhouette/waves and mute cross, 4x4 coverage per output pixel.
+// Square 24px design: a tall speaker and separate, round-ended 90-degree arcs.
+// Geometry uses eighths of a logical pixel, with 4x4 coverage per output pixel.
 static unsigned volume_icon_coverage(unsigned percent,bool muted,int x,int y,int size) {
     if(size<=0)return 0;
     unsigned coverage=0;
     for(int sy=0;sy<4;++sy)for(int sx=0;sx<4;++sx){
         int px=(x*8+sx*2+1)*24/size,py=(y*8+sy*2+1)*24/size;
-        bool ink=(px>=20&&px<=55&&py>=72&&py<=120)||
-            (px>=48&&px<=96&&py>=48+(96-px)/2&&py<=144-(96-px)/2);
+        bool ink=(px>=20&&px<=60&&py>=72&&py<=120)||
+            (px>=60&&px<=100&&py>=132-px&&py<=60+px);
         if(muted||!percent){
-            ink|=power_icon_stroke(px,py,132,72,172,120)||power_icon_stroke(px,py,172,72,132,120);
+            ink|=power_icon_stroke(px,py,124,72,172,120)||power_icon_stroke(px,py,172,72,124,120);
         }else{
-            int dx=px-84,dy=py-96,distance=dx*dx+dy*dy;
-            ink|=px>112&&distance>=40*40&&distance<=49*49;
-            if(percent>50)ink|=px>132&&distance>=66*66&&distance<=75*75;
+            int dx=px-96,dy=py-96,distance=dx*dx+dy*dy;
+            int ay=dy<0?-dy:dy;
+            bool sector=dx>=ay;
+            ink|=(sector&&distance>=48*48&&distance<=58*58)||
+                ((dx-38)*(dx-38)+(ay-38)*(ay-38)<=25);
+            if(percent>50)ink|=(sector&&distance>=76*76&&distance<=86*86)||
+                ((dx-57)*(dx-57)+(ay-57)*(ay-57)<=25);
         }
         if(ink)++coverage;
     }
