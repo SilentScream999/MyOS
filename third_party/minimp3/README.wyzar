@@ -1,0 +1,4 @@
+Source: https://github.com/lieff/minimp3
+Revision: 48e3a085f0e1a99446b34614e1e7f17f09dc2e82
+Files: minimp3.h (unmodified), LICENSE (CC0)
+Used only by the userspace MP3 player. No MP3 decoder runs in the kernel.

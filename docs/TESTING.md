@@ -907,6 +907,19 @@ python3 tests/qemu_gpu_compositor_test.py
 ```
 
 That backend lives in `tests/` and is absent from normal kernels. The test reads
+the volume popup's complete pixels after corrupting its retained cutout, changes
+slider/mute content, leaves stale partial clips and alternates destination
+indices. This uses the same retained panel machinery as the app picker.
+The production CPU interaction test is `python3 tests/qemu_volume_popup_test.py`
+(run after a normal `make iso`); it covers slider endpoints, out-of-panel drag
+capture, shared key/mute state, hold-repeat/release and popup dismissal.
+`make test-audio` also checks repeat deadlines, geometry and icon coverage.
+The covered-log volume probe puts opaque fullscreen Rainbow above the visible
+Boot Log, sends queued volume changes and checks that the log's contents do not
+change. It validates every generated popup/tray damage rectangle through the
+cheap retained repair path and checks that these repairs submit no GPU work.
+
+The rest of the GPU test reads
 the master buffer at completed frame boundaries, verifies current rainbow
 pixels and skipped full CPU surface generation, then injects a partially
 executed batch failure that switches to an empty replacement master buffer.

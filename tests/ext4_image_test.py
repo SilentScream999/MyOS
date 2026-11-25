@@ -26,7 +26,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='wyzar-ext4-test-') as directory:
         work = Path(directory)
         root = work / 'build'; root.mkdir()
-        for name in ('init.elf', 'counter.elf', 'win_test.elf', 'gpu_test.elf'):
+        for name in ('init.elf', 'counter.elf', 'win_test.elf', 'gpu_test.elf', 'mp3_player.elf', 'fn_diag.elf'):
             (root / name).write_bytes(b'first-' + name.encode())
         (root / 'wallpaper.raw').write_bytes(b'original wallpaper')
         partition = work / 'partition.img'
@@ -61,6 +61,9 @@ def main():
         (root / 'init.elf').write_bytes(b'new shell')
         partition.write_bytes(install_ext4(data, root))
         assert read('/bin/init.elf') == b'new shell'
+        assert read('/share/system/mp3_player.elf') == b'first-mp3_player.elf'
+        assert read('/share/system/fn_diag.elf') == b'first-fn_diag.elf'
+        assert read('/share/minimp3-license.txt') == (ROOT / 'third_party/minimp3/LICENSE').read_bytes()
         assert read('/home/saved.txt') == b'personal document'
         assert read('/etc/desktop.cfg') == b'/home/custom.raw\n'
         assert read('/bin/user.elf') == b'personal application'

@@ -97,7 +97,7 @@ static inline uint16_t inw_acpi(uint16_t port) {
 
 // Shared table lookup for boot-time PCI discovery, shutdown, and reset.
 // UEFI systems may supply only an XSDT (RsdtAddress == 0).
-static struct ACPISDTHeader* find_acpi_table(const char* signature) {
+static struct ACPISDTHeader* find_acpi_table(const char* signature,unsigned occurrence=0) {
     if (!rsdp_req.response || rsdp_req.response->address == nullptr)
         return nullptr;
 
@@ -131,8 +131,9 @@ static struct ACPISDTHeader* find_acpi_table(const char* signature) {
 
         if (!addr) continue;
         struct ACPISDTHeader* header = (struct ACPISDTHeader*)(addr + HHDM);
-        if (strncmp(header->signature, signature, 4) == 0 && header->length >= sizeof(ACPISDTHeader))
-            return header;
+        if (strncmp(header->signature, signature, 4) == 0 && header->length >= sizeof(ACPISDTHeader)) {
+            if(occurrence)--occurrence;else return header;
+        }
     }
     return nullptr;
 }

@@ -95,6 +95,8 @@ def install_ext4_file(volume, root, create=False, sectors=EXT4_SECTORS):
             put('bin/' + program, (root / program).read_bytes())
         if (root / 'build/console.elf').exists():
             put('share/system/console.elf', (root / 'build/console.elf').read_bytes())
+        put('share/system/mp3_player.elf', (root / 'mp3_player.elf').read_bytes())
+        put('share/system/fn_diag.elf', (root / 'fn_diag.elf').read_bytes())
         # Sample packages: run them in place or `wiz install` them (docs/APP_PACKAGES.md).
         for package in ('counter.wiz', 'win_test.wiz', 'bundle_demo.wiz', 'explorer.wiz', 'notepad.wiz', 'task_manager.wiz', 'image_viewer.wiz'):
             source = root / 'build' / 'packages' / package
@@ -118,6 +120,7 @@ def install_ext4_file(volume, root, create=False, sectors=EXT4_SECTORS):
         # Ship the dependency license alongside installed OS files.
         put('share/lwext4-license.txt', (ROOT / 'third_party/lwext4/LICENSE').read_bytes())
         put('share/stb-image-license.txt', (ROOT / 'third_party/stb/LICENSE').read_bytes())
+        put('share/minimp3-license.txt', (ROOT / 'third_party/minimp3/LICENSE').read_bytes())
         # Seed replaceable default artwork without overwriting installed themes.
         for asset in sorted((ROOT / 'assets/icons/hicolor').rglob('*.png')):
             relative = asset.relative_to(ROOT / 'assets/icons').as_posix()

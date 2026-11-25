@@ -27,7 +27,7 @@ static void gpu_test_repair_scene(){
         g_menu_open=true;wm_draw_start_menu(0,0,true);
     }
     if(request==2||request==3){g_desktop_fps=g_gpu_test_tray_fps;g_clock_valid=false;}
-    if(request==4){
+    if(request==4||request==5||request==6){
         Window* rain=nullptr;
         for(int i=0;i<g_window_count;++i)if(g_window_list[i]->type==WIN_TYPE_RAIN)rain=g_window_list[i];
         g_gpu_test_scene_repair_accepted=false;
@@ -36,12 +36,24 @@ static void gpu_test_repair_scene(){
             int x=rain->x,y=rain->y,w=rain->w,h=rain->h;
             int cw=rain->canvas_width,ch=rain->canvas_height;
             bool maximized=rain->maximized;
-            g_menu_open=false;g_taskbar_popup=2;g_taskbar_group_id=rain->id;g_taskbar_anchor=100;
+            AudioVolume saved_volume=g_audio_mixer.value;
+            AudioMixer saved_mixer=g_audio_mixer;
+            AudioHotkeyQueue saved_keys=g_audio_hotkeys;
+            DamageList saved_damage=g_damage;
+            int saved_order[MAX_WINDOWS];for(int i=0;i<g_window_count;++i)saved_order[i]=g_window_order[i];
+            g_menu_open=false;g_taskbar_popup=request>=5?3:2;g_taskbar_group_id=rain->id;g_taskbar_anchor=request>=5?wm_volume_tray_x():100;
             rain->x=0;rain->y=g_title_h;rain->w=fb->width;rain->h=fb->height-g_taskbar_h-g_title_h;
             rain->canvas_width=rain->w;rain->canvas_height=rain->h;rain->maximized=true;
+            if(request==6){
+                // Keep Boot Log visible but fully covered by opaque Rainbow.
+                int at=-1;for(int i=0;i<g_window_count;++i)if(g_window_list[g_window_order[i]]==rain)at=i;
+                if(at>=0){int index=g_window_order[at];for(int i=at;i+1<g_window_count;++i)g_window_order[i]=g_window_order[i+1];g_window_order[g_window_count-1]=index;}
+            }
             auto panel=wm_taskbar_panel(wm_taskbar_snapshot());
             VisibleRect cut{panel.x,panel.y,panel.x+panel.w,panel.y+panel.h};
             bool ok=wm_prepare_retained_animation(rain)&&g_retained_animation_plan.count;
+            if(request==6)ok=ok&&g_win_log&&g_win_log->visible&&!g_win_log->minimized&&
+                wm_find_top_window(g_win_log->x+g_win_log->w/2,g_win_log->y+g_win_log->h/2)==g_window_order[g_window_count-1];
             for(unsigned i=0;ok&&i<g_retained_animation_plan.count;++i)
                 ok=!visibility_valid(visibility_intersect(cut,g_retained_animation_plan.copies[i].destination));
             // Compare the entire rendered popup, including text/icon edges,
@@ -54,6 +66,16 @@ static void gpu_test_repair_scene(){
             auto deferred=g_deferred_alpha;g_deferred_alpha.clear();
             if(!expected)ok=false;
             for(unsigned pass=0;ok&&pass<4;++pass){
+                if(request>=5){g_audio_mixer.value.percent=pass*25;g_audio_mixer.value.muted=pass&1;}
+                if(request==6){
+                    auto log_hash=[](){uint64_t hash=1469598103934665603ULL;for(unsigned i=0;i<sizeof(g_log_buf);++i)hash=(hash^((uint8_t*)g_log_buf)[i])*1099511628211ULL;return hash;};
+                    uint64_t before_log=log_hash(),calls=g_gpu_test_calls;
+                    {TtyIrqGuard guard;damage_clear(&g_damage);g_audio_hotkeys={};g_audio_hotkeys.queue(0x30);hda::consume_volume_keys();}
+                    ok=ok&&before_log==log_hash()&&g_damage.n>0;
+                    for(unsigned i=0;ok&&i<g_damage.n;++i){const auto& r=g_damage.r[i];ok=wm_repair_retained_foreground({(int)r.x1,(int)r.y1,(int)r.x2+1,(int)r.y2+1});}
+                    ok=ok&&wm_repair_retained_foreground(cut)&&wm_repair_retained_foreground(
+                        {wm_volume_tray_x(),(int)fb->height-(int)g_taskbar_h,wm_volume_tray_x()+(int)g_taskbar_h,(int)fb->height})&&g_gpu_test_calls==calls;
+                }
                 g_gpu_direct_back=pass%2;
                 g_mouse_x=pass&1?panel.x+45:0;g_mouse_y=pass&1?panel.y+45:0;
                 g_ui_clip_left=panel.x;g_ui_clip_right=panel.x+panel.w;
@@ -78,6 +100,14 @@ static void gpu_test_repair_scene(){
             g_gpu_test_scene_repair_accepted=ok;
             rain->x=x;rain->y=y;rain->w=w;rain->h=h;rain->canvas_width=cw;rain->canvas_height=ch;rain->maximized=maximized;
             g_taskbar_popup=popup;g_taskbar_group_id=group;g_taskbar_anchor=anchor;
+            g_audio_mixer.value=saved_volume;
+            if(request==6){g_audio_mixer=saved_mixer;g_audio_hotkeys=saved_keys;g_damage=saved_damage;}
+            for(int i=0;i<g_window_count;++i)g_window_order[i]=saved_order[i];
+            if(request==6){
+                // The coverage probe temporarily moved Rainbow above every
+                // app; restore the actual scene before later pixel checks.
+                wm_audio_changed();wm_dirty_add(0,fb->width-1,0,fb->height-1);g_needs_refresh=true;
+            }
         }
     }else if(request==2){
         uint64_t bytes=(uint64_t)fb->pitch*g_taskbar_h;

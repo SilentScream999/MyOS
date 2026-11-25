@@ -31,6 +31,8 @@
 #include "window_overlay.h"
 #include "overlay_renderer.h"
 #include "power_icons.h"
+#include "volume_popup.h"
+#include "../drivers/audio_volume.h"
 #include "clipboard_icons.h"
 #include "text_clipboard.h"
 
@@ -1348,7 +1350,21 @@ static inline int32_t wm_fps_width() {
     return wm_text_width("888 FPS",wm_clock_scale())+16;
 }
 static inline int32_t wm_tray_w() {
-    return wm_clock_width()+wm_fps_width();
+    return wm_clock_width()+wm_fps_width()+g_taskbar_h;
+}
+static int wm_volume_tray_x(){return (int)fb->width-6-wm_clock_width()-g_taskbar_h;}
+static void wm_draw_volume_icon(int x,int y,int size,unsigned percent,bool muted,int min_y,int max_y){
+    for(int py=0;py<size;++py){
+        int yy=y+py;if(yy<min_y||yy>max_y||yy<g_ui_clip_top||yy>=g_ui_clip_bottom||yy<0||yy>=(int)fb->height)continue;
+        for(int px=0;px<size;++px){
+            int xx=x+px;if(xx<g_ui_clip_left||xx>=g_ui_clip_right||xx<0||xx>=(int)fb->width)continue;
+            unsigned alpha=volume_icon_coverage(percent,muted,px,py,size);if(!alpha)continue;
+            uint32_t* pixel=(uint32_t*)(g_master_backbuffer+(uint64_t)yy*fb->pitch)+xx;
+            uint32_t color=0xff000000;
+            for(unsigned shift=0;shift<24;shift+=8)color|=(((((*pixel>>shift)&255)*(16-alpha)+0xee*alpha+8)/16)<<shift);
+            *pixel=color;
+        }
+    }
 }
 static int32_t wm_tray_damage_left(){
     int32_t x=(int32_t)fb->width-wm_tray_w()-14;
@@ -2629,7 +2645,10 @@ static void wm_draw_taskbar_tray(VisibleRect clip,bool background=true){
     {
         uint32_t clock_scale = wm_clock_scale();
         int32_t fps_width=wm_fps_width();
-        int32_t clock_x=tray_x+fps_width,clock_width=TRAY_W-fps_width;
+        int32_t clock_x=tray_x+fps_width+g_taskbar_h,clock_width=wm_clock_width();
+        int size=g_taskbar_h-16;if(size>28)size=28;if(size<14)size=14;
+        int icon_x=wm_volume_tray_x()+(g_taskbar_h-size)/2;
+        wm_draw_volume_icon(icon_x,tray_y+(tray_h-size)/2,size,g_audio_mixer.value.percent,g_audio_mixer.value.muted,min_y,max_y);
         char fps[16];to_str(g_desktop_fps,fps);
         resources::append(fps,sizeof(fps)," FPS");
         int32_t ch = wm_text_height(clock_scale);
@@ -2676,7 +2695,10 @@ static bool wm_repair_retained_foreground(VisibleRect r){
         int x,y,w,h;wm_menu_geom(&x,&y,&w,&h);
         tray_clear=y+h<=(int)(fb->height-g_taskbar_h);
     }
-    if(tray_clear&&!g_clipboard_open&&!g_taskbar_popup&&
+    bool popup_above_tray=!g_taskbar_popup;
+    if(g_taskbar_popup){auto panel=wm_taskbar_panel(wm_taskbar_snapshot());
+        popup_above_tray=panel.y+panel.h<=(int)(fb->height-g_taskbar_h);}
+    if(tray_clear&&!g_clipboard_open&&popup_above_tray&&
        r.x1>=wm_tray_damage_left()&&r.x2<=(int)fb->width&&
        r.y1>=(int)(fb->height-g_taskbar_h)&&r.y2<=(int)fb->height&&visibility_valid(r)){
         GpuPerfTimer timer(g_gpu_perf.tray_repair_ticks);
@@ -2686,6 +2708,14 @@ static bool wm_repair_retained_foreground(VisibleRect r){
         return true;
     }
 #endif
+    // The opaque popup is replayed in full after the retained animation and
+    // alpha chain. Its own content damage needs no reconstruction underneath.
+    // Accept only the exact popup geometry captured by this retained frame.
+    if(g_retained_popup_layout&&g_retained_popup_layout==wm_retained_popup_layout()){
+        auto panel=wm_taskbar_panel(wm_taskbar_snapshot());
+        if(visibility_valid(r)&&r.x1>=panel.x&&r.y1>=panel.y&&
+           r.x2<=panel.x+panel.w&&r.y2<=panel.y+panel.h)return true;
+    }
     // Shell bands can contain other decorations with wider repaint rules.
     if(r.y1<60||r.y2>(int)(fb->height-g_taskbar_h))return false;
 #if GPU_RETAINED_MENU

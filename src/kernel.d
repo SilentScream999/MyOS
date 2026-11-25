@@ -29,9 +29,18 @@ src/kernel.o: src/kernel.cpp src/core/helpers.h src/core/structures.h \
   src/gui/resources.h src/gui/../core/app.h src/gui/../core/wiz.h \
   src/gui/window_resize.h src/gui/window_input.h \
   src/gui/window_decorations.h src/gui/overlay_renderer.h \
-  src/gui/power_icons.h src/gui/clipboard_icons.h \
+  src/gui/power_icons.h src/gui/volume_popup.h \
+  src/gui/../drivers/audio_volume.h src/gui/clipboard_icons.h \
   src/core/text_clipboard.h src/gui/wallpaper.h src/gui/taskbar.h \
-  src/gui/taskbar_layout.h src/core/app_console.h src/fs/ramfs.h \
+  src/gui/taskbar_layout.h src/core/app_console.h src/drivers/hda.h \
+  src/drivers/hda_topology.h src/drivers/hda_command.h \
+  src/drivers/hda_link.h src/drivers/thinkpad_audio.h \
+  src/drivers/thinkpad_ec_protocol.h \
+  src/drivers/thinkpad_hotkey_profile.h src/drivers/thinkpad_smi.h \
+  src/drivers/acpi_mode.h src/drivers/audio_hotkeys.h \
+  src/drivers/fn_probe.h src/drivers/fn_trace.h \
+  src/drivers/audio_volume.h src/drivers/hda_pcm_ring.h \
+  src/drivers/hda_pcm.h src/core/firmware_diag.h src/fs/ramfs.h \
   src/fs/recovery.h src/arch/boot_module.h src/arch/../../limine.h \
   src/fs/ext4_vfs.h third_party/lwext4/include/ext4.h \
   third_party/lwext4/include/ext4_config.h \
@@ -221,6 +230,10 @@ src/gui/overlay_renderer.h:
 
 src/gui/power_icons.h:
 
+src/gui/volume_popup.h:
+
+src/gui/../drivers/audio_volume.h:
+
 src/gui/clipboard_icons.h:
 
 src/core/text_clipboard.h:
@@ -232,6 +245,38 @@ src/gui/taskbar.h:
 src/gui/taskbar_layout.h:
 
 src/core/app_console.h:
+
+src/drivers/hda.h:
+
+src/drivers/hda_topology.h:
+
+src/drivers/hda_command.h:
+
+src/drivers/hda_link.h:
+
+src/drivers/thinkpad_audio.h:
+
+src/drivers/thinkpad_ec_protocol.h:
+
+src/drivers/thinkpad_hotkey_profile.h:
+
+src/drivers/thinkpad_smi.h:
+
+src/drivers/acpi_mode.h:
+
+src/drivers/audio_hotkeys.h:
+
+src/drivers/fn_probe.h:
+
+src/drivers/fn_trace.h:
+
+src/drivers/audio_volume.h:
+
+src/drivers/hda_pcm_ring.h:
+
+src/drivers/hda_pcm.h:
+
+src/core/firmware_diag.h:
 
 src/fs/ramfs.h:
 

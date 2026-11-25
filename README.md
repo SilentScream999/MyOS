@@ -61,6 +61,17 @@ options; header dependencies are tracked automatically.
 
 ## What works
 
+- MP3 file playback (`play /path/song.mp3`), shared mute/volume and multimedia-key
+  controls, plus analog HDA diagnostics and short stereo test tones (`audio`,
+  `audio test speaker`, `audio test headphone`); ThinkPad E470 headphones are
+  confirmed working, and speakers are confirmed after `audio unmute`.
+  E470 firmware-mute diagnostics/unmute and deferred PS/2 multimedia keys are
+  implemented; E470 music and Fn media keys are confirmed working.
+  Volume hold-repeat and a taskbar slider/mute popup share the retained popup
+  renderer. Startup configures the captured E470 firmware's ACPI/software-key
+  path automatically. Ordinary F1–F3 remain available to applications; volume
+  follows the keyboard's FnLock mapping. USB multimedia input remains future work.
+  See [audio](docs/AUDIO.md).
 - Limine boot, ACPI power actions, physical/page/heap allocation, per-task kernel
   stacks/address spaces and a single-core preemptive scheduler.
 - Native `.wiz` packages (icons/metadata inside, portable or installed) and `.elf` programs, spawn/wait/exit, foreground Ctrl+C and mapped
@@ -128,6 +139,7 @@ console app; `run /bin/win_test.elf` demonstrates mapped GUI surfaces.
 | [Images/icons](docs/IMAGES.md) | Runtime resources, formats, themes, caching and memory lifetime |
 | [Fonts](docs/FONTS.md) | Runtime TTF selection and limits |
 | [USB/input](docs/USB_INPUT.md) | HID, hubs, reset/probe rules and hardware caveats |
+| [Audio](docs/AUDIO.md) | HDA discovery, analog test tones and ThinkPad verification |
 | [GPU/display roadmap](docs/GPU_DESKTOP_ROADMAP.md) | Current renderer and future display/GPU stages |
 | [Syscalls](APIDocs/Syscalls.md) / [Window API](APIDocs/WindowAPI.md) | Native application interfaces |
 | [Testing](docs/TESTING.md) | Host/QEMU commands and hardware verification scope |

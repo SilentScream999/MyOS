@@ -737,6 +737,7 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
 
     // 2. Start drag / Raise / Close / Taskbar: hit-test Z-stack on fresh click
     if(mouse_press)clipboard_press=wm_clipboard_click(g_mouse_x,g_mouse_y)||wm_taskbar_popup_click(g_mouse_x,g_mouse_y);
+    if(!mouse_press&&wm_volume_pointer(btn_held))clipboard_press=true;
     if (mouse_press && !clipboard_press) {
         int32_t mx = g_mouse_x, my = g_mouse_y;
         
@@ -945,6 +946,7 @@ void compositor_thread_main() {
 #endif
     wm_overlay_update(g_mouse_x, g_mouse_y, g_mouse_buttons);
     g_desktop_ready = true;
+    hda::desktop_ready();
 #ifdef GPU_COMPOSITOR_TEST
     gpu_test_install();
 #endif
@@ -1466,6 +1468,7 @@ extern "C" void kmain(void) {
     uint64_t ui_started = rdtsc();
 #endif
     wm_init();     // Initialize window manager and UI scaling first
+    g_audio_mixer.changed=wm_audio_changed;
     wm_prepare_menu_cache();
     g_task_exit_hook = process_exit_ui;
     g_stdio_exit_hook = console_release;
@@ -1479,6 +1482,7 @@ extern "C" void kmain(void) {
     // Spawn compositor thread extremely early so it guarantees 60fps
     // screen refreshes regardless of whether USB enumeration blocks.
     scheduler_add_task(task_create(compositor_thread_main,16,"Compositor"));
+    scheduler_add_task(task_create(hda::service_task,16,"Audio service"));
 
 
 
@@ -1525,6 +1529,7 @@ extern "C" void kmain(void) {
 					uint32_t id = pci_cfg_read32(virt_base, start, bus, dev, fn, 0x00);
 					if (id == 0xFFFFFFFF) continue;
 					uint32_t class_reg = pci_cfg_read32(virt_base, start, bus, dev, fn, 0x08);
+                    hda::discover(virt_base, seg, start, bus, dev, fn, id, class_reg);
 #if GPU_RENDER && GPU_TRACE
                     trace_pci_discover({virt_base,id,seg,start,(uint8_t)bus,dev,fn},class_reg);
 #endif

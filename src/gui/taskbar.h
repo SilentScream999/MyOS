@@ -30,13 +30,19 @@ static TaskbarSnapshot wm_taskbar_snapshot() {
     return snapshot;
 }
 static int g_taskbar_group_id=0,g_taskbar_first=0,g_taskbar_anchor=0;
-// Popup mode is 0=closed, 1=overflow groups, 2=windows in an application.
+// Popup mode is 0=closed, 1=overflow groups, 2=windows in an application, 3=volume.
 static int g_taskbar_popup=0;
+static bool g_volume_drag=false;
 struct TaskbarPopup {
     int ids[MAX_WINDOWS],count,x,y,w,h,rows;
 };
 static TaskbarPopup wm_taskbar_panel(const TaskbarSnapshot& snapshot) {
     TaskbarPopup panel{};
+    if(g_taskbar_popup==3){
+        auto volume=volume_popup_layout(fb->width,fb->height,g_taskbar_h,g_taskbar_anchor);
+        panel.x=volume.x;panel.y=volume.y;panel.w=volume.w;panel.h=volume.h;
+        panel.count=1;return panel; // Nonempty opaque panel participates in retained cutouts.
+    }
     const auto& layout=snapshot.layout;
     int group=-1;
     if(g_taskbar_popup==2)for(int i=0;i<snapshot.count;++i)
@@ -68,7 +74,7 @@ static void wm_taskbar_damage(bool full=true) {
 }
 static void wm_taskbar_close() {
     if(!g_taskbar_popup)return;
-    g_taskbar_popup=0;g_taskbar_first=0;wm_taskbar_damage();
+    g_taskbar_popup=0;g_taskbar_first=0;g_volume_drag=false;wm_taskbar_damage();
 }
 static bool wm_taskbar_escape(char c,uint32_t mods) {
     if(c!=27||mods||!g_taskbar_popup)return false;
@@ -84,6 +90,10 @@ static void wm_taskbar_activate(int id) {
 }
 static void wm_taskbar_click_bar(int x) {
     TtyIrqGuard guard;
+    if(x>=wm_volume_tray_x()&&x<wm_volume_tray_x()+(int)g_taskbar_h){
+        if(g_taskbar_popup==3)wm_taskbar_close();else wm_taskbar_open(3,0,wm_volume_tray_x());
+        return;
+    }
     auto snapshot=wm_taskbar_snapshot();const auto& layout=snapshot.layout;
     if(layout.overflow_width&&x>=layout.overflow_x&&x<layout.overflow_x+layout.overflow_width){
         if(g_taskbar_popup==1)wm_taskbar_close();else wm_taskbar_open(1,0,layout.overflow_x);
@@ -113,6 +123,14 @@ static bool wm_taskbar_popup_click(int x,int y) {
     TtyIrqGuard guard;
     auto snapshot=wm_taskbar_snapshot();auto panel=wm_taskbar_panel(snapshot);
     if(x<panel.x||x>=panel.x+panel.w||y<panel.y||y>=panel.y+panel.h){wm_taskbar_close();return false;}
+    if(g_taskbar_popup==3){
+        VolumePopupLayout volume{panel.x,panel.y,panel.w,panel.h};
+        if(y>=volume.slider_y()-20&&y<=volume.slider_y()+20){
+            if(x<panel.x+52)g_audio_mixer.mute(2);
+            else {g_volume_drag=true;g_audio_mixer.percent(volume.percent(x));g_audio_mixer.mute(0);}
+        }
+        return true;
+    }
     int row=(y-panel.y-36)/32;
     if(y<panel.y+36||row>=panel.rows)return true;
     int selected=g_taskbar_first+row;
@@ -127,6 +145,11 @@ static bool wm_taskbar_popup_click(int x,int y) {
     wm_taskbar_close();wm_taskbar_activate(id);return true;
 }
 static void wm_taskbar_scroll(int delta) {
+    if(g_taskbar_popup==3){
+        TtyIrqGuard guard;
+        int next=(int)g_audio_mixer.value.percent-delta*5;
+        g_audio_mixer.percent(next<0?0:next>100?100:next);return;
+    }
     auto snapshot=wm_taskbar_snapshot();auto panel=wm_taskbar_panel(snapshot);
     g_taskbar_first+=delta;
     int last=panel.count-panel.rows;if(last<0)last=0;
@@ -148,6 +171,20 @@ static void wm_taskbar_render_popup(int min_y,int max_y) {
         }
     };
     rect(panel.x,panel.y,panel.w,panel.h,0xff151b2e);
+    if(g_taskbar_popup==3){
+        AudioVolume state=g_audio_mixer.value;
+        VolumePopupLayout volume{panel.x,panel.y,panel.w,panel.h};
+        rect(panel.x,panel.y,panel.w,32,0xff303955);
+        wm_draw_string(panel.x+14,panel.y+8,"Volume",0xffeeeeff,g_font_scale_100,panel.w-28);
+        char label[24];to_str(state.percent,label);resources::append(label,sizeof(label),state.muted?"%  Muted":"%");
+        wm_draw_string(panel.x+16,panel.y+44,label,0xffbfc9e8,g_font_scale_100,panel.w-32);
+        int cy=volume.slider_y(),left=volume.slider_left(),right=volume.slider_right(),thumb=volume.thumb(state.percent);
+        wm_draw_volume_icon(panel.x+16,cy-14,28,state.percent,state.muted,min_y,max_y);
+        rect(left,cy-2,right-left,4,0xff465475);
+        if(thumb>left)rect(left,cy-2,thumb-left,4,state.muted?0xff8290ac:0xff9d8aff);
+        rect(thumb-5,cy-10,10,20,state.muted?0xff9da8c0:0xffd2caff);
+        return;
+    }
     rect(panel.x,panel.y,panel.w,32,0xff303955);
     wm_draw_string(panel.x+10,panel.y+8,g_taskbar_popup==1?"More apps":"Open windows",0xffeeeeff,g_font_scale_100,panel.w-20);
     for(int row=0;row<panel.rows;++row){
@@ -166,5 +203,26 @@ static void wm_taskbar_render_popup(int min_y,int max_y) {
         int thumb=track*panel.rows/panel.count;
         rect(panel.x+panel.w-4,panel.y+36+track*g_taskbar_first/panel.count,2,thumb,0xff8295c4);
     }
+}
+static bool wm_volume_pointer(bool held){
+    if(!g_volume_drag)return false;
+    if(!held||g_taskbar_popup!=3){g_volume_drag=false;return true;}
+    TtyIrqGuard guard;
+    auto panel=wm_taskbar_panel(wm_taskbar_snapshot());
+    VolumePopupLayout volume{panel.x,panel.y,panel.w,panel.h};
+    g_audio_mixer.percent(volume.percent(g_mouse_x));g_audio_mixer.mute(0);return true;
+}
+static void wm_audio_changed(){
+    TtyIrqGuard guard;
+    static int previous_icon=-1;
+    const auto& volume=g_audio_mixer.value;
+    int icon=volume.muted||!volume.percent?0:volume.percent>50?2:1;
+    if(icon!=previous_icon&&fb){
+        int x=wm_volume_tray_x();
+        wm_dirty_add(x,x+g_taskbar_h-1,fb->height-g_taskbar_h,fb->height-1);
+        g_needs_refresh=true;
+    }
+    previous_icon=icon;
+    if(g_taskbar_popup==3)wm_taskbar_damage(false);
 }
 #endif

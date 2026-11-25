@@ -65,6 +65,8 @@
 #include "acpi.h"
 #include "wm.h"
 #include "app_console.h"
+#include "drivers/hda.h"
+#include "firmware_diag.h"
 
 // ── MSR addresses ─────────────────────────────────────────────────────────────
 
@@ -123,12 +125,14 @@ static inline uint64_t rdmsr(uint32_t msr) {
 #define SYS_LAUNCH 213u    // subsystem-aware launch; desktop origin=1, shell origin=0
 #define SYS_CONSOLE 214u   // private console-host channel
 #define SYS_DOCUMENT_PATH 215u // copy the optional launch document path
-#define SYS_OPEN_WITH 216u // desktop GUI launch: app path, document path
+#define SYS_OPEN_WITH 216u // app path, document path, origin (0=desktop,1=shell)
 #define SYS_TEXT_CLIPBOARD 217u // action 0=set bytes, 1=get NUL-terminated text
 #define SYS_PROCESS_INFO 218u // (ProcessInfo*, capacity<=256, ProcessTotals*, optional ProcessMetadata*)
 #define SYS_KERNEL_CPU 219u // (KernelCpuInfo*); renew PID 0 profiling lease
 #define SYS_EJECT 220u // external drive path; 0=done, 1=no explicit flush, -2=busy, -3=flush failed
 #define SYS_STORAGE_STATE 221u // action 0=mount generation; action 1=path supports external-drive eject
+#define SYS_AUDIO 224u // action 0=query,1=test,2=alt DAC,3=firmware status,4=unmute,5=toggle; kind 0=auto,1=speaker,2=headphone,3=line
+#define SYS_FIRMWARE_DIAG 225u // bounded Fn trace and read-only ACPI table export
 #define SYS_CHDIR   80u
 #define SYS_MKDIR   83u
 #define SYS_RMDIR   84u
@@ -605,6 +609,8 @@ uint64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, ui
 }
 static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     switch (nr) {
+        case SYS_AUDIO: return (uint64_t)hda::control(a1, a2, a3);
+        case SYS_FIRMWARE_DIAG: return firmware_diag::control(a1,a2,a3,a4,a5);
         case SYS_READ:   return sys_read(a1, a2, a3);
         case SYS_WRITE:  return sys_write(a1, a2, a3);
         case SYS_OPEN:   return sys_open(a1, a2);
@@ -649,8 +655,8 @@ static uint64_t syscall_dispatch_body(uint64_t nr, uint64_t a1, uint64_t a2, uin
         case SYS_CONSOLE:return a1==7?sys_console_wait(a2):sys_console(a1,a2,a3);
         case SYS_OPEN_WITH: {
             char app[256],document[256];
-            if(!get_user_path(a1,app,sizeof(app))||!get_user_path(a2,document,sizeof(document)))return (uint64_t)-1;
-            bool gui=false;return launch_program(app,true,&gui,document);
+            if(a3>1||!get_user_path(a1,app,sizeof(app))||!get_user_path(a2,document,sizeof(document)))return (uint64_t)-1;
+            bool gui=false;return launch_program(app,a3==0,&gui,document);
         }
         case SYS_TEXT_CLIPBOARD: {
             if(a1>1||!a2||a2>=USERSPACE_END||a3>USERSPACE_END-a2||

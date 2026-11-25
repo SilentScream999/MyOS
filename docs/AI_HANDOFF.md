@@ -33,7 +33,121 @@ probes. See [build configurations](../BUILD_CONFIGS.txt) and the
 | Fonts | Runtime TTF selection with built-in fallback; printable ASCII UI | [Fonts](FONTS.md) |
 | Storage | Journaled ext4 USB root, persistent apps/settings/files, atomic saves, automatic capacity setup | [ext4](EXT4.md) |
 | Input | xHCI HID, USB hubs, descriptor-based pointers, PS/2 keyboard/Synaptics | [USB/input](USB_INPUT.md) |
+| Audio | E470 music and volume popup work; Fn volume delivery and FnLock swap confirmed after initialization. Automatic startup probe added; fresh-boot timing awaits hardware check | [Audio](AUDIO.md) |
 | GPU | Intel Gen9 composition, page flips and RCS scaling enabled by runtime validation; CPU fallback | [Display roadmap](GPU_DESKTOP_ROADMAP.md) |
+
+ThinkPad E470 headphones work through codec `14f1:5111`, pin `0x16`, DAC
+`0x10`, after SKL/KBL controller reset/link setup. Speaker pin `0x17` was
+silent despite D0, output enabled, selector 0, unmuted zero-dB DAC gain and
+completed DMA; the EC mute gate was the missing step. GPIO data/mask/direction
+are zero. The alternate-DAC command
+does not change the default route policy. See [Audio](AUDIO.md).
+
+The owner confirmed Windows speakers require a physical volume key after every
+boot; the software slider does not restore them. A Windows warm restart into
+Wyzar does not preserve working speakers. The current firmware-mute backend
+exposes `audio firmware` / `audio unmute`: EC byte `0x30`, bit 6, following
+Linux thinkpad-acpi. It requires exact PCI/controller/codec IDs, checksummed
+Lenovo ECDT/FADT, validated EC System I/O ports and a FACS Global Lock in ACPI
+memory. It preserves every other EC bit, verifies readback, performs no NVRAM
+or GPIO writes, and disables itself after an incomplete transaction. Physical
+speaker recovery was confirmed by the owner on 2026-11-25. The log shows EC
+audio byte `0x40` -> `0x00`, speaker DMA through pin `0x17` / DAC `0x10`, and
+a subsequent `0x00` readback. ECDT ports are `0x62`/`0x66`, path
+`\_SB.PCI0.LPC.EC`; SCI_EN was zero. Missing resources decline EC access.
+Music playback opens that firmware gate automatically; diagnostic tones may
+still require explicit `audio unmute`. Physical hotkey delivery is
+confirmed for volume-down/up in the later MP3 test, with verified DAC gain
+changes. The owner later confirms good sound/no errors and plain F1/F2/F3
+(including mute) after the service/buffer/rate fixes. Fn combinations do nothing.
+The earlier MP3 log contains three combined
+`PCM DMA error/poll deadline missed` failures, which did not distinguish the cause.
+
+PS/2 multimedia make/break events are consumed and queued by IRQ1; the audio
+service task (or a blocking PCM operation) applies shared DAC volume/mute. Up/down change
+volume by 10 and clear shared mute; the multimedia mute key toggles mute.
+The temporary plain F1/F2/F3 audio fallback has been removed, preserving ordinary
+function keys for apps. Volume follows firmware FnLock mapping. USB consumer
+reports remain unsupported. This is not a general AML or
+ACPI HKEY/GPE implementation: the narrow captured-E470 initialization is
+described below; SCI/GPE masks are unchanged. Zero key counters may indicate ACPI-only
+delivery; the direct unmute command still works when EC resources are available.
+
+`play <path.mp3>` starts `/share/system/mp3_player.elf` as a foreground child using
+OPEN_WITH origin=1 (shell); origin=0 retains desktop semantics. The CC0 minimp3
+decoder and continuous windowed-sinc resampler are userspace only. Native 44.1/
+48 kHz PCM bypasses conversion; action 7 optionally negotiates the requested
+rate via its third argument. HDA actions 7–10 own/write/drain/close one stereo
+s16 stream; action 6 returns shared volume/mute, 11 sets volume and 12 controls
+mute. A bounded 256 KiB DMA
+ring clears consumed pages; pointer validation walks user page permissions.
+The dedicated audio task services DMA every 2 ms and cleans up dead/interrupted
+owners, independently of the USB/input loop. A 128 KiB prefill and 1.2 s service
+deadline replace 32 KiB/300 ms; errors log status/position/gap/queue separately. Underflow
+stops instead of replaying a stale ring. See AUDIO.md for limits and QEMU tests.
+
+The volume tray icon sits immediately left of the clock. Taskbar popup mode 3
+uses the existing opaque retained cutout and content replay machinery, including
+stale-clip recovery and both destination indices. The shared AudioMixer publishes
+desired volume/mute with a revision; UI callbacks damage only tray/panel, and
+the audio task applies hardware changes outside IRQ/UI handlers. Keys, slider,
+wheel and syscalls share that state. Up/down repeat at 400 ms then every 80 ms;
+break cancels, typematic makes are suppressed, mute never repeats. CPU QEMU UI
+tests and the GPU mock fixture cover this path; physical popup testing is pending.
+
+Owner reports GPU Rainbow lag during volume changes even with Boot Log fully
+covered. Routine audio-control diagnostics now use memory-only klog output;
+ordinary print() unconditionally rerendered the log's backing surface. The
+volume UI damages only icon appearance changes and the open panel. Stable
+retained popup damage is deferred to the final opaque replay, and tray repairs
+are allowed with popups above the taskbar. GPU regression covers a visible log
+fully occluded by fullscreen opaque Rainbow, actual queued volume updates,
+unchanged log contents and no graphics submissions for panel/tray repair.
+Physical performance verification of this fix is pending.
+
+Owner says the GPU volume change seems fine. Fn audio keys now work after
+firmware initialization; automatic startup activation is the latest change.
+FnLock has no indicator. The attached host is Acer Nitro AN517-54, not the E470.
+The owner supplied `G:\fnkeys.bin`; extracted tables/report are under ignored
+`.storage-test/e470-tables` and `.storage-test/e470-fn-report.txt`. Initially Fn
+combinations emitted only Fn make/break; CMOS/EC status stayed unchanged. The DSDT defines
+SAUM(2) as EC byte 3 bits 5–6 = 2. The new build configures that mode on the
+first successful exact-E470 audio probe, preserving other bits and verifying
+readback under the FACS lock. `thinkpad_hotkey_profile.h` checks captured table
+identity/checksum and EC-field/SAUM fingerprints; other firmware is skipped.
+The follow-up `G:\fnkeys.bin` (48 events, zero drops) confirms SAUM 0x60->0x40
+but still only Fn make/break during combinations; EC/CMOS stay unchanged and
+SCI_EN=0. Latest build adds the captured Linux `_SB._INI` branch's immediately
+following UCMS(0x1c), using fingerprinted SMI/MNVS fields and methods. Its mailbox
+base is extracted from AML and must be backed by ACPI NVS; command is serialized,
+skips pending mailbox, and bounds OS retries to 50 triggers/50 ms. No FACS lock
+is held across SMI. Host tests pass against the second captured DSDT including
+method corruption and relocation cases. The third capture confirms UCMS
+status/result zero but unchanged Fn-only trace and SCI_EN=0 (48 events/no drops).
+Latest build enters ACPI mode through FADT SMI_CMD/ACPI_ENABLE before SAUM/UCMS,
+waiting at most 300 ms for PM1a/b SCI_EN. Only a fingerprinted E470 with unused,
+already masked PIC IRQ9 is accepted. IRQ9 remains masked; there is still no
+general SCI/GPE/query dispatcher. fn_probe now records SCI_EN (kind6) and EC03
+(kind7). The fourth capture confirms SCI_EN=1, EC03=0x40, 65 events/no drops,
+and real Fn+F1/F2/F3 multimedia make/break codes. After Fn+Esc, Fn combinations
+produce plain F1–F3 while plain F keys produce multimedia codes. The owner
+confirms keys work only after starting `audio hotkeys`; lazy initialization was
+the remaining startup defect. Latest code publishes `hda::desktop_ready()` after
+the first desktop frame (PCI discovery already complete), then the audio service
+probes discovered HDA controllers under the existing busy/attempted guard. This
+enables the firmware path without any user audio command. No-HDA boot skips the
+probe; other platforms retain generic HDA initialization and exact firmware gates.
+QEMU audio tests now assert readiness before the first command and no duplicate
+probe. E470 fresh-boot activation without diagnostics remains to be verified.
+Fourth evidence: `.storage-test/e470-fnkeys-fourth.bin`, `e470-fn-bootlog-fourth.txt`.
+Third evidence: `.storage-test/e470-fnkeys-third.bin`, `e470-fn-bootlog-third.txt`.
+Older evidence files are ignored:
+`.storage-test/e470-fnkeys-new.bin`, `e470-tables-new/DSDT.aml`.
+`audio hotkeys` launches a bounded diagnostic helper
+and saves `/home/fnkeys.bin` (raw PS/2, E470-only read-only status, FADT/ECDT/DSDT/
+SSDT export). It uses SYS_FIRMWARE_DIAG 225 and does not execute AML or consume
+EC queries. `tools/read_fn_capture.py` validates/extracts the bundle. Normal
+audio initialization, including SAUM setup, precedes recording.
 
 Normal new images contain a 256 MiB ext4 seed and occupy 385 MiB overall.
 First boot can provision a larger root on a larger stick. This disk seed reserve

@@ -1,7 +1,41 @@
 # Pending platform work
 
-Updated 2026-11-24. Implemented behavior belongs in the feature guides linked
+Updated 2026-11-25. Implemented behavior belongs in the feature guides linked
 from [README](../README.md); this file tracks remaining work.
+
+## Audio
+
+The initial shared HDA driver exposes analog route diagnostics and short stereo
+test tones. ThinkPad E470 headphones and speakers are physically confirmed;
+`audio unmute` restored speakers by clearing EC byte `0x30` bit 6 (`0x40` to
+`0x00`). See [the audio guide](AUDIO.md). Physical multimedia-key delivery
+is confirmed for plain F1/F2/F3 and, after firmware setup, Fn+F1/F2/F3.
+The captured firmware now has narrowly fingerprinted SAUM(2)/UCMS(0x1c) setup;
+the fourth hardware capture confirms SCI_EN=1 and multimedia make/break codes.
+Fn+Esc changes the row mapping as expected. General ACPI HKEY/GPE event
+handling still requires wider ACPI support.
+The new `play /path/song.mp3` foreground player decodes in userspace and streams
+native 44.1/48 kHz stereo PCM (windowed-sinc fallback resampling); E470 playback
+opens the firmware mute gate automatically.
+Shared mute/volume support multimedia PS/2 keys; the temporary plain F1/F2/F3
+fallback is removed now that firmware media delivery works. The owner confirms good sound/no errors after the dedicated audio
+task, 256 KiB ring and native-rate/improved resampling changes. Retest the new
+volume hold-repeat and clock-adjacent slider/mute popup on E470, including the
+physical GPU retained-popup path.
+The owner reports Rainbow lag on GPU while changing volume, even with Boot Log
+covered. Retest the memory-only control logging and bounded retained popup/tray
+repair fixes under that exact layout; GPU mock validates covered-log behavior
+and cheap repair acceptance, not real frame timing.
+The owner reports that the GPU volume fix seems fine and Fn volume works after
+starting `audio hotkeys`. That exposed lazy initialization, now changed to a
+background audio probe after the first desktop frame. Verify Fn keys immediately
+after a fresh E470 boot without running any audio command first, including
+hold/release and popup state. The startup change is QEMU tested; firmware key
+delivery after initialization is already confirmed by capture and owner.
+The profile remains specific to TP-R0D/revision 0x960; IRQ9 stays masked and
+pending EC events remain unconsumed until wider ACPI dispatch support exists.
+Next features: USB HID consumer-control media keys, WAV, seeking/playlists, live jack routing,
+mixing and a graphical player. Volume settings currently reset on reboot.
 
 ## GPU follow-up
 

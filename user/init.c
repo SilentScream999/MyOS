@@ -228,7 +228,7 @@ void add_history(const char* cmd) {
 // Known commands for green highlighting
 static const char* known_commands[] = {
     "clear", "shutdown", "restart", "bsod", "open bootlog", "ls", "run", "help",
-    "write", "append", "mv", "cat", "rm", "stat", "cd", "pwd", "mkdir", "rmdir", "df", "wiz", 0
+    "write", "append", "mv", "cat", "rm", "stat", "cd", "pwd", "mkdir", "rmdir", "df", "wiz", "audio", 0
 };
 
 static char current_dir[256] = "/";
@@ -431,10 +431,94 @@ void _start() {
             print("  run <path>      - Run a .wiz or .elf app; wait until it exits\n");
             print("  wiz <command>   - Inspect/install/pin/remove .wiz app packages (try 'wiz')\n");
             print("  open bootlog    - Display kernel boot log\n");
+            print("  audio           - Probe audio and list analog outputs\n");
+            print("  audio firmware  - Inspect supported ThinkPad hardware mute state\n");
+            print("  audio unmute    - Clear supported ThinkPad hardware mute\n");
+            print("  play <path.mp3> - Play MP3 music (Ctrl+C stops)\n");
+            print("  audio volume <0..100> | audio mute | audio status\n");
+            print("  audio hotkeys   - Capture Fn keys/firmware to /home/fnkeys.bin\n");
+            print("  audio test [speaker|headphone|line] - Play a short test tone\n");
+            print("    Add 'alt' to test another advertised DAC for that output\n");
             print("  clear           - Clear screen\n");
             print("  bsod            - Trigger crash screen\n");
             print("  restart         - Reboot system\n");
             print("  shutdown        - Power off system\n");
+        } else if (streq(buf,"audio hotkeys",13)&&!buf[13]) {
+            int64_t pid;const char* app="/share/system/fn_diag.elf";const char* output="/home/fnkeys.bin";
+            sys_ttyecho(0);
+            __asm__ volatile("syscall":"=a"(pid):"a"(216UL),"D"(app),"S"(output),"d"(1UL):"rcx","r11","memory");
+            uint64_t code=0;
+            if(pid<0)print("Cannot launch Fn capture.\n");
+            else if(sys_waitpid(pid,&code)<0)print("Cannot wait for Fn capture.\n");
+            else if(code==130)print("^C\n");
+            sys_ttyflush_input();sys_ttyecho(1);
+        } else if (streq(buf, "play ", 5)) {
+            const char* path=buf+5;while(*path==' ')++path;
+            if(!*path)print("Usage: play <path.mp3>\n");
+            else {
+                int64_t pid;const char* app="/share/system/mp3_player.elf";
+                sys_ttyecho(0);
+                __asm__ volatile("syscall":"=a"(pid):"a"(216UL),"D"(app),"S"(path),"d"(1UL):"rcx","r11","memory");
+                uint64_t code=0;
+                if(pid<0)print("Cannot launch MP3 player.\n");
+                else if(sys_waitpid(pid,&code)<0)print("Cannot wait for MP3 player.\n");
+                else if(code==130)print("^C\n");
+                sys_ttyflush_input();sys_ttyecho(1);
+            }
+        } else if (streq(buf, "audio", 5) && (buf[5] == ' ' || buf[5] == '\0')) {
+            const char* args = buf + 5;
+            while (*args == ' ') ++args;
+            uint64_t action = 0, kind = 0;
+            int valid = 1;
+            if (streq(args, "firmware", 8) && !args[8]) action = 3;
+            else if (streq(args, "unmute", 6) && !args[6]) action = 4;
+            else if (streq(args, "status", 6) && !args[6]) action = 6;
+            else if (streq(args, "mute", 4) && !args[4]) { action=12;kind=2; }
+            else if (streq(args, "volume ", 7)) {
+                action=11;const char* number=args+7;while(*number==' ')++number;
+                if(!*number)valid=0;
+                while(*number&&valid){if(*number<'0'||*number>'9')valid=0;else{kind=kind*10+*number++-'0';if(kind>100)valid=0;}}
+            }
+            else if (*args) {
+                if (!streq(args, "test", 4) || (args[4] && args[4] != ' ')) valid = 0;
+                else {
+                    action = 1; args += 4; while (*args == ' ') ++args;
+                    if (!*args) kind = 0;
+                    else if (streq(args, "speaker", 7) && (!args[7] || args[7] == ' ')) { kind = 1; args += 7; }
+                    else if (streq(args, "headphone", 9) && (!args[9] || args[9] == ' ')) { kind = 2; args += 9; }
+                    else if (streq(args, "line", 4) && (!args[4] || args[4] == ' ')) { kind = 3; args += 4; }
+                    else valid = 0;
+                    while (*args == ' ') ++args;
+                    if (valid && *args) {
+                        if (streq(args, "alt", 3) && !args[3]) action = 2;
+                        else valid = 0;
+                    }
+                }
+            }
+            if (!valid) print("Usage: audio | audio firmware | audio unmute | audio status | audio mute | audio volume <0..100> | audio test [speaker|headphone|line] [alt]\n");
+            else {
+                uint64_t result;
+                __asm__ volatile("syscall" : "=a"(result) : "a"(224), "D"(action), "S"(kind) : "rcx", "r11", "memory");
+                if ((int64_t)result == -2) print("Audio is busy; try again after the current test.\n");
+                else if ((int64_t)result == -3) print("That output has no supported analog route.\n");
+                else if ((int64_t)result == -5) print("No alternate DAC route is advertised for this output.\n");
+                else if ((int64_t)result == -6) print("Firmware mute control is unavailable here. See 'open bootlog'.\n");
+                else if ((int64_t)result < 0) print("Audio probe/test failed. Run 'open bootlog' for Audio: diagnostics.\n");
+                else if (action == 3) print((result & 0x40) ? "ThinkPad EC mute bit is set.\n" : "ThinkPad EC mute bit is clear.\n");
+                else if (action == 6) {
+                    print("Volume: ");print_dec(result&255);print((result&256)?"% (muted)\n":"%\n");
+                }
+                else if (action == 11 || action == 12) print("Audio control updated.\n");
+                else if (action == 4) print("ThinkPad EC mute bit is clear. Run 'audio test speaker' to check sound.\n");
+                else if (action) print("Test DMA completed. Confirm whether you heard the tone.\n");
+                else {
+                    print("Analog routes:");
+                    if (result & 2) print(" speaker");
+                    if (result & 4) print(" headphone");
+                    if (result & 8) print(" line");
+                    print("\nUse 'audio test speaker' or 'audio test headphone'.\n");
+                }
+            }
         } else if (streq(buf, "cd", 2) && (buf[2] == ' ' || buf[2] == '\0')) {
             const char* target = "/";
             if (buf[2] == ' ') {

@@ -248,6 +248,18 @@ USER_CFLAGS = -O0 -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
 user/init.o: user/init.c user/shell_line.h user/wiz_cmd.h src/core/wiz.h src/core/app.h src/fs/fileinfo.h
 	$(CC) $(USER_CFLAGS) -I. -c $< -o $@
 
+user/mp3_player.o: user/mp3_player.cpp user/audio_resampler.h user/audio_sinc_table.h third_party/minimp3/minimp3.h user/codec_libc/string.h user/codec_libc/stdlib.h
+	$(CXX) $(USER_CFLAGS) -O2 -std=c++20 -fno-exceptions -fno-rtti -I. -Iuser/codec_libc -c $< -o $@
+
+mp3_player.elf: user/mp3_player.o
+	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
+
+user/fn_diag.o: user/fn_diag.cpp src/drivers/fn_trace.h
+	$(CXX) $(USER_CFLAGS) -O2 -std=c++20 -fno-exceptions -fno-rtti -I. -c $< -o $@
+
+fn_diag.elf: user/fn_diag.o
+	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
+
 init.elf: user/init.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
@@ -396,7 +408,7 @@ build/console.elf: user/console.o
 win_test.elf: user/win_test.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
-initrd.tar: init.elf counter.elf win_test.elf gpu_test.elf build/console.elf $(PACKAGES) assets/fonts/selawik/LICENSE.txt assets/fonts/selawik/selawk.ttf $(wildcard assets/icons/hicolor/*/apps/*.png) third_party/stb/LICENSE Makefile
+initrd.tar: init.elf fn_diag.elf mp3_player.elf counter.elf win_test.elf gpu_test.elf build/console.elf $(PACKAGES) assets/fonts/selawik/LICENSE.txt assets/fonts/selawik/selawk.ttf $(wildcard assets/icons/hicolor/*/apps/*.png) third_party/stb/LICENSE third_party/minimp3/LICENSE Makefile
 	rm -rf initrd_root
 	mkdir -p initrd_root/bin
 	cp init.elf initrd_root/bin/
@@ -410,6 +422,8 @@ initrd.tar: init.elf counter.elf win_test.elf gpu_test.elf build/console.elf $(P
 	cp $(PACKAGE_DIR)/task_manager.wiz initrd_root/bin/
 	cp $(PACKAGE_DIR)/image_viewer.wiz initrd_root/bin/
 	mkdir -p initrd_root/share/system
+	cp mp3_player.elf initrd_root/share/system/
+	cp fn_diag.elf initrd_root/share/system/
 	cp build/console.elf initrd_root/share/system/
 	mkdir -p initrd_root/share/fonts
 	cp assets/fonts/selawik/LICENSE.txt initrd_root/share/fonts/selawik.txt
@@ -417,6 +431,7 @@ initrd.tar: init.elf counter.elf win_test.elf gpu_test.elf build/console.elf $(P
 	mkdir -p initrd_root/share/icons
 	cp -r assets/icons/hicolor initrd_root/share/icons/
 	cp third_party/stb/LICENSE initrd_root/share/stb-image-license.txt
+	cp third_party/minimp3/LICENSE initrd_root/share/minimp3-license.txt
 	tar -cf initrd.tar --format=ustar -C initrd_root .
 
 iso: all usb-image
@@ -474,10 +489,45 @@ run: iso
 		-device usb-kbd \
 		-drive if=none,id=stick,format=raw,file=$(PERSIST_DISK) \
 		-device usb-storage,drive=stick,bootindex=2
+
+# Analog audio diagnostic backend. QEMU host output uses its selected backend;
+# e.g. make run-audio QEMU_AUDIO='-audiodev pa,id=audio'.
+QEMU_AUDIO ?= -audiodev driver=none,id=audio
+run-audio: iso
+	$(if $(OVMF),,$(error No OVMF firmware found; set OVMF=/path/to/OVMF_CODE.fd))
+	qemu-system-x86_64 -machine q35 -m 512M -bios $(OVMF) \
+		-drive if=none,id=bootcd,media=cdrom,readonly=on,file=wyzar.iso \
+		-device ide-cd,drive=bootcd,bootindex=1 \
+		-device qemu-xhci,id=xhci -device usb-kbd -device usb-mouse \
+		-drive if=none,id=stick,format=raw,file=$(PERSIST_DISK) \
+		-device usb-storage,drive=stick,bootindex=2 \
+		$(QEMU_AUDIO) -device intel-hda -device hda-duplex,audiodev=audio \
+		-no-reboot -no-shutdown -rtc base=localtime
+
+test-audio:
+	mkdir -p .storage-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/hda_topology_test.cpp -o .storage-test/hda-topology-test
+	.storage-test/hda-topology-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/hda_command_test.cpp -o .storage-test/hda-command-test
+	.storage-test/hda-command-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/hda_link_test.cpp -o .storage-test/hda-link-test
+	.storage-test/hda-link-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/thinkpad_audio_test.cpp -o .storage-test/thinkpad-audio-test
+	.storage-test/thinkpad-audio-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. tests/audio_stream_test.cpp -o .storage-test/audio-stream-test
+	.storage-test/audio-stream-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. tests/volume_popup_test.cpp -o .storage-test/volume-popup-test
+	.storage-test/volume-popup-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. tests/fn_trace_test.cpp -o .storage-test/fn-trace-test
+	.storage-test/fn-trace-test
+
+.PHONY: run-audio test-audio
 	
 
 
 clean:
+	rm -f user/fn_diag.o fn_diag.elf
+	rm -f user/mp3_player.o mp3_player.elf
 	rm -f user/gpu_test.o gpu_test.elf
 	rm -f user/image_viewer.o user/image_codec.o image_viewer.elf image_viewer.wiz
 	rm -rf iso_root initrd_root $(PACKAGE_DIR) build/console.elf $(OBJ) $(OBJ:.o=.d) $(EXT4_OBJ) $(EXT4_OBJ:.o=.d) user/init.o user/counter.o user/win_test.o user/bundle_demo.o user/explorer.o user/notepad.o user/task_manager.o user/console.o wyzar wyzar.iso myos myos.iso init.elf counter.elf win_test.elf bundle_demo.elf explorer.elf notepad.elf task_manager.elf counter.wiz win_test.wiz bundle_demo.wiz initrd.tar

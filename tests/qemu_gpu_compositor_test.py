@@ -65,6 +65,14 @@ def main():
         frame()
         assert value('g_gpu_test_scene_repair_accepted',1),'Opaque taskbar popup rejected retained animation or its cutout'
         print('Retained app picker: cutout and full panel pixels survive corruption, stale clips and hover on both destination indices.',flush=True)
+        debug.write(address('g_gpu_test_scene_repair_request'),b'\5')
+        frame()
+        assert value('g_gpu_test_scene_repair_accepted',1),'Volume popup lost its retained cutout or content repaint'
+        print('Retained volume popup: full pixels, slider/mute changes, stale clips and both destination indices passed.',flush=True)
+        debug.write(address('g_gpu_test_scene_repair_request'),b'\6')
+        frame()
+        assert value('g_gpu_test_scene_repair_accepted',1),'Covered-log volume updates repainted the log or escaped cheap retained repairs'
+        print('Volume under opaque fullscreen Rainbow: covered Boot Log unchanged, tray/panel repairs submit no GPU work, complete popup pixels preserved.',flush=True)
         assert value('g_gpu_test_calls')>0
         assert value('g_gpu_test_rainbow_calls')>0
         assert value('g_titlebar_cache_renders')>0

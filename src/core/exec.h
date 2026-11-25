@@ -206,7 +206,7 @@ static int64_t launch_program(const char* path,bool desktop,bool* gui,const char
     auto* trace=gpu_launch_begin(path);
     if(app_path_is_shell(path)&&!desktop)return -1;
     *gui=exec_is_gui(path);bool host=desktop&&!*gui;
-    if(document&&*document&&!*gui)return -1; // Document handlers currently require a GUI package.
+    if(document&&*document&&!*gui&&desktop)return -1; // Private console hosts do not forward documents yet.
     Task* t=host?exec_console_host(path):execve_path(path);if(!t)return -1;
     t->parent_pid=(desktop||*gui)?0:g_current_task?g_current_task->pid:0;
     if(g_current_task)strcpy(t->cwd,g_current_task->cwd);

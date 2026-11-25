@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / '.storage-test'
 IMAGE = OUT / 'usb.img'
 BOOT_ISO = False
+ISO_PATH = ROOT / 'wyzar.iso'
 
 
 class Qemu:
@@ -40,7 +41,7 @@ class Qemu:
             command += ['-drive', f'if=none,id=stick,format=raw,file={IMAGE}',
                         '-device', f'usb-storage,drive=stick,bootindex={2 if BOOT_ISO else 1}' + (f',bus=xhci.0,port={hub_port}' if hub_depth else '')]
         if BOOT_ISO:
-            command += ['-drive', f'if=none,id=bootcd,media=cdrom,readonly=on,file={ROOT / "wyzar.iso"}',
+            command += ['-drive', f'if=none,id=bootcd,media=cdrom,readonly=on,file={ISO_PATH}',
                         '-device', 'ide-cd,drive=bootcd,bootindex=1']
         command += list(extra_args)
         self.proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

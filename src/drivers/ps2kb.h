@@ -7,6 +7,8 @@
 #include "tty.h"
 #include "terminal.h"
 #include "wm.h"
+#include "audio_hotkeys.h"
+#include "fn_trace.h"
 
 // ── Scancode Set 1 ───────────────────────────────────────────────────────────
 static const char ps2_set1_map[] = {
@@ -60,6 +62,7 @@ void ps2kb_irq_handler() {
     if (status & 0x20)    return; // Data is for mouse (IRQ12)
 
     uint8_t scancode = inb(0x60);
+    g_fn_trace.append(g_tick_count,0,scancode);
 
     if (scancode == 0xE0) {
         ps2_e0_prefix = true;
@@ -93,6 +96,7 @@ void ps2kb_irq_handler() {
 
     bool repeat=ps2_track_key(scancode,was_e0);
     uint32_t mods=ps2_update_modifiers();
+    if(g_audio_hotkeys.accept(was_e0,scancode,repeat,g_tick_count))return;
     if(scancode==0x1c&&ps2_clipboard_enter&&!g_clipboard_open)return;
     if(scancode==0x2f){
         if(ps2_clipboard_v)return;
