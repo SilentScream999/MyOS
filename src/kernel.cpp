@@ -1272,9 +1272,12 @@ void compositor_thread_main() {
         // Starting its successor immediately avoids adding a timer/yield delay
         // after vblank. GPU waits still block and let other tasks run.
         // Software presentation and idle loops retain the timed cadence below.
-        wm_gpu_perf_sample(rdtsc());
-        log_app_launches(rdtsc());
-        log_menu_opens(rdtsc());
+        if(GPU_WORKLOAD || GPU_FRAME_DIAGNOSTICS){
+            const uint64_t sample_now=rdtsc();
+            wm_gpu_perf_sample(sample_now);
+            log_app_launches(sample_now);
+            log_menu_opens(sample_now);
+        }
         uint64_t final_now = rdtsc();
         if(g_gpu_present_count!=frame_present_count){
             target_tsc=final_now;

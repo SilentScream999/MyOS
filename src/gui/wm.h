@@ -2985,7 +2985,6 @@ static void wm_gpu_perf_sample(uint64_t now) {
     if(current!=signature||!started){
         signature=current;started=now;frames=g_compositor_frame;previous=g_gpu_perf;remaining=2;
         if(GPU_RCS_ALPHA){
-            g_cpu_alpha_pixel_limit=0;
             for(auto& rejection:g_scanout_rejections)rejection={};
         }
         g_rain_slowest={};g_gpu_timeline_slowest={};g_gpu_execution_slowest={};g_gpu_timeline_last_latch=0;

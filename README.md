@@ -52,7 +52,7 @@ options; header dependencies are tracked automatically.
 | `GPU_PRESENT=0` | `GPU_COMPOSE` | Use CPU presentation instead of supported vblank page flips |
 | `GPU_RENDER=1` | follows `GPU_COMPOSE` | Gen9 render-engine scaling after runtime discovery and pixel readback; `0` keeps blitter composition |
 | `GPU_RCS_ALPHA=0` | follows `GPU_RENDER` | Use CPU SIMD for translucency while keeping validated Intel scaling and presentation |
-| `GPU_WORKLOAD=1 GPU_FRAME_DIAGNOSTICS=1` | `0` | Collect GPU workload counts and detailed frame timings |
+| `GPU_WORKLOAD=1 GPU_FRAME_DIAGNOSTICS=1` | `0` | Enable GPU performance reports, workload counts and detailed frame timings |
 | `DEBUG=1` | `0` | Fixed-size USB root policy; not a compiler debug switch |
 | `BOOT_DIAGNOSTICS=1` | `0` | Extra boot timings |
 | `CLOCK_UTC_OFFSET_MIN=-420` | `0` | Minutes added to RTC for tray display |

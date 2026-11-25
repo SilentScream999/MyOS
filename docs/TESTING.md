@@ -282,6 +282,8 @@ cache handoffs, timeouts or sleep policy were added or removed for measurement.
 The limit is 32 samples per boot.
 
 `make test-gpu-perf` checks sleep threshold boundaries and sample subtraction.
+Periodic GPU summaries and launch/menu reports require `GPU_WORKLOAD=1` or
+`GPU_FRAME_DIAGNOSTICS=1`. Normal builds still report GPU startup checks and errors.
 Use the measurement flags in [BUILD_CONFIGS](../BUILD_CONFIGS.txt) to
 reproduce the Kaby Lake measurements on the standard `wyzar-usb.img`. The
 default rendering path checks multi-band alpha readback before enabling desktop
@@ -709,9 +711,12 @@ builds. The hardware streaming test raised boot CPU from about 6% to 22%
 and still showed roughly 50 ms between flips under RCS translucency.
 
 With a mock GPU image built using `GPU_COMPOSITOR_TEST`, `GPU_PRESENT_TEST` and
-`GPU_RENDER_TEST`, `python3 tests/qemu_gpu_perf_test.py` verifies matching sample
+`GPU_RENDER_TEST`, add either measurement flag and run
+`python3 tests/qemu_gpu_perf_test.py` to verify matching sample
 windows, phase counters, zero mock GPU sleeps and bounded output. Mock phase
 timings do not represent Intel execution or vblank behavior.
+Build with both flags off and pass `--quiet` to check that periodic reports
+stay out of Boot Log.
 
 `make test-alpha-renderer` checks SIMD source-over against the scalar reference
 with exhaustive alpha/channel values and randomized scaling, clipping,
@@ -896,7 +901,7 @@ To test WM integration without Intel hardware, use the explicit test backend:
 ```sh
 make clean
 make iso CXX='clang++ -DGPU_COMPOSITOR_TEST -DGPU_PRESENT_TEST -DGPU_RENDER_TEST' \
-  GPU_RCS_ALPHA=0 GPU_EXACT_REPAIRS=1 GPU_RETAINED_MENU=1 \
+  GPU_RCS_ALPHA=0 GPU_ALPHA_REPAIR_BATCH=1 GPU_EXACT_REPAIRS=1 GPU_RETAINED_MENU=1 \
   PERSIST_DISK=.storage-test/gpu-test.img ROOT_MIB=64
 python3 tests/qemu_gpu_compositor_test.py
 ```
