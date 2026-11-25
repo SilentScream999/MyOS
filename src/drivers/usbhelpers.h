@@ -121,6 +121,19 @@ struct USBControlGuard {
     USBControlGuard() { __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) :: "memory"); }
     ~USBControlGuard() { if (flags & (1u << 9)) __asm__ volatile("sti" ::: "memory"); }
 };
+// Long synchronous discovery/EP0 ownership is distinct from bulk disk I/O:
+// disk waits still need the input dispatcher to deliver HID completions.
+static Task* usb_control_owner=nullptr;
+static unsigned usb_control_depth=0;
+struct USBTransactionGuard {
+    storage_guard serialization;
+    USBTransactionGuard(){USBControlGuard irq;
+        usb_control_owner=g_current_task;++usb_control_depth;
+    }
+    ~USBTransactionGuard(){USBControlGuard irq;
+        if(!--usb_control_depth)usb_control_owner=nullptr;
+    }
+};
 /* ── get_usb_response ─────────────────────────────────────── */
 static USB_Response get_usb_response_raw(XHCIController* hc, int timeout_ms = 250) {
     uint64_t end = _usb_rdtsc() + (_usb_tsc_hz() / 1000) * (uint64_t)timeout_ms;
@@ -220,7 +233,9 @@ static USB_Response do_control_transfer(USBDevice &dev,
 										USBSetupPacket* setup,
 										volatile uint8_t* data_buffer,
 										uint16_t data_len) {
-	USBControlGuard guard;
+	// Serialize synchronous EP0/ring ownership without masking the timer for
+	// descriptor waits, resets and device settle delays.
+	USBTransactionGuard guard;
 	if (usb_probe_expired(dev.hc)) { USB_Response empty = {}; return empty; }
 	uint64_t setup_pointer = dev.ep0_ring->phys + dev.ep0_ring->enq * 16u;
 	uint64_t data_pointer = 0;
@@ -363,7 +378,7 @@ static bool hub_clear_port_feature(USBDevice &hub, uint16_t port, uint16_t featu
 
 static bool hub_get_port_status(USBDevice &hub, uint16_t port, uint8_t* status4) {
 	++g_usb_hub_status_requests;
-	USBControlGuard guard;
+	USBTransactionGuard guard;
 	static volatile uint8_t* scratch[MAX_CONTROLLERS] = {};
 	volatile uint8_t*& tmp = scratch[hub.hc - xhci_hc];
 	if (!tmp) tmp = (volatile uint8_t*)alloc_table();
@@ -404,7 +419,7 @@ static HubStatusWatch hub_watch[MAX_HUBS] = {};
 
 static bool hub_ack_hub_changes(USBDevice& hub) {
     ++g_usb_hub_status_requests;
-    USBControlGuard guard;
+    USBTransactionGuard guard;
     static volatile uint8_t* buffers[MAX_CONTROLLERS] = {};
     volatile uint8_t*& buf = buffers[hub.hc - xhci_hc];
     if (!buf) buf = (volatile uint8_t*)alloc_table();

@@ -52,10 +52,17 @@ static void exact_scanout_test(){
     assert(hidden_stats.count==1);
     const auto bounded=hidden_stats.rects[0];
     assert(bounded.x1==50&&bounded.x2==80&&bounded.y1==20&&bounded.y2==81);
-    assert(gpu_exact_frame_rect(hidden_stats,{50,110,80,112},W,H,T,false,false));
+    assert(gpu_exact_frame_rect(hidden_stats,{50,110,80,112},W,H,T,false,false,50));
     assert(hidden_stats.count==2);
     const auto taskbar=hidden_stats.rects[1];
-    assert(taskbar.x1==0&&taskbar.x2==W&&taskbar.y1==110&&taskbar.y2==112);
+    assert(taskbar.x1==50&&taskbar.x2==80&&taskbar.y1==110&&taskbar.y2==112);
+    VisibleRegion legacy_tray{},left_of_tray{},popup_tray{};
+    assert(gpu_exact_frame_rect(legacy_tray,{50,110,80,112},W,H,T,false,false));
+    assert(legacy_tray.rects[0].x1==0&&legacy_tray.rects[0].x2==W);
+    assert(gpu_exact_frame_rect(left_of_tray,{49,110,80,112},W,H,T,false,false,50));
+    assert(left_of_tray.rects[0].x1==0&&left_of_tray.rects[0].x2==W);
+    assert(gpu_exact_frame_rect(popup_tray,{50,110,80,112},W,H,T,true,false,50));
+    assert(popup_tray.rects[0].x1==0&&popup_tray.rects[0].x2==W);
     for(unsigned y=0;y<H;++y)for(unsigned x=0;x<W;++x){unsigned hits=0;
         for(unsigned i=0;i<exact.count;++i){auto r=exact.rects[i];hits+=x>=(unsigned)r.x1&&x<(unsigned)r.x2&&y>=(unsigned)r.y1&&y<(unsigned)r.y2;}
         assert(hits==((y>=20&&y<60)||(y>=60&&y<=80&&x>=50&&x<=79)));
@@ -63,13 +70,18 @@ static void exact_scanout_test(){
     std::array<unsigned,W*H> scene{},buffers[2]{};
     VisibleRegion pending[2]{};unsigned cursor[2]={0,0};bool drawn[2]{};
     for(unsigned frame=1;frame<=80;++frame){
+        // Alternate retained-tray and ordinary shell callers while each back
+        // buffer carries pending damage and an old cursor from earlier frames.
+        int tray_left=frame%2?100:-1;
         DamageList changed{};
         for(unsigned i=0;i<8;++i){unsigned x=2+((frame*13+i*17)%150),y=64+((frame*3+i*7)%40);
             scene[y*W+x]=frame*100+i;damage_add(&changed,x,x,y,y);}
-        for(auto& p:pending)assert(gpu_exact_frame_damage(p,changed,W,H,T,false));
+        unsigned tx=120+frame%40,ty=110+frame%8;
+        scene[ty*W+tx]=frame*100+99;damage_add(&changed,tx,tx,ty,ty);
+        for(auto& p:pending)assert(gpu_exact_frame_damage(p,changed,W,H,T,false,true,tray_left));
         unsigned back=frame%2;
         if(drawn[back])assert(gpu_exact_frame_rect(pending[back],{(int)(cursor[back]%W),(int)(cursor[back]/W),
-            (int)(cursor[back]%W)+1,(int)(cursor[back]/W)+1},W,H,T,false));
+            (int)(cursor[back]%W)+1,(int)(cursor[back]/W)+1},W,H,T,false,true,tray_left));
         for(unsigned i=0;i<pending[back].count;++i){auto r=pending[back].rects[i];
             for(int y=r.y1;y<r.y2;++y)for(int x=r.x1;x<r.x2;++x)buffers[back][y*W+x]=scene[y*W+x];}
         assert(buffers[back]==scene);pending[back].count=0;
@@ -159,6 +171,11 @@ int main() {
     assert(gpu_execution_record(execution,1000000,100,stamps,250,150,1000000));
     assert(execution.samples==1&&execution.queue_us==10&&execution.setup_us==10&&execution.parse_us==60);
     assert(execution.rt_us==30&&execution.drain_us==20&&execution.tail_us==20&&execution.observed_us==150);
+    GpuExecutionTiming delayed_observation{};
+    uint32_t quick_draw[]={110,120,180,210,230};
+    assert(gpu_execution_record(delayed_observation,1000000,100,quick_draw,100100,100000,1000000));
+    assert(delayed_observation.samples==1&&delayed_observation.rt_us==30&&
+           delayed_observation.tail_us==99870&&delayed_observation.observed_us==100000);
     uint32_t wrapped[]={0xfffffff5u,0xfffffffau,10,15,20};
     assert(gpu_execution_record(execution,1000000,0xfffffff0u,wrapped,40,56,1000000));
     auto before=execution;

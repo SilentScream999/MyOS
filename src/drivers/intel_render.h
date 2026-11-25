@@ -5,6 +5,7 @@
 #include "gpu_gen9_workarounds.h"
 #include "gpu_upload_cache.h"
 #include "gpu_alpha_coverage.h"
+#include "gpu_alpha_tail_wait.h"
 
 // One kernel-owned logical RCS context. All allocations stay pinned until
 // reboot, so neither a delayed context save nor a late GPU write can hit freed
@@ -35,6 +36,9 @@ static uint32_t render_source_address(unsigned slot){return 0x40000000u+slot*0x0
 static uint64_t g_render_map_updates=0,g_render_map_reuses=0;
 static uint64_t g_render_draws=0;
 static GpuTextureDraw g_render_current_draw{};
+static uint64_t g_render_alpha_workload=0;
+static GpuAlphaWaitProfile g_render_alpha_wait{};
+static GpuAlphaPollBudget g_render_alpha_poll{};
 static bool g_render_isolated_probe=false;
 static bool g_render_tlb_dirty=true;
 static constexpr uint32_t RENDER_RING_OFFSET=96*1024;
@@ -289,8 +293,14 @@ static bool render_submit(bool texture,bool timing_probe=false) {
         return render_stop("GPU: RCS ring did not retire to the submitted tail","HEAD");
     }
     auto* fence=(volatile uint32_t*)(g_render_storage+RENDER_FENCE_OFFSET);
+    const bool regular_sample=g_gpu_timeline.begin&&g_gpu_timeline.measure;
+    const bool trace_completion=GPU_FRAME_DIAGNOSTICS&&g_gpu_timeline.begin&&texture&&g_render_ready;
+    const bool tail_eligible=GPU_RCS_ALPHA&&texture&&g_render_ready&&!g_render_isolated_probe&&
+        g_gpu_direct_back>=0&&g_rain_trace.update&&g_render_current_draw.blend&&g_render_alpha_workload&&
+        g_render_timestamp_ready&&g_render_timestamp_hz&&tsc_hz;
+    if(tail_eligible)g_render_alpha_wait.select(g_render_alpha_workload);
     bool timed=g_render_timestamp_hz&&(timing_probe||
-        (g_gpu_timeline.begin&&g_gpu_timeline.measure&&g_render_timestamp_ready));
+        ((regular_sample||trace_completion||tail_eligible)&&g_render_timestamp_ready));
     if(timed){
         uint32_t sentinel=render_read(0x2358)-(uint32_t)g_render_timestamp_hz;
         for(unsigned i=16;i<32;++i)fence[i]=sentinel;
@@ -329,7 +339,8 @@ static bool render_submit(bool texture,bool timing_probe=false) {
             if(!g_rain_trace.alpha_draws)g_rain_trace.alpha_submit=gpu_tsc();
             ++g_rain_trace.alpha_draws;
         }
-        if(timed){timing_cpu_first=gpu_tsc();submitted=render_read(0x2358);}
+        if(timed||trace_completion)timing_cpu_first=gpu_tsc();
+        if(timed)submitted=render_read(0x2358);
         *elsp=0;*elsp=0;*elsp=1;*elsp=(uint32_t)descriptor;
         (void)render_read(0x2234);
     }
@@ -339,6 +350,15 @@ static bool render_submit(bool texture,bool timing_probe=false) {
     __asm__ volatile("pushfq; pop %0":"=r"(wait_flags));
     gpu_trace_stage("WAIT");
     bool retired=false,fenced=false;
+    uint64_t tail_before=g_render_alpha_poll.total_ticks;
+    bool tail_used=false;
+    auto finish_tail=[&](uint64_t now){
+        g_render_alpha_poll.finish(now);
+        g_gpu_perf.alpha_tail_ticks+=g_render_alpha_poll.total_ticks-tail_before;
+    };
+#if GPU_FRAME_DIAGNOSTICS
+    GpuFrameTimeline::RcsCompletion completion{};
+#endif
     for(;;){
         uint32_t write=render_read(0x23A0)&7;
         if(write<6){
@@ -358,18 +378,46 @@ static bool render_submit(bool texture,bool timing_probe=false) {
             fenced=(*fence==sequence);
         }
         if(fenced && retired){
-            gpu_timeline_ready(gpu_tsc());
+            const uint64_t ready=gpu_tsc();
+            finish_tail(ready);
+            gpu_timeline_ready(ready);
             if(fence[2]!=sequence||fence[4]!=sequence||fence[5]!=sequence||fence[6]!=sequence||fence[8]!=sequence)
                 return render_stop("GPU: RCS command checkpoint mismatch","BADSTAMP");
             if(trace_alpha)g_rain_trace.alpha_done=gpu_tsc();
-            if(timed){
+            bool capture=false;
+#if GPU_FRAME_DIAGNOSTICS
+            capture=trace_completion&&ready-timing_cpu_first>g_gpu_timeline.slowest_rcs.wait_ticks;
+            if(capture){
+                completion.submitted=timing_cpu_first;
+                completion.observed=ready;
+                completion.wait_ticks=ready-timing_cpu_first;
+                completion.sequence=sequence;
+            }
+#endif
+            if(timed&&(timing_probe||regular_sample||capture||tail_eligible)){
                 uint32_t observed=render_read(0x2358);uint64_t cpu_last=gpu_tsc();
                 gpu_clflush_nofence(fence+16,64);gpu_mfence();
                 uint32_t stamps[5];for(unsigned i=0;i<5;++i)stamps[i]=fence[16+i];
-                auto& result=timing_probe?g_render_timing_probe:g_gpu_timeline.rcs_gpu;
-                gpu_execution_record(result,g_render_timestamp_hz,submitted,stamps,observed,
-                    cpu_last-timing_cpu_first,tsc_hz);
+                if(tail_eligible){
+                    GpuExecutionTiming sample{};
+                    gpu_execution_record(sample,g_render_timestamp_hz,submitted,stamps,observed,
+                        cpu_last-timing_cpu_first,tsc_hz);
+                    g_render_alpha_wait.observe(sample);
+                    g_gpu_perf.alpha_tail_prediction_us=g_render_alpha_wait.predicted_us;
+                }
+                if(timing_probe||regular_sample){
+                    auto& result=timing_probe?g_render_timing_probe:g_gpu_timeline.rcs_gpu;
+                    gpu_execution_record(result,g_render_timestamp_hz,submitted,stamps,observed,
+                        cpu_last-timing_cpu_first,tsc_hz);
+                }
+#if GPU_FRAME_DIAGNOSTICS
+                if(capture)gpu_execution_record(completion.hardware,g_render_timestamp_hz,submitted,
+                    stamps,observed,cpu_last-timing_cpu_first,tsc_hz);
+#endif
             }
+#if GPU_FRAME_DIAGNOSTICS
+            if(capture)g_gpu_timeline.slowest_rcs=completion;
+#endif
             g_render_tlb_dirty=false;g_render_busy=false;return true;
         }
         // Always sample completion after waking, even if scheduling delayed
@@ -378,10 +426,37 @@ static bool render_submit(bool texture,bool timing_probe=false) {
         // Short draws retire without a scheduler round trip. Longer work
         // yields the compositor CPU while preserving both retirement checks.
         if(g_render_ready && !g_render_isolated_probe &&
-           gpu_tsc()-started>spin && (wait_flags&(1u<<9)) && g_current_task)
+           gpu_tsc()-started>spin && (wait_flags&(1u<<9)) && g_current_task){
+            // A short, shared tail allowance avoids sleeping a whole timer
+            // tick when a matching alpha workload is almost at its GPU drain.
+            // Wrong predictions exhaust the allowance and resume normal sleeps.
+            uint64_t now=gpu_tsc();
+            if(tail_eligible&&g_render_alpha_poll.poll(g_compositor_frame,now,tsc_hz,
+                    g_render_alpha_wait.near_completion(now-started,tsc_hz))){
+                if(!tail_used){tail_used=true;++g_gpu_perf.alpha_tail_windows;}
+                __asm__ volatile("pause");continue;
+            }
+#if GPU_FRAME_DIAGNOSTICS
+            if(trace_completion){
+                CompositorSleepTrace wake{};
+                auto before=gpu_tsc();
+                gpu_perf_sleep_one(g_gpu_perf.rcs_sleep,tsc_hz,[&](uint64_t ms){task_sleep_ms(ms,&wake);});
+                auto elapsed=gpu_tsc()-before;
+                if(elapsed>completion.max_sleep){
+                    completion.max_sleep=elapsed;
+                    bool valid=wake.ready&&wake.ready>=wake.start&&wake.resumed>=wake.ready;
+                    completion.sleep_ready_pid=valid?wake.ready_pid:-1;
+                    completion.sleep_to_ready=valid?wake.ready-wake.start:0;
+                    completion.ready_to_resume=valid?wake.resumed-wake.ready:0;
+                }
+            }else
+#endif
             gpu_perf_sleep_one(g_gpu_perf.rcs_sleep,tsc_hz,[](uint64_t ms){task_sleep_ms(ms);});
+        }
         else __asm__ volatile("pause");
     }
+    finish_tail(gpu_tsc());
+    if(tail_eligible)g_render_alpha_wait={};
     const char* missing=fenced?"NOEXIT":retired?"NOFENCE":
                         fence[5]==sequence?"DRAINED":fence[8]==sequence?"RTCLEAN":fence[6]==sequence?"SCORE":
                         fence[4]==sequence?"PARSED":
@@ -452,6 +527,23 @@ static bool render_texture(const GpuTextureDraw& draw,bool solid_probe=false,
     // The page stays pinned at the address installed during initialization.
     // Its contents can change after retirement without changing its PTE.
     if(!gpu_build_texture_batch(batch,RENDER_BATCH_VA,submitted,solid_probe,rects,count))return false;
+    // Reuse a timing hint only for identical geometry, sampling and surface
+    // policy. Destination address may alternate between equivalent scanouts.
+    g_render_alpha_workload=0;
+    if(GPU_RCS_ALPHA&&submitted.blend&&g_gpu_direct_back>=0&&g_rain_trace.update){
+        uint64_t key=1469598103934665603ULL,pixels=0;
+        auto hash=[&](uint64_t value){key=(key^value)*1099511628211ULL;};
+        hash(submitted.source.address);hash(submitted.source.width);hash(submitted.source.height);hash(submitted.source.pitch);
+        hash(submitted.destination.width);hash(submitted.destination.height);hash(submitted.destination.pitch);
+        hash(submitted.cache_source);hash(submitted.padded);hash(submitted.threads);hash(count);
+        hash((uint32_t)submitted.client.x1);hash((uint32_t)submitted.client.y1);
+        hash((uint32_t)submitted.client.x2);hash((uint32_t)submitted.client.y2);
+        for(unsigned i=0;i<count;++i){const auto& r=rects?rects[i]:draw.clip;
+            hash((uint32_t)r.x1);hash((uint32_t)r.y1);hash((uint32_t)r.x2);hash((uint32_t)r.y2);
+            pixels+=(uint64_t)(r.x2-r.x1)*(r.y2-r.y1);
+        }
+        if(pixels>=65536)g_render_alpha_workload=key?key:1;
+    }
     gpu_clflush_nofence(batch,4096);gpu_mfence();
     if(!render_submit(true))return false;
 #if GPU_WORKLOAD

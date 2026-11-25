@@ -770,6 +770,8 @@ static void wm_resources_reload() {
     if (previous!=&g_empty_catalog) resources::release(previous);
 }
 static void wm_resource_worker() {
+    // Let the timer preempt catalog loading, including its disk reads.
+    __asm__ volatile("sti" ::: "memory");
     for (;;) {
         if (g_resources_requested) {
             g_resources_requested=false;
@@ -1348,12 +1350,15 @@ static inline int32_t wm_fps_width() {
 static inline int32_t wm_tray_w() {
     return wm_clock_width()+wm_fps_width();
 }
+static int32_t wm_tray_damage_left(){
+    int32_t x=(int32_t)fb->width-wm_tray_w()-14;
+    return x>0?x:0;
+}
 
 // Mark the tray (plus the 2px separator left of it) dirty so the compositor repaints the clock.
 static inline void wm_clock_damage() {
     if (!fb) return;
-    int32_t x1 = (int32_t)fb->width - wm_tray_w() - 6 - 8;
-    if (x1 < 0) x1 = 0;
+    int32_t x1 = wm_tray_damage_left();
     int32_t y1 = (int32_t)fb->height - (int32_t)g_taskbar_h;
     if (y1 < 0) y1 = 0;
     wm_dirty_add((uint32_t)x1, fb->width - 1, (uint32_t)y1, fb->height - 1);
@@ -2200,7 +2205,11 @@ static uint64_t wm_menu_pixel_key(){
 // shine=true draws a bright highlight row on top (glass effect).
 static void wm_draw_button(uint32_t min_y,uint32_t max_y,int32_t bx, int32_t by, int32_t bw, int32_t bh,
                     uint32_t top_c, uint32_t bot_c,
-                    uint32_t edge_c, bool shine) {
+                    uint32_t edge_c, bool shine,int32_t clip_left=0,int32_t clip_right=INT32_MAX) {
+    int32_t left=bx>clip_left?bx:clip_left;if(left<0)left=0;
+    int32_t right=bx+bw<clip_right?bx+bw:clip_right;
+    if(right>(int32_t)fb->width)right=fb->width;
+    if(left>=right)return;
     for (int32_t y = by; y < by + bh; y++) {
         if (y < (int32_t)min_y || y > (int32_t)max_y) continue;
         if (y < 0 || (uint32_t)y >= fb->height) continue;
@@ -2212,17 +2221,14 @@ static void wm_draw_button(uint32_t min_y,uint32_t max_y,int32_t bx, int32_t by,
         uint32_t row_clr = 0xFF000000 | ((uint32_t)rr<<16) | ((uint32_t)gg<<8) | bb;
         if (shine && y == by) row_clr = 0xFFAABBEE;  // top shine row
 
-        int32_t sx = bx < 0 ? 0 : bx;
-        int32_t ex = bx + bw; if (ex > (int32_t)fb->width) ex = (int32_t)fb->width;
-        if (ex > sx) memset_32(drow + sx, row_clr, (uint32_t)(ex - sx));
+        memset_32(drow+left,row_clr,right-left);
 
         // Left/right 1px edges
-        if (bx >= 0 && (uint32_t)bx < fb->width)           drow[bx]       = edge_c;
-        if (bx+bw-1 >= 0 && (uint32_t)(bx+bw-1) < fb->width) drow[bx+bw-1] = edge_c;
+        if(bx>=left&&bx<right)drow[bx]=edge_c;
+        if(bx+bw-1>=left&&bx+bw-1<right)drow[bx+bw-1]=edge_c;
     }
     // Top / bottom edge lines
-    for (int32_t px = bx; px < bx + bw; px++) {
-        if (px < 0 || (uint32_t)px >= fb->width) continue;
+    for(int32_t px=left;px<right;++px){
         auto edge_px = [&](int32_t ey, uint32_t ec) {
             if (ey < (int32_t)min_y || ey > (int32_t)max_y) return;
             if (ey < 0 || (uint32_t)ey >= fb->height) return;
@@ -2390,10 +2396,21 @@ static unsigned g_top_alpha_opaque_count=0;
 static uint64_t g_retained_menu_key=0;
 static VisibleRect g_retained_menu_panel{};
 static bool g_retained_scene_invalidated=false;
+static uint64_t g_retained_popup_layout=0;
+static uint64_t wm_retained_popup_layout(){
+    if(!g_taskbar_popup)return 0;
+    auto panel=wm_taskbar_panel(wm_taskbar_snapshot());
+    uint64_t value=1469598103934665603ULL;
+    auto hash=[&](uint64_t part){value=(value^part)*1099511628211ULL;};
+    hash(g_taskbar_popup);hash(g_taskbar_group_id);hash(g_taskbar_anchor);
+    hash(panel.x);hash(panel.y);hash(panel.w);hash(panel.h);hash(panel.count);
+    return value;
+}
 static uint64_t wm_retained_animation_layout(){
     uint64_t value=1469598103934665603ULL;
     auto hash=[&](uint64_t part){value=(value^part)*1099511628211ULL;};
     hash(g_menu_open);hash(g_clipboard_open);hash(g_taskbar_popup);
+    hash(wm_retained_popup_layout());
 #if GPU_RETAINED_MENU
     if(g_menu_open){int x,y,w,h;wm_menu_geom(&x,&y,&w,&h);hash(x);hash(y);hash(w);hash(h);
         hash(g_decoration_epoch);hash(g_font_scale_100);}
@@ -2416,9 +2433,9 @@ static bool wm_prepare_retained_animation(Window* animation){
     if(!animation||!animation->buffer||!animation->visible||animation->minimized||
        !animation->chrome_drawn||animation->premultiplied||
        animation->canvas_width!=animation->w||animation->canvas_height!=animation->h||
-       (g_menu_open&&!wm_retained_menu_ready())||g_clipboard_open||g_taskbar_popup||!g_gpu_compose_hook)return false;
+       (g_menu_open&&!wm_retained_menu_ready())||g_clipboard_open||!g_gpu_compose_hook)return false;
     bool above=false,found=false,maximized=false;
-    VisibleRect covers[MAX_WINDOWS];unsigned count=0;
+    VisibleRect covers[MAX_WINDOWS+1];unsigned count=0;
     GpuSceneClient client{};
     g_retained_animation_layer_count=0;g_retained_animation_alpha=false;
     g_retained_animation_opaque_pixels=0;
@@ -2426,6 +2443,15 @@ static bool wm_prepare_retained_animation(Window* animation){
     TtyIrqGuard guard;
     if(g_menu_open&&!wm_retained_menu_ready())return false;
     g_retained_menu_key=g_menu_open?wm_menu_pixel_key():0;
+    g_retained_popup_layout=wm_retained_popup_layout();
+    // The app picker is opaque. Keep its pixels in both retained scanouts
+    // and exclude them from Rainbow AND every overlying alpha layer. Hover,
+    // scrolling and content damage still use the ordinary popup renderer.
+    if(g_taskbar_popup){
+        auto panel=wm_taskbar_panel(wm_taskbar_snapshot());
+        if(!panel.count)return false;
+        covers[count++]={panel.x,panel.y,panel.x+panel.w,panel.y+panel.h};
+    }
     if(g_menu_open){int x,y,w,h;wm_menu_geom(&x,&y,&w,&h);
         g_retained_menu_panel=visibility_intersect({x,y,x+w,y+h},{0,0,(int)fb->width,(int)fb->height});}
     for(int s=0;s<g_window_count;++s){
@@ -2556,7 +2582,110 @@ static void wm_copy_cached_menu(VisibleRect r){
     }
 }
 
+// Retained tray repairs share the full taskbar's renderer, including exact
+// gradients, borders and text. Only this opaque strip is touched; no cached
+// scanout pixels or alpha backgrounds are read back.
+static void wm_draw_taskbar_tray(VisibleRect clip,bool background=true){
+    int32_t tb_y=(int32_t)fb->height-(int32_t)g_taskbar_h;
+    clip=visibility_intersect(clip,{wm_tray_damage_left(),tb_y,(int)fb->width,(int)fb->height});
+    if(!visibility_valid(clip))return;
+    ResourceRead resource_read;
+    int32_t old_left=g_ui_clip_left,old_right=g_ui_clip_right;
+    int32_t old_top=g_ui_clip_top,old_bottom=g_ui_clip_bottom;
+    g_ui_clip_left=clip.x1;g_ui_clip_right=clip.x2;g_ui_clip_top=clip.y1;g_ui_clip_bottom=clip.y2;
+    uint32_t min_y=clip.y1,max_y=clip.y2-1;
+    int32_t tbr1=clip.y1,tbr2=clip.y2-1;
+    const int32_t sb_y=tb_y+5,sb_h=(int32_t)g_taskbar_h-10;
+    if(background){
+        // ── Background gradient (deep navy, lighter at top) ──────────────────
+        for (int32_t y = tbr1; y <= tbr2; y++) {
+            if ((uint32_t)y >= fb->height) break;
+            uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
+            uint32_t row_off = (uint32_t)(y - tb_y);
+            uint32_t clr;
+            if      (row_off == 0) clr = 0xFF5a6490;   // bright shelf highlight
+            else if (row_off == 1) clr = 0xFF303555;   // sub-highlight
+            else {
+                uint32_t t = ((row_off - 2) * 255) / (g_taskbar_h > 4 ? g_taskbar_h - 3 : 1);
+                uint8_t r  = (uint8_t)(0x1c + (t * 4) / 255);
+                uint8_t gc = (uint8_t)(0x20 + (t * 3) / 255);
+                uint8_t bc = (uint8_t)(0x38 + (t * 5) / 255);
+                clr = 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)gc << 8) | bc;
+            }
+            memset_32(drow+clip.x1,clr,clip.x2-clip.x1);
+        }
+
+    }
+    // System tray: shared by full taskbar rendering and exact retained repairs.
+    const int32_t TRAY_W = wm_tray_w();
+    int32_t tray_x = (int32_t)fb->width - TRAY_W - 6;
+    int32_t tray_y = sb_y, tray_h = sb_h;
+
+    wm_draw_button(min_y,max_y,tray_x, tray_y, TRAY_W, tray_h,
+            0xFF252a42, 0xFF1a1f35,
+            0xFF303560, false,clip.x1,clip.x2);
+
+    // Clock: time on top, date below (like the Windows taskbar). Only reads the cached g_clock.
+    {
+        uint32_t clock_scale = wm_clock_scale();
+        int32_t fps_width=wm_fps_width();
+        int32_t clock_x=tray_x+fps_width,clock_width=TRAY_W-fps_width;
+        char fps[16];to_str(g_desktop_fps,fps);
+        resources::append(fps,sizeof(fps)," FPS");
+        int32_t ch = wm_text_height(clock_scale);
+        int32_t fps_x=tray_x+(fps_width-wm_text_width(fps,clock_scale))/2;
+        wm_draw_string(fps_x,tray_y+(tray_h-ch)/2,fps,0xFFE6E8FF,clock_scale);
+        char tbuf[16], dbuf[16];
+        int tl, dl = 0;
+        if (g_clock_valid) {
+            tl = rtc_format_time(g_clock, tbuf, CLOCK_SHOW_SECONDS != 0);
+            dl = rtc_format_date(g_clock, dbuf);
+        } else {
+            tbuf[0] = '-'; tbuf[1] = '-'; tbuf[2] = ':'; tbuf[3] = '-'; tbuf[4] = '-'; tbuf[5] = 0;
+            tl = 5;
+        }
+        bool two_lines = dl > 0 && tray_h >= 2 * ch + 2;
+        int32_t ty0 = two_lines ? tray_y + (tray_h - (2 * ch + 2)) / 2
+                                : tray_y + (tray_h - ch) / 2;
+        wm_draw_string((uint32_t)(clock_x + (clock_width - wm_text_width(tbuf, clock_scale)) / 2), (uint32_t)ty0,
+                       tbuf, 0xFFE6E8FF, clock_scale);
+        if (two_lines)
+            wm_draw_string((uint32_t)(clock_x + (clock_width - wm_text_width(dbuf, clock_scale)) / 2), (uint32_t)(ty0 + ch + 2),
+                           dbuf, 0xFF9FA6CC, clock_scale);
+    }
+
+    // Separator between task area and tray
+    for (int32_t y = sb_y + 4; y < sb_y + sb_h - 4; y++) {
+        if (y < (int32_t)min_y || y > (int32_t)max_y) continue;
+        if (y < 0 || (uint32_t)y >= fb->height) continue;
+        uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
+        int32_t sep = tray_x - 6;
+        if(sep>=clip.x1&&sep<clip.x2)drow[sep]=0xFF404870;
+        if(sep+1>=clip.x1&&sep+1<clip.x2)drow[sep+1]=0xFF1a1f35;
+    }
+    g_ui_clip_left=old_left;g_ui_clip_right=old_right;
+    g_ui_clip_top=old_top;g_ui_clip_bottom=old_bottom;
+}
+
 static bool wm_repair_retained_foreground(VisibleRect r){
+#if GPU_EXACT_REPAIRS
+    // Clock/FPS damage is independent of the animation and window stack.
+    // Avoid rebuilding every task button before the critical BCS/RCS chain.
+    bool tray_clear=!g_menu_open;
+    if(g_menu_open&&wm_retained_menu_ready()){
+        int x,y,w,h;wm_menu_geom(&x,&y,&w,&h);
+        tray_clear=y+h<=(int)(fb->height-g_taskbar_h);
+    }
+    if(tray_clear&&!g_clipboard_open&&!g_taskbar_popup&&
+       r.x1>=wm_tray_damage_left()&&r.x2<=(int)fb->width&&
+       r.y1>=(int)(fb->height-g_taskbar_h)&&r.y2<=(int)fb->height&&visibility_valid(r)){
+        GpuPerfTimer timer(g_gpu_perf.tray_repair_ticks);
+        wm_draw_taskbar_tray(r);
+        ++g_gpu_perf.tray_repair_rects;
+        g_gpu_perf.tray_repair_pixels+=(uint64_t)(r.x2-r.x1)*(r.y2-r.y1);
+        return true;
+    }
+#endif
     // Shell bands can contain other decorations with wider repaint rules.
     if(r.y1<60||r.y2>(int)(fb->height-g_taskbar_h))return false;
 #if GPU_RETAINED_MENU
@@ -2571,7 +2700,7 @@ static bool wm_repair_retained_foreground(VisibleRect r){
 #if GPU_ALPHA_REPAIR_BATCH && GPU_OPAQUE_RETAIN
     // Closing the menu can expose a proven fully opaque patch of an alpha
     // window. The destination underneath contributes zero to its final color.
-    if(!g_retained_menu_key&&!g_menu_open&&g_deferred_alpha.active&&
+    if(!g_retained_menu_key&&!g_menu_open&&!g_taskbar_popup&&g_deferred_alpha.active&&
        g_deferred_alpha.append_opaque(r,g_top_alpha_opaque,g_top_alpha_opaque_count,g_retained_animation_plan)){
         ++g_gpu_perf.opaque_repair_rects;
         return true;
@@ -2582,11 +2711,11 @@ static bool wm_repair_retained_foreground(VisibleRect r){
 static bool wm_draw_retained_animation([[maybe_unused]] uint64_t repair_menu_key){
     g_retained_scene_invalidated=false;
     const auto& plan=g_retained_animation_plan;
-    if(!g_gpu_compose_hook||!g_gpu_compose_hook(plan))return false;
+    if(!g_gpu_compose_hook)return false;
     const auto& client=plan.clients[0];
     // The first layer's shadow sees exactly the just-rendered procedural
     // background. Supply WB pixels instead of reading them back from WC RAM.
-    static uint32_t background_row[8192];
+    alignas(64) static uint32_t background_row[8192];
     bool row_available=fb->width<=8192;
     if(row_available){
         int64_t phase=((int64_t)plan.scroll-client.client.x1)%720;
@@ -2596,6 +2725,26 @@ static bool wm_draw_retained_animation([[maybe_unused]] uint64_t repair_menu_key
             if(++phase==720)phase=0;
         }
     }
+    // Tall exposed strips cost a complete BCS submission before alpha can
+    // start. All scanlines of Rainbow have identical colors. Stream the hot
+    // row directly into the retained hidden buffer for these layouts.
+    bool stream=row_available && g_retained_popup_layout;
+    if(row_available && g_retained_animation_alpha){
+        for(unsigned i=0;i<g_retained_animation_layer_count;++i){
+            const auto& layer=g_retained_animation_layers[i].client;
+            if(layer.premultiplied && layer.client.x2-layer.client.x1<(int)fb->width &&
+               layer.client.y2-layer.client.y1>=(int)fb->height/2)stream=true;
+        }
+    }
+    if(stream){
+        for(unsigned i=0;i<plan.count;++i){
+            auto r=plan.copies[i].destination;
+            for(int y=r.y1;y<r.y2;++y)
+                memcpy_vram_sse_headless(g_master_backbuffer+(uint64_t)y*fb->pitch+r.x1*4,
+                    background_row+r.x1,(r.x2-r.x1)*4);
+        }
+        vram_fence();
+    }else if(!g_gpu_compose_hook(plan))return false;
     for(unsigned i=0;i<plan.count;++i){
         auto clip=plan.copies[i].destination;
         g_gpu_perf.retained_animation_pixels+=(uint64_t)(clip.x2-clip.x1)*(clip.y2-clip.y1);
@@ -2703,6 +2852,42 @@ static bool wm_draw_retained_animation([[maybe_unused]] uint64_t repair_menu_key
         return true;
     }
 #endif
+    // A popup may open, move or close while a GPU wait yields. The old
+    // cutout cannot be presented as the new scene; use the existing retry.
+    if(g_retained_popup_layout!=wm_retained_popup_layout()){
+        g_retained_scene_invalidated=true;
+        return true;
+    }
+    if(g_retained_popup_layout){
+        // Popup pixels are topmost even when an earlier scene repair or a
+        // deferred alpha draw touched their retained cutout. Replay the whole
+        // panel with its own clip, independent of the last repair rectangle.
+        ResourceRead resource_read;
+        auto panel=wm_taskbar_panel(wm_taskbar_snapshot());
+        int left=g_ui_clip_left,right=g_ui_clip_right,top=g_ui_clip_top,bottom=g_ui_clip_bottom;
+        g_ui_clip_left=panel.x;g_ui_clip_right=panel.x+panel.w;
+        g_ui_clip_top=panel.y;g_ui_clip_bottom=panel.y+panel.h;
+        auto& scratch=g_menu_pixel_cache;
+        bool buffered=scratch.pixels && scratch.capacity>=(uint64_t)fb->pitch*fb->height;
+        auto* destination=g_master_backbuffer;
+        if(buffered){
+            scratch.key=0;
+            g_master_backbuffer=scratch.pixels;
+        }
+        wm_taskbar_render_popup(panel.y,panel.y+panel.h-1);
+        g_master_backbuffer=destination;
+        if(buffered){
+            auto bounds=visibility_intersect({panel.x,panel.y,panel.x+panel.w,panel.y+panel.h},
+                {0,0,(int)fb->width,(int)fb->height});
+            if(visibility_valid(bounds))wm_copy_cached_menu(bounds);
+            vram_fence();
+        }
+        g_ui_clip_left=left;g_ui_clip_right=right;g_ui_clip_top=top;g_ui_clip_bottom=bottom;
+        if(g_retained_popup_layout!=wm_retained_popup_layout()){
+            g_retained_scene_invalidated=true;
+            return true;
+        }
+    }
     ++g_gpu_perf.retained_animation_frames;
 #if GPU_ALPHA_REPAIR_BATCH
     if(g_deferred_alpha.count){++g_gpu_perf.alpha_repair_frames;g_gpu_perf.alpha_repair_rects+=g_deferred_alpha.count;}
@@ -2897,9 +3082,22 @@ static void wm_gpu_perf_sample(uint64_t now) {
           text(" menuFrames=");number(stats.retained_menu_frames-previous.retained_menu_frames);
           text(" menuKiPx=");number((stats.retained_menu_pixels-previous.retained_menu_pixels)/1024);
           text(" menuCloseDeferred=");number(stats.retained_menu_close_deferrals-previous.retained_menu_close_deferrals);
+          text(" sceneBatches=");number(stats.scene_repair_batches-previous.scene_repair_batches);
+          text(" sceneRects=");number(stats.scene_repair_rects-previous.scene_repair_rects);
+          text(" trayRects=");number(stats.tray_repair_rects-previous.tray_repair_rects);
+          text(" trayUs=");number((stats.tray_repair_ticks-previous.tray_repair_ticks)*1000000/tsc_hz);
+          text(" rebases=");number(stats.transition_rebases);
+          text(" rebaseFailed=");number(stats.transition_rebase_failed);
           *end=0;print(line);
 #endif
           const auto& timeline=g_gpu_timeline_slowest;
+          if(GPU_RCS_ALPHA){
+              end=line;text("GPU alpha wait: layout=");number(signature);
+              text(" windows=");number(stats.alpha_tail_windows-previous.alpha_tail_windows);
+              text(" pollUs=");number((stats.alpha_tail_ticks-previous.alpha_tail_ticks)*1000000/tsc_hz);
+              text(" predictionUs=");number(stats.alpha_tail_prediction_us);
+              *end=0;print(line);
+          }
           end=line;text("GPU timeline: layout=");number(signature);
           auto duration=[&](const char* label,uint64_t ticks){text(label);number(ticks*1000000/tsc_hz);};
           auto phase=[&](const char* label,uint64_t tick){
@@ -3048,10 +3246,17 @@ static void gpu_direct_end();
 static bool gpu_direct_active();
 static inline bool wm_compose_dirty_band(uint32_t min_x, uint32_t max_x,
                                      uint32_t min_y, uint32_t max_y, bool do_overlay = true,
-                                     bool present = true) {
+                                     bool present = true,const VisibleRegion* repairs=nullptr) {
     bool skip_gpu_scene=false,first_attempt=true;
 retry_scene:
-    if(!first_attempt)gpu_direct_end();
+    if(!first_attempt){
+        gpu_direct_end();repairs=nullptr;
+#if GPU_ALPHA_REPAIR_BATCH
+        // The full CPU repaint below replaces even repairs deferred by earlier
+        // calls. Replaying those clips later would blend their alpha twice.
+        wm_cancel_alpha_repairs();
+#endif
+    }
     first_attempt=false;
     if (!fb || !fb->address || !g_master_backbuffer) return false;
     if (min_x>max_x || min_y>max_y || min_x>=fb->width || min_y>=fb->height) return false;
@@ -3229,7 +3434,19 @@ retry_scene:
 
     if(ordered_scene)++g_gpu_ordered_scene_count;
 
+    // Repairs share one snapshot and traverse the stack once. Keep exact clips
+    // for CPU pixels too: drawing bounding-box holes would accumulate alpha.
+    const VisibleRect scene_bounds{(int)min_x,(int)min_y,(int)max_x+1,(int)max_y+1};
+    auto select_repair=[&](unsigned i){
+        auto r=repairs?repairs->rects[i]:scene_bounds;
+        min_x=r.x1;max_x=r.x2-1;min_y=r.y1;max_y=r.y2-1;
+        g_ui_clip_left=bounded_scene?min_x:0;g_ui_clip_right=bounded_scene?max_x+1:fb->width;
+        g_ui_clip_top=min_y;g_ui_clip_bottom=max_y+1;
+    };
+    unsigned repair_count=repairs?repairs->count:1;
     // Stage 1: Desktop wallpaper (hole-punched)
+    for(unsigned repair=0;repair<repair_count;++repair){
+    select_repair(repair);
     for (uint32_t y = min_y; y <= max_y; y++) {
         uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
         uint32_t* wrow = nullptr;
@@ -3312,6 +3529,8 @@ retry_scene:
         }
     }
     
+    }
+    min_x=scene_bounds.x1;max_x=scene_bounds.x2-1;min_y=scene_bounds.y1;max_y=scene_bounds.y2-1;
     t1 = rdtsc_val();
     g_time_bg_ticks = t1 - t0;
 
@@ -3331,6 +3550,11 @@ retry_scene:
         Window* win = frame_windows[idx];
         if (!win || !rects[idx].visible) continue;
         RainbowWindowTimer window_timer(idx,win->id,win->title,sources[idx].alpha);
+        static GpuScenePlan layer_batch{};
+        layer_batch.count=0;layer_batch.accelerated=0;
+        unsigned layer_engine=0;
+        for(unsigned repair=0;repair<repair_count;++repair){
+        select_repair(repair);
         WinRect r = rects[idx];
         Source source_surface=sources[idx];int display_w=r.x2-r.x1,display_h=r.y2-r.y1-g_title_h;
 
@@ -3394,7 +3618,14 @@ retry_scene:
                         if(topmost)deferred=g_deferred_alpha.append(ordered_plan,g_retained_animation_plan);
                     }
 #endif
-                    if(!deferred&&ordered_plan.count&&!hook(ordered_plan)){
+                    if(repairs&&!deferred){
+                        if((layer_engine&&layer_engine!=engine)||!gpu_scene_append_clips(&layer_batch,ordered_plan)){
+                            skip_gpu_scene=true;g_rain_surface_current=false;
+                            min_x=0;min_y=0;max_x=fb->width-1;max_y=fb->height-1;goto retry_scene;
+                        }
+                        layer_engine=engine;
+                    }
+                    if(!repairs&&!deferred&&ordered_plan.count&&!hook(ordered_plan)){
                         if(engine==2)g_gpu_render_hook=nullptr;
                         skip_gpu_scene=true;g_rain_surface_current=false;
                         min_x=0;min_y=0;max_x=fb->width-1;max_y=fb->height-1;goto retry_scene;
@@ -3461,7 +3692,20 @@ retry_scene:
                 }
             }
         }
+        } // repair clips for this window
+        if(repairs&&layer_batch.count){
+            window_timer.next(&RainbowWindowTrace::gpu);
+            auto hook=layer_engine==1?g_gpu_compose_hook:g_gpu_render_hook;
+            if(!hook||!hook(layer_batch)){
+                if(layer_engine==2)g_gpu_render_hook=nullptr;
+                skip_gpu_scene=true;g_rain_surface_current=false;
+                min_x=0;min_y=0;max_x=fb->width-1;max_y=fb->height-1;goto retry_scene;
+            }
+        }
     }
+    min_x=scene_bounds.x1;max_x=scene_bounds.x2-1;min_y=scene_bounds.y1;max_y=scene_bounds.y2-1;
+    g_ui_clip_left=bounded_scene?min_x:0;g_ui_clip_right=bounded_scene?max_x+1:fb->width;
+    g_ui_clip_top=min_y;g_ui_clip_bottom=max_y+1;
 
     // Complete GPU writes before the CPU draws menus/HUD/cursor or reads the
     // master buffer. On a failed batch, recompute the whole scene through the
@@ -3523,55 +3767,7 @@ retry_scene:
                     sb_y + (int32_t)(sb_h - char_h) / 2,
                     start_lbl, 0xFFFFFFFF, g_font_scale_100);
         
-        // ── System tray (right side, drawn before task buttons so we know its x) 
-        const int32_t TRAY_W = wm_tray_w();
-        int32_t tray_x = (int32_t)fb->width - TRAY_W - 6;
-        int32_t tray_y = sb_y, tray_h = sb_h;
-
-        wm_draw_button(min_y,max_y,tray_x, tray_y, TRAY_W, tray_h,
-                0xFF252a42, 0xFF1a1f35,
-                0xFF303560, false);
-
-        // Clock: time on top, date below (like the Windows taskbar). Only reads the cached g_clock.
-        {
-            uint32_t clock_scale = wm_clock_scale();
-            int32_t fps_width=wm_fps_width();
-            int32_t clock_x=tray_x+fps_width,clock_width=TRAY_W-fps_width;
-            char fps[16];to_str(g_desktop_fps,fps);
-            resources::append(fps,sizeof(fps)," FPS");
-            int32_t ch = wm_text_height(clock_scale);
-            int32_t fps_x=tray_x+(fps_width-wm_text_width(fps,clock_scale))/2;
-            wm_draw_string(fps_x,tray_y+(tray_h-ch)/2,fps,0xFFE6E8FF,clock_scale);
-            char tbuf[16], dbuf[16];
-            int tl, dl = 0;
-            if (g_clock_valid) {
-                tl = rtc_format_time(g_clock, tbuf, CLOCK_SHOW_SECONDS != 0);
-                dl = rtc_format_date(g_clock, dbuf);
-            } else {
-                tbuf[0] = '-'; tbuf[1] = '-'; tbuf[2] = ':'; tbuf[3] = '-'; tbuf[4] = '-'; tbuf[5] = 0;
-                tl = 5;
-            }
-            bool two_lines = dl > 0 && tray_h >= 2 * ch + 2;
-            int32_t ty0 = two_lines ? tray_y + (tray_h - (2 * ch + 2)) / 2
-                                    : tray_y + (tray_h - ch) / 2;
-            wm_draw_string((uint32_t)(clock_x + (clock_width - wm_text_width(tbuf, clock_scale)) / 2), (uint32_t)ty0,
-                           tbuf, 0xFFE6E8FF, clock_scale);
-            if (two_lines)
-                wm_draw_string((uint32_t)(clock_x + (clock_width - wm_text_width(dbuf, clock_scale)) / 2), (uint32_t)(ty0 + ch + 2),
-                               dbuf, 0xFF9FA6CC, clock_scale);
-        }
-
-        // Separator between task area and tray
-        for (int32_t y = sb_y + 4; y < sb_y + sb_h - 4; y++) {
-            if (y < (int32_t)min_y || y > (int32_t)max_y) continue;
-            if (y < 0 || (uint32_t)y >= fb->height) continue;
-            uint32_t* drow = (uint32_t*)(g_master_backbuffer + (uint64_t)y * fb->pitch);
-            int32_t sep = tray_x - 6;
-            if (sep >= 0 && (uint32_t)(sep+1) < fb->width) {
-                drow[sep]   = 0xFF404870;
-                drow[sep+1] = 0xFF1a1f35;
-            }
-        }
+        wm_draw_taskbar_tray({0,tbr1,(int)fb->width,tbr2+1},false);
 
         // ── Window task buttons ───────────────────────────────────────────────
         const int32_t WBTN_GAP = (int32_t)(4 * fb->height) / 1080;
@@ -4048,6 +4244,61 @@ static inline bool wm_compose_dirty(uint32_t min_x,uint32_t max_x,
         return result;
     }
     return wm_compose_dirty_band(min_x,max_x,min_y,max_y,do_overlay,present);
+}
+
+// Shell bands keep their full-row repaint contract without forcing all the
+// interior repairs back into separate scene submissions. Their Y ranges are
+// disjoint from the exact interior clips, so no alpha pixel is blended twice.
+static bool wm_compose_scene_repairs(const VisibleRegion& input){
+    if(!fb||!gpu_direct_active()||!g_gpu_compose_hook||g_clipboard_open||g_taskbar_popup||
+       (g_menu_open&&!wm_retained_menu_ready()))return false;
+    static VisibleRegion canonical{},region{};VisibleRect bounds{};
+    if(!gpu_scene_repair_region(&canonical,input,{0,0,(int)fb->width,(int)fb->height},&bounds))return false;
+    int bottom=fb->height-g_taskbar_h,top_end=0,bottom_start=fb->height;
+    region.count=0;
+    for(unsigned i=0;i<canonical.count;++i){auto r=canonical.rects[i];
+        if(r.y1<60&&r.y2>top_end)top_end=r.y2<60?r.y2:60;
+        if(r.y2>bottom&&r.y1<bottom_start)bottom_start=r.y1>bottom?r.y1:bottom;
+        r=visibility_intersect(r,{0,60,(int)fb->width,bottom});
+        if(visibility_valid(r))region.rects[region.count++]=r;
+    }
+    uint64_t bg=0,win=0,rain=0,lock=0,vram=0;
+    auto collect=[&](){bg+=g_time_bg_ticks;win+=g_time_win_ticks;rain+=g_time_rain_ticks;
+        lock+=g_time_lock_ticks;vram+=g_time_vram_ticks;};
+    if(top_end){wm_compose_dirty(0,fb->width-1,0,top_end-1,false);collect();}
+    if(bottom_start<(int)fb->height){wm_compose_dirty(0,fb->width-1,bottom_start,fb->height-1,false);collect();}
+    if(region.count){
+        if(gpu_direct_active()){
+            gpu_animation_damage_bounds(region,&bounds);
+            ++g_gpu_perf.scene_repair_batches;g_gpu_perf.scene_repair_rects+=region.count;
+            wm_compose_dirty_band(bounds.x1,bounds.x2-1,bounds.y1,bounds.y2-1,false,true,&region);collect();
+        }else for(unsigned i=0;i<region.count;++i){
+            // A shell-band GPU failure has already restored the CPU master.
+            auto r=region.rects[i];wm_compose_dirty(r.x1,r.x2-1,r.y1,r.y2-1,false);collect();
+        }
+    }
+    g_time_bg_ticks=bg;g_time_win_ticks=win;g_time_rain_ticks=rain;
+    g_time_lock_ticks=lock;g_time_vram_ticks=vram;
+    return true;
+}
+
+// Both ordinary retained repairs and a single transition rebase use this same
+// ordered traversal. No presentation occurs until repairs and animation finish.
+static void wm_compose_retained_repairs(const VisibleRegion& repairs){
+    static VisibleRegion scene{};scene.count=0;
+    for(unsigned i=0;i<repairs.count;++i)
+        if(!wm_repair_retained_foreground(repairs.rects[i]))scene.rects[scene.count++]=repairs.rects[i];
+    uint64_t bg=0,win=0,rain=0,lock=0,vram=0;
+    auto collect=[&](){bg+=g_time_bg_ticks;win+=g_time_win_ticks;rain+=g_time_rain_ticks;
+        lock+=g_time_lock_ticks;vram+=g_time_vram_ticks;};
+    if(scene.count){
+        if(wm_compose_scene_repairs(scene))collect();
+        else for(unsigned i=0;i<scene.count;++i){auto r=scene.rects[i];
+            wm_compose_dirty(r.x1,r.x2-1,r.y1,r.y2-1,false);collect();
+        }
+    }
+    g_time_bg_ticks=bg;g_time_win_ticks=win;g_time_rain_ticks=rain;
+    g_time_lock_ticks=lock;g_time_vram_ticks=vram;
 }
 
 #endif // WM_H

@@ -1,37 +1,20 @@
 # Pending platform work
 
-Updated 2026-11-22. Implemented behavior belongs in the feature guides linked
+Updated 2026-11-24. Implemented behavior belongs in the feature guides linked
 from [README](../README.md); this file tracks remaining work.
 
-## Current GPU stability gate (2026-11-22)
+## GPU follow-up
 
-Retest opening apps while Rainbow and animated transparency run. The owner
-photograph shows heap corruption during `kmalloc scan`; the accompanying log
-predates that boot. Physical page allocation now serializes reservation/recycling
-against preemption, and the compositor has a larger stack with frame snapshots
-stored statically. Stack canaries and richer heap diagnostics are enabled.
-The photographed crash cause is still unconfirmed. Covered-window CPU use and
-alpha latency remain open; zero-upload timing samples still show large GPU
-wait/presentation costs. Validate stability first, then investigate those waits.
-The next measurement build separates scanout copying, cursor/outline drawing
-and flip-latch waiting, and records actual one-ms GPU sleep return durations.
-Compare Rainbow alone, an opaque covering window, and small/enlarged alpha;
-hold each layout for five seconds and save the three adjacent GPU log records.
-The follow-up owner run narrows the priority to alpha: the default small test
-raises CPU from about 5% to 9% even away from Rainbow; opaque overlap/shadows
-are now acceptable. All logged GPU sleep returns are below 2 ms, uploads are
-reused, and cursor/outline drawing is negligible. The slowest sample records
-40 loops/2016 ms with 43 RCS draws, 426 ms RCS elapsed and 115 ms handoffs
-(about 9.9 and 2.7 ms/draw respectively). Reduce translucent rendering and
-ownership-handoff work; do not treat these timings as a measured CPU breakdown
-or remove cache/fence/retirement checks based on this log.
-The new revision blends alpha through an optimized SSE2 CPU path at all supported
-sizes, retaining BCS underneath and avoiding RCS handoffs for translucent layers.
-The owner confirms smoothness until the previous size cutoff selected RCS; that
-default cutoff is now removed. Validate resizing across the former cutoff:
-`cpuAlpha`/`alphaKiPx` should increase while that layer's RCS and handoff costs
-disappear. Measure CPU use as well as motion, particularly for large layers.
-Opaque scaling retains RCS; no GPU shader/cache-policy change is claimed.
+The retained Rainbow build reached 58–59 FPS with the grouped app picker
+open and 58–60 FPS with tall half-screen translucency on the Kaby Lake
+laptop. Some layout transitions still missed refreshes. If GPU work resumes,
+use the build recipe in [BUILD_CONFIGS](../BUILD_CONFIGS.txt) and include Start
+close, picker open/close, and moving or resizing a tall translucent window
+over Rainbow. The default build uses CPU SIMD translucency.
+
+The scheduler currently runs on one core. Multicore work needs its own
+scheduler, interrupt routing, and shared-state synchronization validation.
+
 
 ## Verify the combined build on hardware
 

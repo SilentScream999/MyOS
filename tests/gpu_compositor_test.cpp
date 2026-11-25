@@ -14,6 +14,50 @@
 #include "src/gui/window_shadow.cpp"
 #include "src/gui/alpha_renderer.cpp"
 
+static void scene_repair_batch_test(){
+    VisibleRegion input{},region{};VisibleRect bounds{};
+    input.count=3;
+    input.rects[0]={1,60,5,64};input.rects[1]={3,62,7,66};input.rects[2]={9,60,11,66};
+    assert(gpu_scene_repair_region(&region,input,{0,60,12,70},&bounds));
+    assert(bounds.x1==1&&bounds.y1==60&&bounds.x2==11&&bounds.y2==66);
+    unsigned hits[12*10]{};
+    for(unsigned i=0;i<region.count;++i){const auto r=region.rects[i];
+        for(int y=r.y1;y<r.y2;++y)for(int x=r.x1;x<r.x2;++x)++hits[(y-60)*12+x];
+    }
+    for(int y=60;y<70;++y)for(int x=0;x<12;++x){
+        bool covered=false;
+        for(unsigned i=0;i<input.count;++i){auto r=input.rects[i];
+            covered|=x>=r.x1&&x<r.x2&&y>=r.y1&&y<r.y2;
+        }
+        assert(hits[(y-60)*12+x]==unsigned(covered));
+    }
+    alignas(64) uint32_t pixels[12*10]{};
+    GpuSceneClient client{{0,60,12,70},{0,60,12,70},pixels,12,10,48,true,false,false,true,123};
+    GpuScenePlan batch{},part{};
+    for(unsigned i=0;i<region.count;++i){
+        assert(gpu_alpha_scene_plan(&part,client,region.rects[i]));
+        assert(gpu_scene_append_clips(&batch,part));
+    }
+    assert(batch.count==region.count&&batch.client_count==1);
+    // Compare a partial-alpha repair with the union, including untouched holes.
+    for(int y=60;y<70;++y)for(int x=0;x<12;++x){
+        uint32_t actual=0xff506070,expected=actual;
+        if(hits[(y-60)*12+x])expected=window_source_over(0x80402010,expected);
+        for(unsigned i=0;i<batch.count;++i){auto r=batch.copies[i].destination;
+            if(x>=r.x1&&x<r.x2&&y>=r.y1&&y<r.y2)actual=window_source_over(0x80402010,actual);
+        }
+        assert(actual==expected);
+    }
+    auto saved=batch.count;part.copies[0].source=1;
+    assert(!gpu_scene_append_clips(&batch,part)&&batch.count==saved);
+    part.copies[0].source=0;batch.count=GpuScenePlan::capacity;
+    assert(!gpu_scene_append_clips(&batch,part)&&batch.count==GpuScenePlan::capacity);
+    input.rects[0].y1=59;
+    assert(!gpu_scene_repair_region(&region,input,{0,60,12,70},&bounds));
+    input.count=VisibleRegion::capacity+1;
+    assert(!gpu_scene_repair_region(&region,input,{0,60,12,70},&bounds));
+}
+
 // Interpret the actual emitted command stream, rather than a second high-level
 // renderer. This checks command addresses, pitches, clipping, overlap, palette
 // wrapping, replication barriers, NOOP padding and ring wrap on host memory.
@@ -138,19 +182,20 @@ static void rainbow_test(){
     std::vector<uint32_t> tile(720*GPU_RAIN_TILE_ROWS);
     for(unsigned i=0;i<tile.size();++i)tile[i]=colors[i%720];
     for(unsigned mode:{0u,1u,2u})
-    for(unsigned width:{1u,15u,16u,719u,720u,721u,1441u,4096u})
-        for(unsigned height:{1u,2u,3u,17u,257u})
+    for(unsigned width:{1u,15u,16u,719u,720u,721u,953u,967u,1441u,1920u,4096u})
+        for(unsigned height:{1u,2u,3u,17u,257u,978u,1025u})
             for(unsigned scroll:{0u,719u,720u,UINT_MAX}){
                 Engine engine;unsigned pitch=(width+31)&~15u;
                 std::vector<uint32_t> pixels(pitch*(height+4),0xdeadbeef);
-                engine.mappings={{0x10000,tile.data(),tile.size()*4},{0x200000,pixels.data(),pixels.size()*4}};
+                engine.mappings={{0x1000000,tile.data(),tile.size()*4},{0x2000000,pixels.data(),pixels.size()*4}};
                 GpuSceneCopy copy{0,{3,2,(int)width+3,(int)height+2},701,19};
-                assert(gpu_emit_rainbow(&engine.ring,0x10000,0x200000,pitch*4,copy,scroll,
+                assert(gpu_emit_rainbow(&engine.ring,0x1000000,0x2000000,pitch*4,copy,scroll,
                     mode?GPU_RAIN_TILE_ROWS:1,mode==2));
                 if(mode==2){
                     unsigned start=((uint64_t)scroll+copy.source_x)%720;
                     unsigned old_ops=((start+width+719)/720)*((height+255)/256);
                     assert(engine.ring.tail<=old_ops*40);
+                    if(width==1920&&height==978)assert(engine.ring.tail<=3*40);
                     if(width==1441&&height==17)assert(engine.ring.tail==40);
                 }
                 engine.execute();
@@ -455,9 +500,9 @@ static void retained_animation_test(){
     Engine engine;
     for(unsigned frame=1;frame<=90;++frame){
         auto& target=buffers[frame%2];unsigned phase=frame*17%720;
-        engine.mappings={{0x100000,palette.data(),palette.size()*4},{0x200000,target.data(),target.size()*4}};
+        engine.mappings={{0x1000000,palette.data(),palette.size()*4},{0x2000000,target.data(),target.size()*4}};
         for(unsigned i=0;i<plan.count;++i)
-            assert(gpu_emit_rainbow(&engine.ring,0x100000,0x200000,W*4,plan.copies[i],phase,GPU_RAIN_TILE_ROWS));
+            assert(gpu_emit_rainbow(&engine.ring,0x1000000,0x2000000,W*4,plan.copies[i],phase,GPU_RAIN_TILE_ROWS));
         uint32_t sequence;assert(gpu_emit_fence(&engine.ring,&sequence,false));engine.execute();
         assert(*engine.ring.fence_cpu==sequence);
         uint32_t background_row[W];
@@ -537,7 +582,7 @@ static void opaque_coverage_test(){
     assert(plan.count==1&&!memcmp(&plan.copies[0],&original,sizeof(original)));
 }
 
-static void retained_translucency_test(bool opaque_cutouts,bool defer_repairs=false,bool menu_replay=false){
+static void retained_translucency_test(bool opaque_cutouts,bool defer_repairs=false,bool menu_replay=false,bool transition_rebase=false,bool picker=false){
     constexpr int W=192,H=128;
     alignas(64) uint32_t textures[2][64*48];
     for(unsigned s=0;s<2;++s)for(unsigned y=0;y<48;++y)for(unsigned x=0;x<64;++x){
@@ -551,7 +596,9 @@ static void retained_translucency_test(bool opaque_cutouts,bool defer_repairs=fa
         {{30,18,162,118},{30,28,162,118},textures[0],64,48,256,true,false,true,true,1},
         {{110,20,174,70},{110,30,174,70},pixels,64,40,256,true,false,false},
         {{65,40,180,125},{65,50,180,125},textures[1],64,48,256,true,false,false,true,2}};
-    VisibleRect screen{0,0,W,H},covers[4];
+    VisibleRect screen{0,0,W,H},covers[5];
+    VisibleRect picker_panel{12,80,72,116};
+    covers[4]=picker_panel;
     for(unsigned s=0;s<4;++s){
         covers[s]=layers[s].outer;
         if(layers[s].premultiplied)covers[s].y2=layers[s].client.y1;
@@ -560,7 +607,7 @@ static void retained_translucency_test(bool opaque_cutouts,bool defer_repairs=fa
     auto prepare=[&](){
         for(unsigned s=0;s<4;++s){covers[s]=layers[s].outer;
             if(layers[s].premultiplied)covers[s].y2=layers[s].client.y1;}
-        assert(gpu_retained_animation_plan(&plan,animation,screen,covers,4));
+        assert(gpu_retained_animation_plan(&plan,animation,screen,covers,picker?5:4));
         uint64_t before=0,after=0;
         for(unsigned i=0;i<plan.count;++i){auto r=plan.copies[i].destination;before+=(r.x2-r.x1)*(r.y2-r.y1);}
         if(opaque_cutouts){
@@ -611,12 +658,19 @@ static void retained_translucency_test(bool opaque_cutouts,bool defer_repairs=fa
         }
         if(menu_open)for(int y=panel.y1;y<panel.y2;++y)for(int x=panel.x1;x<panel.x2;++x)
             if(y>=0&&y<H&&x>=0&&x<W)result[y*W+x]=menu_cache[y*W+x];
+        if(picker)for(int y=picker_panel.y1;y<picker_panel.y2;++y)for(int x=picker_panel.x1;x<picker_panel.x2;++x)
+            result[y*W+x]=0xff151b2e;
         return result;
     };
     std::array<std::vector<uint32_t>,2> buffers{reference(0),reference(0)};
     Engine engine;
     bool pending_repair[2]{};
     unsigned deferred_frames=0;
+    bool full_repair_pending[2]{};
+    auto rebuild=[&](unsigned phase){
+        if(transition_rebase)full_repair_pending[0]=full_repair_pending[1]=true;
+        else for(auto& buffer:buffers)buffer=reference(phase);
+    };
     for(unsigned frame=1;frame<=90;++frame){
         unsigned phase=frame*19%720;
         if(menu_replay&&(frame==20||frame==35||frame==45||frame==55||frame==80)){
@@ -626,7 +680,7 @@ static void retained_translucency_test(bool opaque_cutouts,bool defer_repairs=fa
             if(frame==55){++menu_hover;build_menu();}
             // Cache/layout changes use ordinary complete composition before
             // allowing retained replay again, on both pending scanouts.
-            for(auto& buffer:buffers)buffer=reference(phase);
+            rebuild(phase);
         }
         if(frame==40||frame==50||frame==60||frame==70){
             if(frame==40){layers[1].client.x1-=5;layers[1].outer.x1-=5;}
@@ -639,7 +693,7 @@ static void retained_translucency_test(bool opaque_cutouts,bool defer_repairs=fa
             prepare();
             // Model the normal scene repair required for source/layout changes
             // on both alternating scanouts before retaining the new coverage.
-            for(auto& buffer:buffers)buffer=reference(phase);
+            rebuild(phase);
         }
         // Simulate a genuine foreground update repaired on both retained
         // buffers, including the cached translucent pixels above that update.
@@ -648,6 +702,15 @@ static void retained_translucency_test(bool opaque_cutouts,bool defer_repairs=fa
             for(auto& buffer:buffers)for(int y=32;y<99;++y)for(int x=48;x<109;++x)buffer[y*W+x]=updated[y*W+x];
         }
         auto& target=buffers[frame%2];
+        if(full_repair_pending[frame%2]){
+            VisibleRegion all{},repairs{};all.count=1;all.rects[0]={0,0,W,H};
+            assert(gpu_retained_repair_region(&repairs,all,plan));
+            auto current=reference(phase);
+            for(unsigned i=0;i<repairs.count;++i){auto r=repairs.rects[i];
+                for(int y=r.y1;y<r.y2;++y)for(int x=r.x1;x<r.x2;++x)target[y*W+x]=current[y*W+x];
+            }
+            full_repair_pending[frame%2]=false;
+        }
         GpuDeferredAlpha deferred;
         if(defer_repairs&&frame%7==0){repair_ink+=0x100;pending_repair[0]=pending_repair[1]=true;}
         if(defer_repairs&&pending_repair[frame%2]){
@@ -660,9 +723,9 @@ static void retained_translucency_test(bool opaque_cutouts,bool defer_repairs=fa
             pending_repair[frame%2]=false;deferred.active=false;
             assert(deferred.ready(top,plan));++deferred_frames;
         }
-        engine.mappings={{0x100000,palette.data(),palette.size()*4},{0x200000,target.data(),target.size()*4}};
+        engine.mappings={{0x1000000,palette.data(),palette.size()*4},{0x2000000,target.data(),target.size()*4}};
         for(unsigned i=0;i<plan.count;++i)
-            assert(gpu_emit_rainbow(&engine.ring,0x100000,0x200000,W*4,plan.copies[i],phase,GPU_RAIN_TILE_ROWS));
+            assert(gpu_emit_rainbow(&engine.ring,0x1000000,0x2000000,W*4,plan.copies[i],phase,GPU_RAIN_TILE_ROWS));
         uint32_t sequence;assert(gpu_emit_fence(&engine.ring,&sequence,false));engine.execute();
         uint32_t background_row[W];
         for(int x=0;x<W;++x)background_row[x]=palette[(phase+x-animation.client.x1)%720];
@@ -697,4 +760,4 @@ static void retained_translucency_test(bool opaque_cutouts,bool defer_repairs=fa
     if(defer_repairs)assert(deferred_frames>=20);
 }
 
-int main(){cursor_save_test();scene_test();rainbow_test();invalid_test();memory_and_capacity_test();firmware_layout_test();mapping_cache_test();display_plane_test();complete_frame_flip_test();fullscreen_damage_test();retained_animation_test();opaque_coverage_test();retained_translucency_test(false);retained_translucency_test(true);retained_translucency_test(true,true);retained_translucency_test(true,true,true);timestamp_command_test();puts("GPU composition, timestamp packets, retained animation/alpha/shadows, opaque cutouts, deferred repairs, menu replay, complete flips and retirement tests passed.");}
+int main(){scene_repair_batch_test();cursor_save_test();scene_test();rainbow_test();invalid_test();memory_and_capacity_test();firmware_layout_test();mapping_cache_test();display_plane_test();complete_frame_flip_test();fullscreen_damage_test();retained_animation_test();opaque_coverage_test();retained_translucency_test(false);retained_translucency_test(true);retained_translucency_test(true,true);retained_translucency_test(true,true,true);retained_translucency_test(true,true,true,true);retained_translucency_test(true,false,false,true,true);timestamp_command_test();puts("GPU composition, timestamp packets, retained animation/alpha/shadows, opaque cutouts, deferred repairs, menu replay, complete flips and retirement tests passed.");}

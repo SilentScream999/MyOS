@@ -21,7 +21,7 @@ static inline void gpu_frame_damage(DamageList& frame,const DamageList& input,
     }
 }
 static inline bool gpu_exact_frame_rect(VisibleRegion& frame,VisibleRect r,
-        unsigned width,unsigned height,unsigned taskbar,bool popup,bool stats_visible=true){
+        unsigned width,unsigned height,unsigned taskbar,bool popup,bool stats_visible=true,int tray_left=-1){
     if(!width||!height||taskbar>height||width>INT32_MAX||height>INT32_MAX)return false;
     r=visibility_intersect(r,{0,0,(int)width,(int)height});
     if(!visibility_valid(r))return true;
@@ -35,15 +35,18 @@ static inline bool gpu_exact_frame_rect(VisibleRegion& frame,VisibleRect r,
     if(!add(top))return false;
     auto body=r;if(body.y1<shell_top)body.y1=shell_top;if(body.y2>taskbar_top)body.y2=taskbar_top;
     if(!add(body))return false;
-    auto bottom=r;if(bottom.y1<taskbar_top)bottom.y1=taskbar_top;bottom.x1=0;bottom.x2=width;
+    // Only callers using the opaque retained tray renderer can keep its X
+    // extent. Ordinary taskbar changes retain the full-row repaint contract.
+    auto bottom=r;if(bottom.y1<taskbar_top)bottom.y1=taskbar_top;
+    if(tray_left<0||bottom.x1<tray_left){bottom.x1=0;bottom.x2=width;}
     return add(bottom);
 }
 static inline bool gpu_exact_frame_damage(VisibleRegion& frame,const DamageList& input,
-        unsigned width,unsigned height,unsigned taskbar,bool popup,bool stats_visible=true){
+        unsigned width,unsigned height,unsigned taskbar,bool popup,bool stats_visible=true,int tray_left=-1){
     for(unsigned i=0;i<input.n&&i<DAMAGE_MAX;++i){auto r=input.r[i];
         if(r.x1>r.x2||r.y1>r.y2||r.x1>=width||r.y1>=height)continue;
         if(r.x2>=width)r.x2=width-1;if(r.y2>=height)r.y2=height-1;
-        if(!gpu_exact_frame_rect(frame,{(int)r.x1,(int)r.y1,(int)r.x2+1,(int)r.y2+1},width,height,taskbar,popup,stats_visible))return false;
+        if(!gpu_exact_frame_rect(frame,{(int)r.x1,(int)r.y1,(int)r.x2+1,(int)r.y2+1},width,height,taskbar,popup,stats_visible,tray_left))return false;
     }
     return true;
 }

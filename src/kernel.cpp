@@ -41,7 +41,7 @@ extern "C" void wyzar_ext4_free(void* p) { kfree(p); }
 
 // Each scanout retains a complete scene and accumulates all changes since its
 // last flip. Rebuild its pending damage before presenting it again.
-static bool begin_direct_scanout(DamageList& damage,VisibleRegion* exact_damage=nullptr){
+static bool begin_direct_scanout(DamageList& damage,VisibleRegion* exact_damage=nullptr,bool retained_animation=false){
     if(!GPU_RCS_ALPHA)return false;
     using Check=ScanoutCheck;
     if(!g_gpu_direct_verified)return reject_scanout(Check::Readback);
@@ -66,6 +66,7 @@ static bool begin_direct_scanout(DamageList& damage,VisibleRegion* exact_damage=
     if(armed!=front)return reject_scanout(Check::Surface,armed,front);
     bool popup=g_clipboard_open||g_taskbar_popup||(g_menu_open&&!wm_retained_menu_ready());
 #if GPU_EXACT_REPAIRS
+    int tray_left=retained_animation&&!popup?wm_tray_damage_left():-1;
     if(exact_damage){
 #if GPU_FRAME_DIAGNOSTICS
         GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::Merge),wm_trace_cpu_cycles);
@@ -76,7 +77,7 @@ static bool begin_direct_scanout(DamageList& damage,VisibleRegion* exact_damage=
             TtyIrqGuard guard;
             stats_visible=wm_desktop_stats_visible();
         }
-        gpu_exact_frame_damage(changed,damage,fb->width,fb->height,g_taskbar_h,popup,stats_visible);
+        gpu_exact_frame_damage(changed,damage,fb->width,fb->height,g_taskbar_h,popup,stats_visible,tray_left);
         for(unsigned buffer=0;buffer<2;++buffer)for(unsigned i=0;i<changed.count;++i){
             if(!visibility_add_exact(&g_gpu_scanout_exact_damage[buffer],changed.rects[i])){
                 g_gpu_scanout_exact_damage[buffer].count=1;
@@ -128,7 +129,7 @@ static bool begin_direct_scanout(DamageList& damage,VisibleRegion* exact_damage=
                 stats_visible=wm_desktop_stats_visible();
             }
             gpu_exact_frame_damage(g_gpu_scanout_exact_damage[back],overlay,
-                fb->width,fb->height,g_taskbar_h,popup,stats_visible);
+                fb->width,fb->height,g_taskbar_h,popup,stats_visible,tray_left);
         }
         else
 #endif
@@ -209,6 +210,24 @@ static void log_frame_gap(const GpuFrameTimeline& frame) {
     duration(" readyToResumeUs=",frame.ready_to_resume);
     text(" readyPid=");if(frame.sleep_ready_pid<0)text("-");else number(frame.sleep_ready_pid);
     emit();
+    const auto& rcs=frame.slowest_rcs;
+    if(rcs.submitted){
+        text("GPU gap RCS: frame=");number(g_compositor_frame);
+        text(" seq=");number(rcs.sequence);
+        timestamp(" submittedAtUs=",rcs.submitted);timestamp(" observedAtUs=",rcs.observed);
+        duration(" waitUs=",rcs.wait_ticks);
+        const auto& hw=rcs.hardware;
+        text(" stamp=");text(hw.samples?"valid":hw.invalid?"invalid":"unavailable");
+        if(hw.samples){
+            text(" toDrainUs=");number(hw.queue_us+hw.setup_us+hw.parse_us+hw.rt_us+hw.drain_us);
+            text(" drainToObserveUs=");number(hw.tail_us);
+        }
+        duration(" maxSleepUs=",rcs.max_sleep);
+        duration(" sleepToReadyUs=",rcs.sleep_to_ready);
+        duration(" readyToResumeUs=",rcs.ready_to_resume);
+        text(" readyPid=");if(rcs.sleep_ready_pid<0)text("-");else number(rcs.sleep_ready_pid);
+        emit();
+    }
 
     uint64_t latest;
     {TtyIrqGuard guard;latest=g_gpu_gap_history.latest;}
@@ -225,6 +244,7 @@ static void log_frame_gap(const GpuFrameTimeline& frame) {
         text("GPU gap activity: frame=");number(g_compositor_frame);
         text(" activity=");text(activities[(unsigned)event.activity]);
         text(" pid=");if(event.pid<0)text("-");else number(event.pid);
+        text(" irqEnabled=");number(event.irq_enabled);
         timestamp(" beginAtUs=",event.begin);timestamp(" endAtUs=",event.end);
         if(event.detail[0]){text(" detail=");text(event.detail);}
         emit();
@@ -335,6 +355,9 @@ static bool desktop_shortcut(char key,uint32_t mods,bool repeat) {
     return true;
 }
 static void desktop_launch_worker() {
+    // A fresh kernel task enters from schedule() with IRQs masked.
+    // USB reads must be preemptible, including the first queued launch.
+    __asm__ volatile("sti" ::: "memory");
     for(;;){char path[256];int power=0;
         {TtyIrqGuard guard;
             while(desktop_launch_head==desktop_launch_tail&&!desktop_power_action){g_current_task->state=TaskState::BLOCKED;g_current_task->wake_at_tick=0;
@@ -953,6 +976,9 @@ void compositor_thread_main() {
             g_gpu_timeline.sleep=g_gpu_perf.bcs_sleep.ticks+g_gpu_perf.rcs_sleep.ticks+g_gpu_perf.flip_sleep.ticks;
             g_gpu_timeline.bcs_batches=g_gpu_perf.bcs_batches;g_gpu_timeline.rcs_draws=g_gpu_perf.rcs_draws;
         }
+#ifdef GPU_COMPOSITOR_TEST
+        gpu_test_repair_scene();
+#endif
         wm_collect_retired_surfaces();
         wm_titlebar_hover_damage();
         uint64_t frame_interval = (tsc_hz / 60);
@@ -1069,7 +1095,7 @@ void compositor_thread_main() {
 #if GPU_FRAME_DIAGNOSTICS
                     GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::Direct),wm_trace_cpu_cycles);
 #endif
-                    direct=begin_direct_scanout(frame_dmg,GPU_EXACT_REPAIRS?&exact_damage:nullptr);
+                    direct=begin_direct_scanout(frame_dmg,GPU_EXACT_REPAIRS?&exact_damage:nullptr,retained_animation);
                 }
                 if(retained_animation&&!direct){retained_animation=false;add_animation_damage();}
                 if(!direct && master_needs_repaint){
@@ -1110,20 +1136,17 @@ void compositor_thread_main() {
 #if GPU_FRAME_DIAGNOSTICS
                     GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::RepairPaint),wm_trace_cpu_cycles);
 #endif
-					uint32_t idx = 0;
-                    for (uint32_t i = 0; i < total; i++, idx++) {
-						bool last = (idx == total - 1);
-                        DmgRect repair;
-                        if(retained_animation){
-                            const auto& r=retained_repairs.rects[i];
-                            if(wm_repair_retained_foreground(r))continue;
-                            repair={(uint32_t)r.x1,(uint32_t)r.y1,(uint32_t)r.x2-1,(uint32_t)r.y2-1};
-                        }else repair=frame_dmg.r[i];
-                        if (wm_compose_dirty(repair.x1,repair.x2,repair.y1,repair.y2,last&&!retained_animation)) overlay_done = true;
-						a_bg += g_time_bg_ticks; a_win += g_time_win_ticks; a_rain += g_time_rain_ticks;
-						a_lock += g_time_lock_ticks; a_vram += g_time_vram_ticks;
-					}
-				}
+                    if(retained_animation){
+                        wm_compose_retained_repairs(retained_repairs);
+                        a_bg+=g_time_bg_ticks;a_win+=g_time_win_ticks;a_rain+=g_time_rain_ticks;
+                        a_lock+=g_time_lock_ticks;a_vram+=g_time_vram_ticks;
+                    }else for(unsigned i=0;i<total;++i){
+                        const auto r=frame_dmg.r[i];
+                        if(wm_compose_dirty(r.x1,r.x2,r.y1,r.y2,i+1==total))overlay_done=true;
+                        a_bg+=g_time_bg_ticks;a_win+=g_time_win_ticks;a_rain+=g_time_rain_ticks;
+                        a_lock+=g_time_lock_ticks;a_vram+=g_time_vram_ticks;
+                    }
+                }
 #if GPU_ALPHA_REPAIR_BATCH
                 g_deferred_alpha.active=false;
 #endif
@@ -1134,18 +1157,53 @@ void compositor_thread_main() {
                     // if geometry/opacity changed since the animation snapshot.
                     uint64_t layout=g_retained_animation_layout;
                     uint64_t repair_menu_key=g_retained_menu_key;
-                    bool stable;
+                    bool stable,prepared;
                     {
 #if GPU_FRAME_DIAGNOSTICS
                         GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::Revalidate),wm_trace_cpu_cycles);
 #endif
-                        stable=gpu_direct_active()&&wm_prepare_retained_animation(rain_win)&&
-                            layout==g_retained_animation_layout;
+                        prepared=gpu_direct_active()&&wm_prepare_retained_animation(rain_win);
+                        stable=prepared&&layout==g_retained_animation_layout;
                     }
 #if GPU_ALPHA_REPAIR_BATCH
                     stable=stable&&wm_alpha_repairs_ready();
                     if(!stable)wm_cancel_alpha_repairs();
 #endif
+                    // One layout transition can be repaired against the fresh
+                    // animation plan instead of drawing that animation again in
+                    // a full-scene fallback. A second change keeps the old fallback.
+                    if(!stable&&prepared&&gpu_direct_active()&&layout!=g_retained_animation_layout){
+                        static VisibleRegion all{},rebased{};
+                        all.count=1;all.rects[0]={0,0,(int)fb->width,(int)fb->height};
+                        if(gpu_retained_repair_region(&rebased,all,g_retained_animation_plan)){
+                            ++g_gpu_perf.transition_rebases;
+                            layout=g_retained_animation_layout;repair_menu_key=g_retained_menu_key;
+#if GPU_ALPHA_REPAIR_BATCH
+                            wm_begin_alpha_repairs(true);
+#endif
+                            {
+#if GPU_FRAME_DIAGNOSTICS
+                                GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::RepairPaint),wm_trace_cpu_cycles);
+#endif
+                                wm_compose_retained_repairs(rebased);
+                            }
+#if GPU_ALPHA_REPAIR_BATCH
+                            g_deferred_alpha.active=false;
+#endif
+                            {
+#if GPU_FRAME_DIAGNOSTICS
+                                GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::Revalidate),wm_trace_cpu_cycles);
+#endif
+                                stable=gpu_direct_active()&&wm_prepare_retained_animation(rain_win)&&
+                                    layout==g_retained_animation_layout;
+                            }
+#if GPU_ALPHA_REPAIR_BATCH
+                            stable=stable&&wm_alpha_repairs_ready();
+                            if(!stable)wm_cancel_alpha_repairs();
+#endif
+                            if(!stable)++g_gpu_perf.transition_rebase_failed;
+                        }
+                    }
                     bool drawn=false;
                     if(stable)drawn=wm_draw_retained_animation(repair_menu_key);
                     else {
@@ -1155,7 +1213,6 @@ void compositor_thread_main() {
                         retained_animation=false;
                         overlay_done=wm_compose_dirty(0,fb->width-1,0,fb->height-1,true);
                     }
-#if GPU_RETAINED_MENU
                     if(stable&&drawn&&g_retained_scene_invalidated){
 #if GPU_FRAME_DIAGNOSTICS
                         GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::Fallback),wm_trace_cpu_cycles);
@@ -1166,7 +1223,6 @@ void compositor_thread_main() {
                         retained_animation=false;
                         overlay_done=wm_compose_dirty(0,fb->width-1,0,fb->height-1,true);
                     }
-#endif
                     a_win+=rdtsc()-animation_started;
                     uint64_t present_started=rdtsc();
                     if(retained_animation&&drawn){
@@ -1530,9 +1586,11 @@ extern "C" void kmain(void) {
 	bool usb_restarted[MAX_CONTROLLERS] = {};
 	// Serialize controller resets against synchronous filesystem I/O. Existing
 	// mounted disks are offlined by setupUSB; never rebind an open vnode.
-	__asm__ volatile("cli" ::: "memory");
+    // Discovery and hotplug can wait hundreds of milliseconds. The storage
+    // mutex owns their rings; keep the scheduler/compositor timer running.
+	__asm__ volatile("sti" ::: "memory");
     {
-    storage_guard storage_serialization;
+    USBTransactionGuard storage_serialization;
     for (int c = 0; c < xhci_count; c++) {
         if (xhci_hc[c].portfailed) {
             for (int _p = 0; _p < 4096; _p++) xhci_hc[c].portfailed[_p] = 0;
@@ -1907,6 +1965,9 @@ extern "C" void kmain(void) {
             bool any_resp = false;
             for (int ctrl_idx = 0; ctrl_idx < xhci_count; ctrl_idx++) {
                 USBControlGuard event_ownership;
+                // The synchronous owner polls and defers unrelated events.
+                // Do not steal its command/EP0 completion while it is asleep.
+                if (usb_control_owner && usb_control_owner != g_current_task) continue;
                 if (xhci_hc[ctrl_idx].needsResetting) continue;
 			    // 0ms timeout: fast-poll the event ring without busy-waiting.
 			    USB_Response resp = get_usb_response(&xhci_hc[ctrl_idx], 0);
@@ -2222,7 +2283,10 @@ extern "C" void kmain(void) {
 
         { KernelCpuScope cpu_scope(KCPU_HUBS);
 		for (int h = 0; h < hub_count; ++h) {
-			uint8_t changed_port = hub_poll_changes(h);
+			uint8_t changed_port;
+            { USBControlGuard ownership;
+              if (storage_owner && storage_owner != g_current_task) break;
+              changed_port = hub_poll_changes(h); }
 			if (changed_port) {
 				usb_hub_reconcile(hubs[h], changed_port);
 				goto restart;
@@ -2235,6 +2299,7 @@ extern "C" void kmain(void) {
 		// port that becomes enabled later. Neither path resets mounted disks.
         { KernelCpuScope cpu_scope(KCPU_ROOT_PORTS);
         for (int ctrl_idx = 0; ctrl_idx < xhci_count; ctrl_idx++) {
+            if (storage_owner && storage_owner != g_current_task) break;
             XHCIController* hc = &xhci_hc[ctrl_idx];
             if (hc->needsResetting) continue;
             uint64_t now = _usb_rdtsc();

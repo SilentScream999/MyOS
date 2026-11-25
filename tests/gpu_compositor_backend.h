@@ -6,6 +6,97 @@ static uint64_t g_gpu_test_bcs_pixels=0,g_gpu_test_rcs_pixels=0;
 static bool g_gpu_test_fail=false;
 static uint32_t g_gpu_test_sample[3]{};
 static uint8_t* g_gpu_test_recovery;
+// Invoke the shared repair traversal on the mock retained destination. The
+// production direct-scanout gate requires physical Intel registers and hooks.
+static VisibleRegion g_gpu_test_scene_repairs{};
+static uint8_t g_gpu_test_scene_repair_request=0;
+static bool g_gpu_test_scene_repair_accepted=false;
+static int32_t g_gpu_test_tray_left=0;
+static bool g_gpu_test_tray_enabled=false;
+static bool g_gpu_test_tray_menu=false;
+static unsigned g_gpu_test_tray_fps=0;
+static uint8_t* g_gpu_test_taskbar_before=nullptr;
+static void gpu_test_repair_scene(){
+    if(!g_gpu_test_scene_repair_request)return;
+    unsigned request=g_gpu_test_scene_repair_request;
+    g_gpu_test_scene_repair_request=0;
+    g_gpu_retained_master=g_master_backbuffer;g_gpu_direct_back=0;
+    bool clock_valid=g_clock_valid;
+    bool menu_open=g_menu_open;
+    if((request==2||request==3)&&g_gpu_test_tray_menu){
+        g_menu_open=true;wm_draw_start_menu(0,0,true);
+    }
+    if(request==2||request==3){g_desktop_fps=g_gpu_test_tray_fps;g_clock_valid=false;}
+    if(request==4){
+        Window* rain=nullptr;
+        for(int i=0;i<g_window_count;++i)if(g_window_list[i]->type==WIN_TYPE_RAIN)rain=g_window_list[i];
+        g_gpu_test_scene_repair_accepted=false;
+        if(rain){
+            int popup=g_taskbar_popup,group=g_taskbar_group_id,anchor=g_taskbar_anchor;
+            int x=rain->x,y=rain->y,w=rain->w,h=rain->h;
+            int cw=rain->canvas_width,ch=rain->canvas_height;
+            bool maximized=rain->maximized;
+            g_menu_open=false;g_taskbar_popup=2;g_taskbar_group_id=rain->id;g_taskbar_anchor=100;
+            rain->x=0;rain->y=g_title_h;rain->w=fb->width;rain->h=fb->height-g_taskbar_h-g_title_h;
+            rain->canvas_width=rain->w;rain->canvas_height=rain->h;rain->maximized=true;
+            auto panel=wm_taskbar_panel(wm_taskbar_snapshot());
+            VisibleRect cut{panel.x,panel.y,panel.x+panel.w,panel.y+panel.h};
+            bool ok=wm_prepare_retained_animation(rain)&&g_retained_animation_plan.count;
+            for(unsigned i=0;ok&&i<g_retained_animation_plan.count;++i)
+                ok=!visibility_valid(visibility_intersect(cut,g_retained_animation_plan.copies[i].destination));
+            // Compare the entire rendered popup, including text/icon edges,
+            // after corrupting its pixels and leaving a partial repair clip.
+            // Repeat hover/non-hover on alternating destinations so cutout
+            // acceptance alone cannot hide an incomplete retained panel.
+            auto* expected=(uint8_t*)kmalloc((uint64_t)panel.w*panel.h*4);
+            int mx=g_mouse_x,my=g_mouse_y;
+            int left=g_ui_clip_left,right=g_ui_clip_right,top=g_ui_clip_top,bottom=g_ui_clip_bottom;
+            auto deferred=g_deferred_alpha;g_deferred_alpha.clear();
+            if(!expected)ok=false;
+            for(unsigned pass=0;ok&&pass<4;++pass){
+                g_gpu_direct_back=pass%2;
+                g_mouse_x=pass&1?panel.x+45:0;g_mouse_y=pass&1?panel.y+45:0;
+                g_ui_clip_left=panel.x;g_ui_clip_right=panel.x+panel.w;
+                g_ui_clip_top=panel.y;g_ui_clip_bottom=panel.y+panel.h;
+                wm_taskbar_render_popup(panel.y,panel.y+panel.h-1);
+                for(int py=0;py<panel.h;++py){
+                    auto* row=g_master_backbuffer+(uint64_t)(panel.y+py)*fb->pitch+panel.x*4;
+                    memcpy(expected+(uint64_t)py*panel.w*4,row,panel.w*4);
+                    memset_32((uint32_t*)row,0xffdeadbe,panel.w);
+                }
+                g_ui_clip_right=panel.x+panel.w/2;g_ui_clip_top=panel.y+panel.h/2;
+                ok=wm_draw_retained_animation(0)&&!g_retained_scene_invalidated;
+                for(int py=0;ok&&py<panel.h;++py){
+                    auto* wanted=(uint32_t*)(expected+(uint64_t)py*panel.w*4);
+                    auto* actual=(uint32_t*)(g_master_backbuffer+(uint64_t)(panel.y+py)*fb->pitch+panel.x*4);
+                    for(int px=0;ok&&px<panel.w;++px)ok=wanted[px]==actual[px];
+                }
+            }
+            kfree(expected);g_deferred_alpha=deferred;
+            g_mouse_x=mx;g_mouse_y=my;
+            g_ui_clip_left=left;g_ui_clip_right=right;g_ui_clip_top=top;g_ui_clip_bottom=bottom;
+            g_gpu_test_scene_repair_accepted=ok;
+            rain->x=x;rain->y=y;rain->w=w;rain->h=h;rain->canvas_width=cw;rain->canvas_height=ch;rain->maximized=maximized;
+            g_taskbar_popup=popup;g_taskbar_group_id=group;g_taskbar_anchor=anchor;
+        }
+    }else if(request==2){
+        uint64_t bytes=(uint64_t)fb->pitch*g_taskbar_h;
+        if(!g_gpu_test_taskbar_before)g_gpu_test_taskbar_before=(uint8_t*)kmalloc(bytes);
+        if(!g_gpu_test_taskbar_before)hcf();
+        memcpy(g_gpu_test_taskbar_before,g_master_backbuffer+(uint64_t)(fb->height-g_taskbar_h)*fb->pitch,bytes);
+        g_gpu_test_scene_repair_accepted=true;
+        for(unsigned i=0;i<g_gpu_test_scene_repairs.count;++i)
+            if(!wm_repair_retained_foreground(g_gpu_test_scene_repairs.rects[i]))g_gpu_test_scene_repair_accepted=false;
+    }else if(request==3){
+        wm_compose_dirty(0,fb->width-1,fb->height-g_taskbar_h,fb->height-1,false);
+    }else{
+        wm_compose_retained_repairs(g_gpu_test_scene_repairs);
+        g_gpu_test_scene_repair_accepted=true;
+    }
+    g_menu_open=menu_open;
+    g_clock_valid=clock_valid;
+    gpu_direct_end();
+}
 #ifdef GPU_RENDER_TEST
 static uint64_t g_gpu_test_render_calls=0;
 static uint64_t g_gpu_test_demo_render_calls=0;
@@ -164,6 +255,8 @@ static bool gpu_test_compose(const GpuScenePlan& plan) {
     return true;
 }
 static void gpu_test_install() {
+    g_gpu_test_tray_left=wm_tray_damage_left();
+    g_gpu_test_tray_enabled=GPU_EXACT_REPAIRS;
     // Isolate the existing retained/alpha fixtures; shadow coverage below
     // explicitly enables decorations on these same windows.
     for(int i=0;i<g_window_count;++i)g_window_list[i]->shadow_enabled=false;

@@ -58,8 +58,8 @@ src/kernel.o: src/kernel.cpp src/core/helpers.h src/core/structures.h \
   src/drivers/gpu_render_commands.h src/drivers/gpu_gen9_pipeline.h \
   src/drivers/gpu_render_reset.h src/drivers/gpu_gen9_workarounds.h \
   src/drivers/gpu_upload_cache.h src/drivers/gpu_alpha_coverage.h \
-  src/arch/apic_timer.h src/gui/boot_splash.h src/drivers/synaptics.h \
-  src/drivers/ps2kb.h
+  src/drivers/gpu_alpha_tail_wait.h src/arch/apic_timer.h \
+  src/gui/boot_splash.h src/drivers/synaptics.h src/drivers/ps2kb.h
 
 src/core/helpers.h:
 
@@ -324,6 +324,8 @@ src/drivers/gpu_gen9_workarounds.h:
 src/drivers/gpu_upload_cache.h:
 
 src/drivers/gpu_alpha_coverage.h:
+
+src/drivers/gpu_alpha_tail_wait.h:
 
 src/arch/apic_timer.h:
 

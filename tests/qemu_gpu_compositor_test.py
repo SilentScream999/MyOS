@@ -61,6 +61,10 @@ def main():
             assert debug.request('c').startswith(('T05','S05'))
             assert debug.request(f'z0,{returned:x},1')=='OK'
         for _ in range(4):frame()
+        debug.write(address('g_gpu_test_scene_repair_request'),b'\4')
+        frame()
+        assert value('g_gpu_test_scene_repair_accepted',1),'Opaque taskbar popup rejected retained animation or its cutout'
+        print('Retained app picker: cutout and full panel pixels survive corruption, stale clips and hover on both destination indices.',flush=True)
         assert value('g_gpu_test_calls')>0
         assert value('g_gpu_test_rainbow_calls')>0
         assert value('g_titlebar_cache_renders')>0
@@ -252,6 +256,73 @@ def main():
             assert pixel_at(1084,228)==over(0x80402010,over(0x80601020,0xff008080))
             samples=[(1084,228),(1152,228),(1152,290),(1030,210),(1050,174)]
             accelerated=[pixel_at(px,py) for px,py in samples]
+            # Exercise the real shared compositor on disjoint retained repairs.
+            # Overlapping input is canonicalized; each alpha layer submits once,
+            # and the undamaged gap between clips must keep its sentinel.
+            repair_clips=[(1080,220,1088,226),(1084,224,1092,230),(1100,220,1108,230),
+                          (0,0,1280,1),(0,799,1280,800)]
+            def batch_repairs():
+                region=address('g_gpu_test_scene_repairs')
+                debug.write(region,b''.join(struct.pack('<iiii',*r) for r in repair_clips))
+                debug.write(region+64*16,len(repair_clips).to_bytes(4,'little'))
+                debug.write(address('g_gpu_test_scene_repair_request'),b'\1')
+                frame()
+                assert value('g_gpu_test_scene_repair_accepted',1),'Shared repair batch rejected interior clips'
+            sentinel=0xff7351a9
+            debug.write(master+225*pitch+1095*4,sentinel.to_bytes(4,'little'))
+            for _ in range(3):
+                draws=value('g_gpu_test_render_calls')
+                batch_repairs()
+                assert value('g_gpu_test_render_calls')-draws==2,'Repair clips submitted RCS more than once per layer'
+                assert pixel_at(1095,225)==sentinel,'Batched repairs filled an undamaged hole'
+                for px,py in [(1084,225),(1090,228),(1104,225)]:
+                    assert pixel_at(px,py)==over(0x80402010,over(0x80601020,0xff008080)),('Batched alpha accumulated',px,py)
+            debug.write(address('g_gpu_test_render_fail'),b'\1')
+            batch_repairs()
+            assert value('g_gpu_render_hook')==0
+            assert [pixel_at(px,py) for px,py in samples]==accelerated,'Partial repair batch fallback double-blended alpha'
+            debug.write(address('g_gpu_test_render_fail'),b'\0')
+            debug.write(address('g_gpu_render_hook'),render_hook)
+            repaint()
+            print('Shared scene repairs: one RCS submission per layer, exact holes, overlapping clips and partial-failure CPU recovery passed.',flush=True)
+            if value('g_gpu_test_tray_enabled',1):
+                # Clock/FPS updates must match full taskbar rendering while touching
+                # only their exact strip, including borders and antialiased text.
+                tray_left=value('g_gpu_test_tray_left',4)
+                tray_top=800-value('g_taskbar_h',4)
+                old_fps=value('g_desktop_fps',4)
+                def tray_repair(fps,clips=None):
+                    debug.write(address('g_gpu_test_tray_fps'),fps.to_bytes(4,'little'))
+                    if clips is not None:
+                        region=address('g_gpu_test_scene_repairs')
+                        debug.write(region,b''.join(struct.pack('<iiii',*r) for r in clips))
+                        debug.write(region+64*16,len(clips).to_bytes(4,'little'))
+                    debug.write(address('g_gpu_test_scene_repair_request'),bytes([2 if clips is not None else 3]))
+                    frame()
+                    if clips is not None:assert value('g_gpu_test_scene_repair_accepted',1)
+                def tray_pixels(snapshot=False):
+                    base=value('g_gpu_test_taskbar_before') if snapshot else master+tray_top*pitch
+                    return b''.join(debug.read(base+y*pitch+tray_left*4,(1280-tray_left)*4) for y in range(800-tray_top))
+                tray_clips=[(tray_left,tray_top,1280,800),
+                            (tray_left+3,tray_top+4,1277,798)]
+                for fps in (8,123,60):
+                    debug.write(address('g_gpu_test_tray_menu'),bytes([fps==123]))
+                    tray_repair(fps);expected=tray_pixels()
+                    for clip in tray_clips:
+                        tray_repair(987)
+                        bcs=value('g_gpu_test_calls');rcs=value('g_gpu_test_render_calls')
+                        tray_repair(fps,[clip]);actual=tray_pixels();before=tray_pixels(True)
+                        assert value('g_gpu_test_calls')==bcs and value('g_gpu_test_render_calls')==rcs
+                        preserved=int.from_bytes(debug.read(value('g_gpu_test_taskbar_before')+10*pitch+20*4,4),'little')
+                        assert pixel_at(20,tray_top+10)==preserved,'Tray repair repainted a task button'
+                        for y in range(tray_top,800):
+                            for x in range(tray_left,1280):
+                                p=((y-tray_top)*(1280-tray_left)+x-tray_left)*4
+                                target=expected if clip[0]<=x<clip[2] and clip[1]<=y<clip[3] else before
+                                assert actual[p:p+4]==target[p:p+4],('Tray clip mismatch',fps,x,y)
+                debug.write(address('g_gpu_test_tray_menu'),b'\0')
+                tray_repair(old_fps)
+                print('Retained FPS tray: full/partial clips match full taskbar pixels, preserve task buttons and submit no GPU work.',flush=True)
             cpu_before=value('g_cpu_alpha_pixel_limit')
             debug.write(address('g_cpu_alpha_pixel_limit'),(1024*1024).to_bytes(8,'little'))
             rcs_before=value('g_gpu_test_render_calls');repaint()

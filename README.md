@@ -24,6 +24,7 @@ storage attached. It selects local `OVMF.fd` or installed
 | Command | Result |
 |---|---|
 | `make iso` | Build ISO and refresh USB boot/system files; preserve user data |
+| `make iso GPU=0` | Build and refresh the same image with CPU-only rendering |
 | `make usb-image` | Build/refresh `wyzar-usb.img` for flashing |
 | `make run-usb` | Build/refresh and boot that USB image directly in QEMU |
 | `make clean && make run FRESH=1` | Clean build and reset the selected system image |
@@ -50,6 +51,7 @@ options; header dependencies are tracked automatically.
 | `GPU_COMPOSE=0` | `GPU` | Disable opaque GPU composition and rainbow |
 | `GPU_PRESENT=0` | `GPU_COMPOSE` | Use CPU presentation instead of supported vblank page flips |
 | `GPU_RENDER=1` | follows `GPU_COMPOSE` | Gen9 render-engine scaling after runtime discovery and pixel readback; `0` keeps blitter composition |
+| `GPU_RCS_ALPHA=1` | `0` | Opt in to validated render-engine translucency and retained Rainbow updates |
 | `DEBUG=1` | `0` | Fixed-size USB root policy; not a compiler debug switch |
 | `BOOT_DIAGNOSTICS=1` | `0` | Extra boot timings |
 | `CLOCK_UTC_OFFSET_MIN=-420` | `0` | Minutes added to RTC for tray display |

@@ -32,6 +32,15 @@ offsetof(USBStorageCompletion,active), offsetof(USBStorageCompletion,pointer)); 
     binary = OUT / 'storage-completion-offsets'
     subprocess.run(['clang++', '-std=c++20', '-I.', str(fixture), '-o', str(binary)], cwd=ROOT, check=True)
     size, active_offset, pointer_offset = map(int, subprocess.check_output([str(binary)], text=True).split())
+    task_source=(ROOT/'src/core/task.h').read_text()
+    task=('struct Task {'+task_source.split('struct Task {',1)[1].split('\n};',1)[0]+'\n};').replace('pid_t','uint32_t')
+    console_source=(ROOT/'src/core/app_console.h').read_text()
+    console=('struct AppConsole {'+console_source.split('struct AppConsole {',1)[1].split('\n};',1)[0]+'\n};').replace('pid_t','uint32_t')
+    fixture.write_text('#include <cstdio>\n#include <cstddef>\n#include <cstdint>\n'
+                       '#define MAX_FDS 16\nstruct file;enum class TaskState:uint8_t;\n'+task+console+
+                       'int main(){printf("%zu %zu %zu",offsetof(Task,console),offsetof(AppConsole,output_head),offsetof(AppConsole,line_len));}\n')
+    subprocess.run(['clang++','-std=c++20','-I.',str(fixture),'-o',str(binary)],cwd=ROOT,check=True)
+    console_offset,output_offset,line_offset=map(int,subprocess.check_output([str(binary)]).split())
     q = smoke.Qemu(hub_depth=2, extra_args=('-gdb', 'tcp:127.0.0.1:45456'))
 
     def memory(addr, length):
@@ -72,6 +81,9 @@ offsetof(USBStorageCompletion,active), offsetof(USBStorageCompletion,pointer)); 
         active = [i for i in range(256 * 4) if raw[i * size + active_offset]]
         assert len(active) == 1, active
         entry = base + active[0] * size
+        waiter=int.from_bytes(debug.read(address('usb_storage_waiters')+active[0]*8,8),'little')
+        console=int.from_bytes(debug.read(waiter+console_offset,8),'little')
+        assert console,'Storage writer did not use the desktop console channel'
         pointer = int.from_bytes(raw[active[0] * size + pointer_offset:active[0] * size + pointer_offset + 8], 'little')
         # Keep the real hardware/rings intact; deny only this waiter's expected
         # completion. It must time out while other devices stay operational.
@@ -86,15 +98,15 @@ offsetof(USBStorageCompletion,active), offsetof(USBStorageCompletion,pointer)); 
         after_screen = OUT / 'async-storage-after.ppm'
         q.command('screendump', {'filename': str(before_screen)})
         before_x = scalar('g_mouse_x', 4)
-        before_keys = scalar('tty_out_head', 4)
-        before_line = scalar('tty_line_len', 4)
+        before_keys = memory(console+output_offset,4)
+        before_line = memory(console+line_offset,4)
         q.monitor('mouse_move 13 0')
         q.monitor('sendkey a 500')
         time.sleep(.15)
         assert memory(entry + active_offset, 1) == b'\x01', 'Wait ended before responsiveness measurement'
         assert scalar('g_tick_count') > tick + 20, 'Timer stalled during storage wait'
         assert scalar('g_mouse_x', 4) > before_x, 'Mouse stalled during storage wait'
-        assert (scalar('tty_out_head', 4) != before_keys or scalar('tty_line_len', 4) != before_line), 'Keyboard stalled during storage wait'
+        assert (memory(console+output_offset,4) != before_keys or memory(console+line_offset,4) != before_line), 'Keyboard stalled during storage wait'
         q.command('screendump', {'filename': str(after_screen)})
         assert before_screen.read_bytes() != after_screen.read_bytes(), 'Desktop presentation stalled during storage wait'
         for _ in range(50):

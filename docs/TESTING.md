@@ -74,6 +74,19 @@ I/O, cache replacement/eviction and safe recovery-tree/module-page reclamation.
 QEMU covers default-VGA ISO boot, USB boot, RAM recovery, live icon/manifest
 replacement, menu/window resource lifetimes and failed-disk-shell fallback.
 
+To verify the explicit CPU-only configuration with a disposable disk:
+
+```sh
+make iso GPU=0 PERSIST_DISK=.storage-test/cpu-only.img ROOT_MIB=64
+python3 tests/qemu_boot_framebuffer_test.py --image .storage-test/cpu-only.img
+python3 tests/qemu_gpu_window_test.py
+make iso
+```
+
+The boot suite checks that GPU hooks remain absent in ISO, USB and RAM recovery
+boots. The window suite exercises animation, alpha, resizing and Start close.
+The final build refreshes the standard image while preserving its saved files.
+
 ## Native File Explorer
 
 External filesystem regression tests include FAT32 and exFAT copies, a sparse
@@ -269,8 +282,8 @@ cache handoffs, timeouts or sleep policy were added or removed for measurement.
 The limit is 32 samples per boot.
 
 `make test-gpu-perf` checks sleep threshold boundaries and sample subtraction.
-Build with `make iso GPU_RCS_ALPHA=1 PERSIST_DISK=wyzar-rcs-alpha-usb.img`
-to test optimized RCS translucency on Intel hardware. The default build uses
+Use the retained Rainbow build in [BUILD_CONFIGS](../BUILD_CONFIGS.txt) to
+reproduce the Kaby Lake measurements on the standard `wyzar-usb.img`. The default build uses
 SIMD translucency. The experimental build checks multi-band alpha readback
 before enabling desktop RCS. Leave Rainbow fullscreen for five seconds, then
 keep a medium transparent window stationary above it for at least six seconds.
@@ -353,7 +366,7 @@ with the existing CPU resize-grip strip. Alpha over static foreground pixels
 stays cached. Input/app damage is repaired only outside the refreshed animation
 rectangles, so a translucent update is not drawn twice over the same pixels.
 Source snapshots are refreshed after repairs. A changed layout uses a complete
-ordinary scene before presenting. Start, clipboard/taskbar popups, unsupported scaled animation surfaces,
+ordinary scene before presenting. Uncached Start panels, clipboard popups, unsupported scaled animation surfaces,
 unavailable GPU alpha and visibility-list overflow use ordinary composition.
 Old scanout cursor/outline damage is still repaired before presentation.
 `GPU frame:` includes `animationFrames`, `animationKiPx` and `alphaFrames` to
@@ -537,6 +550,13 @@ background beneath stacked alpha, shadows, menu open/close/move and hover-color
 cache changes. QEMU window checks also exercise real Start opening, changed
 cached hover pixels and Escape closure through CPU fallback. Intel cadence,
 transition stutters and CPU cost still require the owner's hardware log.
+The opaque taskbar app picker uses a cutout shared by Rainbow and its derived
+alpha plans. It is replayed in full after the retained window layers with its
+own saved/restored clip; ordinary opaque-alpha repairs cannot replace it.
+Popup geometry changes during GPU work retain complete-scene recovery.
+The mock compositor test corrupts every popup pixel, leaves a partial repair
+clip, and compares the final full panel, including hover, text and icon edges.
+Its destination-index checks use mock memory, not physical Intel scanouts.
 `GPU_FRAME_DIAGNOSTICS=1` adds observation only, default off. `GPU planning:`
 reports microsecond `wall/cpu` pairs from TSC and the compositor task's existing
 scheduled-CPU accounting: initial preparation, direct-scanout setup, exact
@@ -710,11 +730,63 @@ and 1800x950 over fullscreen Rainbow. It checks animated pixels, zero RCS
 submissions and intact heap/stack guards above the former cutoff. This tests
 the path transition, not physical frame rate. Measure CPU use for large layers.
 
+For experimental `GPU_RCS_ALPHA=1` direct alpha draws covering at least 65,536
+pixels, completion waits can use a short adaptive poll near the GPU drain.
+Two valid timestamp samples with matching source/sampling/rectangle geometry
+are required. All eligible draws share a 250-us polling allowance per compositor
+frame; ordinary one-ms sleeps resume when the prediction misses or the allowance
+is spent. IRQs stay enabled and both fence completion and context retirement
+remain mandatory. Missing/invalid timing disables learning; timeout still takes
+the existing CPU recovery path. The default CPU alpha policy is unchanged.
+`GPU alpha wait` reports `windows` (waits using the poll), `pollUs` (total elapsed
+poll time, including any interrupt/preemption delay), and `predictionUs` (the last
+GPU-to-drain estimate). Allowance accounting can overshoot by the final poll/check
+or an interruption. Confirm nonzero `windows` before attributing hardware gains.
+Compare fullscreen transparency over Rainbow, CPU use, RCS drain-to-observation
+tail and refresh skips; keep Start close in the sequence. QEMU does not execute
+Intel CSB polling. `make test-gpu-alpha-wait` uses a fake timer/GPU completion
+timeline to check warmup/invalidation, shared budget exhaustion, wrong predictions,
+and missing-fence/missing-retirement timeouts. Its simulated latency improvement
+is not a hardware FPS measurement.
+
 `make test-title-bar test-damage-regions` verifies cache invalidation keys,
 text/icon/control pixels, offscreen clipped blits and direct fallback, plus
 non-inflating exposed-strip coalescing and bounded damage coverage under pressure.
 The compositor suite checks cache reuse, title/focus/resource invalidation,
-hover damage, move reuse and release on real app close. Its partial-alpha
+and shared scene repair batching. Its mock retained destination checks that
+overlapping damage becomes disjoint clips, holes remain untouched, and multiple
+clips submit RCS once per window in stack order. HUD/taskbar damage is separated
+from interior repairs. An injected partial repair failure must reconstruct the
+scene through CPU fallback without accumulating alpha. This fixture invokes the
+shared repair traversal directly; it does not validate Intel scanout registers.
+The experimental `GPU repair plan` log reports `sceneBatches` and `sceneRects`;
+compare these with frame-gap `bcsBatches`, `rcsDraws`, `repairsUs` and `fallbackUs`.
+With exact retained damage, clock/FPS updates keep their horizontal extent and
+redraw only the opaque tray. `trayRects` counts those repairs and `trayUs` is
+their total elapsed time in the sample window. Full taskbar drawing shares the
+same tray renderer; ordinary taskbar changes and CPU fallback remain supported.
+The tray path also works under a cached Start panel that ends above the taskbar.
+When repair-time revalidation discovers a changed animation layout, one bounded
+rebase can repair the full screen's complement of the fresh animation plan and
+then draw that animation once. Revalidation runs again; another change, overflow
+or GPU failure retains full-scene recovery. `rebases` counts attempts and
+`rebaseFailed` counts attempts rejected by the second revalidation. These two
+counters are cumulative so a layout-sample reset cannot hide an attempt. Host
+pixel comparisons cover complementary repairs across menu changes, moves, source
+coverage changes and reorder on both scanouts. Physical transition latency
+still needs a new log; QEMU cannot reproduce the Intel mid-frame timing.
+The QEMU suite compares full and partial tray repairs with full taskbar pixels,
+including changing digit widths, clipped text/borders, untouched task buttons,
+and zero extra GPU submissions. Use a new Kaby Lake log to verify that removing
+the former full-taskbar repaint from clock/FPS frames recovers refresh headroom.
+On Kaby Lake, test fullscreen Rainbow with the transparent GPU Scaling Test
+maximized above it, then Image Viewer launch, Start open/hover/close, and window
+restore/resize/close. Keep Start close in the sequence even if steady animation
+looks smooth. Record FPS and save the hardware boot log; QEMU cannot establish
+whether the 50 ms frames or visible fullscreen transparency drops improved.
+
+The compositor suite also checks title hover damage, cache reuse after moves,
+and release on real app close. Its partial-alpha
 fixture requires exactly two one-pixel RCS draws and preserves an unrelated
 sentinel on the same scanline. Ordered draws subtract higher opaque coverage
 without discarding backgrounds beneath alpha/shadows. Measure the new covered-
@@ -923,6 +995,7 @@ inspection, pinning, removal, purge and preservation of saved app data.
 |---|---|
 | `python3 tests/run_usb_hub_tests.py` | Protocol helpers, scripted actual enumeration/reset/wait/write paths, completion ownership |
 | `python3 tests/qemu_late_storage_test.py` | Discovery grace and fixed root after recovery starts |
+| `python3 tests/qemu_usb_probe_failure_test.py` | Timer and desktop progress during stalled synchronous discovery, bounded hub cleanup and existing input/disk survival; uses a disposable copy of `.storage-test/root.img` with the current ISO |
 | `python3 tests/qemu_usb_recovery_test.py` | Root-failure report and topology diagnostics |
 | `python3 tests/qemu_font_selection_test.py wyzar-usb.img assets/fonts/selawik/selawk.ttf` | Custom/missing/corrupt TTF selection and recovery font |
 

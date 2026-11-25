@@ -1,6 +1,6 @@
 # Project handoff
 
-Updated 2026-11-22. This is the current working snapshot, not a change log.
+Updated 2026-11-24. Start with the current status below.
 Start with [README](../README.md), then the guide for the area being changed.
 Pending work is in [NEXT_STEPS](NEXT_STEPS.md); commands are in [TESTING](TESTING.md).
 
@@ -9,6 +9,15 @@ Pending work is in [NEXT_STEPS](NEXT_STEPS.md); commands are in [TESTING](TESTIN
 WyzarOS is a single-core x86-64 OS with a C++ kernel, C/C++ userspace, Limine boot,
 preemptive tasks, static ELF loading and a framebuffer desktop. The long-term
 target is a GPU-composited desktop with installable applications.
+
+The retained Rainbow checkpoint reached 58–60 FPS in steady tall
+half-screen translucency samples and 58–59 FPS with the grouped app picker
+open on Kaby Lake. Brief drops remain during layout changes. The opt-in
+build recipe uses the standard `wyzar-usb.img` filename. Default builds
+retain CPU SIMD translucency, and `GPU=0` selects CPU-only rendering.
+USB discovery now lets the timer and compositor run during synchronous
+probes. See [build configurations](../BUILD_CONFIGS.txt) and the
+[GPU roadmap](GPU_DESKTOP_ROADMAP.md) for the current paths.
 
 | Area | Implemented | Details |
 |---|---|---|
@@ -39,7 +48,7 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
 
 - A prior owner run (2026-11-22) crashed with heap corruption while opening
   an app over GPU tests. Subsequent logs contain no new crash record. Opaque
-  overlap/shadows are now acceptable; choppy animation under alpha is the priority.
+  overlap and shadows were acceptable in that round of testing.
   Page allocator reservation/freelist updates now exclude preemption; zeroing
   follows reservation. The compositor uses a 64 KiB stack and static frame
   snapshots; task canaries and heap-header diagnostics are enabled. These are

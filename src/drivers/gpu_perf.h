@@ -34,8 +34,12 @@ struct GpuPerfCounters {
     uint64_t retained_menu_frames=0,retained_menu_pixels=0;
     uint64_t retained_menu_close_deferrals=0;
     uint64_t exact_repair_frames=0,exact_repair_pixels=0;
+    uint64_t scene_repair_batches=0,scene_repair_rects=0;
+    uint64_t tray_repair_rects=0,tray_repair_pixels=0,tray_repair_ticks=0;
+    uint64_t transition_rebases=0,transition_rebase_failed=0;
     uint64_t cpu_alpha_draws=0,cpu_alpha_pixels=0,cpu_alpha_ticks=0;
     uint64_t rcs_alpha_pixels=0,rcs_alpha_skipped=0;
+    uint64_t alpha_tail_windows=0,alpha_tail_ticks=0,alpha_tail_prediction_us=0;
     GpuPerfSleep bcs_sleep{},rcs_sleep{},flip_sleep{};
 };
 inline GpuPerfCounters g_gpu_perf{};
@@ -181,6 +185,13 @@ struct GpuFrameTimeline {
     Cost planning[PhaseCount]{};
     uint64_t sleep_to_ready=0,ready_to_resume=0,ready_late_ticks=0,resume_late_ticks=0;
     int sleep_ready_pid=-1;
+    struct RcsCompletion {
+        uint64_t submitted=0,observed=0,wait_ticks=0;
+        uint64_t max_sleep=0,sleep_to_ready=0,ready_to_resume=0;
+        int sleep_ready_pid=-1;
+        uint32_t sequence=0;
+        GpuExecutionTiming hardware{};
+    } slowest_rcs;
     GpuDisplayPhase display_previous{},display_start{},display_before{},display_after{},display_latch{};
 #endif
 #if GPU_WORKLOAD

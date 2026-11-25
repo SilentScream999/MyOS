@@ -3,7 +3,10 @@
 
 #include "gpu_cmds.h"
 #include "gpu_compositor.h"
-static constexpr unsigned GPU_RAIN_TILE_ROWS=256;
+// A full-height immutable tile avoids repeated short BLTs when transparent
+// windows split the exposed animation into narrow, tall rectangles. At 1080p
+// the wide-pitch view now needs at most three runs rather than twelve.
+static constexpr unsigned GPU_RAIN_TILE_ROWS=1024;
 static constexpr uint64_t GPU_RAIN_TILE_BYTES=720*4*GPU_RAIN_TILE_ROWS;
 
 // The immutable 720-pixel palette is uploaded once. Build one shifted row with

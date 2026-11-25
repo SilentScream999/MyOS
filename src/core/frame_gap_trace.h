@@ -11,7 +11,7 @@ struct GpuGapScope {
     GpuGapScope(GpuGapActivity activity,const char* detail=nullptr) {
         TtyIrqGuard guard;
         serial=g_gpu_gap_history.begin(gpu_launch_now(),activity,
-            g_current_task?g_current_task->pid:-1,detail);
+            g_current_task?g_current_task->pid:-1,detail,(guard.flags&(1u<<9))!=0);
     }
     ~GpuGapScope(){
         TtyIrqGuard guard;

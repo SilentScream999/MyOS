@@ -38,6 +38,41 @@ extern gpu_compose_hook_fn g_gpu_render_hook;
 extern bool g_gpu_quarantine_sources;
 extern uint64_t g_gpu_surface_epoch;
 
+// Append disjoint clips for one source at its stack position. No submission
+// occurs until the whole layer is ready; overflow must restart on the CPU.
+static inline bool gpu_scene_append_clips(GpuScenePlan* batch,const GpuScenePlan& part){
+    if(part.client_count!=1||part.count>GpuScenePlan::capacity||
+       batch->count>GpuScenePlan::capacity-part.count)return false;
+    for(unsigned i=0;i<part.count;++i)
+        if(part.copies[i].source!=0||!visibility_valid(part.copies[i].destination))return false;
+    if(!batch->count){
+        batch->client_count=1;batch->clients[0]=part.clients[0];
+        batch->scroll=part.scroll;batch->rainbow_colors=part.rainbow_colors;
+    }
+    for(unsigned i=0;i<part.count;++i)batch->copies[batch->count++]=part.copies[i];
+    batch->accelerated=batch->count?1:0;
+    return true;
+}
+
+// Canonicalize repairs before layer batching. Overlapping input must never
+// blend translucent pixels twice, and a bounding box must not fill the holes.
+static inline bool gpu_scene_repair_region(VisibleRegion* result,const VisibleRegion& input,
+                                           VisibleRect screen,VisibleRect* bounds){
+    result->count=0;
+    if(!input.count||input.count>VisibleRegion::capacity)return false;
+    for(unsigned i=0;i<input.count;++i){
+        auto r=input.rects[i];
+        if(!visibility_valid(r)||r.x1<screen.x1||r.y1<screen.y1||
+           r.x2>screen.x2||r.y2>screen.y2||!visibility_add_exact(result,r))return false;
+    }
+    VisibleRect box=result->rects[0];
+    for(unsigned i=1;i<result->count;++i){auto r=result->rects[i];
+        if(r.x1<box.x1)box.x1=r.x1;if(r.y1<box.y1)box.y1=r.y1;
+        if(r.x2>box.x2)box.x2=r.x2;if(r.y2>box.y2)box.y2=r.y2;
+    }
+    *bounds=box;return true;
+}
+
 // One GPU scene pass can clip opaque coverage inside its copy plan. Keeping
 // animation strips as separate scene passes would wait on a fence per strip.
 static inline bool gpu_animation_damage_bounds(const VisibleRegion& exposed,VisibleRect* bounds) {

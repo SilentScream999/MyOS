@@ -106,8 +106,13 @@ FORCE_KERNEL_CONFIG:
 
 $(OBJ) $(EXT4_OBJ): .storage-test/kernel-config
 
-.PHONY: test-gpu-render test-gpu-perf
-test-gpu-perf:
+.PHONY: test-gpu-render test-gpu-perf test-gpu-alpha-wait
+test-gpu-alpha-wait:
+	mkdir -p .storage-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. tests/gpu_alpha_tail_wait_test.cpp -o .storage-test/gpu-alpha-wait-test
+	.storage-test/gpu-alpha-wait-test
+
+test-gpu-perf: test-gpu-alpha-wait
 	mkdir -p .storage-test
 	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -DGPU_FRAME_DIAGNOSTICS=1 -I. tests/gpu_perf_test.cpp -o .storage-test/gpu-perf-test
 	.storage-test/gpu-perf-test

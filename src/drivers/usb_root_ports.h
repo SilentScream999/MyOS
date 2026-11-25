@@ -104,7 +104,7 @@ static void usb_root_detach(XHCIController* hc, uint32_t port) {
 }
 
 static void usb_hub_reconcile(USBDevice* hub, uint8_t port) {
-    USBControlGuard guard;
+    USBTransactionGuard guard;
     USBProbeGuard probe(hub->hc);
     char detail[32];
     print((char*)"[usb] Hub port change handled locally; slot:"); to_str(hub->slot_id, detail); print(detail);
@@ -136,7 +136,7 @@ static void usb_hub_reconcile(USBDevice* hub, uint8_t port) {
 }
 
 static void usb_root_enumerate(XHCIController* hc, uint32_t port, bool reset) {
-    USBControlGuard guard;
+    USBTransactionGuard guard;
     USBProbeGuard probe(hc);
     if (usb_probe_expired(hc)) return;
     int c = hc - xhci_hc;
@@ -221,7 +221,7 @@ static bool usb_root_poll(XHCIController* hc, uint32_t port, uint64_t now) {
                                 !(sc & ((1u << 4) | (1u << 31)))) ? 1u : 0u,
                                now, settle);
     if (!changed && !replaced && !late_ready) return false;
-    USBControlGuard guard;
+    USBTransactionGuard guard;
     USBProbeGuard probe(hc);
     char detail[32];
     print(replaced ? (char*)"[usb] Root device replacement; port:" :

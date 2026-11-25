@@ -56,7 +56,16 @@ with resizing, overlapping and restarts, and smooth direct rendering on v11.
 QEMU fallback tests exercise CPU recovery; Intel execution needs hardware.
 
 Force the CPU renderer, preserving saved files:
-make clean && make iso GPU=0
+make iso GPU=0
+
+Reproduce the measured Kaby Lake retained Rainbow build in wyzar-usb.img:
+make iso GPU_RCS_ALPHA=1 GPU_WORKLOAD=1 GPU_OPAQUE_RETAIN=1 GPU_ALPHA_MERGE=1 \
+  GPU_ALPHA_REPAIR_BATCH=1 GPU_RETAINED_MENU=1 GPU_CURSOR_SAVE=1 \
+  GPU_WIDE_BLITS=1 GPU_EXACT_REPAIRS=1 GPU_FRAME_DIAGNOSTICS=1
+
+Run make iso again to return wyzar-usb.img to the default GPU policy, which
+uses CPU SIMD for translucency and enables supported Intel scaling and flips
+after runtime checks.
 
 Build fresh images without launching QEMU:
 make clean && make iso FRESH=1

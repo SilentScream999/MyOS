@@ -1,32 +1,24 @@
 # GPU and display roadmap
 
-Updated 2026-11-22. Supported Intel composition, page flips and RCS scaling
+Updated 2026-11-24. Supported Intel composition, page flips and RCS scaling
 probe by default after owner validation. GPU_RENDER=0 selects blitter composition.
 General platform priorities are in [NEXT_STEPS](NEXT_STEPS.md).
 
-Current status (2026-11-22): the owner considers opaque overlap/shadow cost
-acceptable. The priority is choppy animation beneath small/medium transparent
-windows; even a small alpha test away from Rainbow raises CPU from about 5%
-to 9%. A prior app-launch run ended with heap corruption in `kmalloc scan`.
-Subsequent logs contain no corruption/stack-overflow/timeout record, but the
-exact cause of that earlier crash remains unconfirmed.
+The Kaby Lake hardware run recorded 58–59 FPS with the grouped app picker
+open over fullscreen translucency and 58–60 FPS with tall half-screen
+translucency over Rainbow. Earlier samples were about 42 FPS and 46–52 FPS,
+respectively. Layout changes can still cause brief drops.
 
-The current stability revision protects physical-page reservations/freelist
-updates against preemption, leaves zeroing outside the new reservation guard,
-moves compositor frame snapshots off the stack and gives the compositor a
-64 KiB stack. Task stack canaries and heap-header diagnostics distinguish future
-stack damage from other overwrites. These address concrete allocator/stack
-risks; the exact cause of the photographed crash is not proven. Retest app
-launches over animated alpha before adding more decoration work.
+The opt-in retained path batches scene repairs and streams a repeated Rainbow
+scanline into the hidden framebuffer for a picker or a tall, narrower-than-screen
+translucent layer. It avoids a blitter submission before blending those frames.
+The picker uses a complete clipped redraw above all window layers. This
+scanline shortcut relies on Rainbow having identical rows. The default
+build uses CPU SIMD translucency and retains validated Intel scaling and flips.
+See [BUILD_CONFIGS](../BUILD_CONFIGS.txt) for the hardware-test flags.
 
-The supplied timings show about 30 completed loops/second in covered opaque
-scenes and about 20 under heavy alpha. Large BCS/presentation waits remain even
-when immutable uploads are reused (zero upload bytes). Source caching alone
-does not solve this regression. Timing categories overlap and include sleeps;
-they are not CPU percentages. Intel DMA/cache/display behavior still needs
-physical validation; mock QEMU cannot establish a hardware fix.
 
-For the remaining slowdown, each bounded `GPU perf:` sample now has companion
+Each bounded `GPU perf:` sample has companion
 `GPU present:` and `GPU sleep:` records. Presentation separates hidden scanout
 copy, CPU cursor/outline drawing and flip-latch wait. BCS, RCS and flip waits
 measure actual elapsed returns from their existing one-ms sleeps, including

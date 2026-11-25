@@ -8,6 +8,7 @@ struct GpuGapEvent {
     uint64_t serial=0,begin=0,end=0;
     GpuGapActivity activity{};
     int pid=-1;
+    bool irq_enabled=false;
     char detail[96]{};
 
     bool overlaps(uint64_t from,uint64_t to) const {
@@ -22,13 +23,14 @@ struct GpuGapHistory {
     uint64_t latest=0;
 
     static unsigned slot(uint64_t serial){return (serial-1)%capacity;}
-    uint64_t begin(uint64_t tick,GpuGapActivity activity,int pid,const char* detail) {
+    uint64_t begin(uint64_t tick,GpuGapActivity activity,int pid,const char* detail,bool irq_enabled=false) {
         auto& event=events[slot(++latest)];
         event.serial=latest;
         event.begin=tick;
         event.end=0;
         event.activity=activity;
         event.pid=pid;
+        event.irq_enabled=irq_enabled;
         unsigned i=0;
         if(detail)for(;i+1<sizeof(event.detail)&&detail[i];++i)event.detail[i]=detail[i];
         event.detail[i]=0;

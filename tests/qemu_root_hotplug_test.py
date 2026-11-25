@@ -157,3 +157,5 @@ for cycle in range(5):
     assert read_file(f'plug{cycle}.txt') == b'keyboard-and-disk-alive'
 assert read_file('late.txt') == b'late-keyboard-working'
 print('Five root keyboard attach/removal cycles plus missed reset completion: keyboard, mouse and disk survived; no xHCI reset')
+partition.unlink()
+smoke.IMAGE.unlink()
