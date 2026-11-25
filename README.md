@@ -51,7 +51,8 @@ options; header dependencies are tracked automatically.
 | `GPU_COMPOSE=0` | `GPU` | Disable opaque GPU composition and rainbow |
 | `GPU_PRESENT=0` | `GPU_COMPOSE` | Use CPU presentation instead of supported vblank page flips |
 | `GPU_RENDER=1` | follows `GPU_COMPOSE` | Gen9 render-engine scaling after runtime discovery and pixel readback; `0` keeps blitter composition |
-| `GPU_RCS_ALPHA=1` | `0` | Opt in to validated render-engine translucency and retained Rainbow updates |
+| `GPU_RCS_ALPHA=0` | follows `GPU_RENDER` | Use CPU SIMD for translucency while keeping validated Intel scaling and presentation |
+| `GPU_WORKLOAD=1 GPU_FRAME_DIAGNOSTICS=1` | `0` | Collect GPU workload counts and detailed frame timings |
 | `DEBUG=1` | `0` | Fixed-size USB root policy; not a compiler debug switch |
 | `BOOT_DIAGNOSTICS=1` | `0` | Extra boot timings |
 | `CLOCK_UTC_OFFSET_MIN=-420` | `0` | Minutes added to RTC for tray display |
@@ -95,8 +96,9 @@ options; header dependencies are tracked automatically.
   and Synaptics input. Hardware coverage and limitations are in the input guide.
 - Automatic Intel Gen9 probing, including visible opaque client composition
   and a resident rainbow palette. Chrome, image/font alpha and resize grips
-  use CPU rendering. RCS renders resized and maximized scaled clients by default
-  after hardware readback checks. `GPU_RENDER=0` selects blitter composition.
+  use CPU rendering. RCS scales clients and blends translucent windows by default
+  after hardware readback checks, with CPU SIMD fallback. `GPU_RENDER=0` selects
+  blitter composition.
   Client-only damage can combine BCS and
   RCS updates while retaining chrome, with CPU copies for uncovered wallpaper
   gaps and tiny resize grips. Supported hardware uses GPU copies to hidden scanout buffers

@@ -10,7 +10,7 @@ open and 58–60 FPS with tall half-screen translucency on the Kaby Lake
 laptop. Some layout transitions still missed refreshes. If GPU work resumes,
 use the build recipe in [BUILD_CONFIGS](../BUILD_CONFIGS.txt) and include Start
 close, picker open/close, and moving or resizing a tall translucent window
-over Rainbow. The default build uses CPU SIMD translucency.
+over Rainbow. The default build enables the retained path on validated hardware.
 
 The scheduler currently runs on one core. Multicore work needs its own
 scheduler, interrupt routing, and shared-state synchronization validation.

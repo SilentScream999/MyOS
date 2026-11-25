@@ -9,13 +9,14 @@ open over fullscreen translucency and 58–60 FPS with tall half-screen
 translucency over Rainbow. Earlier samples were about 42 FPS and 46–52 FPS,
 respectively. Layout changes can still cause brief drops.
 
-The opt-in retained path batches scene repairs and streams a repeated Rainbow
+The retained path batches scene repairs and streams a repeated Rainbow
 scanline into the hidden framebuffer for a picker or a tall, narrower-than-screen
 translucent layer. It avoids a blitter submission before blending those frames.
 The picker uses a complete clipped redraw above all window layers. This
-scanline shortcut relies on Rainbow having identical rows. The default
-build uses CPU SIMD translucency and retains validated Intel scaling and flips.
-See [BUILD_CONFIGS](../BUILD_CONFIGS.txt) for the hardware-test flags.
+scanline shortcut relies on Rainbow having identical rows. The default build
+uses this path after runtime validation on supported Intel hardware. CPU SIMD
+remains available as a fallback and with `GPU_RCS_ALPHA=0`.
+See [BUILD_CONFIGS](../BUILD_CONFIGS.txt) for the measurement flags.
 
 
 Each bounded `GPU perf:` sample has companion
@@ -25,17 +26,15 @@ measure actual elapsed returns from their existing one-ms sleeps, including
 counts above 2 and 10 ms. See [TESTING](TESTING.md) for units and nesting. The
 instrumentation does not change GPU synchronization or scheduling.
 
-The latest optimization uses an isolated `-O2` SSE2 source-over renderer for
+The CPU translucency path uses an isolated `-O2` SSE2 source-over renderer for
 translucent damaged regions at every supported window size. It keeps lower
 opaque/Rainbow work on BCS, blends alpha directly on the CPU, then presents
 normally. This avoids that layer's RCS submission, staging upload and destination
 flush/retirement round trips. The owner confirmed the SIMD path is smooth until
-the earlier one-million-pixel cutoff switched it to RCS; that default cutoff is
-now removed. Opaque scaling retains RCS, including its explicit handoffs and
-both completion checks. The GPU alpha path remains available to explicit driver
-regression fixtures, not normal desktop routing. This is a CPU alpha policy,
-not a faster Gen9 alpha shader. Large-layer CPU use still needs measurement.
-Opaque composition, cache policies and Gen9 workarounds are unchanged.
+the earlier one-million-pixel cutoff switched it to RCS. The SIMD policy now
+applies at every size when selected with `GPU_RCS_ALPHA=0`.
+Opaque scaling retains RCS, including its explicit handoffs and both completion
+checks. Large-layer CPU use still needs measurement.
 
 The renderer uses exact integer source-over and nearest texel-center scaling,
 including clipped/offscreen windows and the CPU grip rows. It allocates no

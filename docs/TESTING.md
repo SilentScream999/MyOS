@@ -282,13 +282,13 @@ cache handoffs, timeouts or sleep policy were added or removed for measurement.
 The limit is 32 samples per boot.
 
 `make test-gpu-perf` checks sleep threshold boundaries and sample subtraction.
-Use the retained Rainbow build in [BUILD_CONFIGS](../BUILD_CONFIGS.txt) to
-reproduce the Kaby Lake measurements on the standard `wyzar-usb.img`. The default build uses
-SIMD translucency. The experimental build checks multi-band alpha readback
-before enabling desktop RCS. Leave Rainbow fullscreen for five seconds, then
+Use the measurement flags in [BUILD_CONFIGS](../BUILD_CONFIGS.txt) to
+reproduce the Kaby Lake measurements on the standard `wyzar-usb.img`. The
+default rendering path checks multi-band alpha readback before enabling desktop
+RCS. Use `GPU_RCS_ALPHA=0` for a SIMD translucency comparison.
+Leave Rainbow fullscreen for five seconds, then
 keep a medium transparent window stationary above it for at least six seconds.
-Each stable layout gets two consecutive two-second samples of the configured
-rendering path. Experimental builds keep RCS enabled throughout sampling.
+Each stable layout gets two consecutive two-second samples.
 Match the layout IDs in the two `GPU Rainbow:` lines with the preceding
 presentation samples. Each trace follows the frame with the longest flip
 interval. Stage timestamps are microseconds since Rainbow updated. The RCS
@@ -312,7 +312,7 @@ snapshot of that painted window. Occlusion may hide the window on that flip.
 The first startup second records direct/copy counts and the longest flip gap
 independently of layout sampling resets. Slow startups log after their first
 flip or after five seconds, with missing milestones shown as dashes.
-The experimental build enables direct scanout after
+The default GPU build enables direct scanout after
 `GPU: direct scanout BCS/RCS readback PASSED`. Every window and desktop layer
 uses the same presentation path, including Start, clipboard, and taskbar popups.
 Each scanout accumulates scene damage until its next use. Only the hidden
@@ -382,7 +382,7 @@ foreground-content changes and exact repair cutouts. Intel timing needs hardware
 Start uses its ordinary cached-menu composition path again. Retaining it as
 another animation occluder fragmented repairs and added BCS submissions on
 hardware. Default menu-open samples therefore have `animationFrames=0`;
-the separate `GPU_RETAINED_MENU` experiment described below uses cached replay.
+the `GPU_RETAINED_MENU` path described below uses cached replay.
 The experimental RCS build can cache read-only texture sampling through a
 separate MOCS entry. Render destinations keep their existing uncached policy,
 and upload flushes, texture invalidations, completion and retirement checks
@@ -431,7 +431,7 @@ before changing the rendering path. `make test-gpu-perf` checks instrumentation
 against decoded BLTs and verifies an identical ring with accounting detached,
 plus alpha rectangle totals and retention with the matching timing snapshot.
 `GPU_OPAQUE_RETAIN=1` enables conservative opaque cutouts on the retained
-animation path; default builds leave it off. Published immutable premultiplied
+animation path and follows `GPU_RCS_ALPHA` by default. Published immutable premultiplied
 surfaces are summarized into at most eight source rectangles. Every source
 texel inside a rectangle must have alpha 255. Only the longest fully opaque
 horizontal run per band is kept; adjacent identical runs merge. Mapping shrinks
@@ -457,8 +457,8 @@ translucency, shadows, source opacity changes, moves, resizing and stack changes
 Coverage tests check integer and floating-point nearest sampling across scales,
 negative origins, pitch padding, grip exclusion, revision invalidation, mutable
 source rejection and unchanged-plan fallback on fragmentation overflow.
-`GPU_ALPHA_MERGE=1` coalesces alpha clip rectangles before desktop submission;
-default builds leave it off and boot readback probes retain their original
+`GPU_ALPHA_MERGE=1` coalesces alpha clip rectangles before desktop submission.
+It follows `GPU_RENDER` by default. Boot readback probes retain their original
 geometry. Rectangles merge only when their union is exactly a rectangle with
 a complete shared edge, for the same staged source and client sampling transform.
 No gap is filled and no extra pixel is rasterized. Repeated edge joins handle
@@ -492,7 +492,8 @@ The geometry logger changes no rendering plans, GPU commands or cache policies.
 including slight alpha-client overlap with large background coverage, overlapping
 opaque windows and clipping at screen edges. Intel occlusion still needs the
 owner's window coordinates and hardware workload log.
-`GPU_ALPHA_REPAIR_BATCH=1` is an opt-in retained-frame optimization, default off.
+`GPU_ALPHA_REPAIR_BATCH=1` enables retained repair batching and follows
+`GPU_RCS_ALPHA` by default.
 Only the topmost visible immutable premultiplied client may defer its final RCS
 repair draw. Ordinary composition still repairs its background immediately.
 Deferred rectangles must lie inside the GPU client body, exclude resize-grip
@@ -538,7 +539,7 @@ Opening or changed hover/resource/geometry cache keys use ordinary composition
 until the cache is valid. The retained layout includes the menu key. A changed
 menu/cache during GPU work triggers complete recomposition before presentation,
 without treating the input change as a GPU fault. No GPU ownership/cache/fence
-rules, encoders or boot probes change. Both flags default off.
+rules, encoders or boot probes change. Both flags follow `GPU_RCS_ALPHA`.
 `GPU repair plan:` reports `exactFrames` and `exactKiPx` for planned retained
 repairs, plus successful cached `menuFrames` and copied `menuKiPx`. The older
 `repairKiPx` counter describes the conservative fallback damage list; actual
@@ -720,7 +721,7 @@ The compositor suite explicitly disables CPU alpha to test RCS/failure
 paths, then enables CPU alpha and compares pixels with RCS. It also
 places a 900x650 transparent/half-alpha/opaque layer over fullscreen animated
 Rainbow, checks changing pixels for several frames, and requires zero RCS
-submissions for that bounded layer. Launch stress uses the production limit.
+submissions for that bounded layer with `GPU_RCS_ALPHA=0`.
 After building production, run `python3 tests/qemu_simd_test.py` for SIMD
 preservation across syscalls/timer preemption. On hardware compare `alphaMs`,
 RCS/handoff totals, CPU use and visible motion. There is no default size-triggered
@@ -730,14 +731,14 @@ and 1800x950 over fullscreen Rainbow. It checks animated pixels, zero RCS
 submissions and intact heap/stack guards above the former cutoff. This tests
 the path transition, not physical frame rate. Measure CPU use for large layers.
 
-For experimental `GPU_RCS_ALPHA=1` direct alpha draws covering at least 65,536
+For `GPU_RCS_ALPHA=1` direct alpha draws covering at least 65,536
 pixels, completion waits can use a short adaptive poll near the GPU drain.
 Two valid timestamp samples with matching source/sampling/rectangle geometry
 are required. All eligible draws share a 250-us polling allowance per compositor
 frame; ordinary one-ms sleeps resume when the prediction misses or the allowance
 is spent. IRQs stay enabled and both fence completion and context retirement
 remain mandatory. Missing/invalid timing disables learning; timeout still takes
-the existing CPU recovery path. The default CPU alpha policy is unchanged.
+the existing CPU recovery path.
 `GPU alpha wait` reports `windows` (waits using the poll), `pollUs` (total elapsed
 poll time, including any interrupt/preemption delay), and `predictionUs` (the last
 GPU-to-drain estimate). Allowance accounting can overshoot by the final poll/check
@@ -894,7 +895,9 @@ To test WM integration without Intel hardware, use the explicit test backend:
 
 ```sh
 make clean
-make iso CXX='clang++ -DGPU_COMPOSITOR_TEST -DGPU_PRESENT_TEST -DGPU_RENDER_TEST' PERSIST_DISK=.storage-test/gpu-test.img ROOT_MIB=64
+make iso CXX='clang++ -DGPU_COMPOSITOR_TEST -DGPU_PRESENT_TEST -DGPU_RENDER_TEST' \
+  GPU_RCS_ALPHA=0 GPU_EXACT_REPAIRS=1 GPU_RETAINED_MENU=1 \
+  PERSIST_DISK=.storage-test/gpu-test.img ROOT_MIB=64
 python3 tests/qemu_gpu_compositor_test.py
 ```
 

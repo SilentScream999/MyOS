@@ -12,9 +12,9 @@ target is a GPU-composited desktop with installable applications.
 
 The retained Rainbow checkpoint reached 58–60 FPS in steady tall
 half-screen translucency samples and 58–59 FPS with the grouped app picker
-open on Kaby Lake. Brief drops remain during layout changes. The opt-in
-build recipe uses the standard `wyzar-usb.img` filename. Default builds
-retain CPU SIMD translucency, and `GPU=0` selects CPU-only rendering.
+open on Kaby Lake. Brief drops remain during layout changes. The standard
+build enables this path after Intel hardware checks. `GPU_RCS_ALPHA=0` selects
+CPU SIMD translucency, and `GPU=0` selects CPU-only rendering.
 USB discovery now lets the timer and compositor run during synchronous
 probes. See [build configurations](../BUILD_CONFIGS.txt) and the
 [GPU roadmap](GPU_DESKTOP_ROADMAP.md) for the current paths.
@@ -58,7 +58,8 @@ the disk later offlines storage until reboot; saves never switch silently to RAM
   Read the `GPU present:`/`GPU sleep:` units and nesting in [TESTING](TESTING.md).
   Alpha draws at all supported sizes now use an isolated optimized SSE2 CPU
   renderer. The owner confirmed smooth SIMD blending then severe lag when the
-  former size cutoff selected RCS; the default cutoff is removed. Opaque scaling
+  former size cutoff selected RCS. The SIMD policy now applies at every size
+  when selected with `GPU_RCS_ALPHA=0`. Opaque scaling
   retains RCS. CPU grip/fallback blending shares the SIMD renderer.
   `cpuAlpha`/`alphaKiPx`/`alphaMs` show the selected CPU work. Hardware smoothness
   and CPU cost need validation; no GPU cache policy or workaround was relaxed.

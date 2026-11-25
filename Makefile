@@ -20,26 +20,29 @@ CFLAGS = $(OPT) -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
 # disables acceleration; GPU=1 GPU_COMPOSE=0 runs the visible blitter diagnostics.
 # RCS follows composition by default. Supported Gen9 hardware must pass
 # offscreen readback before enabling it; GPU_RENDER=0 keeps blitter composition.
+GPU ?= 1
+GPU_COMPOSE ?= $(GPU)
+GPU_PRESENT ?= $(GPU_COMPOSE)
 GPU_RENDER ?= $(GPU_COMPOSE)
+GPU_RCS_ALPHA ?= $(GPU_RENDER)
+
+# Enable the measured compositor optimizations with their parent paths.
+GPU_OPAQUE_RETAIN ?= $(GPU_RCS_ALPHA)
+GPU_ALPHA_MERGE ?= $(GPU_RENDER)
+GPU_ALPHA_REPAIR_BATCH ?= $(GPU_RCS_ALPHA)
+GPU_RETAINED_MENU ?= $(GPU_RCS_ALPHA)
+GPU_EXACT_REPAIRS ?= $(GPU_RCS_ALPHA)
+GPU_CURSOR_SAVE ?= $(GPU_PRESENT)
+GPU_WIDE_BLITS ?= $(GPU_COMPOSE)
+
 # Extended hardware stress sweeps and on-screen tracing. Normal RCS startup
 # retains the short texture/scaling/alpha readback checks.
 GPU_TRACE ?= 0
-GPU_RCS_ALPHA ?= 0
 GPU_WORKLOAD ?= 0
-GPU_OPAQUE_RETAIN ?= 0
-GPU_ALPHA_MERGE ?= 0
-GPU_ALPHA_REPAIR_BATCH ?= 0
-GPU_RETAINED_MENU ?= 0
-GPU_EXACT_REPAIRS ?= 0
-GPU_CURSOR_SAVE ?= 0
-GPU_WIDE_BLITS ?= 0
 GPU_FRAME_DIAGNOSTICS ?= 0
 # A faster streaming copy raised CPU use without improving the alpha test's
 # frame cadence on hardware. Keep automatic selection opt-in for comparisons.
 GPU_SCANOUT_COPY_AUTO ?= 0
-GPU ?= 1
-GPU_COMPOSE ?= $(GPU)
-GPU_PRESENT ?= $(GPU_COMPOSE)
 ifeq ($(GPU_RENDER),1)
 ifneq ($(GPU_COMPOSE),1)
 $(error GPU_RENDER=1 requires GPU_COMPOSE=1)
