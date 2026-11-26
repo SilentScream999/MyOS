@@ -69,10 +69,19 @@ def main():
         frame()
         assert value('g_gpu_test_scene_repair_accepted',1),'Volume popup lost its retained cutout or content repaint'
         print('Retained volume popup: full pixels, slider/mute changes, stale clips and both destination indices passed.',flush=True)
+        debug.write(address('g_gpu_test_scene_repair_request'),b'\7')
+        frame()
+        assert value('g_gpu_test_scene_repair_accepted',1),'Overflow popup cache, exact clips or retained replay failed'
+        print('Shared popup cache: app groups, volume and overflow reuse pixels across animation frames; cached and allocation-failure repairs preserve exact clips.',flush=True)
         debug.write(address('g_gpu_test_scene_repair_request'),b'\6')
         frame()
         assert value('g_gpu_test_scene_repair_accepted',1),'Covered-log volume updates repainted the log or escaped cheap retained repairs'
         print('Volume under opaque fullscreen Rainbow: covered Boot Log unchanged, tray/panel repairs submit no GPU work, complete popup pixels preserved.',flush=True)
+        for request in (8,9):
+            debug.write(address('g_gpu_test_scene_repair_request'),bytes([request]))
+            frame()
+            assert value('g_gpu_test_scene_repair_accepted',1),'Clipboard blocked retained Rainbow, rebuilt static content, lost exact clips or failed selection/close'
+        print('Clipboard over fullscreen Rainbow: populated/empty panels, hover, pin, scroll, delete, paste/close, exact clips and allocation fallback passed; animation submissions continue without rebuilding static popup pixels.',flush=True)
         assert value('g_gpu_test_calls')>0
         assert value('g_gpu_test_rainbow_calls')>0
         assert value('g_titlebar_cache_renders')>0

@@ -91,6 +91,26 @@ int main() {
     assert(hid_mouse_decode(*interface.mouse_layout, trackpad, sizeof(trackpad), interface.held_buttons, event));
     assert(event.dx == 12 && event.dy == -9 && event.buttons == 1);
     puts("Composite wireless pointer: prefixed 8-bit X/Y and held buttons passed");
+    // A keyboard's separate protocol-zero Consumer Control interface must
+    // select descriptor-based media input rather than become a fake mouse.
+    const uint8_t consumer[]={5,0x0c,9,1,0xa1,1,0x85,3,0x15,0,0x25,1,
+        9,0xe2,9,0xea,9,0xe9,0x75,1,0x95,3,0x81,2,0x75,5,0x95,1,0x81,3,0xc0};
+    descriptor.assign(consumer,consumer+sizeof(consumer));
+    interface={};interface.type=2;interface.iface_num=5;interface.mps=8;
+    interface.report_descriptor_length=sizeof(consumer);requests.clear();
+    assert(usb_hid_pointer_prepare(device,interface));
+    assert(interface.type==4 && !interface.mouse_layout && interface.media_layout && interface.media_state);
+    assert(requests.size()==1 && requests[0].wIndex==5 && requests[0].wValue==0x2200);
+    uint8_t media_packet[]={3,4},held_media=0;
+    assert(hid_media_decode(*interface.media_layout,media_packet,2,*interface.media_state,held_media)&&held_media==4);
+    // A boot-capable interface explicitly selects report protocol before it
+    // exposes consumer fields. Protocol failure leaves it inactive.
+    interface.boot_capable=true;requests.clear();
+    assert(usb_hid_pointer_prepare(device,interface) && interface.type==4);
+    assert(requests.size()==2 && requests[1].bRequest==0x0b && requests[1].wValue==1 && requests[1].wIndex==5);
+    fail_protocol=true;
+    assert(usb_hid_pointer_prepare(device,interface) && interface.type==3 && !interface.media_layout);
+    puts("Consumer media setup: separate interface, Report ID, correct protocol and failed-selection handling passed");
     for (void* page : allocations) std::free(page);
     puts("G502 HERO setup: correct interface/protocol, pointer decode, auxiliary rejection and failure handling passed");
 }

@@ -70,7 +70,11 @@ options; header dependencies are tracked automatically.
   Volume hold-repeat and a taskbar slider/mute popup share the retained popup
   renderer. Startup configures the captured E470 firmware's ACPI/software-key
   path automatically. Ordinary F1–F3 remain available to applications; volume
-  follows the keyboard's FnLock mapping. USB multimedia input remains future work.
+  follows the keyboard's FnLock mapping. USB HID media keys support boot keyboard
+  usages and descriptor-based consumer reports, with independent hold-repeat for
+  multiple keyboards and hub hotplug; Dareu EK815S media keys are confirmed working.
+  The audio worker sleeps on events while idle, with timed service for active
+  playback, held volume keys and explicitly armed diagnostics.
   See [audio](docs/AUDIO.md).
 - Limine boot, ACPI power actions, physical/page/heap allocation, per-task kernel
   stacks/address spaces and a single-core preemptive scheduler.

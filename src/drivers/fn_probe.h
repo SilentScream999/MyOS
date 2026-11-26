@@ -13,6 +13,7 @@ static void begin(bool identity,unsigned duration){
     nvram_last=status_last=audio_last=256;
     sci_last=mode_last=256;
     if(identity){thinkpad_audio::initialize(true);g_fn_trace.flags=1|(thinkpad_audio::supported?2:0);}
+    audio_events::notify();
 }
 static void poll(){
     if(g_fn_trace.active(g_tick_count)){

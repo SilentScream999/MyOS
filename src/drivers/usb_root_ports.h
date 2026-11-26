@@ -63,6 +63,7 @@ static bool usb_root_reset(XHCIController* hc, uint32_t port) {
 #include "usb_device_tree.h"
 
 static void usb_detach_branch(XHCIController* hc, uint8_t root, USBDevice* hub = nullptr, uint8_t port = 0) {
+    {USBControlGuard input_lists;
     int keep = 0;
     for (int k = 0; k < keyboard_count; ++k)
         if (keyboards[k]->hc != hc || !usb_in_branch(keyboards[k], root, hub, port))
@@ -84,6 +85,8 @@ static void usb_detach_branch(XHCIController* hc, uint8_t root, USBDevice* hub =
         ++keep;
     }
     hub_count = keep;
+    audio_events::notify();
+    }
     for (int d = 0; d < usb_disk_count; ++d)
         if (usb_disks[d].dev->hc == hc && usb_in_branch(usb_disks[d].dev, root, hub, port))
             usb_disks[d].disk.online = false;

@@ -1,6 +1,7 @@
 #ifndef WYZAR_AUDIO_HOTKEYS_H
 #define WYZAR_AUDIO_HOTKEYS_H
 #include <stdint.h>
+#include "audio_events.h"
 
 struct AudioHotkeyQueue {
     uint8_t entries[8]{};
@@ -11,6 +12,7 @@ struct AudioHotkeyQueue {
         ++received;
         if (count == 8) { ++dropped; return; }
         entries[(head + count++) % 8] = (uint8_t)key;
+        audio_events::notify();
     }
     // PS/2 multimedia make/break codes. Ordinary function keys belong to apps.
     bool accept(bool extended, uint8_t code, bool repeat, uint64_t now = 0) {
@@ -19,11 +21,13 @@ struct AudioHotkeyQueue {
         if(key!=0x20){
             unsigned bit=key==0x30 ? 2u : 1u;
             if(code&0x80){
+                if(!(held&bit))return true; // Orphan/duplicate release has no work to publish.
                 held&=~bit;
                 if(!(held&bit)&&repeating==key){
                     repeating=(held&2)?0x30:(held&1)?0x2e:0;
                     repeat_at=now+400;
                 }
+                audio_events::notify();
                 return true;
             }
             if(repeat||(held&bit))return true;

@@ -70,7 +70,7 @@ def main():
         q.command('send-key', {'keys': [{'type': 'qcode', 'data': 'volumeup'}], 'hold-time': 80})
         time.sleep(1)
         log = q.capture('audio-volume-key')
-        assert 'ThinkPad audio: deferred PS/2 multimedia make code\n0x0000000000000030' in log, log[-5000:]
+        assert 'Audio: deferred multimedia make code\n0x0000000000000030' in log, log[-5000:]
         assert 'Audio: volume percent\n0x0000000000000050' in log, log[-5000:]
         q.type('audio test line alt\n') # one-DAC virtual codec must refuse safely
         log = q.capture('audio-no-alternate')

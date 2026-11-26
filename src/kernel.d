@@ -11,6 +11,7 @@ src/kernel.o: src/kernel.cpp src/core/helpers.h src/core/structures.h \
   src/drivers/usb_storage.h src/drivers/scsi_retry.h \
   src/drivers/usb_storage_completion.h src/drivers/logitech_g502.h \
   src/drivers/hid_pointer_setup.h src/drivers/hid_mouse_report.h \
+  src/drivers/hid_media_report.h src/drivers/audio_events.h \
   src/drivers/usb_hub_watch.h src/drivers/usb_hub_async.h \
   src/drivers/usb_root_ports.h src/drivers/usb_device_tree.h \
   src/arch/idt.h src/arch/fp_context.h src/arch/irq.h src/arch/timer.h \
@@ -31,9 +32,9 @@ src/kernel.o: src/kernel.cpp src/core/helpers.h src/core/structures.h \
   src/gui/window_decorations.h src/gui/overlay_renderer.h \
   src/gui/power_icons.h src/gui/volume_popup.h \
   src/gui/../drivers/audio_volume.h src/gui/clipboard_icons.h \
-  src/core/text_clipboard.h src/gui/wallpaper.h src/gui/taskbar.h \
-  src/gui/taskbar_layout.h src/core/app_console.h src/drivers/hda.h \
-  src/drivers/hda_topology.h src/drivers/hda_command.h \
+  src/core/text_clipboard.h src/gui/wallpaper.h src/gui/popup_cache.h \
+  src/gui/taskbar.h src/gui/taskbar_layout.h src/core/app_console.h \
+  src/drivers/hda.h src/drivers/hda_topology.h src/drivers/hda_command.h \
   src/drivers/hda_link.h src/drivers/thinkpad_audio.h \
   src/drivers/thinkpad_ec_protocol.h \
   src/drivers/thinkpad_hotkey_profile.h src/drivers/thinkpad_smi.h \
@@ -135,6 +136,10 @@ src/drivers/logitech_g502.h:
 src/drivers/hid_pointer_setup.h:
 
 src/drivers/hid_mouse_report.h:
+
+src/drivers/hid_media_report.h:
+
+src/drivers/audio_events.h:
 
 src/drivers/usb_hub_watch.h:
 
@@ -239,6 +244,8 @@ src/gui/clipboard_icons.h:
 src/core/text_clipboard.h:
 
 src/gui/wallpaper.h:
+
+src/gui/popup_cache.h:
 
 src/gui/taskbar.h:
 

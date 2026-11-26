@@ -163,16 +163,20 @@ struct USBSetupPacket {
 } __attribute__((packed));
 
 struct HIDMouseLayout;
+struct HIDMediaLayout;
+struct HIDMediaState;
 struct HIDInterface {
 	uint8_t  ep_num;
 	uint16_t mps;
 	struct Ring* ring;
-	uint8_t  type;     // 1=kbd, 2=mouse
+	uint8_t  type;     // 1=boot keyboard, 2=pointer, 3=ignored, 4=consumer controls
 	uint8_t  protocol; // 1=boot kbd, 2=boot mouse, 0=none/report
 	uint8_t  iface_num;
 	uint8_t  interval;
 	uint16_t report_descriptor_length;
 	HIDMouseLayout* mouse_layout;
+	HIDMediaLayout* media_layout;
+	HIDMediaState* media_state;
 	uint8_t held_buttons;
 	bool boot_capable;
 	bool configured;

@@ -33,6 +33,8 @@ static int g_taskbar_group_id=0,g_taskbar_first=0,g_taskbar_anchor=0;
 // Popup mode is 0=closed, 1=overflow groups, 2=windows in an application, 3=volume.
 static int g_taskbar_popup=0;
 static bool g_volume_drag=false;
+static uint64_t g_taskbar_popup_revision=1;
+static uint64_t g_taskbar_popup_renders=0,g_taskbar_popup_reuses=0;
 struct TaskbarPopup {
     int ids[MAX_WINDOWS],count,x,y,w,h,rows;
 };
@@ -64,6 +66,7 @@ static TaskbarPopup wm_taskbar_panel(const TaskbarSnapshot& snapshot) {
     return panel;
 }
 static void wm_taskbar_damage(bool full=true) {
+    ++g_taskbar_popup_revision;
     if(!fb)return;
     if(full)wm_dirty_add(0,fb->width-1,0,fb->height-1);
     else{
@@ -157,17 +160,22 @@ static void wm_taskbar_scroll(int delta) {
     if(g_taskbar_first<0)g_taskbar_first=0;
     wm_taskbar_damage(false);
 }
-static void wm_taskbar_render_popup(int min_y,int max_y) {
-    if(!g_taskbar_popup)return;
-    auto snapshot=wm_taskbar_snapshot();auto panel=wm_taskbar_panel(snapshot);
-    if(!panel.count){wm_taskbar_close();return;}
-    int last=panel.count-panel.rows;if(g_taskbar_first>last)g_taskbar_first=last;
+static int wm_taskbar_popup_hover(int x,int y) {
+    if(!g_taskbar_popup||g_taskbar_popup==3)return -1;
+    auto panel=wm_taskbar_panel(wm_taskbar_snapshot());
+    if(x<panel.x||x>=panel.x+panel.w||y<panel.y+36||y>=panel.y+36+panel.rows*32)return -1;
+    return (y-panel.y-36)/32;
+}
+static void wm_taskbar_paint_popup(const TaskbarPopup& panel,int min_y,int max_y) {
     auto rect=[&](int x,int y,int w,int h,uint32_t color){
         for(int py=y;py<y+h;++py){
-            if(py<min_y||py>max_y||py<0||py>=(int)fb->height)continue;
+            if(py<min_y||py>max_y||py<g_ui_clip_top||py>=g_ui_clip_bottom||py<0||py>=(int)fb->height)continue;
             auto* pixels=(uint32_t*)(g_master_backbuffer+(uint64_t)py*fb->pitch);
             int right=x+w;if(right>(int)fb->width)right=fb->width;
-            int left=x<0?0:x;if(right>left)memset_32(pixels+left,color,right-left);
+            int left=x<0?0:x;
+            if(left<g_ui_clip_left)left=g_ui_clip_left;
+            if(right>g_ui_clip_right)right=g_ui_clip_right;
+            if(right>left)memset_32(pixels+left,color,right-left);
         }
     };
     rect(panel.x,panel.y,panel.w,panel.h,0xff151b2e);
@@ -193,7 +201,11 @@ static void wm_taskbar_render_popup(int min_y,int max_y) {
         bool hover=g_mouse_x>=panel.x&&g_mouse_x<panel.x+panel.w&&g_mouse_y>=y&&g_mouse_y<y+32;
         if(hover)rect(panel.x+2,y,panel.w-4,32,0xff364366);
         const Image& icon=wm_window_icons(win).task;
-        if(icon.pixels)wm_draw_icon(icon,panel.x+8,y+4,panel.x,min_y,panel.x+panel.w,max_y+1);
+        if(icon.pixels)wm_draw_icon(icon,panel.x+8,y+4,
+            panel.x>g_ui_clip_left?panel.x:g_ui_clip_left,
+            min_y>g_ui_clip_top?min_y:g_ui_clip_top,
+            panel.x+panel.w<g_ui_clip_right?panel.x+panel.w:g_ui_clip_right,
+            max_y+1<g_ui_clip_bottom?max_y+1:g_ui_clip_bottom);
         char label[96];resources::copy(label,sizeof(label),win->title);
         if(g_taskbar_popup==2){char number[24];to_str(win->id,number);resources::append(label,sizeof(label)," #");resources::append(label,sizeof(label),number);}
         wm_draw_string(panel.x+40,y+8,label,win->id==g_focused_win_id?0xffffffff:0xffbfc9e8,g_font_scale_100,panel.w-52);
@@ -203,6 +215,32 @@ static void wm_taskbar_render_popup(int min_y,int max_y) {
         int thumb=track*panel.rows/panel.count;
         rect(panel.x+panel.w-4,panel.y+36+track*g_taskbar_first/panel.count,2,thumb,0xff8295c4);
     }
+}
+// All popup modes use the same cache, clipping and damage contract. New content
+// invalidates it through wm_taskbar_damage; animation frames only copy pixels.
+static void wm_taskbar_render_popup(int min_y,int max_y) {
+    if(!g_taskbar_popup)return;
+    auto snapshot=wm_taskbar_snapshot();auto panel=wm_taskbar_panel(snapshot);
+    if(!panel.count){wm_taskbar_close();return;}
+    int last=panel.count-panel.rows;
+    if(g_taskbar_first>last)g_taskbar_first=last;
+    uint64_t key=1469598103934665603ULL;
+    auto hash=[&](uint64_t value){key=(key^value)*1099511628211ULL;};
+    hash(g_taskbar_popup_revision);hash(g_taskbar_popup);hash(g_taskbar_first);
+    hash(panel.x);hash(panel.y);hash(panel.w);hash(panel.h);hash(panel.count);
+    hash(fb->pitch);hash(fb->height);hash(g_font_scale_100);hash(g_decoration_epoch);
+    hash(g_focused_win_id);hash(wm_taskbar_popup_hover(g_mouse_x,g_mouse_y));
+    // Include live state as well as explicit damage: titles/focus can change
+    // during a client update without a pointer or popup input event.
+    hash(g_audio_mixer.value.percent);hash(g_audio_mixer.value.muted);
+    for(int i=0;i<panel.rows;++i){
+        auto* win=wm_find_window(panel.ids[g_taskbar_first+i]);
+        hash(win?win->id:0);
+        if(win)for(const char* p=win->title;*p;++p)hash((unsigned char)*p);
+    }
+    wm_render_cached_popup({panel.x,panel.y,panel.x+panel.w,panel.y+panel.h},key,1,min_y,max_y,
+        g_taskbar_popup_renders,g_taskbar_popup_reuses,
+        [&](int top,int bottom){wm_taskbar_paint_popup(panel,top,bottom);});
 }
 static bool wm_volume_pointer(bool held){
     if(!g_volume_drag)return false;

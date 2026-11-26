@@ -384,7 +384,8 @@ static uint32_t g_wbtn_w = 124;
 // ── Start Menu (taskbar popup) ────────────────────────────────
 #define g_menu_app_count ((int)g_resources_catalog->count)
 static bool  g_menu_open = false;
-struct MenuPixelCache { uint8_t* pixels=nullptr;uint64_t capacity=0,key=0; };
+// Shell popups are mutually exclusive and share one WB surface.
+struct MenuPixelCache { uint8_t* pixels=nullptr;uint64_t capacity=0,key=0,popup_key=0; };
 static MenuPixelCache g_menu_pixel_cache{};
 static void wm_prepare_menu_cache(){
     uint64_t bytes=(uint64_t)fb->pitch*fb->height;
@@ -529,6 +530,8 @@ static inline void wm_menu_hover_dirty(int previous,int current){
 
 static TextClipboard g_text_clipboard;
 static bool g_clipboard_open=false;
+static uint64_t g_clipboard_popup_revision=1;
+static uint64_t g_clipboard_popup_renders=0,g_clipboard_popup_reuses=0;
 static int g_clipboard_selected=0,g_clipboard_first=0,g_clipboard_target=-1;
 static constexpr int CLIPBOARD_HEADER=40,CLIPBOARD_ROW=68,CLIPBOARD_FOOTER=32,
     CLIPBOARD_PAD=10,CLIPBOARD_GAP=6,CLIPBOARD_VISIBLE_ROWS=4,
@@ -554,6 +557,7 @@ static ClipboardPanel wm_clipboard_panel(){
     return {(int)fb->width-w-8,(int)fb->height-(int)g_taskbar_h-h-8,w,h,rows,count>rows};
 }
 static void wm_clipboard_damage(){
+    ++g_clipboard_popup_revision;
     if(!fb||!g_clipboard_open)return;
     auto p=wm_clipboard_panel();
     wm_dirty_add(p.x,p.x+p.w-1,p.y,p.y+p.h-1);
@@ -1912,6 +1916,7 @@ static inline void wm_dispatch_key(char c, uint32_t scancode, bool is_down, uint
     wm_win_push_event(focused, ev);
 }
 
+#include "popup_cache.h"
 #include "taskbar.h"
 
 static bool wm_taskbar_popup_open(){return g_taskbar_popup!=0;}
@@ -2353,6 +2358,7 @@ static void wm_draw_start_menu(uint32_t min_y,uint32_t max_y,bool cache_only=fal
         ++g_gpu_perf.menu_renders;
     }else{
         if(cache.key!=current){
+            cache.popup_key=0;
 #if GPU_FRAME_DIAGNOSTICS
             GpuCpuPhaseTimer cost(gpu_phase_cost(GpuFrameTimeline::MenuBuild),wm_trace_cpu_cycles);
 #endif
@@ -2388,6 +2394,138 @@ static void wm_draw_start_menu(uint32_t min_y,uint32_t max_y,bool cache_only=fal
     }
 }
 
+static void wm_clipboard_paint_popup(int min_y,int max_y){
+    if(min_y<g_ui_clip_top)min_y=g_ui_clip_top;
+    if(max_y>=g_ui_clip_bottom)max_y=g_ui_clip_bottom-1;
+    int min_x=g_ui_clip_left,max_x=g_ui_clip_right-1;
+    auto button=[&](uint32_t top,uint32_t bottom,int x,int y,int w,int h,
+            uint32_t a,uint32_t b,uint32_t edge,bool shine){
+        wm_draw_button(top,bottom,x,y,w,h,a,b,edge,shine,g_ui_clip_left,g_ui_clip_right);
+    };
+    if(g_clipboard_open){
+        auto panel=wm_clipboard_panel();
+        int x=panel.x,y=panel.y,w=panel.w;
+        if((int)min_x<x+w&&(int)max_x>=x&&(int)min_y<y+panel.h&&(int)max_y>=y){
+            ClipboardPreview previews[CLIPBOARD_VISIBLE_ROWS];
+            int count=0,total,first,selected;
+            ClipboardHit hover;
+            bool can_pin;
+            int card_x=x+CLIPBOARD_PAD,card_w=panel.card_right()-card_x;
+            int preview_width=panel.action_left()-card_x-18;
+            const UiFont* font=wm_ui_font();
+            {
+                TtyIrqGuard guard;
+                total=g_text_clipboard.history_size();first=g_clipboard_first;
+                selected=g_clipboard_selected-first;
+                hover=wm_clipboard_hit(g_mouse_x,g_mouse_y);
+                can_pin=g_text_clipboard.pinned_count()<TextClipboard::pin_limit;
+                for(int i=first;i<total&&count<panel.rows;++i){
+                    wm_clipboard_preview(g_text_clipboard.history(i),previews[count++],font,preview_width);
+                }
+            }
+            button(min_y,max_y,x,y,w,panel.h,0xff23283d,0xff181c30,0xff303560,false);
+            button(min_y,max_y,x,y,w,CLIPBOARD_HEADER,0xff3d4d80,0xff28366a,0xff5568b0,false);
+            int line=font->height;
+            wm_draw_string(x+12,y+(CLIPBOARD_HEADER-line)/2,"Clipboard history",0xffeeeeff,100,panel.clear_left()-x-20);
+            button(min_y,max_y,panel.clear_left(),y+6,CLIPBOARD_CLEAR_WIDTH,CLIPBOARD_HEADER-12,0xff263456,0xff202742,0xff6777a2,false);
+            const char* clear="Clear unpinned";
+            wm_draw_string(panel.clear_left()+(CLIPBOARD_CLEAR_WIDTH-wm_text_width(clear))/2,
+                           y+(CLIPBOARD_HEADER-line)/2,clear,0xffeeeeff,100,CLIPBOARD_CLEAR_WIDTH-8);
+            int card_h=CLIPBOARD_ROW-CLIPBOARD_GAP;
+            const char* hint="Select an entry to paste";
+            if(!count)wm_draw_string(card_x+10,panel.list_top()+(card_h-line)/2,"Nothing copied yet",0xffb9c5ee,100,card_w-20);
+            for(int i=0;i<count;++i){
+                int top=panel.list_top()+i*CLIPBOARD_ROW;
+                bool active=i==selected,pointed=first+i==hover.index;
+                uint32_t fill=active?0xff344469:pointed?0xff2d3a55:0xff242b41;
+                uint32_t edge=active?0xff667aaa:pointed?0xff52617f:0xff343d55;
+                button(min_y,max_y,card_x,top,card_w,card_h,fill,fill,edge,false);
+                if(active)button(min_y,max_y,card_x+1,top+5,3,card_h-10,0xffa6b9f0,0xffa6b9f0,0xffa6b9f0,false);
+                const auto& preview=previews[i];
+                int text_y=top+(card_h-(preview.lines[1][0]?2*line+3:line))/2;
+                wm_draw_string(card_x+10,text_y,preview.lines[0],0xffeeeeff,100,preview_width);
+                if(preview.lines[1][0])wm_draw_string(card_x+10,text_y+line+3,preview.lines[1],0xffeeeeff,100,preview_width);
+                auto action=[&](int action_y,ClipboardIcon icon,uint32_t button_fill,uint32_t border,uint32_t ink){
+                    int ax=panel.action_left(),ay=top+action_y;
+                    button(min_y,max_y,ax,ay,CLIPBOARD_ACTION_WIDTH,CLIPBOARD_ACTION_HEIGHT,button_fill,button_fill,border,false);
+                    constexpr int size=19;
+                    static uint8_t masks[3][size][size]{};
+                    static bool rasterized[3]{};
+                    unsigned index=(unsigned)icon;
+                    auto& mask=masks[index];
+                    if(!rasterized[index]){
+                        for(int row=0;row<size;++row)for(int col=0;col<size;++col)
+                            mask[row][col]=(clipboard_icon_coverage(icon,col,row,size)*255+8)/16;
+                        rasterized[index]=true;
+                    }
+                    int ix=ax+(CLIPBOARD_ACTION_WIDTH-size)/2,iy=ay+(CLIPBOARD_ACTION_HEIGHT-size)/2;
+                    for(int row=0;row<size;++row){
+                        int yy=iy+row;
+                        if(yy<min_y||yy>max_y||yy<0||yy>=(int)fb->height)continue;
+                        auto* pixels=(uint32_t*)(g_master_backbuffer+(uint64_t)yy*fb->pitch)+ix;
+                        for(int col=0;col<size;++col){
+                            int xx=ix+col;
+                            if(xx>=g_ui_clip_left&&xx<g_ui_clip_right&&xx>=0&&xx<(int)fb->width&&mask[row][col])
+                                pixels[col]=ui_font_blend(pixels[col],ink,mask[row][col]);
+                        }
+                    }
+                };
+                bool pin_enabled=preview.pinned||can_pin;
+                bool pin_hover=pointed&&hover.action==ClipboardAction::Pin;
+                bool delete_hover=pointed&&hover.action==ClipboardAction::Delete;
+                bool pin_highlight=preview.pinned||(pin_hover&&pin_enabled);
+                action(CLIPBOARD_PIN_TOP,preview.pinned?ClipboardIcon::Pinned:ClipboardIcon::Pin,
+                       pin_highlight?0xff475980:fill,pin_highlight?0xff7186ba:edge,
+                       pin_enabled?0xffe4ebff:0xff9098ae);
+                action(CLIPBOARD_DELETE_TOP,ClipboardIcon::Delete,delete_hover?0xff59364a:fill,
+                       delete_hover?0xffa46780:edge,delete_hover?0xffffc7d8:0xffdedff0);
+                if(pin_hover)hint=preview.pinned?"Unpin entry":can_pin?"Pin entry":"Pin limit reached";
+                if(delete_hover)hint="Delete entry";
+            }
+            if(total>panel.rows){
+                int track=panel.rows*CLIPBOARD_ROW-CLIPBOARD_GAP,thumb=track*panel.rows/total;
+                int rail_x=panel.card_right()+4,rail_y=panel.list_top();
+                int offset=(track-thumb)*first/(total-panel.rows);
+                button(min_y,max_y,rail_x,rail_y,3,track,0xff293148,0xff293148,0xff293148,false);
+                button(min_y,max_y,rail_x,rail_y+offset,3,thumb,0xff7b8cb7,0xff7b8cb7,0xff7b8cb7,false);
+            }
+            if(count)wm_draw_string(card_x,y+panel.h-(CLIPBOARD_FOOTER+line)/2,
+                                    hint,0xffb9c5ee,100,w-24);
+        }
+    }
+}
+
+static void wm_clipboard_render_popup(int min_y,int max_y){
+    if(!g_clipboard_open)return;
+    auto panel=wm_clipboard_panel();
+    uint64_t key=1469598103934665603ULL;
+    auto hash=[&](uint64_t value){key=(key^value)*1099511628211ULL;};
+    hash(g_clipboard_popup_revision);hash(panel.x);hash(panel.y);hash(panel.w);hash(panel.h);
+    hash(fb->pitch);hash(fb->height);hash(g_decoration_epoch);hash(g_font_scale_100);
+    hash(g_clipboard_selected);hash(g_clipboard_first);
+    auto hover=wm_clipboard_hit(g_mouse_x,g_mouse_y);hash(hover.index);hash((unsigned)hover.action);
+    hash(g_text_clipboard.history_size());
+    for(unsigned i=0;i<g_text_clipboard.history_size();++i){
+        const auto& entry=g_text_clipboard.history(i);
+        hash(entry.hash);hash(entry.length);hash(entry.pinned);
+    }
+    wm_render_cached_popup({panel.x,panel.y,panel.x+panel.w,panel.y+panel.h},key,2,min_y,max_y,
+        g_clipboard_popup_renders,g_clipboard_popup_reuses,wm_clipboard_paint_popup);
+}
+// Every opaque shell popup supplies bounds and a painter to the same retained
+// foreground path. Content changes affect its cache, not animation eligibility.
+static TaskbarPopup wm_shell_popup_panel(){
+    if(g_clipboard_open){
+        auto panel=wm_clipboard_panel();TaskbarPopup result{};
+        result.x=panel.x;result.y=panel.y;result.w=panel.w;result.h=panel.h;result.count=1;
+        return result;
+    }
+    return g_taskbar_popup?wm_taskbar_panel(wm_taskbar_snapshot()):TaskbarPopup{};
+}
+static void wm_render_shell_popup(int min_y,int max_y){
+    if(g_clipboard_open)wm_clipboard_render_popup(min_y,max_y);
+    else wm_taskbar_render_popup(min_y,max_y);
+}
 static bool wm_retained_menu_ready(){
 #if GPU_RETAINED_MENU
     return fb&&g_menu_open&&!g_clipboard_open&&!g_taskbar_popup&&g_menu_pixel_cache.pixels&&
@@ -2414,11 +2552,11 @@ static VisibleRect g_retained_menu_panel{};
 static bool g_retained_scene_invalidated=false;
 static uint64_t g_retained_popup_layout=0;
 static uint64_t wm_retained_popup_layout(){
-    if(!g_taskbar_popup)return 0;
-    auto panel=wm_taskbar_panel(wm_taskbar_snapshot());
+    if(!g_taskbar_popup&&!g_clipboard_open)return 0;
+    auto panel=wm_shell_popup_panel();
     uint64_t value=1469598103934665603ULL;
     auto hash=[&](uint64_t part){value=(value^part)*1099511628211ULL;};
-    hash(g_taskbar_popup);hash(g_taskbar_group_id);hash(g_taskbar_anchor);
+    hash(g_clipboard_open);hash(g_taskbar_popup);hash(g_taskbar_group_id);hash(g_taskbar_anchor);
     hash(panel.x);hash(panel.y);hash(panel.w);hash(panel.h);hash(panel.count);
     return value;
 }
@@ -2449,7 +2587,7 @@ static bool wm_prepare_retained_animation(Window* animation){
     if(!animation||!animation->buffer||!animation->visible||animation->minimized||
        !animation->chrome_drawn||animation->premultiplied||
        animation->canvas_width!=animation->w||animation->canvas_height!=animation->h||
-       (g_menu_open&&!wm_retained_menu_ready())||g_clipboard_open||!g_gpu_compose_hook)return false;
+       (g_menu_open&&!wm_retained_menu_ready())||!g_gpu_compose_hook)return false;
     bool above=false,found=false,maximized=false;
     VisibleRect covers[MAX_WINDOWS+1];unsigned count=0;
     GpuSceneClient client{};
@@ -2460,11 +2598,11 @@ static bool wm_prepare_retained_animation(Window* animation){
     if(g_menu_open&&!wm_retained_menu_ready())return false;
     g_retained_menu_key=g_menu_open?wm_menu_pixel_key():0;
     g_retained_popup_layout=wm_retained_popup_layout();
-    // The app picker is opaque. Keep its pixels in both retained scanouts
+    // Shell popups are opaque. Keep their pixels in both retained scanouts
     // and exclude them from Rainbow AND every overlying alpha layer. Hover,
     // scrolling and content damage still use the ordinary popup renderer.
-    if(g_taskbar_popup){
-        auto panel=wm_taskbar_panel(wm_taskbar_snapshot());
+    if(g_retained_popup_layout){
+        auto panel=wm_shell_popup_panel();
         if(!panel.count)return false;
         covers[count++]={panel.x,panel.y,panel.x+panel.w,panel.y+panel.h};
     }
@@ -2695,10 +2833,10 @@ static bool wm_repair_retained_foreground(VisibleRect r){
         int x,y,w,h;wm_menu_geom(&x,&y,&w,&h);
         tray_clear=y+h<=(int)(fb->height-g_taskbar_h);
     }
-    bool popup_above_tray=!g_taskbar_popup;
-    if(g_taskbar_popup){auto panel=wm_taskbar_panel(wm_taskbar_snapshot());
+    bool popup_above_tray=!g_taskbar_popup&&!g_clipboard_open;
+    if(g_taskbar_popup||g_clipboard_open){auto panel=wm_shell_popup_panel();
         popup_above_tray=panel.y+panel.h<=(int)(fb->height-g_taskbar_h);}
-    if(tray_clear&&!g_clipboard_open&&popup_above_tray&&
+    if(tray_clear&&popup_above_tray&&
        r.x1>=wm_tray_damage_left()&&r.x2<=(int)fb->width&&
        r.y1>=(int)(fb->height-g_taskbar_h)&&r.y2<=(int)fb->height&&visibility_valid(r)){
         GpuPerfTimer timer(g_gpu_perf.tray_repair_ticks);
@@ -2712,7 +2850,7 @@ static bool wm_repair_retained_foreground(VisibleRect r){
     // alpha chain. Its own content damage needs no reconstruction underneath.
     // Accept only the exact popup geometry captured by this retained frame.
     if(g_retained_popup_layout&&g_retained_popup_layout==wm_retained_popup_layout()){
-        auto panel=wm_taskbar_panel(wm_taskbar_snapshot());
+        auto panel=wm_shell_popup_panel();
         if(visibility_valid(r)&&r.x1>=panel.x&&r.y1>=panel.y&&
            r.x2<=panel.x+panel.w&&r.y2<=panel.y+panel.h)return true;
     }
@@ -2758,7 +2896,9 @@ static bool wm_draw_retained_animation([[maybe_unused]] uint64_t repair_menu_key
     // Tall exposed strips cost a complete BCS submission before alpha can
     // start. All scanlines of Rainbow have identical colors. Stream the hot
     // row directly into the retained hidden buffer for these layouts.
-    bool stream=row_available && g_retained_popup_layout;
+    // An opaque shell popup is a cutout, not a reason to regenerate the
+    // fullscreen animation on the compositor CPU. Keep its BCS palette path.
+    bool stream=false;
     if(row_available && g_retained_animation_alpha){
         for(unsigned i=0;i<g_retained_animation_layer_count;++i){
             const auto& layer=g_retained_animation_layers[i].client;
@@ -2893,25 +3033,12 @@ static bool wm_draw_retained_animation([[maybe_unused]] uint64_t repair_menu_key
         // deferred alpha draw touched their retained cutout. Replay the whole
         // panel with its own clip, independent of the last repair rectangle.
         ResourceRead resource_read;
-        auto panel=wm_taskbar_panel(wm_taskbar_snapshot());
+        auto panel=wm_shell_popup_panel();
         int left=g_ui_clip_left,right=g_ui_clip_right,top=g_ui_clip_top,bottom=g_ui_clip_bottom;
         g_ui_clip_left=panel.x;g_ui_clip_right=panel.x+panel.w;
         g_ui_clip_top=panel.y;g_ui_clip_bottom=panel.y+panel.h;
-        auto& scratch=g_menu_pixel_cache;
-        bool buffered=scratch.pixels && scratch.capacity>=(uint64_t)fb->pitch*fb->height;
-        auto* destination=g_master_backbuffer;
-        if(buffered){
-            scratch.key=0;
-            g_master_backbuffer=scratch.pixels;
-        }
-        wm_taskbar_render_popup(panel.y,panel.y+panel.h-1);
-        g_master_backbuffer=destination;
-        if(buffered){
-            auto bounds=visibility_intersect({panel.x,panel.y,panel.x+panel.w,panel.y+panel.h},
-                {0,0,(int)fb->width,(int)fb->height});
-            if(visibility_valid(bounds))wm_copy_cached_menu(bounds);
-            vram_fence();
-        }
+        wm_render_shell_popup(panel.y,panel.y+panel.h-1);
+        vram_fence();
         g_ui_clip_left=left;g_ui_clip_right=right;g_ui_clip_top=top;g_ui_clip_bottom=bottom;
         if(g_retained_popup_layout!=wm_retained_popup_layout()){
             g_retained_scene_invalidated=true;
@@ -3394,7 +3521,7 @@ retry_scene:
     }
     bool ordered_scene=direct||alpha_scene||(!fullscreen_fast&&!scaled_fast&&!retained_fast&&
         exposed_shadow({0,(int)min_y,(int)fb->width,(int)max_y+1}));
-    bool bounded_scene=ordered_scene&&(!g_menu_open||wm_retained_menu_ready())&&!g_clipboard_open&&!g_taskbar_popup&&
+    bool bounded_scene=ordered_scene&&(!g_menu_open||wm_retained_menu_ready())&&
         (min_y>=60||(GPU_EXACT_REPAIRS&&direct&&!show_desktop_stats))&&max_y<fb->height-g_taskbar_h;
     if(ordered_scene){
         // Shell/HUD paths still paint full rows. Ordinary client updates clip
@@ -4054,95 +4181,7 @@ retry_scene:
     
     wm_taskbar_render_popup(min_y,max_y);
     wm_draw_start_menu(min_y,max_y);
-    if(g_clipboard_open){
-        auto panel=wm_clipboard_panel();
-        int x=panel.x,y=panel.y,w=panel.w;
-        if((int)min_x<x+w&&(int)max_x>=x&&(int)min_y<y+panel.h&&(int)max_y>=y){
-            ClipboardPreview previews[CLIPBOARD_VISIBLE_ROWS];
-            int count=0,total,first,selected;
-            ClipboardHit hover;
-            bool can_pin;
-            int card_x=x+CLIPBOARD_PAD,card_w=panel.card_right()-card_x;
-            int preview_width=panel.action_left()-card_x-18;
-            const UiFont* font=wm_ui_font();
-            {
-                TtyIrqGuard guard;
-                total=g_text_clipboard.history_size();first=g_clipboard_first;
-                selected=g_clipboard_selected-first;
-                hover=wm_clipboard_hit(g_mouse_x,g_mouse_y);
-                can_pin=g_text_clipboard.pinned_count()<TextClipboard::pin_limit;
-                for(int i=first;i<total&&count<panel.rows;++i){
-                    wm_clipboard_preview(g_text_clipboard.history(i),previews[count++],font,preview_width);
-                }
-            }
-            wm_draw_button(min_y,max_y,x,y,w,panel.h,0xff23283d,0xff181c30,0xff303560,false);
-            wm_draw_button(min_y,max_y,x,y,w,CLIPBOARD_HEADER,0xff3d4d80,0xff28366a,0xff5568b0,false);
-            int line=font->height;
-            wm_draw_string(x+12,y+(CLIPBOARD_HEADER-line)/2,"Clipboard history",0xffeeeeff,100,panel.clear_left()-x-20);
-            wm_draw_button(min_y,max_y,panel.clear_left(),y+6,CLIPBOARD_CLEAR_WIDTH,CLIPBOARD_HEADER-12,0xff263456,0xff202742,0xff6777a2,false);
-            const char* clear="Clear unpinned";
-            wm_draw_string(panel.clear_left()+(CLIPBOARD_CLEAR_WIDTH-wm_text_width(clear))/2,
-                           y+(CLIPBOARD_HEADER-line)/2,clear,0xffeeeeff,100,CLIPBOARD_CLEAR_WIDTH-8);
-            int card_h=CLIPBOARD_ROW-CLIPBOARD_GAP;
-            const char* hint="Select an entry to paste";
-            if(!count)wm_draw_string(card_x+10,panel.list_top()+(card_h-line)/2,"Nothing copied yet",0xffb9c5ee,100,card_w-20);
-            for(int i=0;i<count;++i){
-                int top=panel.list_top()+i*CLIPBOARD_ROW;
-                bool active=i==selected,pointed=first+i==hover.index;
-                uint32_t fill=active?0xff344469:pointed?0xff2d3a55:0xff242b41;
-                uint32_t edge=active?0xff667aaa:pointed?0xff52617f:0xff343d55;
-                wm_draw_button(min_y,max_y,card_x,top,card_w,card_h,fill,fill,edge,false);
-                if(active)wm_draw_button(min_y,max_y,card_x+1,top+5,3,card_h-10,0xffa6b9f0,0xffa6b9f0,0xffa6b9f0,false);
-                const auto& preview=previews[i];
-                int text_y=top+(card_h-(preview.lines[1][0]?2*line+3:line))/2;
-                wm_draw_string(card_x+10,text_y,preview.lines[0],0xffeeeeff,100,preview_width);
-                if(preview.lines[1][0])wm_draw_string(card_x+10,text_y+line+3,preview.lines[1],0xffeeeeff,100,preview_width);
-                auto action=[&](int action_y,ClipboardIcon icon,uint32_t button_fill,uint32_t border,uint32_t ink){
-                    int ax=panel.action_left(),ay=top+action_y;
-                    wm_draw_button(min_y,max_y,ax,ay,CLIPBOARD_ACTION_WIDTH,CLIPBOARD_ACTION_HEIGHT,button_fill,button_fill,border,false);
-                    constexpr int size=19;
-                    static uint8_t masks[3][size][size]{};
-                    static bool rasterized[3]{};
-                    unsigned index=(unsigned)icon;
-                    auto& mask=masks[index];
-                    if(!rasterized[index]){
-                        for(int row=0;row<size;++row)for(int col=0;col<size;++col)
-                            mask[row][col]=(clipboard_icon_coverage(icon,col,row,size)*255+8)/16;
-                        rasterized[index]=true;
-                    }
-                    int ix=ax+(CLIPBOARD_ACTION_WIDTH-size)/2,iy=ay+(CLIPBOARD_ACTION_HEIGHT-size)/2;
-                    for(int row=0;row<size;++row){
-                        int yy=iy+row;
-                        if(yy<(int)min_y||yy>(int)max_y)continue;
-                        auto* pixels=(uint32_t*)(g_master_backbuffer+(uint64_t)yy*fb->pitch)+ix;
-                        for(int col=0;col<size;++col){
-                            if(mask[row][col])pixels[col]=ui_font_blend(pixels[col],ink,mask[row][col]);
-                        }
-                    }
-                };
-                bool pin_enabled=preview.pinned||can_pin;
-                bool pin_hover=pointed&&hover.action==ClipboardAction::Pin;
-                bool delete_hover=pointed&&hover.action==ClipboardAction::Delete;
-                bool pin_highlight=preview.pinned||(pin_hover&&pin_enabled);
-                action(CLIPBOARD_PIN_TOP,preview.pinned?ClipboardIcon::Pinned:ClipboardIcon::Pin,
-                       pin_highlight?0xff475980:fill,pin_highlight?0xff7186ba:edge,
-                       pin_enabled?0xffe4ebff:0xff9098ae);
-                action(CLIPBOARD_DELETE_TOP,ClipboardIcon::Delete,delete_hover?0xff59364a:fill,
-                       delete_hover?0xffa46780:edge,delete_hover?0xffffc7d8:0xffdedff0);
-                if(pin_hover)hint=preview.pinned?"Unpin entry":can_pin?"Pin entry":"Pin limit reached";
-                if(delete_hover)hint="Delete entry";
-            }
-            if(total>panel.rows){
-                int track=panel.rows*CLIPBOARD_ROW-CLIPBOARD_GAP,thumb=track*panel.rows/total;
-                int rail_x=panel.card_right()+4,rail_y=panel.list_top();
-                int offset=(track-thumb)*first/(total-panel.rows);
-                wm_draw_button(min_y,max_y,rail_x,rail_y,3,track,0xff293148,0xff293148,0xff293148,false);
-                wm_draw_button(min_y,max_y,rail_x,rail_y+offset,3,thumb,0xff7b8cb7,0xff7b8cb7,0xff7b8cb7,false);
-            }
-            if(count)wm_draw_string(card_x,y+panel.h-(CLIPBOARD_FOOTER+line)/2,
-                                    hint,0xffb9c5ee,100,w-24);
-        }
-    }
+    wm_clipboard_render_popup(min_y,max_y);
     t2 = rdtsc_val();
     g_time_win_ticks = t2 - t1;
     }
@@ -4279,7 +4318,7 @@ static inline bool wm_compose_dirty(uint32_t min_x,uint32_t max_x,
 // interior repairs back into separate scene submissions. Their Y ranges are
 // disjoint from the exact interior clips, so no alpha pixel is blended twice.
 static bool wm_compose_scene_repairs(const VisibleRegion& input){
-    if(!fb||!gpu_direct_active()||!g_gpu_compose_hook||g_clipboard_open||g_taskbar_popup||
+    if(!fb||!gpu_direct_active()||!g_gpu_compose_hook||
        (g_menu_open&&!wm_retained_menu_ready()))return false;
     static VisibleRegion canonical{},region{};VisibleRect bounds{};
     if(!gpu_scene_repair_region(&canonical,input,{0,0,(int)fb->width,(int)fb->height},&bounds))return false;

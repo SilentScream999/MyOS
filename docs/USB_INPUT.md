@@ -1,6 +1,6 @@
 # USB and pointer input
 
-Updated 2026-11-11. Storage boot behavior is in
+Updated 2026-11-25. Storage boot behavior is in
 [PERSISTENT_STORAGE](PERSISTENT_STORAGE.md); test commands are in [TESTING](TESTING.md).
 
 Initial USB disk readiness polling tolerates `02/3A/00` (medium not present)
@@ -17,6 +17,56 @@ the driver records that capability for this device and completes subsequent
 flush requests using completed USB writes. The device provides no explicit
 cache-flush guarantee in this mode. Other flush failures, invalid sense data
 and failed WRITE(10) commands still fail the operation.
+
+## USB media keys
+
+USB keyboards can send volume controls through Keyboard-page usages 0x7f/80/81
+or a separate Consumer Control report interface. Both now feed the shared audio
+mixer, including mute, volume down/up and 400 ms/80 ms hold-repeat. Fn itself
+stays inside the keyboard; Wyzar decodes the reported usages rather than binding
+Fn+4–6 or remapping ordinary function keys. The current physical target is a
+directly wired Dareu EK815S, with hub and multiple-keyboard operation required.
+The owner confirms that its volume keys work. Its raw descriptor has not been
+captured, and physical hub/multiple-keyboard tests are not separately confirmed.
+
+`hid_media_report.h` parses bounded HID short items: input offsets, padding,
+Report IDs, global push/pop, usage lists/ranges, absolute variable fields and
+selector arrays. Only supported mute/up/down usages in Consumer/Keyboard
+application collections become media actions. Unknown Report IDs, short reports,
+vendor data and boot rollover errors preserve held state. Unrelated reports do
+not release keys held in another Report ID. General report-protocol/NKRO keyboard
+typing, relative volume dials and other media actions are outside this change.
+
+Consumer-only interfaces are type 4 and use the keyboard input registry without
+consuming mouse slots. Combined pointer/media interfaces remain type 2, with
+each descriptor decoder accepting only its own reports. All state is per
+interface; each keyboard keeps independent press/release and repeat state, while
+the audio service queues repeated actions independently of USB polling latency.
+Changes to held state notify the worker; duplicate reports do not wake it. The
+worker sleeps until the earliest repeat deadline, and blocks indefinitely when
+no playback, repeat, diagnostic or mixer work remains. USB attach/detach updates
+wake it to recompute deadlines, so unplug cancels a pending repeat wake.
+Registry publication/compaction and media-state updates are IRQ guarded. Confirmed
+unplug removes that source from the repeat scan, leaving sibling input and PS/2
+state intact. The existing limits are eight keyboard devices and four HID
+interfaces per device. Unsupported/malformed descriptors retain existing pointer
+fallback policy; arbitrary consumer packets are never interpreted as boot keys.
+The legacy four-interface receiver typing suppression is now restricted to Razer
+vendor 0x1532 rather than disabling any four-interface keyboard.
+
+`audio firmware` prints the USB media-event count (including repeat), total
+queued multimedia actions and overflow count. Regular changes use the in-memory
+audio log and existing tray/popup damage notifications. Standard references:
+[USB HID 1.11](https://www.usb.org/sites/default/files/hid1_11.pdf) and
+[HID usage tables](https://usb.org/hid).
+
+Host tests cover Consumer bitmaps/arrays/IDs, malformed descriptors/packets,
+boot media usages and independent keyboard repeat state; the actual setup helper
+is also checked for consumer classification and protocol selection/failure.
+`tests/qemu_usb_audio_test.py` uses real xHCI boot-keyboard transfers with two
+keyboards, direct/hub attachment, hotplug and held-key disconnection. QEMU exposes
+Keyboard-page media usages, so its test does not prove the Dareu's Consumer
+descriptor format; that path is covered by host fixtures until hardware testing.
 
 ## HID pointers
 

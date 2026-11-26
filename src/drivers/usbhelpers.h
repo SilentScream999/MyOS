@@ -33,6 +33,7 @@
 static XHCIController xhci_hc[MAX_CONTROLLERS];
 static int xhci_count = 0;
 static uint64_t g_usb_hub_status_requests = 0;
+static uint64_t g_usb_media_key_events = 0;
 static XHCIPortWatch usb_root_watch[MAX_CONTROLLERS][256] = {};
 static XHCIPortWatch usb_root_ready_watch[MAX_CONTROLLERS][256] = {};
 static XHCIPortChangeLatch usb_root_changes[MAX_CONTROLLERS][256] = {};
@@ -405,6 +406,34 @@ static  int           keyboard_count = 0;
 #define MAX_MICE 8
 static  USBDevice*    mice[MAX_MICE];
 static  int           mouse_count = 0;
+// Called with IRQs guarded by the audio consumer. Endpoint/device pages remain
+// pinned; removal from these registries ends that source's repeat. No USB I/O
+// occurs here, so held volume keys do not depend on the USB polling cadence.
+template<class Emit> static void usb_media_repeat(uint64_t now,Emit emit){
+    for(int k=0;k<keyboard_count;++k)for(int i=0;i<keyboards[k]->interface_count;++i){
+        auto& hi=keyboards[k]->interfaces[i];
+        if((hi.type==1 || hi.type==4) && hi.media_state && hi.configured)
+            hid_media_repeat(*hi.media_state,now,emit);
+    }
+    for(int m=0;m<mouse_count;++m)for(int i=0;i<mice[m]->interface_count;++i){
+        auto& hi=mice[m]->interfaces[i];
+        if(hi.type==2 && hi.media_state && hi.configured)hid_media_repeat(*hi.media_state,now,emit);
+    }
+}
+static uint64_t usb_media_deadline(){
+    uint64_t next=0;
+    auto take=[&](HIDInterface& hi){
+        if(hi.media_state && hi.configured && hi.media_state->repeating &&
+           (!next || hi.media_state->repeat_at<next))next=hi.media_state->repeat_at;
+    };
+    for(int k=0;k<keyboard_count;++k)for(int i=0;i<keyboards[k]->interface_count;++i){
+        auto& hi=keyboards[k]->interfaces[i];if(hi.type==1 || hi.type==4)take(hi);
+    }
+    for(int m=0;m<mouse_count;++m)for(int i=0;i<mice[m]->interface_count;++i){
+        auto& hi=mice[m]->interfaces[i];if(hi.type==2)take(hi);
+    }
+    return next;
+}
 
 // Each registered hub gets a slot here so kmain can queue and service
 // its status-change interrupt endpoint — exactly like Linux hub_activate()
@@ -884,6 +913,10 @@ static void enumerate_device_after_address(
 			continue;
 		}
 		if (hi->type == 2 && usb_hid_pointer_prepare(*dev, *hi)) continue;
+		if(hi->type==1){
+			hi->media_state=(HIDMediaState*)alloc_table();
+			*hi->media_state={};
+		}
 		USBSetupPacket bp = {};
 		bp.bmRequestType = 0x21;
 		bp.bRequest      = 0x0B;
@@ -983,11 +1016,13 @@ static void enumerate_device_after_address(
 	for (int i = 0; i < dev->interface_count; i++) {
 		HIDInterface* hi = &dev->interfaces[i];
 		hi->configured = true;
-		if (hi->type == 1) has_keyboard = true;
+		if (hi->type == 1 || hi->type == 4) has_keyboard = true;
 		else if (hi->type == 2) has_mouse = true;
 	}
-	if (has_keyboard && keyboard_count < MAX_KEYBOARDS) keyboards[keyboard_count++] = dev;
-	if (has_mouse && mouse_count < MAX_MICE) mice[mouse_count++] = dev;
+	{USBControlGuard input_lists;
+	 if (has_keyboard && keyboard_count < MAX_KEYBOARDS) keyboards[keyboard_count++] = dev;
+	 if (has_mouse && mouse_count < MAX_MICE) mice[mouse_count++] = dev;
+	 audio_events::notify();}
 }
 
 
@@ -1582,6 +1617,7 @@ static void setupUSB(XHCIController* hc) {
 
 	// Reset keyboard list so a retry pass does not accumulate stale entries
 	// from the failed first pass. We only clear devices belonging to THIS controller.
+	{USBControlGuard input_lists;
 	int new_kbd = 0;
 	for (int k = 0; k < keyboard_count; k++) {
 		if (keyboards[k] && keyboards[k]->hc != hc) keyboards[new_kbd++] = keyboards[k];
@@ -1605,6 +1641,8 @@ static void setupUSB(XHCIController* hc) {
 		}
 	}
 	hub_count = new_hub;
+	audio_events::notify();
+	}
 
 	char str[64];
 

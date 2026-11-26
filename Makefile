@@ -506,6 +506,8 @@ run-audio: iso
 
 test-audio:
 	mkdir -p .storage-test
+	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined -I. tests/hid_media_report_test.cpp -o .storage-test/hid-media-report-test
+	.storage-test/hid-media-report-test
 	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/hda_topology_test.cpp -o .storage-test/hda-topology-test
 	.storage-test/hda-topology-test
 	$(CXX) -std=c++20 -O1 -g -no-pie -fsanitize=address,undefined tests/hda_command_test.cpp -o .storage-test/hda-command-test

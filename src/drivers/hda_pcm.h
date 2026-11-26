@@ -4,6 +4,23 @@
 static uint64_t pcm_phys = 0;
 static pid_t pcm_owner = 0;
 static bool pcm_running = false, pcm_fault = false;
+static bool pcm_abandoned = false;
+static Task* service_thread = nullptr;
+static bool service_waiting=false,service_pending=true;
+static uint64_t service_iterations=0,volume_failed_revision=0;
+static void wake_service(){
+    TtyIrqGuard guard;service_pending=true;
+    // Do not shorten the worker's internal hardware/EC sleeps: only wake its
+    // explicit event/deadline wait at the bottom of the service loop.
+    if(service_waiting && service_thread && service_thread->state==TaskState::BLOCKED){
+        service_thread->wake_at_tick=0;service_thread->state=TaskState::READY;
+    }
+}
+static void task_departed(pid_t pid){
+    TtyIrqGuard guard;
+    if(pcm_owner && pcm_owner==pid){pcm_abandoned=true;audio_events::notify();}
+    if(g_fn_trace_owner==pid){g_fn_trace.deadline=0;audio_events::notify();}
+}
 static HdaPcmRing pcm{};
 static uint64_t pcm_progress_tick = 0;
 // High-frequency controls must not use print(): it synchronously redraws and
@@ -37,12 +54,14 @@ static bool apply_volume() {
 }
 static bool consume_volume_keys() {
     bool changed = false;
-    {TtyIrqGuard guard;g_audio_hotkeys.tick(g_tick_count);}
+    {TtyIrqGuard guard;
+     g_audio_hotkeys.tick(g_tick_count);
+     usb_media_repeat(g_tick_count,[](unsigned key){++g_usb_media_key_events;g_audio_hotkeys.queue(key);});}
     for (;;) {
         uint8_t key;
         { TtyIrqGuard guard; key = g_audio_hotkeys.pop(); }
         if (!key) break;
-        control_log_hex("ThinkPad audio: deferred PS/2 multimedia make code", key);
+        control_log_hex("Audio: deferred multimedia make code", key);
         {TtyIrqGuard guard;g_audio_mixer.key(key);} changed = true;
     }
     if (g_audio_mixer.applied==g_audio_mixer.revision) return true;
@@ -59,7 +78,7 @@ static void pcm_disconnect() {
         set(live_route.nodes[live_route.count - 1], 0x706, 0);
         set(live_route.nodes[0], 0x707, 0);
     }
-    live_route = {}; pcm_owner = 0;
+    live_route = {}; pcm_owner = 0;pcm_abandoned=false;
 }
 static bool pcm_service() {
     if (!pcm_running) return !pcm_fault;
@@ -147,7 +166,7 @@ static int64_t pcm_open(unsigned kind, unsigned requested_rate) {
     w32(stream + 8, pcm.capacity); w16(stream + 0xc, descriptors - 1); w16(stream + 0x12, stream_format);
     w8(stream + 2, 0x10); w8(stream + 3, 0x1c);
     pcm = {}; pcm_fault = false; pcm_running = false;
-    live_route = route; pcm_owner = g_current_task->pid;
+    live_route = route; pcm_owner = g_current_task->pid;pcm_abandoned=false;
     print((char*)"Audio: PCM stream opened");
     log_hex("Audio: PCM sample rate Hz", rate);
     log_hex("Audio: PCM DMA ring bytes", pcm.capacity);
@@ -209,7 +228,7 @@ static int64_t control(uint64_t action, uint64_t arg, uint64_t bytes = 0) {
             print((char*)(result ? "Audio: PCM drain failed" : "Audio: PCM drain completed"));
         } else if (action == 10) { pcm_disconnect(); result = 0; }
     } else if (pcm_owner) result = -2;
-    { TtyIrqGuard guard; busy = false; }
+    { TtyIrqGuard guard; busy = false;audio_events::notify(); }
     return result;
 }
 static void poll_hotkeys() {
@@ -218,24 +237,54 @@ static void poll_hotkeys() {
         bool alive = false;
         { TtyIrqGuard guard;
           Task* task = g_task_list;
-          if (task) do { if (task->pid == pcm_owner && task->state != TaskState::DEAD && !task->interrupt_requested) alive = true; task = task->next; } while (task != g_task_list);
+          if (task) do { if (!pcm_abandoned && task->pid == pcm_owner && task->state != TaskState::DEAD && !task->interrupt_requested) alive = true; task = task->next; } while (task != g_task_list);
         }
         if (!alive) pcm_disconnect();
         else pcm_service();
     }
-    consume_volume_keys();
+    volume_failed_revision=consume_volume_keys()?0:g_audio_mixer.revision;
     fn_probe::poll();
     { TtyIrqGuard guard; busy = false; }
 }
+// Called under the same IRQ guard used to publish BLOCKED. Producers cannot
+// insert a key/mixer update between the final predicate check and sleeping.
+// Zero means manual/event wake only. An owned but stopped PCM stream has no
+// periodic work; owner exit is an explicit notification.
+static uint64_t service_deadline(uint64_t now){
+    if(busy)return 0; // The hardware owner notifies when it releases the driver.
+    if(service_pending || (desktop_initialized && device_count && !attempted) ||
+       g_audio_hotkeys.count || (g_audio_mixer.revision!=g_audio_mixer.applied &&
+                                g_audio_mixer.revision!=volume_failed_revision))return now;
+    uint64_t next=pcm_running?now+2:0;
+    auto take=[&](uint64_t at){if(at && (!next || at<next))next=at;};
+    if(g_audio_hotkeys.repeating)take(g_audio_hotkeys.repeat_at);
+    take(usb_media_deadline());
+    if(g_fn_trace.active(now))take(now+20<g_fn_trace.deadline?now+20:g_fn_trace.deadline);
+    return next;
+}
 static void service_task() {
+    {TtyIrqGuard guard;service_thread=g_current_task;audio_events::wake=wake_service;}
+    __asm__ volatile("sti" ::: "memory"); // Fresh task contexts begin with IRQs masked.
     for (;;) {
+        {TtyIrqGuard guard;service_pending=false;}
+        ++service_iterations;
         // Initialize discovered HDA controllers and the matching firmware
         // hotkey path without requiring playback or the capture command.
         // Explicit audio calls share the same busy/attempted guard. Failure
         // remains bounded and is not retried on every service tick.
         if(__atomic_load_n(&desktop_initialized,__ATOMIC_ACQUIRE) && device_count && !attempted)
             control_legacy(0,0);
-        poll_hotkeys();sleep_ms(2);
+        poll_hotkeys();
+        {TtyIrqGuard guard;
+            uint64_t deadline=service_deadline(g_tick_count);
+            if(deadline && deadline<=g_tick_count)continue;
+            service_thread->wake_at_tick=deadline;
+            service_thread->state=TaskState::BLOCKED;service_waiting=true;
+            while(service_thread->state==TaskState::BLOCKED){
+                schedule();if(service_thread->state==TaskState::BLOCKED)scheduler_idle_halt();
+            }
+            service_waiting=false;
+        }
     }
 }
 #endif

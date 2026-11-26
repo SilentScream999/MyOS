@@ -39,6 +39,7 @@ static bool desktop_initialized = false;
 // task may have been scheduled while boot was still filling devices/bars.
 static void desktop_ready() {
     __atomic_store_n(&desktop_initialized,true,__ATOMIC_RELEASE);
+    audio_events::notify();
 }
 static unsigned available = 0;
 static uint32_t codec_id = 0;
@@ -529,8 +530,9 @@ static int64_t control_legacy(uint64_t action, uint64_t kind) {
             bool identity = thinkpad_audio_identity(active.id, subsystem, codec_id);
             unsigned received, dropped;
             { TtyIrqGuard guard; received = g_audio_hotkeys.received; dropped = g_audio_hotkeys.dropped; }
-            log_hex("ThinkPad audio: PS/2 multimedia key presses received", received);
-            log_hex("ThinkPad audio: PS/2 multimedia queue overflow", dropped);
+            log_hex("Audio: multimedia key presses received", received);
+            log_hex("Audio: multimedia queue overflow", dropped);
+            log_hex("Audio: USB media key events (including repeat)",g_usb_media_key_events);
             result = thinkpad_audio::control(identity, (unsigned)action - 3);
             if (result == -6) print((char*)"ThinkPad audio: firmware control unavailable on this platform");
         } else if (!action) result = available;
@@ -545,7 +547,7 @@ static int64_t control_legacy(uint64_t action, uint64_t kind) {
             print((char*)(result == 0 ? "Audio: test DMA completed" : "Audio: test failed or route unavailable"));
         }
     }
-    { TtyIrqGuard guard; busy = false; }
+    { TtyIrqGuard guard; busy = false;audio_events::notify(); }
     return result;
 }
 #include "hda_pcm.h"

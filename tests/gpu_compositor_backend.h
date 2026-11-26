@@ -27,12 +27,27 @@ static void gpu_test_repair_scene(){
         g_menu_open=true;wm_draw_start_menu(0,0,true);
     }
     if(request==2||request==3){g_desktop_fps=g_gpu_test_tray_fps;g_clock_valid=false;}
-    if(request==4||request==5||request==6){
+    if(request>=4&&request<=9){
         Window* rain=nullptr;
         for(int i=0;i<g_window_count;++i)if(g_window_list[i]->type==WIN_TYPE_RAIN)rain=g_window_list[i];
         g_gpu_test_scene_repair_accepted=false;
         if(rain){
             int popup=g_taskbar_popup,group=g_taskbar_group_id,anchor=g_taskbar_anchor;
+            unsigned button_width=g_wbtn_w;
+            bool clipboard_open=g_clipboard_open;
+            int selected=g_clipboard_selected,first=g_clipboard_first,target=g_clipboard_target;
+            TextClipboard* saved_clipboard=nullptr;
+            if(request>=8){
+                saved_clipboard=(TextClipboard*)kmalloc(sizeof(TextClipboard));
+                if(!saved_clipboard)hcf();
+                memcpy(saved_clipboard,&g_text_clipboard,sizeof(TextClipboard));
+                memset(&g_text_clipboard,0,sizeof(TextClipboard));
+                if(request==8)for(int i=0;i<6;++i){
+                    char sample[]="Clipboard entry 0\nSecond preview line";sample[16]='0'+i;
+                    g_text_clipboard.set(sample,sizeof(sample)-1);
+                }
+                g_clipboard_selected=g_clipboard_first=0;g_clipboard_target=-1;
+            }
             int x=rain->x,y=rain->y,w=rain->w,h=rain->h;
             int cw=rain->canvas_width,ch=rain->canvas_height;
             bool maximized=rain->maximized;
@@ -42,6 +57,8 @@ static void gpu_test_repair_scene(){
             DamageList saved_damage=g_damage;
             int saved_order[MAX_WINDOWS];for(int i=0;i<g_window_count;++i)saved_order[i]=g_window_order[i];
             g_menu_open=false;g_taskbar_popup=request>=5?3:2;g_taskbar_group_id=rain->id;g_taskbar_anchor=request>=5?wm_volume_tray_x():100;
+            if(request==7){g_taskbar_popup=1;g_wbtn_w=fb->width;}
+            if(request>=8){g_taskbar_popup=0;g_clipboard_open=true;}
             rain->x=0;rain->y=g_title_h;rain->w=fb->width;rain->h=fb->height-g_taskbar_h-g_title_h;
             rain->canvas_width=rain->w;rain->canvas_height=rain->h;rain->maximized=true;
             if(request==6){
@@ -49,7 +66,7 @@ static void gpu_test_repair_scene(){
                 int at=-1;for(int i=0;i<g_window_count;++i)if(g_window_list[g_window_order[i]]==rain)at=i;
                 if(at>=0){int index=g_window_order[at];for(int i=at;i+1<g_window_count;++i)g_window_order[i]=g_window_order[i+1];g_window_order[g_window_count-1]=index;}
             }
-            auto panel=wm_taskbar_panel(wm_taskbar_snapshot());
+            auto panel=wm_shell_popup_panel();
             VisibleRect cut{panel.x,panel.y,panel.x+panel.w,panel.y+panel.h};
             bool ok=wm_prepare_retained_animation(rain)&&g_retained_animation_plan.count;
             if(request==6)ok=ok&&g_win_log&&g_win_log->visible&&!g_win_log->minimized&&
@@ -66,6 +83,11 @@ static void gpu_test_repair_scene(){
             auto deferred=g_deferred_alpha;g_deferred_alpha.clear();
             if(!expected)ok=false;
             for(unsigned pass=0;ok&&pass<4;++pass){
+                if(request==8){
+                    if(pass==1){wm_clipboard_toggle_pin(0);wm_clipboard_scroll(1);}
+                    if(pass==2)wm_clipboard_delete(1);
+                    if(pass==3)wm_clipboard_move(1);
+                }
                 if(request>=5){g_audio_mixer.value.percent=pass*25;g_audio_mixer.value.muted=pass&1;}
                 if(request==6){
                     auto log_hash=[](){uint64_t hash=1469598103934665603ULL;for(unsigned i=0;i<sizeof(g_log_buf);++i)hash=(hash^((uint8_t*)g_log_buf)[i])*1099511628211ULL;return hash;};
@@ -78,21 +100,67 @@ static void gpu_test_repair_scene(){
                 }
                 g_gpu_direct_back=pass%2;
                 g_mouse_x=pass&1?panel.x+45:0;g_mouse_y=pass&1?panel.y+45:0;
+                if(request==8&&pass&1){
+                    auto clipboard=wm_clipboard_panel();
+                    g_mouse_x=clipboard.action_left()+5;
+                    g_mouse_y=clipboard.list_top()+CLIPBOARD_PIN_TOP+5;
+                }
                 g_ui_clip_left=panel.x;g_ui_clip_right=panel.x+panel.w;
                 g_ui_clip_top=panel.y;g_ui_clip_bottom=panel.y+panel.h;
-                wm_taskbar_render_popup(panel.y,panel.y+panel.h-1);
+                if(request>=8)wm_clipboard_paint_popup(panel.y,panel.y+panel.h-1);
+                else wm_taskbar_paint_popup(panel,panel.y,panel.y+panel.h-1);
                 for(int py=0;py<panel.h;++py){
                     auto* row=g_master_backbuffer+(uint64_t)(panel.y+py)*fb->pitch+panel.x*4;
                     memcpy(expected+(uint64_t)py*panel.w*4,row,panel.w*4);
                     memset_32((uint32_t*)row,0xffdeadbe,panel.w);
                 }
                 g_ui_clip_right=panel.x+panel.w/2;g_ui_clip_top=panel.y+panel.h/2;
-                ok=wm_draw_retained_animation(0)&&!g_retained_scene_invalidated;
+                // Both cached replay and allocation-failure painting must obey
+                // an exact scene-repair clip, preserving all pixels outside it.
+                for(unsigned fallback=0;ok&&fallback<2;++fallback){
+                    for(int py=0;py<panel.h;++py){
+                        auto* row=g_master_backbuffer+(uint64_t)(panel.y+py)*fb->pitch+panel.x*4;
+                        memset_32((uint32_t*)row,0xffdeadbe,panel.w);
+                    }
+                    auto cache=g_menu_pixel_cache;
+                    if(fallback)g_menu_pixel_cache.pixels=nullptr;
+                    wm_render_shell_popup(panel.y,panel.y+panel.h-1);
+                    if(fallback)g_menu_pixel_cache=cache;
+                    for(int py=0;ok&&py<panel.h;++py){
+                        auto* wanted=(uint32_t*)(expected+(uint64_t)py*panel.w*4);
+                        auto* actual=(uint32_t*)(g_master_backbuffer+(uint64_t)(panel.y+py)*fb->pitch+panel.x*4);
+                        for(int px=0;ok&&px<panel.w;++px){
+                            bool clipped=px<panel.w/2&&py>=panel.h/2;
+                            ok=actual[px]==(clipped?wanted[px]:0xffdeadbe);
+                        }
+                    }
+                }
+                ok=ok&&wm_draw_retained_animation(0)&&!g_retained_scene_invalidated;
                 for(int py=0;ok&&py<panel.h;++py){
                     auto* wanted=(uint32_t*)(expected+(uint64_t)py*panel.w*4);
                     auto* actual=(uint32_t*)(g_master_backbuffer+(uint64_t)(panel.y+py)*fb->pitch+panel.x*4);
                     for(int px=0;ok&&px<panel.w;++px)ok=wanted[px]==actual[px];
                 }
+                // Real animation submissions must keep running while a static
+                // popup reuses its pixels, including on alternating scanouts.
+                auto& render_count=request>=8?g_clipboard_popup_renders:g_taskbar_popup_renders;
+                auto& reuse_count=request>=8?g_clipboard_popup_reuses:g_taskbar_popup_reuses;
+                uint64_t renders=render_count,reuses=reuse_count,rainbows=g_gpu_test_rainbow_calls;
+                for(unsigned frame=0;ok&&frame<8;++frame){
+                    g_gpu_direct_back=frame%2;
+                    ok=wm_draw_retained_animation(0)&&!g_retained_scene_invalidated;
+                }
+                ok=ok&&render_count==renders&&reuse_count>=reuses+8&&g_gpu_test_rainbow_calls>=rainbows+8;
+            }
+            if(request==8&&ok){
+                uint64_t wanted=g_text_clipboard.history(g_clipboard_selected).hash;
+                wm_clipboard_accept(g_clipboard_selected);
+                ok=!g_clipboard_open&&g_text_clipboard.history(0).hash==wanted&&
+                    wm_prepare_retained_animation(rain)&&g_retained_animation_plan.count;
+                bool uncovered=false;
+                for(unsigned i=0;i<g_retained_animation_plan.count;++i)
+                    uncovered|=visibility_valid(visibility_intersect(cut,g_retained_animation_plan.copies[i].destination));
+                ok=ok&&uncovered;
             }
             kfree(expected);g_deferred_alpha=deferred;
             g_mouse_x=mx;g_mouse_y=my;
@@ -100,6 +168,10 @@ static void gpu_test_repair_scene(){
             g_gpu_test_scene_repair_accepted=ok;
             rain->x=x;rain->y=y;rain->w=w;rain->h=h;rain->canvas_width=cw;rain->canvas_height=ch;rain->maximized=maximized;
             g_taskbar_popup=popup;g_taskbar_group_id=group;g_taskbar_anchor=anchor;
+            g_wbtn_w=button_width;
+            if(saved_clipboard){memcpy(&g_text_clipboard,saved_clipboard,sizeof(TextClipboard));kfree(saved_clipboard);}
+            g_clipboard_open=clipboard_open;g_clipboard_selected=selected;g_clipboard_first=first;g_clipboard_target=target;
+            if(request>=8)g_damage=saved_damage;
             g_audio_mixer.value=saved_volume;
             if(request==6){g_audio_mixer=saved_mixer;g_audio_hotkeys=saved_keys;g_damage=saved_damage;}
             for(int i=0;i<g_window_count;++i)g_window_order[i]=saved_order[i];

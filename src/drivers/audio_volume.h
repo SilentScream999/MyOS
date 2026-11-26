@@ -1,6 +1,7 @@
 #ifndef WYZAR_AUDIO_VOLUME_H
 #define WYZAR_AUDIO_VOLUME_H
 #include <stdint.h>
+#include "audio_events.h"
 struct AudioVolume {
     unsigned percent = 70;
     bool muted = false;
@@ -30,7 +31,7 @@ struct AudioMixer {
     void (*changed)() = nullptr;
     void publish(AudioVolume next) {
         if(next.percent==value.percent&&next.muted==value.muted)return;
-        value=next;++revision;if(changed)changed();
+        value=next;++revision;if(changed)changed();audio_events::notify();
     }
     void percent(unsigned amount) { auto next=value;next.percent=amount>100?100:amount;publish(next); }
     void mute(unsigned mode) { auto next=value;next.muted=mode==2?!next.muted:bool(mode);publish(next); }

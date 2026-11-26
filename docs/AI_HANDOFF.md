@@ -67,8 +67,27 @@ PS/2 multimedia make/break events are consumed and queued by IRQ1; the audio
 service task (or a blocking PCM operation) applies shared DAC volume/mute. Up/down change
 volume by 10 and clear shared mute; the multimedia mute key toggles mute.
 The temporary plain F1/F2/F3 audio fallback has been removed, preserving ordinary
-function keys for apps. Volume follows firmware FnLock mapping. USB consumer
-reports remain unsupported. This is not a general AML or
+function keys for apps. Volume follows firmware FnLock mapping. USB media input
+now handles boot keyboard usages and Consumer Control reports; see USB_INPUT.
+Each interface owns its report-ID held state and repeat timer. The audio consumer
+ticks repeat while USB registry publication/removal is IRQ guarded; unplugging
+one keyboard cannot cancel another's or PS/2's held keys. Consumer-only interfaces
+are type4 in the keyboard registry, avoiding mouse-slot exhaustion. The four-
+interface receiver typing suppression now requires Razer VID 0x1532. USB event
+counts are available through `audio firmware`. User target: wired Dareu EK815S,
+Fn+4–6; also wants hubs and multiple keyboards. Host media/setup fixtures and
+real QEMU USB transfers/hub hotplug pass. The owner confirms Dareu media keys work,
+but reports Audio service at 1.2–2.5% idle CPU. Latest code replaces the perpetual
+2 ms loop with event-driven blocking and exact repeat/diagnostic deadlines. DMA
+keeps 2 ms service only while running; busy syscall owners notify on release.
+Key/mixer/startup/USB/capture events wake the worker, with its final predicate
+and BLOCKED publication IRQ guarded. The wake hook only interrupts the explicit
+service wait, preserving internal hardware sleeps. `process_exit_ui` also
+notifies PCM owner departure so idle open streams do not require owner polling.
+QEMU idle probes use actual Task layout/accounting and assert stable service
+iteration and CPU-cycle counts plus BLOCKED/wake_at_tick=0 before/after activity.
+Hardware idle CPU with this change remains to be checked.
+The icon redesign was pushed as f2bf09a before this USB work. This is not a general AML or
 ACPI HKEY/GPE implementation: the narrow captured-E470 initialization is
 described below; SCI/GPE masks are unchanged. Zero key counters may indicate ACPI-only
 delivery; the direct unmute command still works when EC resources are available.

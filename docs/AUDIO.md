@@ -53,7 +53,8 @@ paired Linux-initialization `UCMS(0x1c)` call. Key delivery in that build is
 hardware verified after initialization. The temporary plain-F1/F2/F3 fallback
 has been removed: ordinary function-key scan codes pass through to applications.
 Volume follows whichever row combination the firmware maps to multimedia codes,
-according to FnLock. USB consumer-control reports are not yet supported.
+according to FnLock. USB boot keyboard media usages and descriptor-based
+Consumer Control reports now feed the same mixer.
 Each press changes volume
 by 10 percentage points; up/down also clear software mute. Holding up/down
 repeats after 400 ms, then every 80 ms; release cancels repeat and delayed
@@ -94,7 +95,20 @@ owning PID to write/drain/close, and pins a 256 KiB cyclic DMA buffer. Consumed
 pages are cleared before reuse. Playback stops on underrun, DMA errors, missed
 poll deadlines or owner exit/interruption. Only one stream is supported; a
 second player or diagnostic tone is rejected while a stream is open. A dedicated
-audio task services the ring every 2 ms, independently of USB/input enumeration.
+audio task services a running ring every 2 ms, independently of USB/input enumeration.
+It now blocks indefinitely when idle rather than waking every 2 ms. Media keys,
+mixer changes, desktop readiness, USB attach/detach, diagnostic start/stop and
+hardware-owner completion wake it explicitly. Repeat wakes are scheduled at
+the next held key's 400 ms/80 ms deadline; diagnostic sampling uses 20 ms only
+while armed. Merely opening an unused PCM stream does not start periodic work.
+Task-exit notification reclaims an abandoned stream, including one that never
+started DMA. The final work check and publishing BLOCKED share an IRQ guard to
+prevent lost wakeups. Notifications do not interrupt the worker's hardware/EC
+transaction sleeps. Failed mixer revisions are not retried in a tight loop.
+Idle QEMU checks observe no service-loop iterations or added task CPU cycles,
+with wake_at_tick=0 and the task BLOCKED, before/after input and after unplug.
+The owner confirmed Dareu USB media keys work, but reported 1.2–2.5% idle CPU
+with the previous polling worker; hardware CPU usage with this change is pending.
 The 128 KiB prefill gives about 0.68 seconds of queued audio at 48 kHz; a full
 usable ring holds about 1.34 seconds. The conservative poll deadline is 1.2 s.
 Errors now distinguish descriptor DMA, hardware FIFO, invalid position and

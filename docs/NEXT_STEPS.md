@@ -34,7 +34,16 @@ hold/release and popup state. The startup change is QEMU tested; firmware key
 delivery after initialization is already confirmed by capture and owner.
 The profile remains specific to TP-R0D/revision 0x960; IRQ9 stays masked and
 pending EC events remain unconsumed until wider ACPI dispatch support exists.
-Next features: USB HID consumer-control media keys, WAV, seeking/playlists, live jack routing,
+USB media input is implemented for boot usages and descriptor-based Consumer
+Control reports. Test the wired Dareu EK815S with Fn+4–6, including hold/release,
+two simultaneous keyboards, hub attachment and unplug while holding volume.
+Host fixtures and actual QEMU USB transfers/hub hotplug pass; the owner confirms
+the Dareu's keys work. The owner then reported 1.2–2.5% idle Audio service CPU;
+the latest build removes perpetual polling, sleeps until events/repeat deadlines,
+and is checked for zero idle worker iterations/CPU cycles in QEMU. Verify the
+hardware task's idle CPU after startup and after music stops. Ordinary F1–F3
+remain available to apps.
+Next features: WAV, seeking/playlists, live jack routing,
 mixing and a graphical player. Volume settings currently reset on reboot.
 
 ## GPU follow-up

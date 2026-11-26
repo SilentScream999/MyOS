@@ -5,6 +5,7 @@ import sys
 import time
 import qemu_storage_smoke as smoke
 from qemu_audio_test import boot
+from audio_service_probe import AudioServiceProbe
 sys.path.insert(0,str(smoke.ROOT/'tools'))
 from read_fn_capture import decode
 
@@ -37,6 +38,7 @@ def main():
         raise AssertionError('Directory cycle')
     try:
         boot(q,'fn-capture-boot')
+        service=AudioServiceProbe(q);service.assert_idle()
         q.type('audio hotkeys\n',pause=1)
         for key in ('f1','f2','f3','volumeup'):
             q.command('send-key',{'keys':[{'type':'qcode','data':key}],'hold-time':60});time.sleep(.15)
@@ -65,6 +67,7 @@ def main():
         q.monitor('sendkey ctrl-c 80');time.sleep(1)
         assert number(address('g_fn_trace')+deadline)==0,'Cancelled capture kept recording'
         assert q.command('query-status')['running']
+        service.assert_idle()
         print(f'PASS: bounded raw PS/2 capture, 10 stages, {len(tables)} checksummed ACPI tables, saved bundle, unsupported-platform firmware exclusion and cancellation')
     finally:q.close()
 

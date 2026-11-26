@@ -4,6 +4,7 @@ import subprocess
 import time
 import qemu_storage_smoke as smoke
 from qemu_audio_test import boot
+from audio_service_probe import AudioServiceProbe
 
 def main():
     smoke.OUT.mkdir(exist_ok=True);smoke.BOOT_ISO=True
@@ -33,6 +34,7 @@ def main():
         time.sleep(duration/1000+.2)
     try:
         boot(q,'volume-boot');assert state()==(70,False)
+        service=AudioServiceProbe(q);service.assert_idle()
         for code in ('f1','f2','f3'):
             key(code,500);assert state()==(70,False),'Ordinary function key changed volume/mute'
         tb=scalar('g_taskbar_h')
@@ -72,6 +74,7 @@ def main():
         assert scalar('g_taskbar_popup')==0,('Escape did not close popup',scalar('g_kbd_modifiers'))
         click(anchor+tb//2,800-tb//2);assert scalar('g_taskbar_popup')==3
         click(950,600);assert scalar('g_taskbar_popup')==0
+        service.assert_idle()
         assert q.command('query-status')['running']
         print('PASS: CPU tray/popup, 0/50/100 slider, drag capture/clamping, mute/shared keys, hold repeat/release, Escape and outside dismissal')
     finally:q.close()

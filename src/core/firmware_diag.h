@@ -83,7 +83,7 @@ static int64_t control(uint64_t action,uint64_t arg,uint64_t buffer,uint64_t cap
         memcpy((void*)buffer,(uint8_t*)&g_fn_trace+arg,count);return count;
     }
     if(action==3){if(arg>15)return -4;TtyIrqGuard guard;g_fn_trace.stage=arg;g_fn_trace.append(g_tick_count,4,arg);return 0;}
-    if(action==4){TtyIrqGuard guard;g_fn_trace.deadline=0;return 0;}
+    if(action==4){TtyIrqGuard guard;g_fn_trace.deadline=0;audio_events::notify();return 0;}
     return -4;
 }
 }

@@ -8,6 +8,8 @@
 #include "../src/drivers/thinkpad_smi.h"
 #include "../src/drivers/acpi_mode.h"
 #include "../src/drivers/audio_hotkeys.h"
+static unsigned wake_calls=0;
+static void wake_test(){++wake_calls;}
 
 struct Ec {
     uint8_t memory[256]{}, status = 0, cmd = 0, address = 0;
@@ -217,4 +219,12 @@ int main(int argc,char** argv) {
     assert(keys.accept(true,0xb0,false,1001));keys.tick(2000);assert(!keys.pop());
     assert(keys.accept(true,0x20,false,2100)&&keys.pop()==0x20);
     assert(keys.accept(true,0x20,true,2600));keys.tick(3000);assert(!keys.pop());
+    keys={};audio_events::wake=wake_test;
+    assert(keys.accept(true,0xb0,false) && !wake_calls); // orphan release
+    assert(!keys.accept(false,0x3d,false) && !wake_calls);
+    assert(keys.accept(true,0x30,false,100) && wake_calls==1);
+    assert(keys.accept(true,0x30,true,110) && wake_calls==1);
+    assert(keys.accept(true,0xb0,false,120) && wake_calls==2);
+    assert(keys.accept(true,0xb0,false,130) && wake_calls==2);
+    audio_events::wake=nullptr;
 }

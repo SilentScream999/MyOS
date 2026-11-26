@@ -64,7 +64,9 @@ static bool begin_direct_scanout(DamageList& damage,VisibleRegion* exact_damage=
     if(live!=front)return reject_scanout(Check::Live,live,front);
     uint32_t armed=plane_base(g_gpu_display_plane.surface);
     if(armed!=front)return reject_scanout(Check::Surface,armed,front);
-    bool popup=g_clipboard_open||g_taskbar_popup||(g_menu_open&&!wm_retained_menu_ready());
+    // Shell popups obey exact clips in both cached and fallback painting.
+    // Keep client animation repairs bounded even when no Rainbow is running.
+    bool popup=g_menu_open&&!wm_retained_menu_ready();
 #if GPU_EXACT_REPAIRS
     int tray_left=retained_animation&&!popup?wm_tray_damage_left():-1;
     if(exact_damage){
@@ -308,6 +310,7 @@ static void log_menu_opens(uint64_t now){
 }
 
 static void process_exit_ui(pid_t pid) {
+    hda::task_departed(pid);
     bool foreground = pid == g_terminal_foreground_pid;
     wm_destroy_task_windows(pid);
     if (foreground && g_win_terminal) {
@@ -720,6 +723,7 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
     // 1. Move cursor (clamped to screen)
     auto clipboard_hover=wm_clipboard_hit(g_mouse_x,g_mouse_y);
     int previous_menu_item=g_menu_open?wm_menu_hit_test(g_mouse_x,g_mouse_y):-1;
+    int previous_popup_item=wm_taskbar_popup_hover(g_mouse_x,g_mouse_y);
     g_mouse_x += dx;
     g_mouse_y += dy;
     if (dx != 0 || dy != 0 || buttons != g_mouse_prev_buttons) g_needs_refresh = true;
@@ -733,7 +737,7 @@ extern "C" void mouse_process_input(int16_t dx, int16_t dy, uint8_t buttons) {
 
     // Start menu hover highlight follows the pointer
     if (g_menu_open && (dx != 0 || dy != 0)) wm_menu_hover_dirty(previous_menu_item,wm_menu_hit_test(g_mouse_x,g_mouse_y));
-    if(g_taskbar_popup&&(dx!=0||dy!=0))wm_taskbar_damage(false);
+    if(g_taskbar_popup&&(dx||dy)&&previous_popup_item!=wm_taskbar_popup_hover(g_mouse_x,g_mouse_y))wm_taskbar_damage(false);
 
     // 2. Start drag / Raise / Close / Taskbar: hit-test Z-stack on fresh click
     if(mouse_press)clipboard_press=wm_clipboard_click(g_mouse_x,g_mouse_y)||wm_taskbar_popup_click(g_mouse_x,g_mouse_y);
@@ -1865,6 +1869,7 @@ extern "C" void kmain(void) {
 	const uint64_t REPEAT_PERIOD = tsc_hz *  40 / 1000;   //  40 ms in ticks
 
 	// ── Per-keyboard state ────────────────────────────────────────────────────
+	auto media_key=[](unsigned key){TtyIrqGuard guard;++g_usb_media_key_events;g_audio_hotkeys.queue(key);};
 
 	uint8_t  last_keys[MAX_KEYBOARDS][6];
 	uint8_t  last_mods[MAX_KEYBOARDS];
@@ -1890,7 +1895,7 @@ extern "C" void kmain(void) {
 		USBDevice* kd = keyboards[k];
 		for (int i = 0; i < kd->interface_count; i++) {
 			HIDInterface* hi = &kd->interfaces[i];
-			if (hi->type != 1 || hi->armed || !hi->configured) continue;
+			if ((hi->type != 1 && hi->type != 4) || hi->armed || !hi->configured) continue;
 
 			volatile uint8_t* buf = (volatile uint8_t*)alloc_table();
 			for (int j = 0; j < 4096; j++) buf[j] = 0;
@@ -2059,7 +2064,7 @@ extern "C" void kmain(void) {
 					for (int k = 0; k < keyboard_count; k++) {
 						if (keyboards[k]->slot_id == slot_from_event && keyboards[k]->hc == &xhci_hc[ctrl_idx]) {
 							for (int i=0; i<keyboards[k]->interface_count; i++) {
-								if (keyboards[k]->interfaces[i].type == 1 && 
+								if ((keyboards[k]->interfaces[i].type == 1 || keyboards[k]->interfaces[i].type == 4) &&
 									(keyboards[k]->interfaces[i].ep_num*2+1) == dci_from_event &&
 									trb_ptr >= keyboards[k]->interfaces[i].ring->phys &&
 									trb_ptr < keyboards[k]->interfaces[i].ring->phys + LINK_INDEX * 16u) {
@@ -2077,7 +2082,7 @@ extern "C" void kmain(void) {
 					for (int m = 0; m < mouse_count; m++) {
 						if (mice[m]->slot_id == slot_from_event && mice[m]->hc == &xhci_hc[ctrl_idx]) {
 							for (int i=0; i<mice[m]->interface_count; i++) {
-								if (mice[m]->interfaces[i].type == 2 && 
+								if (mice[m]->interfaces[i].type == 2 &&
 									(mice[m]->interfaces[i].ep_num*2+1) == dci_from_event &&
 									trb_ptr >= mice[m]->interfaces[i].ring->phys &&
 									trb_ptr < mice[m]->interfaces[i].ring->phys + LINK_INDEX * 16u) {
@@ -2091,6 +2096,18 @@ extern "C" void kmain(void) {
 					}
 
 					if (which_kbd >= 0) {
+						uint32_t requested=completed_trb->status&0x1ffffu;
+						uint32_t remaining=resp.event->status&0xffffffu;
+						size_t report_bytes=requested<=k_hi->mps && remaining<=requested ? requested-remaining : 0;
+						if(k_hi->type==4 && k_hi->media_layout && k_hi->media_state){
+							uint8_t mask=0;
+							if(hid_media_decode(*k_hi->media_layout,(const uint8_t*)report,report_bytes,*k_hi->media_state,mask))
+								{TtyIrqGuard guard;hid_media_update(*k_hi->media_state,mask,g_tick_count,media_key);}
+						}else if(k_hi->type==1 && report_bytes>=8){
+							uint8_t mask=0;
+							bool legacy_receiver=keyboards[which_kbd]->vendor_id==0x1532 && keyboards[which_kbd]->interface_count==4;
+							if(!legacy_receiver && k_hi->media_state && hid_boot_media_decode((const uint8_t*)report,report_bytes,mask))
+								{TtyIrqGuard guard;hid_media_update(*k_hi->media_state,mask,g_tick_count,media_key);}
 						int     k         = which_kbd;
 						uint8_t modifiers = report[0];
                         g_kbd_modifiers=wm_hid_modifiers(modifiers); // Publish releases even with no printable keys.
@@ -2117,13 +2134,13 @@ extern "C" void kmain(void) {
 						// ── Emit and timestamp newly-pressed keys ─────────────
 						// Razer dongles (4 interfaces) send Battery/DPI data over 
 						// the keyboard channel. We suppress terminal typing for them.
-						if (keyboards[k]->interface_count != 4) {
+						if (!legacy_receiver) {
 							bool other_key_held=false;
 							for(int b=2;b<8;++b)other_key_held|=report[b]!=0;
 							wm_gui_key_update(win_taps[k],wm_hid_modifiers(modifiers),other_key_held);
 							for (int b = 2; b < 8; b++) {
 								uint8_t key = report[b];
-							if (key == 0) continue;
+							if (key == 0 || hid_boot_media_usage(key)) continue;
 							if (key_down_at[k][key] == 0) {
 								bool already_held=false;
 								for(uint8_t previous:last_keys[k])already_held|=previous==key;
@@ -2174,6 +2191,7 @@ extern "C" void kmain(void) {
 						}
 						for (int j = 0; j < 6; j++) last_keys[k][j] = report[2 + j];
 						last_mods[k] = modifiers;
+						}
 
 						// ── Re-queue transfer TRB ──────────────────────────────
 						volatile TRB* new_trb = &k_hi->ring->trb[k_hi->ring->enq];
@@ -2187,12 +2205,17 @@ extern "C" void kmain(void) {
 							k_hi->ring->enq = 0;
 							k_hi->ring->pcs ^= 1;
 						}
-						keyboards[k]->hc->doorbell32[slot_from_event] = dci_from_event;
+						keyboards[which_kbd]->hc->doorbell32[slot_from_event] = dci_from_event;
 					} else if (which_mouse >= 0) {
 						int m = which_mouse;
 						uint32_t requested = completed_trb->status & 0x1ffffu;
 						uint32_t remaining = resp.event->status & 0xffffffu;
 						size_t report_bytes = requested <= m_hi->mps && remaining <= requested ? requested - remaining : 0;
+						if(m_hi->media_layout && m_hi->media_state){
+							uint8_t mask=0;
+							if(hid_media_decode(*m_hi->media_layout,(const uint8_t*)report,report_bytes,*m_hi->media_state,mask))
+								{TtyIrqGuard guard;hid_media_update(*m_hi->media_state,mask,g_tick_count,media_key);}
+						}
 						if (m_hi->mouse_layout) {
 							HIDMouseEvent decoded;
 							if (hid_mouse_decode(*m_hi->mouse_layout, (const uint8_t*)report, report_bytes,
@@ -2200,7 +2223,7 @@ extern "C" void kmain(void) {
 								mouse_process_input(decoded.dx, decoded.dy, decoded.buttons);
 								if (decoded.wheel) mouse_process_scroll(-decoded.wheel);
 							}
-						} else {
+						} else if(m_hi->type==2) {
 
 						// Legacy report-mode fallback for existing receivers. Boot
 						// reports never infer a Report ID from the button mask.
@@ -2224,7 +2247,7 @@ extern "C" void kmain(void) {
 							// We match the Razer's exact physical USB profile (MPS=64, 4 Interfaces) 
 							// plus the keyboard traffic fingerprint so we don't accidentally
 							// apply this layout to standard composite trackpad keyboards.
-							bool is_razer_wireless = (mice[m]->is_dongle && m_hi->mps == 64 && mice[m]->interface_count == 4);
+							bool is_razer_wireless = (mice[m]->vendor_id==0x1532 && mice[m]->is_dongle && m_hi->mps == 64 && mice[m]->interface_count == 4);
 							if (m_hi->protocol != 2 || is_razer_wireless) {
 								if (report_bytes >= (shifted ? 9u : 8u)) {
 									// Wireless Razer Dongle (Extended 16-bit layout)
@@ -2327,7 +2350,7 @@ extern "C" void kmain(void) {
 		uint64_t repeat_rate_tsc  = 30 * ms_to_tsc;
 
 		for (int k = 0; k < keyboard_count; k++) {
-			if (keyboards[k]->interface_count == 4) continue; // Skip phantom dongles
+			if (keyboards[k]->vendor_id==0x1532 && keyboards[k]->interface_count == 4) continue; // Legacy Razer receiver quirk.
 			for (int key = 2; key < 256; key++) {
 				uint64_t down_time = key_down_at[k][key];
 				if (down_time != 0) {

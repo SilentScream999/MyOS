@@ -910,10 +910,36 @@ That backend lives in `tests/` and is absent from normal kernels. The test reads
 the volume popup's complete pixels after corrupting its retained cutout, changes
 slider/mute content, leaves stale partial clips and alternates destination
 indices. This uses the same retained panel machinery as the app picker.
+App groups, overflow, volume and clipboard history share `popup_cache.h` and
+the opaque shell popup retained-foreground path. The suite
+requires static popups to reuse that cache during eight consecutive animation
+submissions on alternating destinations, compares replay with uncached painting,
+and checks exact repair clips with and without cache storage. Content damage,
+slider/mute changes, hover, titles, font scale and catalog changes invalidate
+the cache; ordinary pointer motion within the same row does not. Start and
+other shell popups share the existing scratch allocation and invalidate each other's
+cached pixels when repainting. No animation frame rate is reduced.
+Clipboard coverage includes populated and empty history, hover, pinning,
+scrolling, deleting and selecting an entry to paste/close over fullscreen
+Rainbow. Each static clipboard must reuse its pixels while all eight animation
+submissions execute; closing must restore the animation's exposed region.
+For another opaque shell popup, use `wm_render_cached_popup` for painting and
+provide its bounds/dispatch through `wm_shell_popup_panel`/`wm_render_shell_popup`.
+Keep content invalidation separate from the geometry signature: ordinary hover
+or selection changes must not disable retained animation or widen scene repairs.
 The production CPU interaction test is `python3 tests/qemu_volume_popup_test.py`
 (run after a normal `make iso`); it covers slider endpoints, out-of-panel drag
 capture, shared key/mute state, hold-repeat/release and popup dismissal.
-`make test-audio` also checks repeat deadlines, geometry and icon coverage.
+`make test-audio` also checks repeat deadlines, geometry, icon coverage and HID
+media descriptors (bitmaps/arrays/IDs, malformed input and per-keyboard state).
+`python3 tests/qemu_usb_audio_test.py` verifies real xHCI media-key transfers,
+ordinary F1–F3 preservation, two keyboards, direct/hub hotplug and held-key
+disconnect. Consumer-report formats are covered by host fixtures; QEMU's virtual
+keyboard sends Keyboard-page media usages. The owner confirms physical Dareu
+EK815S media keys. `audio_service_probe.py` checks the real guest task's CPU
+cycles, service iterations, state and wake deadline: idle must add zero CPU
+cycles/iterations with manual wake only. USB, MP3, popup and capture tests use
+this probe around activity to catch missed notifications or continued polling.
 The covered-log volume probe puts opaque fullscreen Rainbow above the visible
 Boot Log, sends queued volume changes and checks that the log's contents do not
 change. It validates every generated popup/tray damage rectangle through the

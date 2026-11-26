@@ -16,6 +16,7 @@ import time
 import wave
 import qemu_storage_smoke as smoke
 from qemu_audio_test import boot
+from audio_service_probe import AudioServiceProbe
 
 
 def encode(rate, channels, seconds):
@@ -66,6 +67,23 @@ def fixtures():
     content = {'music.mp3': encode(44100, 2, 6), 'mono song.mp3': tag + mono,
                'short.mp3': encode(48000, 2, .04),
                'long.mp3': encode(48000, 2, 30), 'bad.mp3': b'not an MP3\n'}
+    # Own an open, stopped stream and exit on foreground cancellation without
+    # closing it. Event-driven cleanup must not depend on a 2 ms owner scan.
+    owner_source=smoke.OUT/'idle-pcm-owner.cpp';owner_object=smoke.OUT/'idle-pcm-owner.o';owner_elf=smoke.OUT/'idle-pcm-owner.elf'
+    owner_source.write_text(r'''
+static long call(unsigned long n,unsigned long a=0,unsigned long b=0,unsigned long c=0){
+    long result;asm volatile("syscall":"=a"(result):"a"(n),"D"(a),"S"(b),"d"(c):"rcx","r11","memory");return result;
+}
+extern "C" void _start(){
+    if(call(224,7)<0){call(60,1);for(;;){}}
+    const char message[]="Opened idle PCM owner.\n";call(1,1,(unsigned long)message,sizeof(message)-1);
+    call(35,30000);call(60,0);for(;;){}
+}
+''')
+    subprocess.run(['clang++','-target','x86_64-elf','-ffreestanding','-fno-stack-protector','-fno-pic','-fno-pie',
+        '-mno-red-zone','-fno-exceptions','-fno-rtti','-c',str(owner_source),'-o',str(owner_object)],check=True)
+    subprocess.run(['ld.lld','-nostdlib','-z','max-page-size=0x1000','-Ttext=0x400000','-o',str(owner_elf),str(owner_object)],check=True)
+    content['idle-owner.elf']=owner_elf.read_bytes()
     with tarfile.open(smoke.ROOT / 'initrd.tar') as original, tarfile.open(archive, 'w', format=tarfile.USTAR_FORMAT) as result:
         for entry in original:
             result.addfile(entry, original.extractfile(entry) if entry.isfile() else None)
@@ -104,6 +122,7 @@ def main():
         raise AssertionError('Missing ' + text + '\n' + log[-5000:])
     try:
         boot(q, 'mp3-boot')
+        service=AudioServiceProbe(q);service.assert_idle()
         q.type('play /music.mp3\n', pause=0)
         wait_for('Audio: PCM stream opened')
         time.sleep(.7); key('audiomute'); time.sleep(.7); key('audiomute')
@@ -114,6 +133,7 @@ def main():
         assert 'Audio: muted\n0x0000000000000001' in log, log[-5000:]
         assert 'Audio: volume percent\n0x000000000000003C' in log, log[-5000:]
         assert 'Audio: PCM drain failed' not in log, log[-5000:]
+        service.assert_idle()
         q.type('play /mono song.mp3\n', pause=0)
         wait_for('Audio: PCM drain completed', 2)
         q.type('play /bad.mp3\n', pause=1)
@@ -129,6 +149,15 @@ def main():
         log = wait_for('Audio: PCM drain completed', 4)
         assert log.count('Audio: PCM stream opened') == 5, log[-5000:]
         assert 'Audio: PCM DMA stalled' not in log, log[-5000:]
+        q.type('run /idle-owner.elf\n',pause=0);wait_for('Audio: PCM stream opened',6)
+        assert service.number('hda::pcm_owner',4)
+        service.assert_idle() # An allocated but stopped stream needs no timer.
+        key('ctrl-c')
+        for _ in range(50):
+            if not service.number('hda::pcm_owner',4):break
+            time.sleep(.1)
+        else:raise AssertionError('Exited idle PCM owner retained the audio device')
+        service.assert_idle()
         assert q.command('query-status')['running']
     finally:
         q.close()
@@ -151,7 +180,7 @@ def main():
     # intervals, rather than merely setting a state flag in the kernel log.
     quiet = [sum(v*v for v in left[i:i+4800])/4800 for i in range(first+4800, min(first+5*48000,len(left)-4800),4800)]
     assert min(quiet)<1, 'Mute key did not silence recorded audio'
-    print('PASS: stereo 44.1 kHz and tagged mono 22.05 kHz MP3, resampling, multimedia volume/mute, malformed/missing file, Ctrl+C and reopen, short-stream drain, recorded PCM frequencies')
+    print('PASS: zero idle audio CPU, stopped-owner exit cleanup, stereo/mono MP3, resampling, multimedia volume/mute, malformed/missing file, Ctrl+C/reopen, short drain and recorded PCM frequencies')
 
 
 if __name__ == '__main__': main()
