@@ -47,6 +47,7 @@ options; header dependencies are tracked automatically.
 | Option | Default | Purpose |
 |---|---|---|
 | `OPT=-O2` | `-O0` | Kernel-wide optimization; test separately on hardware |
+| `USER_OPT=-O0` | `-O2` | Userspace app optimization; use `-O0` for app debugging. Flag changes rebuild app objects automatically |
 | `GPU=0` | `1` | Disable Intel GPU probing/acceleration; unsupported hardware falls back automatically |
 | `GPU_COMPOSE=0` | `GPU` | Disable opaque GPU composition and rainbow |
 | `GPU_PRESENT=0` | `GPU_COMPOSE` | Use CPU presentation instead of supported vblank page flips |
@@ -95,6 +96,9 @@ options; header dependencies are tracked automatically.
   opens text documents in it and offers a right-click Open with menu.
 - Native Image Viewer: PNG/JPEG, checkerboard transparency, fit/actual size,
   zoom and pan. Open from Start or double-click an image in Explorer.
+- Native Music Player: MP3 streaming, play/pause/stop, elapsed time and app
+  volume/mute. Open from Start or double-click an MP3 in Explorer. See
+  [Music Player](docs/MUSIC_PLAYER.md).
 - Native Task Manager: a 60-second Core 0 CPU graph, collapsible Programs,
   Background processes and Kernel / System sections, CPU sorting within each,
   PID and scheduler state. Open with Ctrl+Shift+Esc, from Start, or

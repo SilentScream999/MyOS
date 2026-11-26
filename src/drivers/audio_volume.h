@@ -5,6 +5,12 @@
 struct AudioVolume {
     unsigned percent = 70;
     bool muted = false;
+    AudioVolume combined(unsigned app_percent,bool app_muted) const {
+        auto result=*this;
+        result.percent=percent*(app_percent>100?100:app_percent)/100;
+        result.muted=muted||app_muted;
+        return result;
+    }
     void key(unsigned code) {
         if (code == 0x20) muted = !muted;
         else {

@@ -38,7 +38,24 @@ struct WindowShadowTarget {
     // that it matches the target before this shadow, including prior layers.
     const uint32_t* background_row=nullptr;
 };
+struct WindowShadowLayer { VisibleRect outer;bool visible,shadow; };
+// Equal-bounds clients never touch the shadow outside their shared rectangle.
+// Consecutive shadows can therefore be replayed as one exact repeated blend,
+// even when one of those clients is translucent. Different bounds split runs.
+static inline void window_shadow_runs(const WindowShadowLayer* layers,unsigned count,unsigned* repeats){
+    for(unsigned i=0;i<count;++i)repeats[i]=layers[i].visible&&layers[i].shadow?1:0;
+    for(unsigned i=0;i<count;++i){
+        if(!repeats[i])continue;
+        const auto a=layers[i].outer;
+        for(unsigned j=i+1;j<count;++j){
+            if(!layers[j].visible)continue;
+            const auto b=layers[j].outer;
+            if(a.x1!=b.x1||a.y1!=b.y1||a.x2!=b.x2||a.y2!=b.y2)break;
+            repeats[i]+=repeats[j];repeats[j]=0;
+        }
+    }
+}
 // Target is the opaque desktop master. Clip and outer bounds are exclusive.
 void window_shadow_draw(WindowShadowTarget target,VisibleRect outer,VisibleRect clip,
-                        const VisibleRect* opaque=nullptr,unsigned opaque_count=0);
+                        const VisibleRect* opaque=nullptr,unsigned opaque_count=0,unsigned repetitions=1);
 #endif

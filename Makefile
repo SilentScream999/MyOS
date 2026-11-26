@@ -241,9 +241,24 @@ test-exfat: .storage-test/fat32-test
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -MMD -MP -I. -c $< -o $@
 
-USER_CFLAGS = -O0 -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
+# Native apps draw their own contents; debug-only code generation makes their
+# first frame visibly lag window creation. Keep kernel OPT independent.
+USER_OPT ?= -O2
+USER_CFLAGS = $(USER_OPT) -g -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
               -mno-red-zone -target x86_64-elf -fno-builtin \
               -fno-unwind-tables -fno-asynchronous-unwind-tables
+
+# Flag changes must rebuild apps too, rather than leave stale debug binaries
+# packaged in a freshly built ISO. Keep the stamp stable for identical flags.
+.PHONY: FORCE_USER_CONFIG
+FORCE_USER_CONFIG:
+
+.storage-test/user-config: FORCE_USER_CONFIG
+	@mkdir -p .storage-test
+	@printf '%s\n' '$(CC) $(CXX) $(USER_CFLAGS)' > $@.tmp
+	@cmp -s $@.tmp $@ && rm $@.tmp || mv $@.tmp $@
+
+$(addprefix user/,init.o counter.o win_test.o gpu_test.o mp3_player.o music_player.o fn_diag.o bundle_demo.o explorer.o notepad.o task_manager.o image_viewer.o image_codec.o console.o): .storage-test/user-config
 
 user/init.o: user/init.c user/shell_line.h user/wiz_cmd.h src/core/wiz.h src/core/app.h src/fs/fileinfo.h
 	$(CC) $(USER_CFLAGS) -I. -c $< -o $@
@@ -253,6 +268,16 @@ user/mp3_player.o: user/mp3_player.cpp user/audio_resampler.h user/audio_sinc_ta
 
 mp3_player.elf: user/mp3_player.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
+
+user/music_player.o: user/music_player.cpp user/native_ui.h user/native_audio.h user/native_file_dialog.h user/native_text.h user/native_controls.h user/audio_resampler.h user/audio_sinc_table.h src/gui/power_icons.h src/fs/fileinfo.h src/gui/ui_font.h src/gui/ui_font_data.h third_party/minimp3/minimp3.h user/codec_libc/string.h user/codec_libc/stdlib.h
+	$(CXX) $(USER_CFLAGS) -O2 -std=c++20 -fno-exceptions -fno-rtti -I. -Iuser/codec_libc -c $< -o $@
+
+music_player.elf: user/music_player.o
+	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
+
+test-music-player:
+	python3 tests/run_music_player_tests.py
+.PHONY: test-music-player
 
 user/fn_diag.o: user/fn_diag.cpp src/drivers/fn_trace.h
 	$(CXX) $(USER_CFLAGS) -O2 -std=c++20 -fno-exceptions -fno-rtti -I. -c $< -o $@
@@ -271,7 +296,7 @@ init.elf: user/init.o
 WIZ_ASSETS = tools/wiz_pack.py $(wildcard assets/apps/*/app.manifest) $(wildcard assets/apps/*/data/*) \
              $(wildcard assets/icons/hicolor/*/apps/*.png)
 PACKAGE_DIR := build/packages
-PACKAGES := $(addprefix $(PACKAGE_DIR)/,counter.wiz win_test.wiz bundle_demo.wiz explorer.wiz notepad.wiz task_manager.wiz image_viewer.wiz)
+PACKAGES := $(addprefix $(PACKAGE_DIR)/,counter.wiz win_test.wiz bundle_demo.wiz explorer.wiz notepad.wiz task_manager.wiz image_viewer.wiz music_player.wiz)
 $(PACKAGE_DIR)/%.wiz: %.elf $(WIZ_ASSETS)
 	mkdir -p $(@D)
 	$(if $(wildcard assets/apps/$*/app.manifest),python3 tools/wiz_pack.py pack --elf $< --manifest assets/apps/$*/app.manifest --icons assets/icons/hicolor $(if $(wildcard assets/apps/$*/data),--data assets/apps/$*/data,) -o $@,cp $< $@)
@@ -354,7 +379,7 @@ user/bundle_demo.o: user/bundle_demo.c user/wizlib.h src/core/wiz.h
 bundle_demo.elf: user/bundle_demo.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
-user/explorer.o: user/explorer.cpp user/native_ui.h user/native_text.h user/native_controls.h src/gui/window_input.h src/gui/power_icons.h user/wiz_cmd.h src/core/wiz.h src/core/app.h src/gui/ui_font.h src/gui/ui_font_data.h
+user/explorer.o: user/explorer.cpp user/native_ui.h user/native_audio.h user/native_text.h user/native_controls.h src/gui/window_input.h src/gui/power_icons.h user/wiz_cmd.h src/core/wiz.h src/core/app.h src/gui/ui_font.h src/gui/ui_font_data.h
 	$(CXX) $(USER_CFLAGS) -std=c++20 -fno-exceptions -fno-rtti -I. -c $< -o $@
 
 explorer.elf: user/explorer.o
@@ -421,6 +446,7 @@ initrd.tar: init.elf fn_diag.elf mp3_player.elf counter.elf win_test.elf gpu_tes
 	cp $(PACKAGE_DIR)/notepad.wiz initrd_root/bin/
 	cp $(PACKAGE_DIR)/task_manager.wiz initrd_root/bin/
 	cp $(PACKAGE_DIR)/image_viewer.wiz initrd_root/bin/
+	cp $(PACKAGE_DIR)/music_player.wiz initrd_root/bin/
 	mkdir -p initrd_root/share/system
 	cp mp3_player.elf initrd_root/share/system/
 	cp fn_diag.elf initrd_root/share/system/
@@ -530,6 +556,7 @@ test-audio:
 clean:
 	rm -f user/fn_diag.o fn_diag.elf
 	rm -f user/mp3_player.o mp3_player.elf
+	rm -f user/music_player.o music_player.elf music_player.wiz
 	rm -f user/gpu_test.o gpu_test.elf
 	rm -f user/image_viewer.o user/image_codec.o image_viewer.elf image_viewer.wiz
 	rm -rf iso_root initrd_root $(PACKAGE_DIR) build/console.elf $(OBJ) $(OBJ:.o=.d) $(EXT4_OBJ) $(EXT4_OBJ:.o=.d) user/init.o user/counter.o user/win_test.o user/bundle_demo.o user/explorer.o user/notepad.o user/task_manager.o user/console.o wyzar wyzar.iso myos myos.iso init.elf counter.elf win_test.elf bundle_demo.elf explorer.elf notepad.elf task_manager.elf counter.wiz win_test.wiz bundle_demo.wiz initrd.tar

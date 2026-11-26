@@ -20,6 +20,50 @@ static uint32_t darken(uint32_t pixel,unsigned alpha) {
     return result;
 }
 int main() {
+    // Combined shadows must match every rounding step of repeated painting,
+    // for real clipped pixels, padding, all color channels and cover geometry.
+    for(unsigned repeats:{1u,2u,3u,7u,15u,32u})for(int variant=0;variant<4;++variant){
+        constexpr int w=96,h=80,stride=104;
+        std::vector<uint32_t> expected(stride*h+16,0xa5a5a5a5);
+        for(int y=0;y<h;++y)for(int x=0;x<w;++x)expected[y*stride+x]=0xff000000u|((x*7919u+y*104729u)&0xffffffu);
+        auto actual=expected;
+        VisibleRect outer{12,15,75,63},clip{variant*3,variant*2,w-variant,h-variant};
+        VisibleRect covers[]={outer,{35,8,90,30},{0,45,40,78}};
+        for(unsigned i=0;i<repeats;++i)
+            window_shadow_draw({(uint8_t*)expected.data(),w,h,stride*4},outer,clip,covers,variant);
+        window_shadow_draw({(uint8_t*)actual.data(),w,h,stride*4},outer,clip,covers,variant,repeats);
+        assert(actual==expected);
+        // Exercise the known-row path as well; successive passes must use the
+        // previous output after the first pass, rather than reuse the old row.
+        std::vector<uint32_t> row(w);
+        for(int x=0;x<w;++x)row[x]=0xff000000u|x*123457u;
+        for(int y=0;y<h;++y)for(int x=0;x<w;++x)actual[y*stride+x]=expected[y*stride+x]=row[x];
+        for(unsigned i=0;i<repeats;++i)
+            window_shadow_draw({(uint8_t*)expected.data(),w,h,stride*4,i?nullptr:row.data()},outer,clip,covers,variant);
+        window_shadow_draw({(uint8_t*)actual.data(),w,h,stride*4,row.data()},outer,clip,covers,variant,repeats);
+        assert(actual==expected);
+    }
+    {
+        VisibleRect a{10,10,60,60},b{20,20,70,70};
+        WindowShadowLayer layers[]={{a,true,true},{a,true,false},{a,true,true},
+            {b,false,true},{a,true,true},{b,true,true},{a,true,true}};
+        unsigned repeats[7];window_shadow_runs(layers,7,repeats);
+        unsigned expected[]={3,0,0,0,0,1,1};
+        for(unsigned i=0;i<7;++i)assert(repeats[i]==expected[i]);
+        std::vector<uint32_t> full(96*80,0xffaabbcc),batched=full;
+        for(unsigned i=0;i<7;++i){
+            if(!layers[i].visible)continue;
+            auto bounds=layers[i].outer;
+            if(layers[i].shadow)window_shadow_draw({(uint8_t*)full.data(),96,80,96*4},bounds,{0,0,96,80});
+            window_shadow_draw({(uint8_t*)batched.data(),96,80,96*4},bounds,{0,0,96,80},nullptr,0,repeats[i]);
+            // Opaque and translucent body draws remain between shadows.
+            for(int y=bounds.y1;y<bounds.y2;++y)for(int x=bounds.x1;x<bounds.x2;++x){
+                auto paint=[&](uint32_t p){return i&1?darken(p,100):0xff507090u+i*0x010203;};
+                full[y*96+x]=paint(full[y*96+x]);batched[y*96+x]=paint(batched[y*96+x]);
+            }
+        }
+        assert(full==batched);
+    }
     static_assert(sizeof(window_shadow_cache)==169); // bounded shared cache
     constexpr int width=96,height=80,pitch=width*4+32;
     for(int test=0;test<80;++test){

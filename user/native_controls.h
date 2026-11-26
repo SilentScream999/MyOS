@@ -5,7 +5,8 @@
 
 enum class NativeIcon {
     Up, Refresh, Open, Minus, Plus, Fit, ActualSize, Back, Forward,
-    NewFolder, NewFile, Rename, Copy, Cut, Paste, Delete, Install, Pin, ShowHidden, Eject, DisclosureDown
+    NewFolder, NewFile, Rename, Copy, Cut, Paste, Delete, Install, Pin, ShowHidden, Eject, DisclosureDown,
+    Play, Pause, Stop, Music
 };
 
 // Use the Start menu's restart artwork for refresh. Other toolbar symbols use
@@ -21,7 +22,13 @@ static unsigned native_icon_coverage(NativeIcon icon,int x,int y,int size){
             return distance>=(radius-6)*(radius-6)&&distance<=(radius+6)*(radius+6);
         };
         bool ink=false;
-        if(icon==NativeIcon::Up)ink=stroke(0,56,0,-48)||stroke(-40,-8,0,-48)||stroke(0,-48,40,-8);
+        if(icon==NativeIcon::Play)ink=px>=-40&&px<=56&&py>=-64&&py<=64&&
+            (py<0?-py:py)*96<=(56-px)*64;
+        else if(icon==NativeIcon::Pause)ink=py>=-56&&py<=56&&((px>=-48&&px<=-16)||(px>=16&&px<=48));
+        else if(icon==NativeIcon::Stop)ink=px>=-48&&px<=48&&py>=-48&&py<=48;
+        else if(icon==NativeIcon::Music)ink=stroke(-24,40,-24,-48)||stroke(-24,-48,56,-64)||
+            stroke(56,-64,56,24)||ring(-44,44,20)||ring(36,28,20);
+        else if(icon==NativeIcon::Up)ink=stroke(0,56,0,-48)||stroke(-40,-8,0,-48)||stroke(0,-48,40,-8);
         else if(icon==NativeIcon::Back)ink=stroke(32,-48,-16,0)||stroke(-16,0,32,48);
         else if(icon==NativeIcon::Forward)ink=stroke(-32,-48,16,0)||stroke(16,0,-32,48);
         else if(icon==NativeIcon::Open)ink=stroke(-64,-32,-24,-32)||stroke(-24,-32,-8,-16)||
@@ -104,7 +111,10 @@ struct NativeToolbarButton {
         surface.rounded(x,y,w,h,6,edge);surface.rounded(x+1,y+1,w-2,h-2,5,fill);
         int text_width=label?ui_text_width(ui_font_for_pixels(12),label):0;
         int size=18,start=x+(w-size-(text_width?text_width+5:0))/2;
-        native_draw_icon(surface,icon,start,y+(h-size)/2,size,ink);
+        // Folder artwork sits below the center of its logical square. Align
+        // its visible silhouette with the label, rather than the empty margin.
+        int icon_y=y+(h-size)/2-(icon==NativeIcon::Open?2:0);
+        native_draw_icon(surface,icon,start,icon_y,size,ink);
         if(text_width)surface.text(start+size+5,y+(h-ui_font_for_pixels(12)->height)/2,label,ink,x+w-4,12);
     }
 };

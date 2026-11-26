@@ -38,7 +38,7 @@ for `rcx`/`r11` and memory effects. User-pointer validation remains incomplete.
 | 221 | `STORAGE_STATE` | Action 0 returns the storage namespace generation. Action 1 takes a path as the second argument and returns 1 if it supports external-drive eject, otherwise 0. Invalid requests return -1. Explorer polls the generation to refresh drives without directory polling |
 | 222 | `WIN_PUBLISH` | Owner-only immutable surface snapshot; optional source-space top damage height, zero for full image. Returns 0 on publication or -1 on invalid arguments/deferred publication. See the window API |
 | 223 | `WIN_ALPHA` | ABI 11. Owned window ID and mode: 0=opaque (default), 1=premultiplied source-over. Returns 0 or -1; changing modes damages the full window. See the window API |
-| 224 | `AUDIO` | `(action, arg, bytes)`. Actions 0–5 retain HDA diagnostics/firmware mute controls; actions 6–12 add shared volume/mute and an exclusive PCM stream, described below. Errors: -1 failed/unavailable hardware, stream underflow or DMA failure; -2 busy/wrong stream owner; -3 unsupported route; -4 invalid arguments/user buffer; -5 no alternate DAC; -6 unavailable firmware backend. Operations may sleep and check interruption. See [audio](../docs/AUDIO.md) |
+| 224 | `AUDIO` | `(action, arg, bytes)`. Actions 0–5 retain HDA diagnostics/firmware mute controls; actions 6–17 add master/stream volume and an exclusive PCM stream, described below. Errors: -1 failed/unavailable hardware, stream underflow or DMA failure; -2 busy/wrong stream owner; -3 unsupported route; -4 invalid arguments/user buffer; -5 no alternate DAC; -6 unavailable firmware backend. Operations may sleep and check interruption. See [audio](../docs/AUDIO.md) |
 | 225 | `FIRMWARE_DIAG` | `(action,arg,buffer,capacity,offset)`. Action 0 arms an owner-scoped Fn trace for arg=1000..45000 ms. Action 1 copies trace bytes starting at arg; zero buffer/capacity returns total trace bytes. Action 2 exports table selector arg: 0=FADT, 1=ECDT, 2=DSDT, 3..34=SSDT occurrences; zero buffer/capacity queries size, otherwise copies from offset. Action 3 marks stage arg=0..15; action 4 disarms. Trace read/mark/stop require the owning PID. Tables are read-only, checksummed, limited to 1 MiB and backed by ACPI memory. Output buffers require user-writable pages and 1..65536-byte capacity. Errors: -1 missing/invalid table or task, -2 capture busy/wrong owner, -4 invalid arguments/buffer |
 | 200–208 | Window operations, including native resizing (206–208, ABI 4) | See [Window API](WindowAPI.md) |
 | 209 | `WIN_ROLE` | Owned window ID, role (0=app, 1=common file dialog); returns 0 or -1. ABI 6; gives common dialogs the Explorer icon without changing ownership |
@@ -57,8 +57,13 @@ for `rcx`/`r11` and memory effects. User-pointer validation remains incomplete.
 | 10 | Stop and close the owning stream, return 0. Owner exit/interruption also triggers cleanup |
 | 11 | arg=volume 0..100; update shared volume, return 0; does not change software mute |
 | 12 | arg=0 unmute software / 1 mute software / 2 toggle software mute; return 0; volume level is retained |
+| 13 | ABI 12. Same buffer rules as action 8; copy available space and return bytes accepted (possibly 0 or partial) without waiting for DMA space. Advance the source pointer before retrying; negative errors require closing the stream |
+| 14 | ABI 12. arg=1 pause / 0 resume. Preserve queued PCM and DMA position; return 0. Paused streams retain ownership and do not need periodic DMA service |
+| 15 | ABI 12. Return queued PCM bytes. arg=1 also starts a short stream below the prefill threshold; arg=0 reads the service's latest counters without waking it. Poll for zero to finish without a blocking drain |
+| 16 | ABI 12. arg=0; read the service's latest consumed PCM bytes, clamped to bytes submitted, without waking it. Divide by actual rate times 4 for elapsed seconds |
+| 17 | ABI 13. Owner-only stream volume: arg=0..100 and bytes=0 unmuted / 1 muted. Publish app gain/mute without changing shared system volume/mute. The audio worker applies the combined app/system level; a new stream starts at 100%, unmuted |
 
-Only the opening PID can write/drain/close. Volume/mute controls are global.
+Only the opening PID can write/drain/close or use actions 13–17. Actions 11/12 control the global mixer; action 17 controls only the owning stream.
 There is one 256 KiB DMA ring with a reserved page and a 128 KiB start threshold.
 An exhausted stream is stopped; writing again after underrun fails, so close
 and reopen. PCM pages/descriptors stay pinned even on failed device shutdown.

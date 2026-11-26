@@ -57,7 +57,7 @@ def encode(rate, channels, seconds):
         library.lame_close(state)
 
 
-def fixtures():
+def fixtures(extra_files=None):
     target = smoke.OUT / 'mp3-test.iso'
     archive = smoke.OUT / 'mp3-test-initrd.tar'
     mono = encode(22050, 1, 2)
@@ -84,6 +84,7 @@ extern "C" void _start(){
         '-mno-red-zone','-fno-exceptions','-fno-rtti','-c',str(owner_source),'-o',str(owner_object)],check=True)
     subprocess.run(['ld.lld','-nostdlib','-z','max-page-size=0x1000','-Ttext=0x400000','-o',str(owner_elf),str(owner_object)],check=True)
     content['idle-owner.elf']=owner_elf.read_bytes()
+    content.update(extra_files or {})
     with tarfile.open(smoke.ROOT / 'initrd.tar') as original, tarfile.open(archive, 'w', format=tarfile.USTAR_FORMAT) as result:
         for entry in original:
             result.addfile(entry, original.extractfile(entry) if entry.isfile() else None)

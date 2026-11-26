@@ -449,6 +449,24 @@ def main():
             debug.write(address('g_gpu_render_hook'),bytes(8));repaint()
             assert [pixel_at(px,py) for px,py in shadow_samples]==expected_shadow,'CPU and GPU shadow scenes differ'
             debug.write(address('g_gpu_render_hook'),render_hook)
+            # Coincident windows keep the exact darkness of both shadows while
+            # the compositor batches their shadow run and culls the hidden body.
+            lower_geometry=debug.read(lower+x_offset,16)
+            upper_geometry=debug.read(upper+x_offset,16)
+            debug.write(lower+x_offset,upper_geometry)
+            debug.write(upper+shadow_offset,b'\0');repaint()
+            coincident_base=[pixel_at(px,py) for px,py in shadow_samples]
+            double_shadow=[over(shadow_alpha(px,py)<<24,over(shadow_alpha(px,py)<<24,color))
+                for (px,py),color in zip(shadow_samples,coincident_base)]
+            debug.write(lower+shadow_offset,b'\1');debug.write(upper+shadow_offset,b'\1')
+            skipped=value('g_scene_occluded_windows');repaint()
+            assert [pixel_at(px,py) for px,py in shadow_samples]==double_shadow,'Batched shadows changed stacked opacity'
+            assert value('g_scene_occluded_windows')>skipped,'Fully covered client/chrome work was not culled'
+            for _ in range(3):
+                repaint(1036,228,1036,228)
+                assert pixel_at(1036,228)==double_shadow[0],'Repeated shadow repair accumulated opacity'
+            debug.write(lower+x_offset,lower_geometry);debug.write(lower+shadow_offset,b'\0');repaint()
+            assert [pixel_at(px,py) for px,py in shadow_samples]==expected_shadow,'Restoring window geometry left stale shadow pixels'
             debug.write(upper+maximized_offset,b'\1');repaint()
             assert pixel_at(1170,228)==base[1] and pixel_at(1152,300)==base[2],'Maximize left shadow pixels'
             debug.write(upper+maximized_offset,b'\0');repaint()

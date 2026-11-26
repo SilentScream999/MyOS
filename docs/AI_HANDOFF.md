@@ -30,6 +30,7 @@ probes. See [build configurations](../BUILD_CONFIGS.txt) and the
 | Task Manager | Core 0 CPU history, grouped programs/background/kernel tasks and opt-in Kernel / Input breakdown (ABI 10) | [Syscalls](../APIDocs/Syscalls.md) |
 | Images | PNG/JPEG wallpapers; lazy PNG icons, alpha, themes and bounded caching | [Images](IMAGES.md) |
 | Image Viewer | Native PNG/JPEG app, Explorer association, fit/zoom/pan, bounded userspace arena | [Viewer](IMAGE_VIEWER.md) |
+| Music Player | Native MP3 app, Explorer association, common picker, play/pause/stop and draggable app volume; ABI 13 owner-scoped gain | [Music Player](MUSIC_PLAYER.md) |
 | Fonts | Runtime TTF selection with built-in fallback; printable ASCII UI | [Fonts](FONTS.md) |
 | Storage | Journaled ext4 USB root, persistent apps/settings/files, atomic saves, automatic capacity setup | [ext4](EXT4.md) |
 | Input | xHCI HID, USB hubs, descriptor-based pointers, PS/2 keyboard/Synaptics | [USB/input](USB_INPUT.md) |

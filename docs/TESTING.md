@@ -4,12 +4,64 @@ Updated 2026-11-17. Run commands from the repository root in WSL/Linux.
 Use current build artifacts, clang sanitizers, QEMU, OVMF and e2fsprogs as needed.
 Build/setup instructions are in [README](../README.md).
 
+Native apps default to `USER_OPT=-O2`, independently of kernel `OPT=-O0`.
+Their drawing runs in userspace; unoptimized app builds can leave the initial
+window frame visible noticeably before its contents are ready. The userspace
+configuration stamp rebuilds app objects when compiler/flag settings change.
+Use `USER_OPT=-O0` explicitly for app debugging.
+
+For startup measurements, run `python3 tests/qemu_app_startup_test.py` after
+`make iso`. It reports load, scheduler-to-window and window-to-first-paint
+intervals for Notepad, Task Manager, Image Viewer and Explorer in a diskless
+guest. These are QEMU measurements, not physical-GPU presentation timings.
+An isolated comparison at 1280x800 reduced window-to-paint from 51/144/63/426 ms
+to 20/28/33/44 ms respectively with optimized apps and the same debug kernel.
+Host rendering/behavior suites also pass with `-O2` plus ASan/UBSan.
+Timings vary with host load. The many-terminal idle-CPU check in
+`qemu_terminal_test.py` keeps its original five-percentage-point limit. The
+compositor now batches consecutive equal-bounds shadows using exact repeated
+per-channel blending, skips covered client/title work on CPU fallback as well
+as direct scanout, and avoids rebuilding unchanged visibility regions or
+scanning covered window bodies per background row. The original 10–12% versus
+33–36% one/fifteen-terminal workload measured 10% versus 10% after this fix.
+The workload includes exposed Rainbow animation; terminal shells are blocked.
+These are QEMU measurements; physical-hardware CPU remains to be checked.
+`make test-window-shadow` compares 1/2/3/7/15/32 combined shadows against the
+original repeated pixel operations, including clipping, padding, cover masks,
+known background rows and opaque/translucent bodies between shadows. The GPU
+integration suite checks coincident-window shadow pixels, tiny repairs and
+restored geometry as well as ordinary alpha/source/presentation recovery.
+
 For journal initialization on reused media, run
 `python3 tests/journal_reformat_test.py`. It creates an older journaled
 filesystem, reformats the same blocks, provisions new files without journaling
 as automatic expansion does, and repeatedly interrupts otherwise idle mounts.
 Fresh processes must recover the new marker and document unchanged. Independent
 `e2fsck -fn` checks validate the final metadata. Fixtures are disposable files.
+
+## Music Player
+
+```sh
+make test-music-player test-explorer test-audio test-wiz
+make iso PERSIST_DISK=.storage-test/music-player-seed.img ROOT_MIB=64
+python3 tests/qemu_music_player_test.py
+python3 tests/qemu_mp3_test.py
+```
+
+The player host test runs the real decoder/resampler and native renderer under
+ASan/UBSan, checking partial PCM writes, backpressure, pause, finish, errors and
+cleanup, including 8 kHz conversion. Explorer tests check MP3 associations and
+Open with. The diskless QEMU GUI test checks actual DMA progress, pause longer
+than the service deadline with an idle audio worker, modal picker input,
+resume, stop/replay and close cleanup. Its screenshot is
+`.storage-test/music-player-paused.png`. The console suite separately verifies
+captured PCM and existing playback behavior. QEMU cannot prove physical sound.
+
+ABI 13 coverage also drags the app slider, verifies owner gain/mute reaches the
+codec, and asserts that the system mixer value/revision stays unchanged. Host
+tests cover drag clamping, release outside the client, and app/master gain
+combination. `python3 tests/qemu_volume_popup_test.py` checks the system tray and
+popup with the smaller speaker artwork and its unchanged click targets.
 
 ## Image Viewer and retained Start icons
 

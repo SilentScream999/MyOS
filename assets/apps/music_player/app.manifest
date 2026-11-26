@@ -1,0 +1,7 @@
+id=music_player
+name=Music Player
+version=1.0.0
+abi=13
+type=gui
+icon=music_player
+description=Play MP3 files with native pause, stop and app volume controls.

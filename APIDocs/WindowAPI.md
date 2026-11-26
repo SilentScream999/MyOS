@@ -38,6 +38,8 @@ It sets the common file-dialog role automatically. See [common file dialogs](../
 ## Input keys and buttons
 
 Mouse down/up `key` values are button bits: 1=left, 2=right, 4=middle.
+Since ABI 13, mouse-move `key` also reports the currently held button bits.
+Clients can cancel a drag after a release outside the window by checking this mask.
 Native clients receive right/middle transitions in their client area; right
 click also focuses the window without beginning a drag.
 Keyboard events contain ASCII text, or arrows at `0x1041` through `0x1044`

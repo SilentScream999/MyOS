@@ -55,6 +55,30 @@ def desktop_symbol(name, x, y):
             color = (255, 229, 155)
         if inside(x, y, [(7, 53), (57.3, 53), (57, 55), (7, 55)]):
             color = (220, 151, 36)
+    elif name == 'music_player':
+        # A navy record with silver rim and warm play badge. Use the same
+        # full-canvas, shaded silhouettes as the other native app icons.
+        radius = math.hypot(x-29, y-29)
+        if math.hypot(x-30, y-31) <= 26:
+            color = (40, 59, 82)
+        if radius <= 26:
+            color = (190, 209, 227) if y < 29 else (117, 147, 176)
+        if radius <= 23:
+            color = (34, 53, 78)
+            if any(abs(radius-r) < .45 for r in (14, 17, 20)):
+                color = (60, 82, 109)
+            if y < 27 and -3 < x-y < 8:
+                color = (71, 98, 127)
+        if radius <= 10:
+            color = (155, 134, 209) if y < 29 else (110, 88, 166)
+        if radius <= 2.5:
+            color = (223, 232, 243)
+        if math.hypot(x-47, y-47) <= 14:
+            color = (143, 91, 31)
+        if math.hypot(x-46, y-45) <= 13:
+            color = (255, 216-round((y-32)*1.8), 128-round(y-32))
+        if inside(x, y, [(43, 38), (43, 52), (53, 45)]):
+            color = (70, 60, 85)
     elif name == 'image_viewer':
         if 5 <= x <= 59 and 10 <= y <= 55:
             color = (210, 219, 238)
@@ -135,7 +159,7 @@ def icon(name, size):
             for sy in range(4):
                 for sx in range(4):
                     x, y = (px+(sx+.5)/4)*64/size, (py+(sy+.5)/4)*64/size
-                    if name in ('explorer', 'notepad', 'task_manager', 'image_viewer'):
+                    if name in ('explorer', 'notepad', 'task_manager', 'image_viewer', 'music_player'):
                         color = desktop_symbol(name, x, y)
                         if color is not None:
                             for i in range(3): sums[i] += color[i]
@@ -177,7 +201,7 @@ def icon(name, size):
 
 
 def main():
-    names = ('terminal', 'application-default', 'visual-test', 'rainbow', 'boot-log', 'counter', 'win_test', 'explorer', 'notepad', 'task_manager', 'image_viewer')
+    names = ('terminal', 'application-default', 'visual-test', 'rainbow', 'boot-log', 'counter', 'win_test', 'explorer', 'notepad', 'task_manager', 'image_viewer', 'music_player')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--only', choices=names, help='Regenerate one icon family')
     args = parser.parse_args()

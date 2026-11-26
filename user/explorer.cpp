@@ -1,6 +1,7 @@
 // Native, freestanding file manager. Host tests exercise the same filesystem
 // and input code through NATIVE_HOST_TEST; no host GUI toolkit is involved.
 #include "user/native_ui.h"
+#include "user/native_audio.h"
 #include "user/native_text.h"
 #include "user/native_controls.h"
 #include "src/gui/window_input.h"
@@ -168,6 +169,7 @@ static void select_row(int index) {
 }
 static void open_with_notepad();
 static void open_with_viewer();
+static void open_with_music();
 static bool image_document(const char* name) {
     return native_image_file(name);
 }
@@ -187,6 +189,7 @@ static void open_selected() {
     }
     if(text_document(path)){open_with_notepad();return;}
     if(image_document(path)){open_with_viewer();return;}
+    if(native_music_file(path)){open_with_music();return;}
     uint64_t fd=sys_open(path,0);if(fd==(uint64_t)-1){status("Cannot read that file.");return;}
     uint64_t n=sys_read(fd,dialog_text,sizeof(dialog_text)-1);sys_close(fd);
     if(n>=sizeof(dialog_text)){status("File read failed.");return;}
@@ -210,6 +213,12 @@ static void open_with_viewer() {
     int64_t pid=native_call(216,(uint64_t)"/bin/image_viewer.wiz",(uint64_t)path);
     if(pid<=0){status("Could not open Image Viewer. Check /bin/image_viewer.wiz.");return;}
     dialog=NONE;status("File opened in Image Viewer.");
+}
+static void open_with_music() {
+    char path[256];if(!selected_path(path)||entries[selected].type!=1)return;
+    int64_t pid=native_call(216,(uint64_t)"/bin/music_player.wiz",(uint64_t)path);
+    if(pid<=0){status("Could not open Music Player. Check /bin/music_player.wiz.");return;}
+    dialog=NONE;status("File opened in Music Player.");
 }
 static void begin_dialog(Dialog kind) {
     if((kind==RENAME||kind==DELETE_ITEM)&&!selected_path(dialog_target))return;
@@ -556,13 +565,14 @@ static void render() {
         }else multiline(transfer.message,left+24,top+194,472,2);
         draw_button({left+404,top+238,92,30,transfer.active?"Cancel":"Close"});
     } else if(dialog==OPEN_WITH) {
-        int left=(WIDTH-480)/2,top=(HEIGHT-202)/2;
-        surface.rounded(left,top,480,202,8,0xff332a42);
+        int left=(WIDTH-480)/2,top=(HEIGHT-240)/2;
+        surface.rounded(left,top,480,240,8,0xff332a42);
         surface.text(left+22,top+18,"Open with",INK,left+458,18);
         surface.text(left+22,top+52,entries[selected].name,MUTED,left+458);
         draw_button({left+22,top+88,436,38,"Notepad - edit text files"},true);
         draw_button({left+22,top+128,436,28,"Image Viewer - PNG / JPEG (press I)"},true);
-        draw_button({left+366,top+158,92,30,"Cancel"});
+        draw_button({left+22,top+162,436,28,"Music Player - MP3 (press M)"},true);
+        draw_button({left+366,top+202,92,30,"Cancel"});
     } else if(dialog!=NONE) {
         bool reading=dialog==PREVIEW||dialog==PACKAGE_RESULT;int height=reading?380:202;if(height>HEIGHT-40)height=HEIGHT-40;
         int top=(HEIGHT-height)/2,left=(WIDTH-480)/2;
@@ -616,7 +626,7 @@ static void handle_event(const NativeEvent& event) {
     if(event.type==5) {
         uint32_t key=event.key;
         if(context_open){context_open=false;dirty=true;if(key==27)return;}
-        if(dialog==OPEN_WITH){if(key==27){dialog=NONE;dirty=true;}else if(key=='i'||key=='I')open_with_viewer();else if(key=='\n'||key=='\r'){if(image_document(entries[selected].name))open_with_viewer();else open_with_notepad();}return;}
+        if(dialog==OPEN_WITH){if(key==27){dialog=NONE;dirty=true;}else if(key=='i'||key=='I')open_with_viewer();else if(key=='m'||key=='M')open_with_music();else if(key=='\n'||key=='\r'){if(image_document(entries[selected].name))open_with_viewer();else if(native_music_file(entries[selected].name))open_with_music();else open_with_notepad();}return;}
         if(dialog!=NONE){if(key==27){dialog=NONE;dirty=true;}else if(key=='\n'||key=='\r')commit_dialog();
             else if(editing_dialog()){
                 if((event.mods&1)&&(key=='v'||key=='V'))paste_text(edit_text,sizeof(edit_text));else edit_key(edit_text,sizeof(edit_text),key,event.mods);}return;}
@@ -649,10 +659,11 @@ static void handle_event(const NativeEvent& event) {
                 if(action==0)open_selected();else if(action==1)choose_open_with();else if(action==2)copy_selection(false);
                 else if(action==3)copy_selection(true);else if(action==4)copy_as_path();else if(action==5)begin_dialog(RENAME);else if(action==6)begin_dialog(DELETE_ITEM);}
             return;}
-        if(dialog==OPEN_WITH){int left=(WIDTH-480)/2,top=(HEIGHT-202)/2;
+        if(dialog==OPEN_WITH){int left=(WIDTH-480)/2,top=(HEIGHT-240)/2;
             if(hit(x,y,left+22,top+88,436,38))open_with_notepad();
             else if(hit(x,y,left+22,top+128,436,28))open_with_viewer();
-            else if(hit(x,y,left+366,top+158,92,30)){dialog=NONE;dirty=true;}return;}
+            else if(hit(x,y,left+22,top+162,436,28))open_with_music();
+            else if(hit(x,y,left+366,top+202,92,30)){dialog=NONE;dirty=true;}return;}
         if(dialog!=NONE){bool reading=dialog==PREVIEW||dialog==PACKAGE_RESULT;int h=reading?380:202;if(h>HEIGHT-40)h=HEIGHT-40;
             int top=(HEIGHT-h)/2,left=(WIDTH-480)/2;
             if(editing_dialog()&&hit(x,y,left+20,top+57,438,34)){

@@ -187,7 +187,7 @@ static void wm_taskbar_paint_popup(const TaskbarPopup& panel,int min_y,int max_y
         char label[24];to_str(state.percent,label);resources::append(label,sizeof(label),state.muted?"%  Muted":"%");
         wm_draw_string(panel.x+16,panel.y+44,label,0xffbfc9e8,g_font_scale_100,panel.w-32);
         int cy=volume.slider_y(),left=volume.slider_left(),right=volume.slider_right(),thumb=volume.thumb(state.percent);
-        wm_draw_volume_icon(panel.x+16,cy-14,28,state.percent,state.muted,min_y,max_y);
+        wm_draw_volume_icon(panel.x+19,cy-11,22,state.percent,state.muted,min_y,max_y);
         rect(left,cy-2,right-left,4,0xff465475);
         if(thumb>left)rect(left,cy-2,thumb-left,4,state.muted?0xff8290ac:0xff9d8aff);
         rect(thumb-5,cy-10,10,20,state.muted?0xff9da8c0:0xffd2caff);

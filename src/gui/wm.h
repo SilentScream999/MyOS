@@ -2536,6 +2536,7 @@ static bool wm_retained_menu_ready(){
 #endif
 }
 static uint64_t g_scene_compose_count=0,g_scene_compose_pixels=0;
+static uint64_t g_scene_occluded_windows=0;
 static GpuScenePlan g_retained_animation_plan{};
 struct RetainedAnimationLayer {GpuSceneClient client;bool shadow;int id;};
 static RetainedAnimationLayer g_retained_animation_layers[MAX_WINDOWS];
@@ -2784,7 +2785,7 @@ static void wm_draw_taskbar_tray(VisibleRect clip,bool background=true){
         uint32_t clock_scale = wm_clock_scale();
         int32_t fps_width=wm_fps_width();
         int32_t clock_x=tray_x+fps_width+g_taskbar_h,clock_width=wm_clock_width();
-        int size=g_taskbar_h-16;if(size>28)size=28;if(size<14)size=14;
+        int size=g_taskbar_h-20;if(size>22)size=22;if(size<12)size=12;
         int icon_x=wm_volume_tray_x()+(g_taskbar_h-size)/2;
         wm_draw_volume_icon(icon_x,tray_y+(tray_h-size)/2,size,g_audio_mixer.value.percent,g_audio_mixer.value.muted,min_y,max_y);
         char fps[16];to_str(g_desktop_fps,fps);
@@ -2922,12 +2923,19 @@ static bool wm_draw_retained_animation([[maybe_unused]] uint64_t repair_menu_key
     }
     static GpuScenePlan alpha_plan{};
     bool clean_background=row_available,used_background_row=false;
+    static WindowShadowLayer shadow_layers[MAX_WINDOWS];
+    static unsigned shadow_repeats[MAX_WINDOWS];
+    for(unsigned s=0;s<g_retained_animation_layer_count;++s){
+        const auto& layer=g_retained_animation_layers[s];
+        shadow_layers[s]={layer.client.outer,layer.client.visible,layer.shadow};
+    }
+    window_shadow_runs(shadow_layers,g_retained_animation_layer_count,shadow_repeats);
     for(unsigned s=0;s<g_retained_animation_layer_count;++s){
         const auto& layer=g_retained_animation_layers[s];
         const auto& c=layer.client;
         for(unsigned i=0;i<plan.count;++i){
             auto clip=plan.copies[i].destination;
-            if(layer.shadow){
+            if(shadow_repeats[s]){
                 auto plain=clip;
                 if(clean_background){
                     // CPU grip ink differs from the palette in the last rows.
@@ -2935,14 +2943,14 @@ static bool wm_draw_retained_animation([[maybe_unused]] uint64_t repair_menu_key
                     if(visibility_valid(plain)){
                         window_shadow_draw(
                             {g_master_backbuffer,(int)fb->width,(int)(fb->height-g_taskbar_h),(int)fb->pitch,background_row},
-                            c.outer,plain);
+                            c.outer,plain,nullptr,0,shadow_repeats[s]);
                         used_background_row=true;
                     }
                     if(clip.y1<plain.y2)clip.y1=plain.y2;
                 }
                 if(visibility_valid(clip))window_shadow_draw(
                     {g_master_backbuffer,(int)fb->width,(int)(fb->height-g_taskbar_h),(int)fb->pitch},
-                    c.outer,clip);
+                    c.outer,clip,nullptr,0,shadow_repeats[s]);
             }
         }
         if(layer.shadow||c.premultiplied)clean_background=false;
@@ -3446,12 +3454,31 @@ retry_scene:
             if(rects[i].visible)gpu_launch_sample(win->id,g_compositor_frame);
             const auto& slot=win->published[win->published_slot];
             if(slot.pixels && !g_gpu_quarantine_sources)sources[i]={slot.pixels,slot.width,slot.height,(uint32_t)slot.width*4,win->premultiplied,slot.revision};}}
+    static WindowShadowLayer shadow_layers[MAX_WINDOWS];
+    static unsigned shadow_repeats[MAX_WINDOWS];
+    static bool client_hidden[MAX_WINDOWS];
+    static int background_clients[MAX_WINDOWS];unsigned background_count=0;
+    for(int s=0;s<frame_count;++s){
+        int i=frame_order[s];const auto& r=rects[i];
+        client_hidden[i]=false;
+        for(int t=s+1;r.visible&&t<frame_count;++t){
+            int higher=frame_order[t];const auto& cover=rects[higher];
+            if(!cover.visible||sources[higher].alpha||!sources[higher].pixels)continue;
+            if(cover.x1<=r.x1&&cover.y1<=r.y1&&cover.x2>=r.x2&&cover.y2>=r.y2){
+                client_hidden[i]=true;break;
+            }
+        }
+        shadow_layers[s]={{r.x1,r.y1,r.x2,r.y2},r.visible,
+            frame_windows[i]->shadow_enabled&&!frame_windows[i]->maximized};
+        if(r.visible&&!client_hidden[i])background_clients[background_count++]=i;
+    }
+    window_shadow_runs(shadow_layers,frame_count,shadow_repeats);
     // Ignore shadow areas hidden by higher opaque windows. This preserves the
     // fullscreen fast paths and retained client updates away from shadow edges.
     auto exposed_shadow=[&](VisibleRect damage){
         for(int s=0;s<frame_count;++s){
-            int i=frame_order[s];const auto& r=rects[i];auto* win=frame_windows[i];
-            if(!r.visible||!win->shadow_enabled||win->maximized)continue;
+            int i=frame_order[s];const auto& r=rects[i];
+            if(!r.visible||!shadow_repeats[s])continue;
             VisibleRect outer{r.x1,r.y1,r.x2,r.y2};
             auto hit=visibility_intersect(window_shadow_bounds(outer),damage);
             if(!visibility_valid(hit))continue;
@@ -3461,6 +3488,7 @@ retry_scene:
                 int j=frame_order[t];if(!rects[j].visible)continue;
                 auto cover=VisibleRect{rects[j].x1,rects[j].y1,rects[j].x2,rects[j].y2};
                 if(sources[j].alpha)cover.y2=cover.y1+(int)g_title_h;
+                if(cover.x1>=outer.x1&&cover.y1>=outer.y1&&cover.x2<=outer.x2&&cover.y2<=outer.y2)continue;
                 if(!visibility_subtract(&region,cover))return true;
             }
             if(region.count)return true;
@@ -3616,8 +3644,9 @@ retry_scene:
         Span spans[MAX_WINDOWS+1];
         int num_spans = 0;
         
-        for (int i = 0; i < frame_count; i++) {
-            if (frame_windows[i] && rects[i].visible && (int32_t)y >= rects[i].y1 && (int32_t)y < rects[i].y2 &&
+        for(unsigned at=0;at<background_count;++at){
+            int i=background_clients[at];
+            if ((int32_t)y >= rects[i].y1 && (int32_t)y < rects[i].y2 &&
                 (!sources[i].alpha || (int32_t)y<rects[i].y1+(int32_t)g_title_h)) {
                 // Intersects this scanline
                 int32_t sx1 = rects[i].x1; if (sx1 < (int32_t)min_x) sx1 = min_x;
@@ -3692,8 +3721,9 @@ retry_scene:
 
     // Stage 2: Windows in stack order
     int first_window=0;
-    if(direct){
-        // Any opaque client covering this damage makes lower layers hidden.
+    {
+        // An opaque client covering the entire repair hides every lower layer
+        // on CPU fallback too. Caret updates must not repaint all idle windows.
         for(int s=0;s<frame_count;++s){
             int i=frame_order[s];const auto& r=rects[i];
             if(r.visible && sources[i].pixels &&
@@ -3714,7 +3744,7 @@ retry_scene:
         WinRect r = rects[idx];
         Source source_surface=sources[idx];int display_w=r.x2-r.x1,display_h=r.y2-r.y1-g_title_h;
 
-        if(win->shadow_enabled&&!win->maximized){
+        if(shadow_repeats[s]){
             VisibleRect covers[MAX_WINDOWS+1];unsigned cover_count=0;
             if(visibility_valid(menu_cover))covers[cover_count++]=menu_cover;
             for(int t=s+1;t<frame_count;++t){
@@ -3724,8 +3754,9 @@ retry_scene:
                     sources[higher].alpha?cover.y1+(int)g_title_h:cover.y2};
             }
             window_shadow_draw({g_master_backbuffer,(int)fb->width,(int)(fb->height-g_taskbar_h),(int)fb->pitch},
-                {r.x1,r.y1,r.x2,r.y2},{(int)min_x,(int)min_y,(int)max_x+1,(int)max_y+1},covers,cover_count);
+                {r.x1,r.y1,r.x2,r.y2},{(int)min_x,(int)min_y,(int)max_x+1,(int)max_y+1},covers,cover_count,shadow_repeats[s]);
         }
+        if(client_hidden[idx]){++g_scene_occluded_windows;continue;}
 
         int32_t dr1 = (r.y1 > (int32_t)min_y) ? r.y1 : (int32_t)min_y;
         // Window bounds and row loops are half-open; damage max_y is inclusive.
@@ -3736,6 +3767,23 @@ retry_scene:
         // Don't draw windows over taskbar area
         if (dr2 > (int32_t)(fb->height - g_taskbar_h)) dr2 = fb->height - g_taskbar_h;
         if (dr1 >= dr2) continue;
+
+        // GPU plans already subtract higher opaque windows. Apply the same
+        // coverage proof before CPU/client/chrome work: a fully covered body
+        // contributes no pixels. Its exposed shadow was still composed above.
+        VisibleRegion exposed{};
+        auto body=visibility_intersect({r.x1,r.y1,r.x2,r.y2},
+            {g_ui_clip_left,dr1,g_ui_clip_right,dr2});
+        if(visibility_valid(body))exposed.rects[exposed.count++]=body;
+        bool exact=true;
+        if(visibility_valid(menu_cover))exact=visibility_subtract(&exposed,menu_cover);
+        for(int t=s+1;exact&&exposed.count&&t<frame_count;++t){
+            int higher=frame_order[t];if(!rects[higher].visible)continue;
+            const auto& cover=rects[higher];
+            exact=visibility_subtract(&exposed,{cover.x1,cover.y1,cover.x2,
+                sources[higher].alpha||!sources[higher].pixels?cover.y1+(int)g_title_h:cover.y2});
+        }
+        if(exact&&!exposed.count){++g_scene_occluded_windows;continue;}
 
         // Unified surface compositor: every window (system or user) is backed by its surface buffer
         window_timer.next(&RainbowWindowTrace::chrome);

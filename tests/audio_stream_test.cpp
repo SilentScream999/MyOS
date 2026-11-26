@@ -27,6 +27,8 @@ int main() {
     double rms=std::sqrt(power/47800);
     assert(rms>6900&&rms<7250); // Linear interpolation lost substantial treble.
     AudioVolume volume{};
+    volume.percent=80;auto app=volume.combined(25,false);assert(app.percent==20&&!app.muted&&volume.percent==80);
+    assert(volume.combined(100,true).muted);volume.muted=true;assert(volume.combined(50,false).muted);volume.muted=false;
     for(unsigned p=0;p<=100;++p){volume.percent=p;unsigned value=volume.amp(0x80034a4a);assert((value&127)<=74);assert(bool(value&128)==!p);}
     volume.percent=100;volume.key(0x30);assert(volume.percent==100);
     for(unsigned i=0;i<20;++i)volume.key(0x2e);assert(volume.percent==0);

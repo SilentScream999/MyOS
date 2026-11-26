@@ -23,6 +23,13 @@ static inline bool visibility_valid(VisibleRect r) {
 // On overflow leave the input untouched. Callers may conservatively retain
 // covered pixels, but must never lose exposed pixels.
 static inline bool visibility_subtract(VisibleRegion* region, VisibleRect cover) {
+    // Repeated/overlapping windows often supply a cover already removed by a
+    // higher layer. Preserve the existing region without rebuilding/copying it
+    // when this subtraction cannot change any rectangle.
+    bool intersects=false;
+    for(unsigned i=0;i<region->count;++i)
+        if(visibility_valid(visibility_intersect(region->rects[i],cover))){intersects=true;break;}
+    if(!intersects)return true;
     VisibleRegion next{};
     for (unsigned i = 0; i < region->count; ++i) {
         VisibleRect r = region->rects[i], cut = visibility_intersect(r, cover);

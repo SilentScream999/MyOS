@@ -17,6 +17,11 @@ int main(){
         assert(a<=16&&b<=16&&c<=16);loud+=a;muted+=b;quiet+=c;
     }
     assert(loud&&muted&&quiet&&loud!=muted&&loud>quiet);
+    for(int size:{12,16,18,20,22}){
+        unsigned ink=0;
+        for(int y=0;y<size;++y)for(int x=0;x<size;++x){auto a=volume_icon_coverage(80,false,x,y,size);assert(a<=16);ink+=a;}
+        assert(ink>0);
+    }
     AudioMixer mixer{};
     mixer.percent(200);assert(mixer.value.percent==100&&mixer.revision==2);
     mixer.percent(100);assert(mixer.revision==2);

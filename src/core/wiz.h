@@ -43,7 +43,7 @@ typedef unsigned long long wiz_u64;
 
 #define WIZ_FOOTER_SIZE    40u
 #define WIZ_FORMAT_VERSION 2u
-#define WIZ_ABI            11u         // ABI 11 adds opt-in premultiplied window alpha
+#define WIZ_ABI            13u         // ABI 13 adds owner-scoped PCM volume/mute
 #define WIZ_MAX_MANIFEST   4096u
 #define WIZ_MAX_ICON       (4u * 1024u * 1024u)
 #define WIZ_MAX_ENTRIES    512u

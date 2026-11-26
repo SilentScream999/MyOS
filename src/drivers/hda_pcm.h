@@ -4,6 +4,10 @@
 static uint64_t pcm_phys = 0;
 static pid_t pcm_owner = 0;
 static bool pcm_running = false, pcm_fault = false;
+static bool pcm_paused = false;
+static unsigned pcm_percent=100;
+static bool pcm_muted=false;
+static uint64_t pcm_gain_revision=1,pcm_gain_applied=0,pcm_gain_failed=0;
 static bool pcm_abandoned = false;
 static Task* service_thread = nullptr;
 static bool service_waiting=false,service_pending=true;
@@ -35,9 +39,10 @@ static bool firmware_identity() {
         pci_cfg_read32(active.ecam, active.start, active.bus, active.dev, active.fn, 0x2c), codec_id);
 }
 static bool apply_volume() {
-    AudioVolume desired;uint64_t revision;
-    {TtyIrqGuard guard;desired=volume;revision=g_audio_mixer.revision;}
-    if (!live_route.count) {g_audio_mixer.applied=revision;return true;}
+    AudioVolume desired;uint64_t revision,gain_revision;
+    {TtyIrqGuard guard;desired=pcm_owner?volume.combined(pcm_percent,pcm_muted):volume;
+        revision=g_audio_mixer.revision;gain_revision=pcm_gain_revision;}
+    if (!live_route.count) {g_audio_mixer.applied=revision;pcm_gain_applied=gain_revision;return true;}
     unsigned dac = live_route.nodes[live_route.count - 1], pin = live_route.nodes[0];
     const auto& widget = widgets[dac];
     if (widget.caps & 4) {
@@ -50,7 +55,7 @@ static bool apply_volume() {
     }
     unsigned enable = 0x40 | (hda_pin_kind(widgets[pin]) == 2 && (widgets[pin].pin_caps & 8) ? 0x80 : 0);
     if(!set(pin, 0x707, desired.muted || !desired.percent ? 0 : enable))return false;
-    g_audio_mixer.applied=revision;return true;
+    g_audio_mixer.applied=revision;pcm_gain_applied=gain_revision;return true;
 }
 static bool consume_volume_keys() {
     bool changed = false;
@@ -64,7 +69,7 @@ static bool consume_volume_keys() {
         control_log_hex("Audio: deferred multimedia make code", key);
         {TtyIrqGuard guard;g_audio_mixer.key(key);} changed = true;
     }
-    if (g_audio_mixer.applied==g_audio_mixer.revision) return true;
+    if (g_audio_mixer.applied==g_audio_mixer.revision && pcm_gain_applied==pcm_gain_revision) return true;
     if(changed){control_log_hex("Audio: volume percent", volume.percent);control_log_hex("Audio: muted", volume.muted);}
     return apply_volume();
 }
@@ -78,7 +83,8 @@ static void pcm_disconnect() {
         set(live_route.nodes[live_route.count - 1], 0x706, 0);
         set(live_route.nodes[0], 0x707, 0);
     }
-    live_route = {}; pcm_owner = 0;pcm_abandoned=false;
+    live_route = {}; pcm_owner = 0;pcm_abandoned=false;pcm_paused=false;
+    pcm_percent=100;pcm_muted=false;pcm_gain_applied=pcm_gain_revision;
 }
 static bool pcm_service() {
     if (!pcm_running) return !pcm_fault;
@@ -111,8 +117,8 @@ static bool pcm_service() {
     return !pcm_fault;
 }
 static bool pcm_start() {
-    if (pcm_running || !pcm.written || (pcm.consumed && pcm.consumed >= pcm.written)) return !pcm_fault;
-    pcm.position = 0; pcm.tick = pcm_progress_tick = g_tick_count;
+    if (pcm_paused || pcm_running || !pcm.written || (pcm.consumed && pcm.consumed >= pcm.written)) return !pcm_fault;
+    pcm.tick = pcm_progress_tick = g_tick_count;
     w8(stream + 3, 0x1c); fence(); w8(stream, 2);
     if (!wait([] { return r8(stream); }, 2, 2)) { pcm_fault = true; return false; }
     pcm_running = true; return true;
@@ -165,19 +171,20 @@ static int64_t pcm_open(unsigned kind, unsigned requested_rate) {
     w32(stream + 0x18, (uint32_t)(dma_phys + 3072)); w32(stream + 0x1c, (dma_phys + 3072) >> 32);
     w32(stream + 8, pcm.capacity); w16(stream + 0xc, descriptors - 1); w16(stream + 0x12, stream_format);
     w8(stream + 2, 0x10); w8(stream + 3, 0x1c);
-    pcm = {}; pcm_fault = false; pcm_running = false;
+    pcm = {}; pcm_fault = false; pcm_running = false; pcm_paused = false;
     live_route = route; pcm_owner = g_current_task->pid;pcm_abandoned=false;
+    pcm_percent=100;pcm_muted=false;++pcm_gain_revision;
     print((char*)"Audio: PCM stream opened");
     log_hex("Audio: PCM sample rate Hz", rate);
     log_hex("Audio: PCM DMA ring bytes", pcm.capacity);
     return requested_rate ? rate : 0;
 }
-static int64_t pcm_write(uint64_t address, unsigned bytes) {
+static int64_t pcm_write(uint64_t address, unsigned bytes, bool nonblocking = false) {
     if (!pcm_buffer_valid(address, bytes)) return -4;
     unsigned done = 0;
     while (done < bytes) {
         if (g_current_task->interrupt_requested || !pcm_service() || !consume_volume_keys()) return -1;
-        if (!pcm_running && pcm.consumed) {
+        if (!pcm_running && !pcm_paused && pcm.consumed >= pcm.written && pcm.consumed) {
             print((char*)"Audio: PCM underrun; playback stopped"); pcm_fault = true; return -1;
         }
         unsigned free = pcm.space();
@@ -185,11 +192,12 @@ static int64_t pcm_write(uint64_t address, unsigned bytes) {
         unsigned count = bytes - done;
         if (count > free) count = free;
         if (count > pcm.capacity - offset) count = pcm.capacity - offset;
-        if (!count) { sleep_ms(2); continue; }
+        if (!count) { if(nonblocking)return done; sleep_ms(2); continue; }
         auto* destination = (int16_t*)(HHDM + pcm_phys + offset);
         const auto* source = (const int16_t*)(address + done);
         if (!(widgets[live_route.nodes[live_route.count - 1]].caps & 4)) {
-            for (unsigned i = 0; i < count / 2; ++i) destination[i] = (int32_t)source[i] * volume.percent / 100;
+            auto desired=volume.combined(pcm_percent,pcm_muted);
+            for (unsigned i = 0; i < count / 2; ++i) destination[i] = desired.muted?0:(int32_t)source[i] * desired.percent / 100;
         } else memcpy(destination, source, count);
         dma_flush(HHDM + pcm_phys + offset, count);
         pcm.written += count; done += count;
@@ -198,14 +206,39 @@ static int64_t pcm_write(uint64_t address, unsigned bytes) {
     return done;
 }
 // Shared controls: 6=status, 7=open(kind), 8=write(ptr,bytes), 9=drain,
-// 10=close, 11=volume(0..100), 12=mute(0=off,1=on,2=toggle).
+// 10=close, 11=volume(0..100), 12=mute(0=off,1=on,2=toggle),
+// 13=try-write(ptr,bytes), 14=pause(1)/resume(0), 15=queued(start=0/1),
+// 16=played bytes, 17=stream volume(arg=0..100,bytes=mute 0/1).
+// Interactive operations retain opening-PID ownership.
 static int64_t control(uint64_t action, uint64_t arg, uint64_t bytes = 0) {
     if (action <= 5) {
         if (pcm_owner && (action == 1 || action == 2)) return -2;
         return control_legacy(action, arg);
     }
-    if (action > 12 || (action == 11 && arg > 100) || (action == 12 && arg > 2)) return -4;
+    if (action > 17 || (action == 11 && arg > 100) || (action == 12 && arg > 2) ||
+        (action == 17 && (arg>100 || bytes>1)) ||
+        ((action == 14 || action == 15) && arg > 1) || (action == 16 && arg)) return -4;
     if (action == 6) return volume.percent | ((uint64_t)volume.muted << 8);
+    if(action == 17) {
+        TtyIrqGuard guard;
+        if(!pcm_owner)return -1;
+        if(!g_current_task || pcm_owner!=g_current_task->pid)return -2;
+        if(pcm_percent!=arg || pcm_muted!=bool(bytes)) {
+            pcm_percent=arg;pcm_muted=bool(bytes);++pcm_gain_revision;audio_events::notify();
+        }
+        return 0;
+    }
+    if(action == 16 || (action == 15 && !arg)) {
+        // Read the service's latest counters without acquiring hardware or
+        // waking its worker. A paused player's elapsed-time UI must not turn
+        // an event-driven audio service back into a periodic poller.
+        TtyIrqGuard guard;
+        if(!pcm_owner)return -1;
+        if(!g_current_task || pcm_owner!=g_current_task->pid)return -2;
+        if(pcm_fault)return -1;
+        return action==16 ? (int64_t)(pcm.consumed<pcm.written?pcm.consumed:pcm.written) :
+            (int64_t)(pcm.written>pcm.consumed?pcm.written-pcm.consumed:0);
+    }
     if (!attempted && control_legacy(0, 0) < 0) return -1;
     { TtyIrqGuard guard; if (busy) return -2; busy = true; }
     int64_t result = -1;
@@ -216,9 +249,9 @@ static int64_t control(uint64_t action, uint64_t arg, uint64_t bytes = 0) {
         result = apply_volume() ? 0 : -1;
     } else if (ready && action == 7) result = arg <= 3 && (!bytes || bytes == 44100 || bytes == 48000) ? pcm_open(arg, bytes) : -4;
     else if (pcm_owner && g_current_task && pcm_owner == g_current_task->pid) {
-        if (action == 8) result = bytes <= 65536 ? pcm_write(arg, bytes) : -4;
+        if (action == 8 || action == 13) result = bytes <= 65536 ? pcm_write(arg, bytes, action == 13) : -4;
         else if (action == 9) {
-            result = pcm_start() ? 0 : -1;
+            result = !pcm_paused && pcm_start() ? 0 : -1;
             while (result == 0 && pcm_running) {
                 if (g_current_task->interrupt_requested || !pcm_service() || !consume_volume_keys()) result = -1;
                 if (pcm_running && result == 0) sleep_ms(2);
@@ -227,6 +260,17 @@ static int64_t control(uint64_t action, uint64_t arg, uint64_t bytes = 0) {
             log_hex("Audio: PCM bytes submitted", pcm.written);
             print((char*)(result ? "Audio: PCM drain failed" : "Audio: PCM drain completed"));
         } else if (action == 10) { pcm_disconnect(); result = 0; }
+        else if (action == 14) {
+            // Preserve the DMA position and queued samples across pause.
+            if(pcm_service()) {
+                if(arg) { pcm_stop(); pcm_paused=true; }
+                else { pcm_paused=false; pcm_start(); }
+                result=pcm_fault?-1:0;
+            }
+        } else if(action == 15) {
+            if(pcm_service() && pcm_start())
+                result=(int64_t)(pcm.written>pcm.consumed?pcm.written-pcm.consumed:0);
+        }
     } else if (pcm_owner) result = -2;
     { TtyIrqGuard guard; busy = false;audio_events::notify(); }
     return result;
@@ -242,7 +286,9 @@ static void poll_hotkeys() {
         if (!alive) pcm_disconnect();
         else pcm_service();
     }
-    volume_failed_revision=consume_volume_keys()?0:g_audio_mixer.revision;
+    bool volume_ok=consume_volume_keys();
+    volume_failed_revision=volume_ok?0:g_audio_mixer.revision;
+    pcm_gain_failed=volume_ok?0:pcm_gain_revision;
     fn_probe::poll();
     { TtyIrqGuard guard; busy = false; }
 }
@@ -254,7 +300,8 @@ static uint64_t service_deadline(uint64_t now){
     if(busy)return 0; // The hardware owner notifies when it releases the driver.
     if(service_pending || (desktop_initialized && device_count && !attempted) ||
        g_audio_hotkeys.count || (g_audio_mixer.revision!=g_audio_mixer.applied &&
-                                g_audio_mixer.revision!=volume_failed_revision))return now;
+                                g_audio_mixer.revision!=volume_failed_revision) ||
+       (pcm_owner && pcm_gain_revision!=pcm_gain_applied && pcm_gain_revision!=pcm_gain_failed))return now;
     uint64_t next=pcm_running?now+2:0;
     auto take=[&](uint64_t at){if(at && (!next || at<next))next=at;};
     if(g_audio_hotkeys.repeating)take(g_audio_hotkeys.repeat_at);
