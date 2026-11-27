@@ -5,6 +5,30 @@ A hobby x86-64 operating system with a C++ kernel, C userspace and
 desktop, preemptive tasks, native ELF applications and persistent USB storage.
 The long-term target is a Windows-like, GPU-composited desktop.
 
+## CPU power management: support and verification TODO
+
+> [!IMPORTANT]
+> **CPU power-management coverage is incomplete. Expand support and verify each
+> supported hardware family before claiming broad compatibility.**
+
+The battery-boot performance correction currently accepts Intel family 6 models
+`0x4E`, `0x5E`, `0x8E` and `0x9E`, with SpeedStep enabled and HWP disabled.
+The correction is confirmed working on the reported Kaby Lake laptop
+(`CPUID 0x806E9`); the other accepted models still need physical verification.
+Other CPUs and existing HWP policies retain their firmware settings. This is a
+startup correction, not full automatic CPU power management.
+
+- [ ] Expand power-management support beyond the current Intel model list,
+  including capability-based HWP support for newer Intel CPUs.
+- [ ] Verify every currently accepted model on physical hardware: AC and battery
+  cold boots/restarts, unplug/reconnect behaviour, idle and sustained workloads,
+  responsiveness, thermals and battery consumption. Record results per system;
+  QEMU tests do not establish hardware compatibility.
+- [ ] Implement automatic performance scaling, AC/battery policies and user
+  power profiles, with verification across supported systems.
+
+See [power diagnostics, current limits and the hardware test procedure](docs/POWER_DIAGNOSTICS.md).
+
 ## Build and run
 
 Use WSL/Linux with `make`, `clang`, `clang++`, `ld.lld`, `xorriso`,
