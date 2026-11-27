@@ -15,6 +15,16 @@ static bool same(){
     return true;
 }
 #define XMM_CLOBBERS "xmm0","xmm1","xmm2","xmm3","xmm4","xmm5","xmm6","xmm7","xmm8","xmm9","xmm10","xmm11","xmm12","xmm13","xmm14","xmm15"
+static bool user_selectors(){
+    // Read selectors immediately after SYSRET, before any reporting syscall.
+    // AMD preserves STAR's SS.RPL bits; Intel may hide a missing RPL=3.
+    uint64_t pid;
+    uint16_t cs,ss;
+    __asm__ volatile("syscall\n mov %%cs, %1\n mov %%ss, %2"
+        : "=a"(pid),"=r"(cs),"=r"(ss) : "a"(39)
+        : "rcx","r11","memory","cc");
+    return cs==0x23 && ss==0x1b;
+}
 static bool syscalls(){
     __asm__ volatile(
         "fxrstor64 (%0)\n"
@@ -37,12 +47,15 @@ extern "C" void _start(){
     __asm__ volatile("fninit; fld1; fldpi; fxsave64 (%0); fninit"::"r"(&expected):"memory");
     expected.bytes[24]=0x80;expected.bytes[25]=0x5f; // nondefault SSE rounding
     for(unsigned i=160;i<416;++i)expected.bytes[i]=(uint8_t)(i*37+11);
+    bool selectors_ok=user_selectors();
     bool syscall_ok=syscalls(),irq_ok=preemption();
-    const char* result=syscall_ok?(irq_ok?"SIMD PASS\n":"SIMD FAIL IRQ\n"):(irq_ok?"SIMD FAIL SYSCALL\n":"SIMD FAIL BOTH\n");
+    selectors_ok=user_selectors()&&selectors_ok;
+    const char* result=!selectors_ok?"SIMD FAIL SELECTORS\n":
+        syscall_ok?(irq_ok?"SIMD PASS\n":"SIMD FAIL IRQ\n"):(irq_ok?"SIMD FAIL SYSCALL\n":"SIMD FAIL BOTH\n");
     unsigned n=0;while(result[n])++n;call(1,1,(uint64_t)result,n);
     // Report independently of the terminal frontend's private text storage.
     // The result is computed above, before these reporting-only syscalls.
     call(200,(uint64_t)result,160,160,320,100);
     call(35,2000);
-    call(60,!(syscall_ok&&irq_ok));for(;;){}
+    call(60,!(selectors_ok&&syscall_ok&&irq_ok));for(;;){}
 }

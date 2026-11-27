@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify real guest SSE state survives syscalls and timer preemption.
+"""Verify user selectors and SSE state across syscalls and timer preemption.
 
 Build: make iso PERSIST_DISK=.storage-test/viewer-seed.img ROOT_MIB=64
 Run: python3 tests/qemu_simd_test.py
@@ -52,7 +52,7 @@ def main():
                 # Window's stable prefix is id followed by title[64].
                 result=memory(pointer+4,64).split(b'\0')[0].decode(errors='replace').strip()
                 if result=='SIMD PASS':
-                    print('SIMD PASS: XMM0-15, MXCSR and x87 preserved across syscalls and timer preemption.',flush=True);return
+                    print('SIMD PASS: ring-3 CS/SS selectors and XMM0-15, MXCSR and x87 preserved across syscalls and timer preemption.',flush=True);return
                 if result.startswith('SIMD FAIL'):raise AssertionError(result)
             time.sleep(.2)
         raise AssertionError('SIMD probe timed out')

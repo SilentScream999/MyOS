@@ -18,11 +18,12 @@
 //   SYSRET (REX.W=1, 64-bit):
 //     1. Restores RIP    from RCX
 //     2. Restores RFLAGS from R11
-//     3. CS = STAR[63:48]+16 | 3,  SS = STAR[63:48]+8 | 3
+//     3. CS = STAR[63:48]+16 | 3,  SS = STAR[63:48]+8
+//        Set RPL=3 in STAR itself: AMD does not force SS.RPL to 3.
 //
 // MSR VALUES (derived from gdt.h layout):
 //   STAR[47:32] = 0x08  syscall  CS=0x08(kcode)  SS=0x08+8=0x10(kdata)
-//   STAR[63:48] = 0x10  sysretq  CS=0x10+16=0x20|3  SS=0x10+8=0x18|3
+//   STAR[63:48] = 0x13  sysretq  CS=0x13+16=0x23  SS=0x13+8=0x1B
 //                                   SEG_USER_CODE         SEG_USER_DATA
 //   LSTAR       = &syscall_entry
 //   SFMASK      = (1<<9)   clear IF on syscall entry
@@ -947,8 +948,15 @@ static void syscall_init() {
 
     // STAR: kernel CS base in [47:32], user CS base in [63:48].
     // SYSCALL  → CS=0x08, SS=0x10  (kernel code/data)
-    // SYSRETQ  → CS=0x10+16=0x20|3, SS=0x10+8=0x18|3  (user code/data)
-    wrmsr(MSR_STAR, ((uint64_t)0x0010u << 48) | ((uint64_t)0x0008u << 32));
+    // SYSRETQ  → CS=0x13+16=0x23, SS=0x13+8=0x1B (user code/data).
+    // AMD preserves STAR's RPL bits when forming SS, unlike Intel. Without
+    // RPL=3 here, SYSRET leaves SS=0x18 and a later interrupt's IRETQ faults
+    // with #GP(0x18), even though the first entry via IRETQ succeeded.
+    constexpr uint64_t user_base = (SEG_USER_DATA - 8u) | 3u;
+    static_assert(user_base + 8u == (SEG_USER_DATA | 3u));
+    static_assert(user_base + 16u == (SEG_USER_CODE | 3u));
+    static_assert(SEG_KERNEL_CODE + 8u == SEG_KERNEL_DATA);
+    wrmsr(MSR_STAR, (user_base << 48) | ((uint64_t)SEG_KERNEL_CODE << 32));
 
     // LSTAR: entry point for SYSCALL.
     wrmsr(MSR_LSTAR, (uint64_t)(uintptr_t)syscall_entry);
