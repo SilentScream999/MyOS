@@ -437,12 +437,26 @@ void _start() {
             print("  play <path.mp3> - Play MP3 music (Ctrl+C stops)\n");
             print("  audio volume <0..100> | audio mute | audio status\n");
             print("  audio hotkeys   - Capture Fn keys/firmware to /home/fnkeys.bin\n");
+            print("  power <path>    - Save CPU/GPU power diagnostic report\n");
             print("  audio test [speaker|headphone|line] - Play a short test tone\n");
             print("    Add 'alt' to test another advertised DAC for that output\n");
             print("  clear           - Clear screen\n");
             print("  bsod            - Trigger crash screen\n");
             print("  restart         - Reboot system\n");
             print("  shutdown        - Power off system\n");
+        } else if (streq(buf,"power",5)&&(buf[5]==' '||!buf[5])) {
+            const char* output=buf+5;while(*output==' ')++output;
+            if(!*output)print("Usage: power /home/power-ac.txt (or power-battery.txt)\n");
+            else {
+                int64_t pid;const char* app="/share/system/power_diag.elf";
+                sys_ttyecho(0);
+                __asm__ volatile("syscall":"=a"(pid):"a"(216UL),"D"(app),"S"(output),"d"(1UL):"rcx","r11","memory");
+                uint64_t code=0;
+                if(pid<0)print("Cannot launch power diagnostic.\n");
+                else if(sys_waitpid(pid,&code)<0)print("Cannot wait for power diagnostic.\n");
+                else if(code==130)print("^C\n");
+                sys_ttyflush_input();sys_ttyecho(1);
+            }
         } else if (streq(buf,"audio hotkeys",13)&&!buf[13]) {
             int64_t pid;const char* app="/share/system/fn_diag.elf";const char* output="/home/fnkeys.bin";
             sys_ttyecho(0);

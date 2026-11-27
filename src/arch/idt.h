@@ -50,6 +50,7 @@
 #include <stdint.h>
 #include "helpers.h"   // print(), to_hex(), hcf()
 #include "fp_context.h"
+#include "msr_probe.h"
 
 // ── Gate descriptor ───────────────────────────────────────────────────────────
 struct IDTEntry {
@@ -189,6 +190,7 @@ static const char* const exception_names[32] = {
 static void scheduler_idle_interrupt();
 extern "C" __attribute__((used))
 void exception_dispatch(ExceptionFrame* f) {
+    if(f->vector==13&&power_msr_fixup(f->vector,f->error_code,f->cs,f->rip))return;
     scheduler_idle_interrupt();
     KernelCpuScope cpu_scope(KCPU_INTERRUPTS);
     if (f->vector == LOCAL_SPURIOUS_VECTOR) return; // APIC spurious: no EOI

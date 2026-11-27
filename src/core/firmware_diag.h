@@ -2,6 +2,8 @@
 #define WYZAR_FIRMWARE_DIAG_H
 // Read-only target-machine evidence for firmware hotkey bring-up. Does not
 // interpret AML or enter ACPI mode. Export only FADT/ECDT/DSDT/SSDT, not MSDM.
+#include "drivers/power_diag.h"
+static void collect_power_sample(power_diag::Sample&);
 namespace firmware_diag {
 static pid_t owner=0;
 static bool starting=false;
@@ -58,6 +60,11 @@ static const ACPISDTHeader* table(unsigned index){
 }
 static int64_t control(uint64_t action,uint64_t arg,uint64_t buffer,uint64_t capacity,uint64_t offset){
     if(!g_current_task)return -1;
+    if(action==5){
+        if(arg||offset||capacity!=sizeof(power_diag::Sample)||!writable(buffer,capacity))return -4;
+        power_diag::Sample sample{};collect_power_sample(sample);
+        memcpy((void*)buffer,&sample,sizeof(sample));return sizeof(sample);
+    }
     if(action==0){
         if(arg<1000||arg>45000)return -4;
         {TtyIrqGuard guard;if(starting||g_fn_trace.active(g_tick_count))return -2;starting=true;}

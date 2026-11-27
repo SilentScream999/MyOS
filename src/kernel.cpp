@@ -7,6 +7,7 @@
 
 #include "arch/gdt.h"
 #include "arch/idt.h"
+#include "arch/cpu_power.h"
 
 #include "arch/irq.h"    // PIC remapping + irq_register
 #include "arch/timer.h"  // PIT driver + g_tick_count
@@ -38,6 +39,7 @@ extern "C" void wyzar_ext4_free(void* p) { kfree(p); }
 #include "../tests/gpu_compositor_backend.h"
 #endif
 #include "arch/apic_timer.h"
+#include "drivers/power_diag_collect.h"
 
 // Each scanout retains a complete scene and accumulates all changes since its
 // last flip. Rebuild its pending damage before presenting it again.
@@ -1342,6 +1344,7 @@ extern "C" void kmain(void) {
 	syscall_init();
 	print((char*)"GDT loaded.");
 	init_idt();
+	init_cpu_power();
 	// ── END NEW ──────────────────────────────────────
 
 	print((char*)"Stack size req response:");

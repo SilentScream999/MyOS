@@ -285,6 +285,12 @@ user/fn_diag.o: user/fn_diag.cpp src/drivers/fn_trace.h
 fn_diag.elf: user/fn_diag.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
+user/power_diag.o: user/power_diag.cpp src/drivers/power_diag.h .storage-test/user-config
+	$(CXX) $(USER_CFLAGS) -O2 -std=c++20 -fno-exceptions -fno-rtti -I. -c $< -o $@
+
+power_diag.elf: user/power_diag.o
+	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
+
 init.elf: user/init.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
@@ -433,7 +439,7 @@ build/console.elf: user/console.o
 win_test.elf: user/win_test.o
 	$(LD) -nostdlib -z max-page-size=0x1000 -Ttext=0x400000 -o $@ $<
 
-initrd.tar: init.elf fn_diag.elf mp3_player.elf counter.elf win_test.elf gpu_test.elf build/console.elf $(PACKAGES) assets/fonts/selawik/LICENSE.txt assets/fonts/selawik/selawk.ttf $(wildcard assets/icons/hicolor/*/apps/*.png) third_party/stb/LICENSE third_party/minimp3/LICENSE Makefile
+initrd.tar: init.elf fn_diag.elf power_diag.elf mp3_player.elf counter.elf win_test.elf gpu_test.elf build/console.elf $(PACKAGES) assets/fonts/selawik/LICENSE.txt assets/fonts/selawik/selawk.ttf $(wildcard assets/icons/hicolor/*/apps/*.png) third_party/stb/LICENSE third_party/minimp3/LICENSE Makefile
 	rm -rf initrd_root
 	mkdir -p initrd_root/bin
 	cp init.elf initrd_root/bin/
@@ -450,6 +456,7 @@ initrd.tar: init.elf fn_diag.elf mp3_player.elf counter.elf win_test.elf gpu_tes
 	mkdir -p initrd_root/share/system
 	cp mp3_player.elf initrd_root/share/system/
 	cp fn_diag.elf initrd_root/share/system/
+	cp power_diag.elf initrd_root/share/system/
 	cp build/console.elf initrd_root/share/system/
 	mkdir -p initrd_root/share/fonts
 	cp assets/fonts/selawik/LICENSE.txt initrd_root/share/fonts/selawik.txt
@@ -555,6 +562,7 @@ test-audio:
 
 clean:
 	rm -f user/fn_diag.o fn_diag.elf
+	rm -f user/power_diag.o power_diag.elf
 	rm -f user/mp3_player.o mp3_player.elf
 	rm -f user/music_player.o music_player.elf music_player.wiz
 	rm -f user/gpu_test.o gpu_test.elf

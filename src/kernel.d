@@ -14,7 +14,9 @@ src/kernel.o: src/kernel.cpp src/core/helpers.h src/core/structures.h \
   src/drivers/hid_media_report.h src/drivers/audio_events.h \
   src/drivers/usb_hub_watch.h src/drivers/usb_hub_async.h \
   src/drivers/usb_root_ports.h src/drivers/usb_device_tree.h \
-  src/arch/idt.h src/arch/fp_context.h src/arch/irq.h src/arch/timer.h \
+  src/arch/idt.h src/arch/fp_context.h src/arch/msr_probe.h \
+  src/arch/cpu_power.h src/arch/cpu_power_policy.h \
+  src/arch/../drivers/power_diag.h src/arch/irq.h src/arch/timer.h \
   src/arch/rtc.h src/core/tty.h src/core/terminal.h src/arch/acpi.h \
   src/core/syscall.h src/core/app.h src/gui/wm.h src/gui/graphics.h \
   src/drivers/mouse.h src/gui/surface.h src/gui/visibility.h \
@@ -41,9 +43,10 @@ src/kernel.o: src/kernel.cpp src/core/helpers.h src/core/structures.h \
   src/drivers/acpi_mode.h src/drivers/audio_hotkeys.h \
   src/drivers/fn_probe.h src/drivers/fn_trace.h \
   src/drivers/audio_volume.h src/drivers/hda_pcm_ring.h \
-  src/drivers/hda_pcm.h src/core/firmware_diag.h src/fs/ramfs.h \
-  src/fs/recovery.h src/arch/boot_module.h src/arch/../../limine.h \
-  src/fs/ext4_vfs.h third_party/lwext4/include/ext4.h \
+  src/drivers/hda_pcm.h src/core/firmware_diag.h \
+  src/drivers/power_diag.h src/fs/ramfs.h src/fs/recovery.h \
+  src/arch/boot_module.h src/arch/../../limine.h src/fs/ext4_vfs.h \
+  third_party/lwext4/include/ext4.h \
   third_party/lwext4/include/ext4_config.h \
   third_party/lwext4/include/ext4_types.h \
   third_party/lwext4/include/ext4_blockdev.h \
@@ -69,7 +72,8 @@ src/kernel.o: src/kernel.cpp src/core/helpers.h src/core/structures.h \
   src/drivers/gpu_render_reset.h src/drivers/gpu_gen9_workarounds.h \
   src/drivers/gpu_upload_cache.h src/drivers/gpu_alpha_coverage.h \
   src/drivers/gpu_alpha_tail_wait.h src/arch/apic_timer.h \
-  src/gui/boot_splash.h src/drivers/synaptics.h src/drivers/ps2kb.h
+  src/drivers/power_diag_collect.h src/gui/boot_splash.h \
+  src/drivers/synaptics.h src/drivers/ps2kb.h
 
 src/core/helpers.h:
 
@@ -152,6 +156,14 @@ src/drivers/usb_device_tree.h:
 src/arch/idt.h:
 
 src/arch/fp_context.h:
+
+src/arch/msr_probe.h:
+
+src/arch/cpu_power.h:
+
+src/arch/cpu_power_policy.h:
+
+src/arch/../drivers/power_diag.h:
 
 src/arch/irq.h:
 
@@ -285,6 +297,8 @@ src/drivers/hda_pcm.h:
 
 src/core/firmware_diag.h:
 
+src/drivers/power_diag.h:
+
 src/fs/ramfs.h:
 
 src/fs/recovery.h:
@@ -380,6 +394,8 @@ src/drivers/gpu_alpha_coverage.h:
 src/drivers/gpu_alpha_tail_wait.h:
 
 src/arch/apic_timer.h:
+
+src/drivers/power_diag_collect.h:
 
 src/gui/boot_splash.h:
 
